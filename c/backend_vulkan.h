@@ -88,6 +88,20 @@ int  coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                            ColiVkTensor *const *downs, const int *rows, int count,
                            float *y, const float *x);
 
+/* Third device: same contract as dev2, on a third GPU. auto skips both dev0's
+ * and dev2's physical device. */
+int  coli_vk_init_dev3(const char *spv_path, int devidx);
+int  coli_vk_dev3_available(void);
+int  coli_vk_mem_budget3(double *used_gb, double *budget_gb);
+int  coli_vk_tensor_ensure3(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);
+int  coli_vk_expert_group_issue3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                 ColiVkTensor *const *downs, const int *rows, int count,
+                                 const float *x);
+int  coli_vk_expert_group_take3(float *y);
+int  coli_vk_expert_group3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                           ColiVkTensor *const *downs, const int *rows, int count,
+                           float *y, const float *x);
+
 /* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
  * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize
  * via _reset), _row mirrors one host row (absolute position), _reset drops all layers.

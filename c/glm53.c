@@ -971,6 +971,23 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
 }
 
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
+static void mv_cpu(float *out, const Mat *w, const float *x) {
+    switch (w->fmt) {
+    case 4: matmul_i4_grouped(out, x, w->q4, w->s, 1, w->columns, w->rows, w->gs); break;
+    case 1: matmul_q(out, x, w->q8, w->s, 1, w->columns, w->rows); break;
+    default: matmul(out, x, w->f, 1, w->columns, w->rows); break;
+    }
+}
+static int g_kda_cpu = -1;
+static int g_kda_cpu_on(void) {
+    if (g_kda_cpu < 0) g_kda_cpu = getenv("COLI_KDA_CPU") ? atoi(getenv("COLI_KDA_CPU")) : 0;
+    return g_kda_cpu;
+}
+#define KMV(o, w, xx) do { \
+    if (g_kda_cpu < 0) g_kda_cpu = getenv("COLI_KDA_CPU") ? atoi(getenv("COLI_KDA_CPU")) : 0; \
+    if (g_kda_cpu) mv_cpu((o), (w), (xx)); else mv((o), (w), (xx)); \
+} while (0)
+
 static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, float *state, float *window, float *scratch) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
@@ -980,27 +997,51 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *beta = malloc((size_t)H * sizeof(float));
     float *low = malloc((size_t)D * sizeof(float));
     float *core = malloc((size_t)P * sizeof(float));
+    float *lowg = malloc((size_t)D * sizeof(float));
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
-        mv(qkv, &l->kq, row);
-        mv(qkv + P, &l->kk, row);
-        mv(qkv + 2 * P, &l->kv, row);
+        /* kq/kk/kv/kfa/kb/kga sono indipendenti e leggono tutte la stessa riga:
+         * un submit invece di sei. Il costo del percorso denso e' il round trip,
+         * non la matrice. */
+        int batched = 0;
+#ifdef COLI_VULKAN
+        if (g_vk_ready && !g_kda_cpu_on()) {
+            const Mat *bw[6] = { &l->kq, &l->kk, &l->kv, &l->kfa, &l->kb, &l->kga };
+            float *bo[6] = { qkv, qkv + P, qkv + 2 * P, low, beta, lowg };
+            ColiVkMM it[6];
+            int ok = 1;
+            for (int q = 0; q < 6; q++) {
+                if (bw[q]->fmt != 1 && bw[q]->fmt != 4) { ok = 0; break; }
+                Mat *mw = (Mat *)bw[q];
+                it[q].tensor = (ColiVkTensor **)&mw->vk;
+                it[q].weights = mw->fmt == 4 ? (const void *)mw->q4 : (const void *)mw->q8;
+                it[q].scales = mw->s; it[q].fmt = mw->fmt; it[q].O = mw->rows;
+                it[q].gs = mw->gs; it[q].out = bo[q];
+            }
+            if (ok) batched = coli_vk_matmul_multi(it, 6, row, c->hidden);
+        }
+#endif
+        if (!batched) {
+            KMV(qkv, &l->kq, row);
+            KMV(qkv + P, &l->kk, row);
+            KMV(qkv + 2 * P, &l->kv, row);
+            KMV(low, &l->kfa, row);
+            KMV(beta, &l->kb, row);
+            KMV(lowg, &l->kga, row);
+        }
         /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
-        mv(low, &l->kfa, row);
-        mv(decay, &l->kfb, low);
+        KMV(decay, &l->kfb, low);
         for (int h = 0; h < H; h++)
             for (int d = 0; d < D; d++) {
                 int i = h * D + d;
                 decay[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (decay[i] + l->dt[i]));
             }
-        mv(beta, &l->kb, row);
         for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
         coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
                       H, D, D, c->conv_k, 1e-6f, scratch);
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
          * low-rank, poi la proiezione di uscita. */
-        mv(low, &l->kga, row);
-        mv(gate, &l->kgb, low);
+        KMV(gate, &l->kgb, lowg);
         float *normed = qkv;                         /* riuso: 3P >= P */
         for (int h = 0; h < H; h++) {
             const float *src = core + (size_t)h * D;
@@ -1011,9 +1052,9 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             for (int d = 0; d < D; d++)
                 dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gate[(size_t)h * D + d]);
         }
-        mv(out + (size_t)t * c->hidden, &l->ko, normed);
+        KMV(out + (size_t)t * c->hidden, &l->ko, normed);
     }
-    free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
+    free(lowg); free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */

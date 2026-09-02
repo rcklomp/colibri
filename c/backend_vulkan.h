@@ -75,6 +75,18 @@ int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const flo
  * physical device is allowed with a warning — pre-hardware test mode). Its group
  * may be in flight simultaneously with device 0's. Tensors remember their device
  * (coli_vk_tensor_dev); free/bytes work on either. */
+/* Batched dense matvec: N independent tensors against one shared input vector,
+ * one submit instead of N. The dense path costs ~0.4 ms of submit+fence per call
+ * regardless of size, so batching is worth it even for tiny matrices. */
+#define VK_MM_MAX 8
+typedef struct {
+    ColiVkTensor **tensor;
+    const void *weights; const float *scales;
+    int fmt, O, gs;
+    float *out;
+} ColiVkMM;
+int  coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I);
+
 int  coli_vk_init_dev2(const char *spv_path, int devidx);
 int  coli_vk_dev2_available(void);
 int  coli_vk_tensor_dev(const ColiVkTensor *t);

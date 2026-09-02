@@ -92,6 +92,7 @@ static struct {
      * expert-called-repeatedly pattern). The synchronous fence wait each call means no
      * submission is ever in flight, so rebinding/re-recording only when something
      * actually changed is safe. */
+    VkDescriptorPool mm_pool; VkDescriptorSet mm_set[VK_MM_MAX];  /* batched dense matvec */
     ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, cmd_ready;
     VkBuffer bound_xbuf, bound_ybuf;
     size_t used_bytes, tensor_count;
@@ -652,6 +653,85 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
             fprintf(stderr, "[VK_PROF dense] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f | wait %.0f | memcpy_y %.0f ms\n",
                     p_n, p_x, p_desc, p_rec, p_sub, p_wait, p_y);
     }
+    return 1;
+}
+
+/* Batched dense matvec: N independent (tensor -> output) pairs that all consume
+ * the SAME input vector, recorded into one command buffer and submitted once.
+ * The dense path pays ~0.4 ms of submit+fence per call regardless of matrix
+ * size, so N separate calls pay N round trips for work the GPU finishes inside
+ * one of them. Returns 0 (and touches nothing) if it cannot serve the batch, so
+ * the caller can fall back to N plain coli_vk_matmul calls. */
+int coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I) {
+    if (!G.ready || count < 1 || count > VK_MM_MAX || I < 1) return 0;
+    for (int c = 0; c < count; c++)
+        if (!upload_tensor(items[c].tensor, items[c].weights, items[c].scales,
+                           items[c].fmt, I, items[c].O, items[c].gs)) return 0;
+
+    /* y offsets must satisfy the storage-buffer offset alignment; 256 covers it. */
+    size_t yoff[VK_MM_MAX], ytot = 0;
+    for (int c = 0; c < count; c++) {
+        yoff[c] = ytot;
+        ytot += ((size_t)items[c].O * sizeof(float) + 255) & ~(size_t)255;
+    }
+    const size_t xb = (size_t)I * sizeof(float);
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, ytot, G.memtype_cached)) return 0;
+    memcpy(G.x.ptr, x, xb);
+
+    if (!G.mm_pool) {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * VK_MM_MAX};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = VK_MM_MAX, .poolSizeCount = 1, .pPoolSizes = &ps};
+        VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.mm_pool), "mm descPool");
+        VkDescriptorSetLayout ls[VK_MM_MAX];
+        for (int c = 0; c < VK_MM_MAX; c++) ls[c] = G.dsl;
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = G.mm_pool, .descriptorSetCount = VK_MM_MAX, .pSetLayouts = ls};
+        VKCHECK(vkAllocateDescriptorSets(G.dev, &ai, G.mm_set), "mm descSets");
+    }
+
+    for (int c = 0; c < count; c++) {
+        ColiVkTensor *t = *items[c].tensor;
+        VkDescriptorBufferInfo bi[4] = {
+            {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
+            {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = G.y.buf, .offset = yoff[c], .range = (VkDeviceSize)items[c].O * sizeof(float)}};
+        VkWriteDescriptorSet w[4];
+        for (int i = 0; i < 4; i++) w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.mm_set[c],
+            .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+        vkUpdateDescriptorSets(G.dev, 4, w, 0, NULL);
+    }
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "mm resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "mm beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    for (int c = 0; c < count; c++) {
+        ColiVkTensor *t = *items[c].tensor;
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.mm_set[c], 0, NULL);
+        struct PC pc = {items[c].fmt, 1, I, items[c].O, t->rowWords, t->gs};
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd, (uint32_t)((items[c].O + 7) / 8), 1, 1);
+    }
+    VKCHECK(vkEndCommandBuffer(G.cmd), "mm endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "mm resetFence");
+    double _s0 = G.eg_prof ? vk_now() : 0;
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "mm queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] batched matmul fence wait failed - disabling GPU offload\n");
+        G.ready = 0; G.cmd_ready = 0; G.bound_tensor = NULL;
+        return 0;
+    }
+    if (G.eg_prof) { double _d = vk_now() - _s0; g_vsub_ms += _d; g_vwait_ms += 0; g_vsub_n++; }
+    for (int c = 0; c < count; c++)
+        memcpy(items[c].out, (const uint8_t *)G.y.ptr + yoff[c], (size_t)items[c].O * sizeof(float));
+
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
     return 1;
 }
 

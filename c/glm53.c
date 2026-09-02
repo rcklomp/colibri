@@ -971,6 +971,8 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
 }
 
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
+static int vk_batch_mv_chain(const Mat *const *ws, float *const *os, const int *srcs,
+                             int n, const float *xin, int I);
 static void mv_cpu(float *out, const Mat *w, const float *x) {
     switch (w->fmt) {
     case 4: matmul_i4_grouped(out, x, w->q4, w->s, 1, w->columns, w->rows, w->gs); break;
@@ -1003,24 +1005,18 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         /* kq/kk/kv/kfa/kb/kga sono indipendenti e leggono tutte la stessa riga:
          * un submit invece di sei. Il costo del percorso denso e' il round trip,
          * non la matrice. */
+        /* kq/kk/kv/kfa/kb/kga leggono la stessa riga; kfb e kgb dipendono solo
+         * da kfa e kga, quindi entrano nello STESSO submit dietro una barriera e
+         * i due intermedi non tornano mai in RAM: due round trip invece di
+         * quattro. */
         int batched = 0;
-#ifdef COLI_VULKAN
-        if (g_vk_ready && !g_kda_cpu_on()) {
-            const Mat *bw[6] = { &l->kq, &l->kk, &l->kv, &l->kfa, &l->kb, &l->kga };
-            float *bo[6] = { qkv, qkv + P, qkv + 2 * P, low, beta, lowg };
-            ColiVkMM it[6];
-            int ok = 1;
-            for (int q = 0; q < 6; q++) {
-                if (bw[q]->fmt != 1 && bw[q]->fmt != 4) { ok = 0; break; }
-                Mat *mw = (Mat *)bw[q];
-                it[q].tensor = (ColiVkTensor **)&mw->vk;
-                it[q].weights = mw->fmt == 4 ? (const void *)mw->q4 : (const void *)mw->q8;
-                it[q].scales = mw->s; it[q].fmt = mw->fmt; it[q].O = mw->rows;
-                it[q].gs = mw->gs; it[q].out = bo[q];
-            }
-            if (ok) batched = coli_vk_matmul_multi(it, 6, row, c->hidden);
+        if (!g_kda_cpu_on()) {
+            const Mat *bw[8] = { &l->kq, &l->kk, &l->kv, &l->kfa, &l->kb, &l->kga,
+                                 &l->kfb, &l->kgb };
+            float *bo[8] = { qkv, qkv + P, qkv + 2 * P, NULL, beta, NULL, decay, gate };
+            const int src[8] = { -1, -1, -1, -1, -1, -1, 3, 5 };
+            batched = vk_batch_mv_chain(bw, bo, src, 8, row, c->hidden);
         }
-#endif
         if (!batched) {
             KMV(qkv, &l->kq, row);
             KMV(qkv + P, &l->kk, row);
@@ -1028,9 +1024,10 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             KMV(low, &l->kfa, row);
             KMV(beta, &l->kb, row);
             KMV(lowg, &l->kga, row);
+            KMV(decay, &l->kfb, low);
+            KMV(gate, &l->kgb, lowg);
         }
         /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
-        KMV(decay, &l->kfb, low);
         for (int h = 0; h < H; h++)
             for (int d = 0; d < D; d++) {
                 int i = h * D + d;
@@ -1041,7 +1038,6 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       H, D, D, c->conv_k, 1e-6f, scratch);
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
          * low-rank, poi la proiezione di uscita. */
-        KMV(gate, &l->kgb, lowg);
         float *normed = qkv;                         /* riuso: 3P >= P */
         for (int h = 0; h < H; h++) {
             const float *src = core + (size_t)h * D;
@@ -1060,8 +1056,8 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
 /* N matrici indipendenti contro lo stesso vettore d'ingresso, in un submit
  * solo. Ritorna 0 se il batch non e' servibile, e il chiamante ricade sui mv()
  * singoli. */
-static int vk_batch_mv(const Mat *const *ws, float *const *os, int n,
-                       const float *xin, int I) {
+static int vk_batch_mv_chain(const Mat *const *ws, float *const *os, const int *srcs,
+                             int n, const float *xin, int I) {
 #ifdef COLI_VULKAN
     if (!g_vk_ready || n < 1 || n > VK_MM_MAX) return 0;
     ColiVkMM it[VK_MM_MAX];
@@ -1075,12 +1071,19 @@ static int vk_batch_mv(const Mat *const *ws, float *const *os, int n,
         it[q].O = mw->rows;
         it[q].gs = mw->gs;
         it[q].out = os[q];
+        it[q].I = 0;
+        it[q].src = srcs ? srcs[q] : -1;
     }
     return coli_vk_matmul_multi(it, n, xin, I);
 #else
-    (void)ws; (void)os; (void)n; (void)xin; (void)I;
+    (void)ws; (void)os; (void)srcs; (void)n; (void)xin; (void)I;
     return 0;
 #endif
+}
+
+static int vk_batch_mv(const Mat *const *ws, float *const *os, int n,
+                       const float *xin, int I) {
+    return vk_batch_mv_chain(ws, os, NULL, n, xin, I);
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */

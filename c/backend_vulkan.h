@@ -83,7 +83,9 @@ typedef struct {
     ColiVkTensor **tensor;
     const void *weights; const float *scales;
     int fmt, O, gs;
-    float *out;
+    float *out;    /* NULL = intermediate, stays on the device */
+    int I;         /* input width */
+    int src;       /* -1 = the shared input vector; >=0 = output of that item */
 } ColiVkMM;
 int  coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I);
 

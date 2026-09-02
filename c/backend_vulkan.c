@@ -664,9 +664,22 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
  * the caller can fall back to N plain coli_vk_matmul calls. */
 int coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I) {
     if (!G.ready || count < 1 || count > VK_MM_MAX || I < 1) return 0;
-    for (int c = 0; c < count; c++)
+    /* Chained items must follow the independent ones: one barrier, two stages. */
+    int nchained = 0;
+    for (int c = 0; c < count; c++) {
+        const int src = items[c].src;
+        if (src < 0) { if (nchained) return 0; continue; }
+        if (src >= c) return 0;            /* must already have been produced */
+        if (items[src].src >= 0) return 0; /* only one level of chaining */
+        nchained++;
+    }
+    for (int c = 0; c < count; c++) {
+        const int iw = items[c].src < 0 ? I : items[items[c].src].O;
+        if (iw < 1) return 0;
+        items[c].I = iw;
         if (!upload_tensor(items[c].tensor, items[c].weights, items[c].scales,
-                           items[c].fmt, I, items[c].O, items[c].gs)) return 0;
+                           items[c].fmt, iw, items[c].O, items[c].gs)) return 0;
+    }
 
     /* y offsets must satisfy the storage-buffer offset alignment; 256 covers it. */
     size_t yoff[VK_MM_MAX], ytot = 0;
@@ -692,8 +705,11 @@ int coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I) {
 
     for (int c = 0; c < count; c++) {
         ColiVkTensor *t = *items[c].tensor;
+        const int src = items[c].src;
         VkDescriptorBufferInfo bi[4] = {
-            {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
+            src < 0 ? (VkDescriptorBufferInfo){.buffer = G.x.buf, .range = VK_WHOLE_SIZE}
+                    : (VkDescriptorBufferInfo){.buffer = G.y.buf, .offset = yoff[src],
+                                               .range = (VkDeviceSize)items[src].O * sizeof(float)},
             {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
             {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
             {.buffer = G.y.buf, .offset = yoff[c], .range = (VkDeviceSize)items[c].O * sizeof(float)}};
@@ -709,10 +725,19 @@ int coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I) {
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "mm beginCmd");
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    int barrier_done = 0;
     for (int c = 0; c < count; c++) {
         ColiVkTensor *t = *items[c].tensor;
+        if (items[c].src >= 0 && !barrier_done) {
+            VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            barrier_done = 1;
+        }
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.mm_set[c], 0, NULL);
-        struct PC pc = {items[c].fmt, 1, I, items[c].O, t->rowWords, t->gs};
+        struct PC pc = {items[c].fmt, 1, items[c].I, items[c].O, t->rowWords, t->gs};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd, (uint32_t)((items[c].O + 7) / 8), 1, 1);
     }
@@ -729,7 +754,8 @@ int coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I) {
     }
     if (G.eg_prof) { double _d = vk_now() - _s0; g_vsub_ms += _d; g_vwait_ms += 0; g_vsub_n++; }
     for (int c = 0; c < count; c++)
-        memcpy(items[c].out, (const uint8_t *)G.y.ptr + yoff[c], (size_t)items[c].O * sizeof(float));
+        if (items[c].out)
+            memcpy(items[c].out, (const uint8_t *)G.y.ptr + yoff[c], (size_t)items[c].O * sizeof(float));
 
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
     return 1;

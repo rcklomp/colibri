@@ -1527,6 +1527,40 @@ static int vk_cand_cmp(const void *a, const void *b) {
     return ua < ub ? 1 : ua > ub ? -1 : 0;
 }
 /* heat-ranked preload from the (fixed) usage histogram loaded at startup */
+/* Il denso prima del tier. Attenzione e shared expert servono a OGNI token,
+ * un esperto instradato a circa un token su quaranta: lasciare che il tier si
+ * prenda la VRAM per primo manda le matrici dense a rimbalzare sulla CPU e
+ * costa molto piu' di quanto rendano gli esperti residenti in piu'. */
+static void vk_warm_dense(GModel *m) {
+    if (!m->layer) return;
+    long warmed = 0, skipped = 0;
+    double bytes = 0.0;
+    for (int i = m->layer_begin; i < m->layer_end; i++) {
+        GLayer *l = &m->layer[i];
+        Mat *set[] = {
+            &l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb, &l->kfa, &l->kfb, &l->kb,
+            &l->qa, &l->qb, &l->kva, &l->kvb_kt, &l->kvb_v, &l->o,
+            &l->iwq, &l->iwk, &l->iwp, &l->ikpg,
+            &l->dg, &l->du, &l->dd, &l->rg, &l->ru, &l->rd,
+        };
+        for (size_t q = 0; q < sizeof(set) / sizeof(set[0]); q++) {
+            Mat *w = set[q];
+            if (w->fmt != 1 && w->fmt != 4) continue;
+            const void *src = (w->fmt == 4) ? (const void *)w->q4 : (const void *)w->q8;
+            if (!src || !w->s || w->rows < 1 || w->columns < 1) continue;
+            if (coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, src, w->s, w->fmt,
+                                      w->columns, w->rows, w->gs)) {
+                warmed++;
+                bytes += (double)w->rows * (double)w->columns * 0.5;
+            } else {
+                skipped++;
+            }
+        }
+    }
+    fprintf(stderr, "[VK] denso residente: %ld matrici (~%.2f GB)%s\n",
+            warmed, bytes / 1e9, skipped ? " (alcune non entrate)" : "");
+}
+
 static void vk_preload_tier(GModel *m) {
     if (!g_vk_ready || !m->streaming || !g_vkreg || !g_eusage) return;
     int nsp = m->c.n_layers - m->c.first_dense, E = m->c.n_experts, fd = m->c.first_dense;
@@ -1538,6 +1572,7 @@ static void vk_preload_tier(GModel *m) {
         for (int e = 0; e < E; e++)
             if (g_eusage[(size_t)i * E + e]) cand[n++] = (VkCand){ g_eusage[(size_t)i * E + e], i, e };
     qsort(cand, (size_t)n, sizeof(VkCand), vk_cand_cmp);
+    if (!getenv("COLI_VK_NO_WARM_DENSE")) vk_warm_dense(m);
     Slot tmp; memset(&tmp, 0, sizeof(tmp)); tmp.eid = -1;
     int loaded = 0;
     for (int i = 0; i < (int)n && (g_vk_budget <= 0 || loaded < g_vk_budget); i++) {

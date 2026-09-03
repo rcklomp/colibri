@@ -977,6 +977,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
+    q38_ik_pool_reset(m);
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
     int len = np;
@@ -1012,6 +1013,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
+    q38_ik_pool_reset(m);
     double nll = 0; int scored = 0;
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
@@ -1519,7 +1521,7 @@ static int serve_one(Model *m, ServeReq *q){
     if(reuse==np){
         const float *cached=q38_prefix_cached_logits(m);
         if(!cached){
-            q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
+            q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;q38_ik_pool_reset(m);
             lo=step(m,ids,np,0);reuse=0;
         }else{
             lo=falloc(m->c.vocab);
@@ -1530,7 +1532,7 @@ static int serve_one(Model *m, ServeReq *q){
     }else{
         /* A miss invalidates the snapshot before reset so no later request can
          * pair its recurrent state with the old token record. */
-        q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
+        q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;q38_ik_pool_reset(m);
         lo=step(m,ids,np,0);
     }
     if(reuse!=np&&!q38_prefix_cache_save(m,ids,np,lo)&&getenv("Q38_PREFIX_LOG"))
@@ -2264,8 +2266,10 @@ static int qwen38_segment_session_run(void *impl,const ColiSegmentRunRequest *r,
     if(r->output!=r->input)memcpy(r->output,r->input,bytes);
     pthread_mutex_lock(&e->run_lock); Model *m=&e->model;
     m->K=s->K;m->V=s->V;m->IK=s->IK;m->DN_rec=s->DN_rec;m->DN_conv=s->DN_conv;m->ple_history=s->ple_history;m->ple_history_len=s->ple_history_len;m->PLE_conv_state=s->PLE_conv_state;m->kv_cap=(int)s->context_tokens;m->kv_len=(int)s->position;
+    m->IK_pooled=NULL;m->IK_pooled_count=NULL;
     q38_layers_forward_range(m,(float*)r->output,r->token_ids,(int)r->rows,(int)r->position,(int)e->layer_begin,(int)e->layer_end);
     s->ple_history_len=m->ple_history_len;m->K=NULL;m->V=NULL;m->IK=NULL;m->DN_rec=NULL;m->DN_conv=NULL;m->ple_history=NULL;m->PLE_conv_state=NULL;m->kv_len=0;
+    m->IK_pooled=NULL;m->IK_pooled_count=NULL;
     pthread_mutex_unlock(&e->run_lock);s->position+=r->rows;return 0;
 }
 

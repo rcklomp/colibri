@@ -133,6 +133,7 @@ typedef struct {
     uint64_t expert_scale_bytes;
     float **DN_rec, **DN_conv;
     float **K, **V, **IK;
+    float **IK_pooled; int *IK_pooled_count;
     int kv_len, kv_cap, max_t;
     st_tensor *ple_parts[Q38_MAX_PLE_PARTS];
     char ple_part_names[Q38_MAX_PLE_PARTS][320];
@@ -1806,10 +1807,23 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
         if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
+        float *pcache=(m->IK_pooled&&m->IK_pooled_count)?m->IK_pooled[layer]:NULL;
+        if(pcache) for(int b=m->IK_pooled_count[layer];b<blocks;b++){
+            float *dst=pcache+(int64_t)b*ID;
+            memset(dst,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)dst[d]+=raw[d]/R;}
+            q38_rms0(dst,dst,l->idx_kn,ID,c->eps);q38_rope(dst,ID,c->rotary_dim,b*R,c->theta);
+        }
+        if(pcache&&blocks>m->IK_pooled_count[layer])m->IK_pooled_count[layer]=blocks;
         for(int b=0;b<blocks;b++){
-            memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
-            q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,c->theta);
-            float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
+            const float *pv;
+            if(pcache){
+                pv=pcache+(int64_t)b*ID;
+            }else{
+                memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
+                q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,c->theta);
+                pv=pool;
+            }
+            float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pv[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
         }
         if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
         for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
@@ -2220,12 +2234,25 @@ static void reset_recurrent(Model *m) {
     memset(m->PLE_conv_state,0,(size_t)c->hc_width*(c->ple_convk-1)*c->ngram_size*sizeof(float));m->ple_history_len=0;
 }
 
+/* Blocks only grow (KV is append-only); IK_pooled_count tracks how many
+ * leading blocks per layer already have a cached pooled key, so a fresh
+ * sequence (kv_len reset to 0) must also reset this or a later request
+ * would silently reuse a different sequence's cached block. */
+static void q38_ik_pool_reset(Model *m) {
+    if(!m->IK_pooled_count) return;
+    Cfg *c=&m->c;
+    for(int i=0;i<c->layers;i++) m->IK_pooled_count[i]=0;
+}
+
 static void ensure_kv(Model *m) {
     Cfg *c=&m->c;if(m->max_t<=m->kv_cap&&m->K)return;
-    if(m->K){for(int i=0;i<c->layers;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);}free(m->K);free(m->V);free(m->IK);}
+    if(m->K){for(int i=0;i<c->layers;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);if(m->IK_pooled)free(m->IK_pooled[i]);}free(m->K);free(m->V);free(m->IK);free(m->IK_pooled);free(m->IK_pooled_count);}
     m->K=(float**)calloc((size_t)c->layers,sizeof(float*));m->V=(float**)calloc((size_t)c->layers,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers,sizeof(float*));
+    m->IK_pooled=(float**)calloc((size_t)c->layers,sizeof(float*));m->IK_pooled_count=(int*)calloc((size_t)c->layers,sizeof(int));
+    int64_t max_blocks=(int64_t)m->max_t/c->idx_ratio+1;
     for(int i=0;i<c->layers;i++)if(c->is_attn[i]){
         m->K[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->V[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->IK[i]=falloc((int64_t)m->max_t*c->idx_dim);
+        m->IK_pooled[i]=falloc(max_blocks*(int64_t)c->idx_dim);
     }
     m->kv_cap=m->max_t;
 }
@@ -2361,8 +2388,9 @@ static void q38_model_free(Model *m) {
         if(m->expert_scales)free(m->expert_scales[i].values);
         free(m->DN_rec ? m->DN_rec[i] : NULL); free(m->DN_conv ? m->DN_conv[i] : NULL);
         free(m->K ? m->K[i] : NULL); free(m->V ? m->V[i] : NULL); free(m->IK ? m->IK[i] : NULL);
+        free(m->IK_pooled ? m->IK_pooled[i] : NULL);
     }
-    free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
+    free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK); free(m->IK_pooled); free(m->IK_pooled_count);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);

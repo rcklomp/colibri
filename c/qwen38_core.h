@@ -1034,6 +1034,59 @@ incompatible:
     free(gate_up);free(down);cache->ready=-1;return 0;
 }
 
+/* Una mappatura per SHARD, non per tensore: 24576 esperti x 3 matrici
+ * sarebbero 73728 mappature. compat_map_readonly gestisce l'allineamento e
+ * funziona anche su Windows; le pagine restano file-backed e reclaimable, cioe'
+ * non sono il working set anonimo che la cache degli slot creava copiandole. */
+#define Q38_MAXFD 4096
+static compat_ro_map q38_shard_map[Q38_MAXFD];
+static const unsigned char *q38_shard_base[Q38_MAXFD];
+static int64_t q38_shard_len[Q38_MAXFD];
+static signed char q38_shard_tried[Q38_MAXFD];
+static long q38_map_serve, q38_map_copy;
+
+static int q38_mmap_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("Q38_NO_MMAP") && atoi(getenv("Q38_NO_MMAP")));
+    return on;
+}
+
+/* Ritorna la base mappata dello shard, o NULL. Un fallimento si ricorda: non
+ * si ritenta una mmap per ogni singolo esperto. */
+static const unsigned char *q38_shard_mapped(int fd) {
+    if (fd < 0 || fd >= Q38_MAXFD || !q38_mmap_enabled()) return NULL;
+    if (q38_shard_base[fd]) return q38_shard_base[fd];
+    if (q38_shard_tried[fd]) return NULL;
+    q38_shard_tried[fd] = 1;
+    int64_t len = (int64_t)lseek(fd, 0, SEEK_END);
+    if (len <= 0) return NULL;
+    const void *data = NULL;
+    if (compat_map_readonly(fd, 0, (size_t)len, &q38_shard_map[fd], &data) != 0) return NULL;
+    q38_shard_base[fd] = (const unsigned char *)data;
+    q38_shard_len[fd] = len;
+    return q38_shard_base[fd];
+}
+
+/* Un intervallo e' servibile dalla mappatura se lo shard e' mappato e
+ * l'intervallo ci sta dentro. FP8 e' un byte per elemento: nessun vincolo di
+ * allineamento, e le scale arrivano dal banco per-layer, non dal file. */
+static const unsigned char *q38_mapped_range(int fd, int64_t off, int64_t nbytes) {
+    if (off < 0 || nbytes <= 0) return NULL;
+    const unsigned char *base = q38_shard_mapped(fd);
+    if (!base) return NULL;
+    if (off > q38_shard_len[fd] - nbytes) return NULL;
+    return base + off;
+}
+
+static void q38_unmap_shards(void) {
+    for (int fd = 0; fd < Q38_MAXFD; fd++)
+        if (q38_shard_base[fd]) {
+            compat_unmap_readonly(&q38_shard_map[fd]);
+            q38_shard_base[fd] = NULL;
+            q38_shard_len[fd] = 0;
+        }
+}
+
 static void q38_bind_borrowed_fp8(Q38Weight *weight,void *data,float *scales,
                                   int rows,int cols) {
     q38_weight_free(weight);
@@ -1094,6 +1147,25 @@ static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
     Cfg *c=&m->c;
     Q38ExpertScaleCache *cache=&m->expert_scales[layer];
     float *scales=cache->values+(int64_t)expert*3*cache->scale_count;
+    /* Se i tre intervalli sono mappati, lo slot li PUNTA invece di copiarli:
+     * niente slab, niente 14 MB per miss, e la residenza la gestisce il kernel. */
+    {
+        const unsigned char *pg=q38_mapped_range(weight[0]->fd,weight[0]->off,weight[0]->nbytes);
+        const unsigned char *pu=q38_mapped_range(weight[1]->fd,weight[1]->off,weight[1]->nbytes);
+        const unsigned char *pd=q38_mapped_range(weight[2]->fd,weight[2]->off,weight[2]->nbytes);
+        if(pg&&pu&&pd){
+            int sc=(int)cache->scale_count;
+            q38_bind_borrowed_fp8(&slot->gate,(void*)pg,scales,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->up,(void*)pu,scales+sc,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->down,(void*)pd,scales+2*sc,c->hidden,c->inter);
+            /* lo slab di questo slot non serve piu': e' esattamente la memoria
+             * che stava duplicando la page cache. */
+            if(slot->fp8_slab){free(slot->fp8_slab);slot->fp8_slab=NULL;slot->fp8_slab_bytes=0;}
+            q38_map_serve++;
+            return;
+        }
+    }
+    q38_map_copy++;
     q38_bind_fp8_slot(slot,scales,(int)cache->scale_count,c->hidden,c->inter);
     int64_t pair_bytes=weight[0]->nbytes+weight[1]->nbytes;
     unsigned char *raw=(unsigned char*)slot->fp8_slab;

@@ -2087,67 +2087,97 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             int load_count=unique_count-unique_base;
             if(load_count>load_limit)load_count=load_limit;
 #ifdef Q38_VK_TIER
-            int gpu_handled=0;
-            if(rows==1&&g_q38vk_ready&&load_count<=64){
-                static ColiVkTensor *q38vk_gt[64],*q38vk_ut[64],*q38vk_dt[64];
-                static int q38vk_rows[64];
-                static float *q38vk_x=NULL,*q38vk_y=NULL;
-                if(!q38vk_x){q38vk_x=falloc(64*(int64_t)H);q38vk_y=falloc(64*(int64_t)H);}
-                int ok=1;
+            int cpu_idx[Q38_MAX_TOPK],cpu_n=load_count;
+            for(int z=0;z<load_count;z++) cpu_idx[z]=z;
+            /* Row budget per device batch: bounded by the scratch buffers
+             * below (Q38_MAX_TOPK*Q38_PREFILL_BATCH_ROWS covers the worst
+             * case -- every expert in the group claimed by every row). */
+            if(g_q38vk_ready&&load_count<=64){
+                static ColiVkTensor *bufG[3][64],*bufU[3][64],*bufD[3][64];
+                static int bufRows[3][64],bufFirst[3][64],bufOff[3][64],bufN[3];
+                static float *bufX[3],*bufY[3];
+                const int64_t rowcap=(int64_t)Q38_MAX_TOPK*Q38_PREFILL_BATCH_ROWS;
+                if(!bufX[0]) for(int dv=0;dv<3;dv++){ bufX[dv]=falloc(rowcap*(int64_t)H); bufY[dv]=falloc(rowcap*(int64_t)H); }
+                bufN[0]=bufN[1]=bufN[2]=0;
+                int64_t bufTot[3]={0,0,0};
+                int placed_mask[Q38_MAX_TOPK]; for(int z=0;z<load_count;z++) placed_mask[z]=0;
                 for(int offset=0;offset<load_count;offset++){
                     int e=unique[unique_base+offset];
-                    if(!q38vk_expert_ensure(m,layer,e)){ok=0;break;}
+                    int dev=q38vk_expert_ensure(m,layer,e);
+                    if(dev<0||dev>2) continue;
+                    int count=group_counts[e],first=group_offsets[e];
+                    if(bufTot[dev]+count>rowcap) continue;   /* scratch exhausted: leave unplaced, CPU handles it */
                     ColiVkTensor **reg=q38vk_reg_at(layer,e);
-                    q38vk_gt[offset]=reg[0];q38vk_ut[offset]=reg[1];q38vk_dt[offset]=reg[2];
-                    q38vk_rows[offset]=1;
-                    int assignment=assignments[group_offsets[e]];
-                    int row=assignment/K;
-                    memcpy(q38vk_x+(int64_t)offset*H,x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
-                }
-                if(ok){
-                    phase_started=now_s();
-                    if(coli_vk_expert_group(q38vk_gt,q38vk_ut,q38vk_dt,q38vk_rows,load_count,q38vk_y,q38vk_x)){
-                        for(int offset=0;offset<load_count;offset++){
-                            int e=unique[unique_base+offset];
-                            int first=group_offsets[e];
-                            memcpy(routed_out+(int64_t)first*H,q38vk_y+(int64_t)offset*H,(size_t)H*sizeof(float));
-                        }
-                        q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
-                        gpu_handled=1;
+                    int n=bufN[dev]++;
+                    bufG[dev][n]=reg[0]; bufU[dev][n]=reg[1]; bufD[dev][n]=reg[2];
+                    bufRows[dev][n]=count; bufFirst[dev][n]=first; bufOff[dev][n]=offset;
+                    for(int a=0;a<count;a++){
+                        int assignment=assignments[first+a];
+                        int row=assignment/K;
+                        memcpy(bufX[dev]+(bufTot[dev]+a)*H,x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
                     }
-                }
-            }
-            if(!gpu_handled){
-#endif
-            int loaded_batch=load_count>=2&&q38_expert_get_batch(
-                m,layer,unique+unique_base,load_count,batch_slots);
-            for(int offset=0;offset<load_count;offset++) {
-                int e=unique[unique_base+offset];
-                int count=group_counts[e];
-                Slot *expert=loaded_batch?batch_slots[offset]:
-                                          q38_expert_get(m,layer,e);
-                int first=group_offsets[e];
-                for(int a=0;a<count;a++) {
-                    int assignment=assignments[first+a];
-                    int row=assignment/K;
-                    memcpy(expert_input+(int64_t)a*H,
-                           x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+                    bufTot[dev]+=count;
+                    placed_mask[offset]=1;
                 }
                 phase_started=now_s();
-                q38_weight_matmul(expert_gate,expert_input,&expert->gate,
-                                  count,H,I);
-                q38_weight_matmul(expert_up,expert_input,&expert->up,count,H,I);
-                for(int a=0;a<count;a++)for(int j=0;j<I;j++)
-                    expert_gate[(int64_t)a*I+j]=
-                        q38_silu(expert_gate[(int64_t)a*I+j])*
-                        expert_up[(int64_t)a*I+j];
-                q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
-                                  &expert->down,count,I,H);
-                q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                int any_gpu=0;
+                for(int dev=0;dev<3;dev++){
+                    if(!bufN[dev]) continue;
+                    int rc;
+                    if(dev==0) rc=coli_vk_expert_group(bufG[0],bufU[0],bufD[0],bufRows[0],bufN[0],bufY[0],bufX[0]);
+                    else if(dev==1) rc=coli_vk_expert_group2(bufG[1],bufU[1],bufD[1],bufRows[1],bufN[1],bufY[1],bufX[1]);
+                    else rc=coli_vk_expert_group3(bufG[2],bufU[2],bufD[2],bufRows[2],bufN[2],bufY[2],bufX[2]);
+                    if(!rc){
+                        /* this device's bucket failed: only ITS offsets fall back to CPU */
+                        for(int n=0;n<bufN[dev];n++) placed_mask[bufOff[dev][n]]=0;
+                        continue;
+                    }
+                    int64_t off=0;
+                    for(int n=0;n<bufN[dev];n++){
+                        memcpy(routed_out+(int64_t)bufFirst[dev][n]*H,bufY[dev]+off*H,(size_t)bufRows[dev][n]*H*sizeof(float));
+                        off+=bufRows[dev][n];
+                        any_gpu=1;
+                    }
+                }
+                if(any_gpu) q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                cpu_n=0;
+                for(int offset=0;offset<load_count;offset++) if(!placed_mask[offset]) cpu_idx[cpu_n++]=offset;
             }
-#ifdef Q38_VK_TIER
-            }
+#else
+            int cpu_idx[Q38_MAX_TOPK],cpu_n=load_count;
+            for(int z=0;z<load_count;z++) cpu_idx[z]=z;
 #endif
+            if(cpu_n>0){
+                static int unplaced[Q38_MAX_TOPK];
+                for(int zi=0;zi<cpu_n;zi++) unplaced[zi]=unique[unique_base+cpu_idx[zi]];
+                int loaded_batch=cpu_n>=2&&q38_expert_get_batch(
+                    m,layer,unplaced,cpu_n,batch_slots);
+                for(int zi=0;zi<cpu_n;zi++) {
+                    int offset=cpu_idx[zi];
+                    int e=unique[unique_base+offset];
+                    int count=group_counts[e];
+                    Slot *expert=loaded_batch?batch_slots[zi]:
+                                              q38_expert_get(m,layer,e);
+                    int first=group_offsets[e];
+                    for(int a=0;a<count;a++) {
+                        int assignment=assignments[first+a];
+                        int row=assignment/K;
+                        memcpy(expert_input+(int64_t)a*H,
+                               x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+                    }
+                    phase_started=now_s();
+                    q38_weight_matmul(expert_gate,expert_input,&expert->gate,
+                                      count,H,I);
+                    q38_weight_matmul(expert_up,expert_input,&expert->up,count,H,I);
+                    for(int a=0;a<count;a++)for(int j=0;j<I;j++)
+                        expert_gate[(int64_t)a*I+j]=
+                            q38_silu(expert_gate[(int64_t)a*I+j])*
+                            expert_up[(int64_t)a*I+j];
+                    q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
+                                      &expert->down,count,I,H);
+                    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                }
+            }
             unique_base+=load_count;
         }
 

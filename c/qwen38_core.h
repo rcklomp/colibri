@@ -245,8 +245,36 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
 /* Native BF16 storage with FP32 activations and accumulation.  This deliberately
  * does not round activations to BF16 or use BF16 dot-product instructions: it is
  * the storage-equivalent form of the existing st_read_f32 reference. */
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+static inline __m256 q38_bf16x8_to_f32x8(__m128i h) {
+    __m256i widened=_mm256_cvtepu16_epi32(h);
+    return _mm256_castsi256_ps(_mm256_slli_epi32(widened,16));
+}
+#endif
+
 static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
                             int S,int I,int O) {
+#if defined(__AVX2__) && defined(__FMA__)
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint16_t *w=W+(int64_t)o*I;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            __m256 vacc=_mm256_setzero_ps();int i=0;
+            for(;i+8<=I;i+=8){
+                __m128i wh=_mm_loadu_si128((const __m128i*)(w+i));
+                __m256 wf=q38_bf16x8_to_f32x8(wh);
+                __m256 xf=_mm256_loadu_ps(xs+i);
+                vacc=_mm256_fmadd_ps(xf,wf,vacc);
+            }
+            float buf[8];_mm256_storeu_ps(buf,vacc);
+            float a=buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+            for(;i<I;i++)a+=xs[i]*bf16_to_f32(w[i]);
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+#else
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint16_t *w=W+(int64_t)o*I;
@@ -256,6 +284,7 @@ static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
             y[(int64_t)s*O+o]=a;
         }
     }
+#endif
 }
 
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,

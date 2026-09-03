@@ -16,6 +16,17 @@
 #define Q38_PREFILL_BATCH_ROWS 32
 #define Q38_PREFILL_WORKSPACE_BYTES (64u << 20)
 
+/* Persistent GPU expert cache (fmt=8 e4m3), opt-in via Q38_VULKAN=1. Off by
+ * default: g_q38vk_ready stays 0 and every check below short-circuits to the
+ * unmodified CPU path. See the module comment in patch_qwen38_gputier.py for
+ * the residency rationale (why a persistent cache, not per-call upload). */
+#ifdef Q38_VK_TIER
+#include "backend_vulkan.h"
+static int g_q38vk_ready = 0;
+static int g_q38vk_NL, g_q38vk_E;
+static ColiVkTensor **g_q38vk_reg;   /* [(layer*E+eid)*3] -> {gate,up,down} */
+#endif
+
 typedef struct {
     int hidden, layers, vocab, max_positions, eos_id;
     float eps, theta;
@@ -914,6 +925,23 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
 
 static void model_init(Model *m,const char *snap,int cap,int bits) {
     model_init_range(m,snap,cap,bits,0,0,1,1);
+#ifdef Q38_VK_TIER
+    /* Vulkan is optional here exactly like in glm53.c: absent or disabled,
+     * the engine says nothing more than usual and stays on CPU. */
+    if (getenv("Q38_VULKAN") && atoi(getenv("Q38_VULKAN"))) {
+        char spv[1024];
+        const char *given = getenv("COLI_VK_SHADERS");
+        if (given && strstr(given, ".spv")) snprintf(spv, sizeof(spv), "%s", given);
+        else snprintf(spv, sizeof(spv), "%s/qmatmul.spv", given ? given : "shaders");
+        g_q38vk_ready = coli_vk_init(spv);
+        if (g_q38vk_ready) {
+            g_q38vk_NL = m->c.layers; g_q38vk_E = m->c.experts;
+            g_q38vk_reg = (ColiVkTensor **)calloc((size_t)g_q38vk_NL * g_q38vk_E * 3, sizeof(ColiVkTensor *));
+            if (!g_q38vk_reg) { g_q38vk_ready = 0; }
+            else fprintf(stderr, "[qwen38] Vulkan expert offload ready (fmt=8 e4m3, persistent cache)\n");
+        }
+    }
+#endif
 }
 
 static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
@@ -1323,6 +1351,36 @@ static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
         else q38_load_expert_weight(m,nm,dst[k],os[k],is[k]);
     }
 }
+
+static Slot *q38_expert_get(Model *m,int layer,int eid);
+#ifdef Q38_VK_TIER
+static ColiVkTensor **q38vk_reg_at(int layer, int eid) {
+    return &g_q38vk_reg[((size_t)layer * (size_t)g_q38vk_E + (size_t)eid) * 3];
+}
+/* Uploads an expert once and caches the GPU tensors; returns 0 (no upload,
+ * caller falls back to CPU) once the VRAM budget margin is reached, or if
+ * this expert isn't natively FP8-resident on the CPU side. The source bytes
+ * come from the SAME Slot the CPU path already fetches -- q38_expert_get's
+ * mmap-backed data/scales pointers (see the mmap commit) are stable for the
+ * process lifetime, so there is nothing to keep alive beyond this call:
+ * coli_vk_tensor_ensure copies into VRAM immediately. */
+static int q38vk_expert_ensure(Model *m, int layer, int eid) {
+    ColiVkTensor **reg = q38vk_reg_at(layer, eid);
+    if (reg[0]) return 1;
+    double used = 0, budget = 0;
+    if (coli_vk_mem_budget(&used, &budget) && budget > 0 && (budget - used) < 1.5) return 0;
+    Slot *s = q38_expert_get(m, layer, eid);
+    if (!s || s->gate.kind != Q38_WEIGHT_FP8 || s->up.kind != Q38_WEIGHT_FP8 || s->down.kind != Q38_WEIGHT_FP8) return 0;
+    Cfg *c = &m->c;
+    ColiVkTensor *tg = NULL, *tu = NULL, *td = NULL;
+    if (!coli_vk_tensor_ensure(&tg, s->gate.data, s->gate.scales, 8, c->hidden, c->inter, 128) ||
+        !coli_vk_tensor_ensure(&tu, s->up.data, s->up.scales, 8, c->hidden, c->inter, 128) ||
+        !coli_vk_tensor_ensure(&td, s->down.data, s->down.scales, 8, c->inter, c->hidden, 128))
+        return 0;
+    reg[0] = tg; reg[1] = tu; reg[2] = td;
+    return 1;
+}
+#endif
 
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
@@ -1756,6 +1814,33 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
         float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+#ifdef Q38_VK_TIER
+        int q38vk_handled=0;
+        if(g_q38vk_ready&&K<=64){
+            static ColiVkTensor *q38vk_gt[64],*q38vk_ut[64],*q38vk_dt[64];
+            static int q38vk_rows[64];
+            static float *q38vk_x=NULL,*q38vk_y=NULL;
+            if(!q38vk_x){q38vk_x=falloc(64*(int64_t)H);q38vk_y=falloc(64*(int64_t)H);}
+            int ok=1;
+            for(int z=0;z<K;z++){
+                if(!q38vk_expert_ensure(m,layer,idx[z])){ok=0;break;}
+                ColiVkTensor **reg=q38vk_reg_at(layer,idx[z]);
+                q38vk_gt[z]=reg[0];q38vk_ut[z]=reg[1];q38vk_dt[z]=reg[2];
+                q38vk_rows[z]=1;
+                memcpy(q38vk_x+(int64_t)z*H,xs,(size_t)H*sizeof(float));
+            }
+            if(ok){
+                phase_started=now_s();
+                if(coli_vk_expert_group(q38vk_gt,q38vk_ut,q38vk_dt,q38vk_rows,K,q38vk_y,q38vk_x)){
+                    for(int z=0;z<K;z++)
+                        for(int d=0;d<H;d++)ys[d]+=route_gates[z]*q38vk_y[(int64_t)z*H+d];
+                    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                    q38vk_handled=1;
+                }
+            }
+        }
+        if(!q38vk_handled){
+#endif
         Slot *selected[Q38_MAX_TOPK];
         int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
         for(int z=0;z<K;z++){
@@ -1765,6 +1850,9 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
         }
+#ifdef Q38_VK_TIER
+        }
+#endif
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();
@@ -1934,6 +2022,39 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
         for(int unique_base=0;unique_base<unique_count;) {
             int load_count=unique_count-unique_base;
             if(load_count>load_limit)load_count=load_limit;
+#ifdef Q38_VK_TIER
+            int gpu_handled=0;
+            if(rows==1&&g_q38vk_ready&&load_count<=64){
+                static ColiVkTensor *q38vk_gt[64],*q38vk_ut[64],*q38vk_dt[64];
+                static int q38vk_rows[64];
+                static float *q38vk_x=NULL,*q38vk_y=NULL;
+                if(!q38vk_x){q38vk_x=falloc(64*(int64_t)H);q38vk_y=falloc(64*(int64_t)H);}
+                int ok=1;
+                for(int offset=0;offset<load_count;offset++){
+                    int e=unique[unique_base+offset];
+                    if(!q38vk_expert_ensure(m,layer,e)){ok=0;break;}
+                    ColiVkTensor **reg=q38vk_reg_at(layer,e);
+                    q38vk_gt[offset]=reg[0];q38vk_ut[offset]=reg[1];q38vk_dt[offset]=reg[2];
+                    q38vk_rows[offset]=1;
+                    int assignment=assignments[group_offsets[e]];
+                    int row=assignment/K;
+                    memcpy(q38vk_x+(int64_t)offset*H,x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+                }
+                if(ok){
+                    phase_started=now_s();
+                    if(coli_vk_expert_group(q38vk_gt,q38vk_ut,q38vk_dt,q38vk_rows,load_count,q38vk_y,q38vk_x)){
+                        for(int offset=0;offset<load_count;offset++){
+                            int e=unique[unique_base+offset];
+                            int first=group_offsets[e];
+                            memcpy(routed_out+(int64_t)first*H,q38vk_y+(int64_t)offset*H,(size_t)H*sizeof(float));
+                        }
+                        q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                        gpu_handled=1;
+                    }
+                }
+            }
+            if(!gpu_handled){
+#endif
             int loaded_batch=load_count>=2&&q38_expert_get_batch(
                 m,layer,unique+unique_base,load_count,batch_slots);
             for(int offset=0;offset<load_count;offset++) {
@@ -1960,6 +2081,9 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                                   &expert->down,count,I,H);
                 q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
             }
+#ifdef Q38_VK_TIER
+            }
+#endif
             unique_base+=load_count;
         }
 

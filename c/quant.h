@@ -520,6 +520,32 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * is the GPU one; a vectorized CPU kernel is future work if measured needed).
  * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
  * convention so cross-block cancellation doesn't cost precision unfairly. */
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+/* Decode 8 e4m3 bytes -> 8 f32 via pure bit manipulation (see the module
+ * comment above for the derivation and exhaustive-validation record). No
+ * table, no gather -- vpgatherdd measured SLOWER than scalar table lookup on
+ * Zen 2, so this sidesteps that weakness instead of working around it. */
+static inline __m256 e4m3x8_to_f32x8(__m128i b8) {
+    __m256i b = _mm256_cvtepu8_epi32(b8);
+    __m256i sign = _mm256_slli_epi32(_mm256_and_si256(b, _mm256_set1_epi32(0x80)), 24);
+    __m256i exp4 = _mm256_and_si256(_mm256_srli_epi32(b, 3), _mm256_set1_epi32(0xF));
+    __m256i mant3 = _mm256_and_si256(b, _mm256_set1_epi32(0x7));
+    __m256i mag7 = _mm256_and_si256(b, _mm256_set1_epi32(0x7F));
+    __m256i normal_bits = _mm256_or_si256(sign,
+        _mm256_or_si256(_mm256_slli_epi32(_mm256_add_epi32(exp4, _mm256_set1_epi32(120)), 23),
+                         _mm256_slli_epi32(mant3, 20)));
+    __m256 mant3f = _mm256_cvtepi32_ps(mant3);
+    __m256 signf = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_castps_si256(_mm256_set1_ps(1.0f))));
+    __m256 subnorm = _mm256_mul_ps(_mm256_mul_ps(mant3f, signf), _mm256_set1_ps(1.0f/512.0f));
+    __m256i is_sub = _mm256_cmpeq_epi32(exp4, _mm256_setzero_si256());
+    __m256 blended = _mm256_blendv_ps(_mm256_castsi256_ps(normal_bits), subnorm, _mm256_castsi256_ps(is_sub));
+    __m256i is_nan = _mm256_cmpeq_epi32(mag7, _mm256_set1_epi32(0x7F));
+    __m256 nanval = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_set1_epi32(0x7FC00000)));
+    return _mm256_blendv_ps(blended, nanval, _mm256_castsi256_ps(is_nan));
+}
+#endif
+
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
@@ -533,8 +559,22 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
             double a=0;
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
                 int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
-                float sc=scl[bi]; float acc=0;
+                float sc=scl[bi];
+#if defined(__AVX2__) && defined(__FMA__)
+                __m256 vacc=_mm256_setzero_ps(); int i=base;
+                for(;i+8<=base+blen;i+=8){
+                    __m128i wb=_mm_loadl_epi64((const __m128i*)(w+i));
+                    __m256 wf=e4m3x8_to_f32x8(wb);
+                    __m256 xf=_mm256_loadu_ps(xs+i);
+                    vacc=_mm256_fmadd_ps(xf,wf,vacc);
+                }
+                float buf[8]; _mm256_storeu_ps(buf,vacc);
+                float acc=buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+                for(;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+#else
+                float acc=0;
                 for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+#endif
                 a += (double)acc*sc;
             }
             y[(int64_t)s*O+o]=(float)a;

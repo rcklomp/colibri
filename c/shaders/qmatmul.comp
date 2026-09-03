@@ -55,6 +55,23 @@ float mx4(uint word, int lane) {
     float v = lut[n & 7u];
     return (n & 8u) != 0u ? -v : v;
 }
+// fmt=8: E4M3-FN (Qwen3.8 experts) via pure bit manipulation, no table --
+// matches quant.h's matmul_fp8/e4m3x8_to_f32x8 bit-for-bit (see that file's
+// derivation and its exhaustive 256-code validation record). sign(1) exp(4,
+// bias=7) mant(3); subnormal at exp==0 -> mant/512; NaN only at byte&0x7F==0x7F.
+float e4m3(uint word, int lane) {
+    uint b = (word >> (uint(lane) * 8u)) & 0xffu;
+    uint sign = (b & 0x80u) << 24;
+    uint exp4 = (b >> 3) & 0xFu;
+    uint mant3 = b & 0x7u;
+    if ((b & 0x7Fu) == 0x7Fu) return uintBitsToFloat(sign | 0x7FC00000u);
+    if (exp4 == 0u) {
+        float mag = float(mant3) * (1.0 / 512.0);
+        return (sign != 0u) ? -mag : mag;
+    }
+    uint bits = sign | ((exp4 + 120u) << 23) | (mant3 << 20);
+    return uintBitsToFloat(bits);
+}
 
 void main() {
     int s   = int(gl_WorkGroupID.y);
@@ -124,6 +141,21 @@ void main() {
                 }
                 sum += a * scale[sb + uint(i0 / p.gs)];
             }
+        } else if (p.fmt == 8) { // E4M3 FP8, 128x128-blocked scale
+            int words = (p.I + 3) / 4;                 // 4 bytes/word, 1 byte/element
+            int nblkI = (p.I + 127) / 128;
+            int blkO = o / 128;
+            uint sb = uint(blkO) * uint(nblkI);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        float xv = staged ? xsh[i] : x[xoff + i];
+                        sum += xv * e4m3(pk, k) * scale[sb + uint(i / 128)];
+                    }
+                }
+            }
         } else { // int4
             int words = (p.I + 7) / 8;
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
@@ -135,6 +167,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7) ? tot : tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8) ? tot : tot * scale[o];
     }
 }

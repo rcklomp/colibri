@@ -203,7 +203,7 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
 static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt(s, bytes, G.memtype); }
 
 static int rowwords(int fmt, int I) {
-    size_t rb = fmt == 1 ? (size_t)I                         // bytes/row on CPU side
+    size_t rb = (fmt == 1 || fmt == 8) ? (size_t)I            // bytes/row on CPU side
               : fmt == 5 ? ((size_t)I + 63) / 64 * 24        // int3-g64: 24B per 64-group
               : (size_t)(I + 1) / 2;
     return (int)((rb + 3) / 4);                              // padded to uint32 (24|4: exact)
@@ -214,6 +214,8 @@ static size_t scale_floats(int fmt, int I, int O, int gs) {
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
+    if (fmt == 8)                                          // 128x128-blocked [ceil(O/128),ceil(I/128)]
+        return (((size_t)O + 127) / 128) * (((size_t)I + 127) / 128);
     return (size_t)O;
 }
 
@@ -508,13 +510,13 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&              /* fmt=4/7: word-aligned groups only */
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&  /* fmt=4/7: word-aligned groups only */
         !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
-    size_t cpu_rb = fmt == 1 ? (size_t)I
+    size_t cpu_rb = (fmt == 1 || fmt == 8) ? (size_t)I
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
     t->wbytes = stride * (size_t)O;

@@ -1364,6 +1364,23 @@ static int piece_mappable(const GModel *m, const ERef *ref, int q) {
  * eight threads calling madvise concurrently on the SAME per-file mapping.
  * Default OFF (opt-in only) until that regression is understood; do not flip
  * this to default-on without a new measurement. */
+/* G1b instrumentation: how many advises, how long inside them, how many bytes.
+ * Reported by prof_print. Wall time here is what tells apart "the madvise calls
+ * themselves cost the regression" from "they cost little but slow everything
+ * else down" -- the two hypotheses G1 left open. */
+static double g_t_pop; static long g_n_pop; static double g_b_pop;
+static double g_t_pop_max;
+static long g_n_bind_contig, g_n_bind_split;   /* mmap binds: 1 advise vs 6 */
+static long g_n_bind_gpu, g_n_bind_cpu;        /* binds whose expert is/isn't VRAM-resident */
+
+/* Is this expert served from VRAM? Defined with the tier below (it needs
+ * vk_reg_at); declared here because expert_read has to ask before it decides
+ * whether prefaulting the expert's host pages is worth anything. */
+#ifdef COLI_VULKAN
+static int glm53_expert_on_gpu(int layer, int eid);
+#else
+#define glm53_expert_on_gpu(layer, eid) 0
+#endif
 static void glm53_populate_range(const uint8_t *p, int64_t nbytes) {
 #if defined(__linux__) && defined(MADV_POPULATE_READ)
     static int on = -1;
@@ -1373,7 +1390,24 @@ static void glm53_populate_range(const uint8_t *p, int64_t nbytes) {
     if (!page) page = sysconf(_SC_PAGESIZE);
     uintptr_t a = (uintptr_t)p & ~((uintptr_t)page - 1);
     uintptr_t e = ((uintptr_t)p + (uintptr_t)nbytes + (uintptr_t)page - 1) & ~((uintptr_t)page - 1);
+    struct timespec _t0, _t1;
+    clock_gettime(CLOCK_MONOTONIC, &_t0);
     (void)madvise((void *)a, (size_t)(e - a), MADV_POPULATE_READ);
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    double _dt = (double)(_t1.tv_sec - _t0.tv_sec) + (double)(_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    g_t_pop += _dt;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    g_n_pop++;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    g_b_pop += (double)(e - a);
+    if (_dt > g_t_pop_max) g_t_pop_max = _dt;   /* racy, indicative only */
 #else
     (void)p; (void)nbytes;
 #endif
@@ -1514,15 +1548,42 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
                 slot->piece[p] = g_fmap[ref->fd[p]] + ref->off[p];
             /* Prefault on the thread that binds this expert, not inside the
              * matmul that first touches it -- see glm53_populate_range above.
-             * The six pieces are usually not contiguous (unlike Qwen's
-             * gate/up), so ref->contig (already computed in
-             * expert_table_init) decides one advice for the whole slot vs
-             * six small ones. */
-            if (ref->contig)
-                glm53_populate_range(slot->piece[0], m->e_slot);
-            else
-                for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-                    glm53_populate_range(slot->piece[p], m->e_len[p]);
+             *
+             * But ONLY if the CPU is the one that will read it. An expert that
+             * is VRAM-resident is still bound here (expert_mats builds its
+             * views unconditionally) and then served from its GPU tensors, so
+             * its host pages are never touched at all: faulting the whole
+             * ~14 MB slot in for it is pure waste. That waste is what G1
+             * measured as a regression -- see the record.
+             *
+             * ref->contig decides one advice for the whole slot vs six small
+             * ones; measured contig=0 on this checkpoint, so in practice it is
+             * always the six. */
+            const int on_gpu = glm53_expert_on_gpu(layer, eid);
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+            g_n_bind_gpu += on_gpu ? 1 : 0;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+            g_n_bind_cpu += on_gpu ? 0 : 1;
+            if (!on_gpu) {
+                if (ref->contig) {
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+                    g_n_bind_contig++;
+                    glm53_populate_range(slot->piece[0], m->e_slot);
+                } else {
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+                    g_n_bind_split++;
+                    for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+                        glm53_populate_range(slot->piece[p], m->e_len[p]);
+                }
+            }
             slot->mapped = 1;
             slot->eid = eid;
 #ifdef _OPENMP
@@ -1617,10 +1678,20 @@ static double prof_now_s(void) { struct timespec _ts; clock_gettime(CLOCK_MONOTO
 __attribute__((destructor)) static void prof_print(void) {
     fprintf(stderr, "[PROF] eg=%.3fs(disp=%ld experts=%ld) cpu=%.3fs(n=%ld) devloss=%ld\n",
             g_t_eg, g_n_eg_disp, g_n_eg, g_t_cpu, g_n_cpu, g_n_devloss);
+    fprintf(stderr, "[PROF] mmap serve=%ld copy=%ld | binds gpu=%ld cpu=%ld (contig=%ld split=%ld)\n",
+            g_map_serve, g_map_copy, g_n_bind_gpu, g_n_bind_cpu,
+            g_n_bind_contig, g_n_bind_split);
+    if (g_n_pop)
+        fprintf(stderr, "[PROF] populate n=%ld t=%.3fs (%.1f us/call, max %.1f us) bytes=%.2f GB\n",
+                g_n_pop, g_t_pop, g_t_pop / (double)g_n_pop * 1e6,
+                g_t_pop_max * 1e6, g_b_pop / 1e9);
     const char *p2 = getenv("COLI_USAGE_PATH");
     if (p2 && g_eusage) { FILE *f = fopen(p2, "wb"); if (f) { fwrite(g_eusage, sizeof(uint64_t), (size_t)g_vk_NL * g_vk_E, f); fclose(f); } }
 }
 static void **vk_reg_at(int layer, int eid) { return (void **)g_vkreg + ((size_t)layer * g_vk_E + eid) * 3; }
+static int glm53_expert_on_gpu(int layer, int eid) {
+    return g_vk_ready && g_vkreg && vk_reg_at(layer, eid)[0] != NULL;
+}
 typedef struct { uint64_t u; int layer, eid; } VkCand;
 static int vk_cand_cmp(const void *a, const void *b) {
     uint64_t ua = ((const VkCand *)a)->u, ub = ((const VkCand *)b)->u;

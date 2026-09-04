@@ -951,6 +951,28 @@ static float sigmoidf_(float x) {
 }
 static float siluf_(float x) { return x / (1.0f + expf(-x)); }
 
+/* G3/G4 per-op timer state and helpers (tools/hot-expert/ROADMAP-2026-09.md).
+ * Declared here, above kda_layer, because every timed site from kda_layer
+ * down to forward_span reads them; the report and the reset live next to
+ * run_layers. Gated on COLI_TIMERS=1 (the name rome_bench.sh already
+ * exports) so the default path pays nothing -- not even the clock reads. */
+static int g_optime = -1;
+static double g_ot_kda, g_ot_mla, g_ot_ffn_dense, g_ot_ffn_moe, g_ot_hc, g_ot_head, g_ot_layers;
+static long   g_on_kda, g_on_mla, g_on_ffn_dense, g_on_ffn_moe, g_on_hc, g_on_head, g_on_layers;
+static double g_ot_router, g_ot_shared; static long g_on_router;   /* MoE sub-split */
+/* G4 diagnosis: kda_layer sub-split. Parallelising the 64 heads moved the
+ * total 2%, so the 2.2 ms/call is somewhere other than the recurrence. */
+static double g_kt_proj, g_kt_decay, g_kt_step, g_kt_norm, g_kt_ko;
+static long g_kn_calls, g_kn_batched;
+static inline int optime_on(void) {
+    if (g_optime < 0) g_optime = getenv("COLI_TIMERS") && atoi(getenv("COLI_TIMERS"));
+    return g_optime;
+}
+static inline double optime_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
 /* SwiGLU clampata: il gate ha solo il tetto, up e' limitato da entrambi i lati.
  * Vale sia per l'MLP denso che per gli esperti -- il testo di GLM-5.3 NON usa
  * la SiLU semplice, ed e' un errore che darebbe un modello che parla bene e
@@ -1009,6 +1031,7 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
          * da kfa e kga, quindi entrano nello STESSO submit dietro una barriera e
          * i due intermedi non tornano mai in RAM: due round trip invece di
          * quattro. */
+        const double _tk0 = optime_on() ? optime_now() : 0.0;
         int batched = 0;
         if (!g_kda_cpu_on()) {
             const Mat *bw[8] = { &l->kq, &l->kk, &l->kv, &l->kfa, &l->kb, &l->kga,
@@ -1027,6 +1050,8 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             KMV(decay, &l->kfb, low);
             KMV(gate, &l->kgb, lowg);
         }
+        if (optime_on()) { g_kt_proj += optime_now() - _tk0; g_kn_batched += batched ? 1 : 0; }
+        const double _tk1 = optime_on() ? optime_now() : 0.0;
         /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias))
          *
          * exp(A_log[h]) dipende solo dal peso: fuori dal ciclo su d si calcola
@@ -1041,8 +1066,12 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             }
         }
         for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
+        if (optime_on()) { g_kt_decay += optime_now() - _tk1; }
+        const double _tk2 = optime_on() ? optime_now() : 0.0;
         coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
                       H, D, D, c->conv_k, 1e-6f, scratch);
+        if (optime_on()) { g_kt_step += optime_now() - _tk2; }
+        const double _tk3 = optime_on() ? optime_now() : 0.0;
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
          * low-rank, poi la proiezione di uscita. */
         float *normed = qkv;                         /* riuso: 3P >= P */
@@ -1055,7 +1084,10 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             for (int d = 0; d < D; d++)
                 dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gate[(size_t)h * D + d]);
         }
+        if (optime_on()) { g_kt_norm += optime_now() - _tk3; }
+        const double _tk4 = optime_on() ? optime_now() : 0.0;
         KMV(out + (size_t)t * c->hidden, &l->ko, normed);
+        if (optime_on()) { g_kt_ko += optime_now() - _tk4; g_kn_calls++; }
     }
     free(lowg); free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
 }
@@ -1375,24 +1407,6 @@ static int piece_mappable(const GModel *m, const ERef *ref, int q) {
  * Reported by prof_print. Wall time here is what tells apart "the madvise calls
  * themselves cost the regression" from "they cost little but slow everything
  * else down" -- the two hypotheses G1 left open. */
-/* G3 per-op timer state and helpers (tools/hot-expert/ROADMAP-2026-09.md).
- * Declared this early because ffn_layer, run_layers and forward_span all
- * read them; the report and the reset live next to run_layers. Gated on
- * COLI_TIMERS=1 (the name rome_bench.sh already exports) so the default path
- * pays nothing -- not even the clock reads. */
-static int g_optime = -1;
-static double g_ot_kda, g_ot_mla, g_ot_ffn_dense, g_ot_ffn_moe, g_ot_hc, g_ot_head, g_ot_layers;
-static long   g_on_kda, g_on_mla, g_on_ffn_dense, g_on_ffn_moe, g_on_hc, g_on_head, g_on_layers;
-static double g_ot_router, g_ot_shared; static long g_on_router;   /* MoE sub-split */
-static inline int optime_on(void) {
-    if (g_optime < 0) g_optime = getenv("COLI_TIMERS") && atoi(getenv("COLI_TIMERS"));
-    return g_optime;
-}
-static inline double optime_now(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
-}
-
 static double g_t_pop; static long g_n_pop; static double g_b_pop;
 static double g_t_pop_max;
 static long g_n_bind_contig, g_n_bind_split;   /* mmap binds: 1 advise vs 6 */
@@ -2495,6 +2509,8 @@ static void optime_reset(void) {
     g_ot_kda = g_ot_mla = g_ot_ffn_dense = g_ot_ffn_moe = g_ot_hc = g_ot_head = g_ot_layers = 0.0;
     g_on_kda = g_on_mla = g_on_ffn_dense = g_on_ffn_moe = g_on_hc = g_on_head = g_on_layers = 0;
     g_ot_router = g_ot_shared = 0.0; g_on_router = 0;
+    g_kt_proj = g_kt_decay = g_kt_step = g_kt_norm = g_kt_ko = 0.0;
+    g_kn_calls = g_kn_batched = 0;
     /* The [PROF] sub-split of the MoE bucket must describe the same window,
      * so it is zeroed here too -- only under COLI_TIMERS=1, so the default
      * [PROF] line keeps its whole-run meaning. */
@@ -2518,6 +2534,15 @@ __attribute__((destructor)) static void optime_print(void) {
             g_ot_ffn_moe, g_on_ffn_moe, g_on_ffn_moe ? 1e3 * g_ot_ffn_moe / g_on_ffn_moe : 0.0);
     fprintf(stderr, "[OPTIME] hc+norm=%.3fs n=%ld (%.3f ms/site) | layers-sum=%.3fs unaccounted=%.3fs\n",
             g_ot_hc, g_on_hc, g_on_hc ? 1e3 * g_ot_hc / g_on_hc : 0.0, sum, g_ot_layers - sum);
+    if (g_kn_calls)
+        fprintf(stderr, "[OPTIME] kda split (n=%ld, gpu-batched=%ld): proj=%.3fs (%.3f ms) "
+                        "decay=%.3fs (%.3f) step=%.3fs (%.3f) norm=%.3fs (%.3f) ko=%.3fs (%.3f)\n",
+                g_kn_calls, g_kn_batched,
+                g_kt_proj,  1e3 * g_kt_proj  / g_kn_calls,
+                g_kt_decay, 1e3 * g_kt_decay / g_kn_calls,
+                g_kt_step,  1e3 * g_kt_step  / g_kn_calls,
+                g_kt_norm,  1e3 * g_kt_norm  / g_kn_calls,
+                g_kt_ko,    1e3 * g_kt_ko    / g_kn_calls);
     fprintf(stderr, "[OPTIME] moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
                     "eg and cpu experts are the [PROF] line; the rest of ffn_moe is bind+dispatch+accumulate\n",
             g_ot_router, g_ot_shared, g_on_router,

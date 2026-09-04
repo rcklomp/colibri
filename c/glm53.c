@@ -1345,6 +1345,40 @@ static int piece_mappable(const GModel *m, const ERef *ref, int q) {
     return (ref->off[q] & 3) == 0;
 }
 
+/* Port of qwen38_core.h's q38_populate_range: same MADV_POPULATE_READ
+ * primitive, same call shape (prefault on the thread that binds an expert
+ * instead of inside the matmul that first touches it), but the opposite
+ * default. Ported and A/B'd on the 2026-09-04 rig against G0
+ * (tools/hot-expert/ROME-3x7900XTX-2026-09-04.md): where this helped Qwen's
+ * CPU expert path 4-6x (fault stalls were 45% of decode as libgomp barrier
+ * spin, fifteen threads idling on the one taking the fault), it measured a
+ * REGRESSION on GLM's -- rotating median 1.65-1.66 -> 1.48 tok/s, cold
+ * decode 1.23-1.25 -> 0.98-0.99, reproduced twice each way, isolated by
+ * toggling only this knob with everything else held fixed. teacher_forcing
+ * and last_logits are bit-identical to pristine either way (this changes
+ * only when pages fault, never what gets read), so the difference is real
+ * runtime cost, not a shortcut. Root cause not profiled here (out of scope
+ * for a port) -- candidates are GLM's much higher call frequency (this fires
+ * on every expert_read cache miss inside the per-token dispatch loop, not a
+ * bounded one-time loader like Qwen's) and/or mmap_lock contention from
+ * eight threads calling madvise concurrently on the SAME per-file mapping.
+ * Default OFF (opt-in only) until that regression is understood; do not flip
+ * this to default-on without a new measurement. */
+static void glm53_populate_range(const uint8_t *p, int64_t nbytes) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+    static int on = -1;
+    if (on < 0) on = (getenv("GLM53_MMAP_POPULATE") && atoi(getenv("GLM53_MMAP_POPULATE")));
+    if (!on || !p || nbytes <= 0) return;
+    static long page = 0;
+    if (!page) page = sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t)p & ~((uintptr_t)page - 1);
+    uintptr_t e = ((uintptr_t)p + (uintptr_t)nbytes + (uintptr_t)page - 1) & ~((uintptr_t)page - 1);
+    (void)madvise((void *)a, (size_t)(e - a), MADV_POPULATE_READ);
+#else
+    (void)p; (void)nbytes;
+#endif
+}
+
 static void expert_map_init(GModel *m) {
     if (getenv("GLM53_NO_MMAP") || !m->eref) return;
     const Cfg *c = &m->c;
@@ -1363,6 +1397,18 @@ static void expert_map_init(GModel *m) {
                 g_fmap[fd] = (uint8_t *)pm;
                 g_fmaplen[fd] = (size_t)st.st_size;
                 files++;
+                /* GLM53_POPULATE_LOAD: fault the whole shard in right here,
+                 * instead of leaving it to the first per-expert bind. Default
+                 * OFF, unlike the per-bind prefault above -- this is new and
+                 * unmeasured on this box, and the record already has one
+                 * incident of an eager, unbounded preload thrashing the page
+                 * cache (91 GB "resident" from an uncapped dev2/dev3 loop).
+                 * The 182 GiB checkpoint fits the 247 GB box alone, per the
+                 * "one model at a time" discipline in CLAUDE.md, but that is
+                 * exactly the assumption a bad interaction could violate, so
+                 * this stays opt-in until it has its own A/B on record. */
+                if (getenv("GLM53_POPULATE_LOAD") && atoi(getenv("GLM53_POPULATE_LOAD")))
+                    glm53_populate_range((const uint8_t *)pm, (int64_t)st.st_size);
             }
         }
     if (!files) return;
@@ -1466,6 +1512,17 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
         if (ok) {
             for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
                 slot->piece[p] = g_fmap[ref->fd[p]] + ref->off[p];
+            /* Prefault on the thread that binds this expert, not inside the
+             * matmul that first touches it -- see glm53_populate_range above.
+             * The six pieces are usually not contiguous (unlike Qwen's
+             * gate/up), so ref->contig (already computed in
+             * expert_table_init) decides one advice for the whole slot vs
+             * six small ones. */
+            if (ref->contig)
+                glm53_populate_range(slot->piece[0], m->e_slot);
+            else
+                for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+                    glm53_populate_range(slot->piece[p], m->e_len[p]);
             slot->mapped = 1;
             slot->eid = eid;
 #ifdef _OPENMP

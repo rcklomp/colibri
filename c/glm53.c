@@ -1957,30 +1957,58 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         float *yk1 = (nvk1 > 0) ? malloc((size_t)vtot1 * c->hidden * sizeof(float)) : NULL;
         float *yk2 = (nvk2 > 0) ? malloc((size_t)vtot2 * c->hidden * sizeof(float)) : NULL;
         int ok = (nvk0 == 0 || yk0 != NULL) && (nvk1 == 0 || yk1 != NULL) && (nvk2 == 0 || yk2 != NULL);
-        int base = 0;
-        for (int q = 0; ok && q < nvk0; ) {
-            int n = nvk0 - q; if (n > 64) n = 64;
-            int rs = 0; for (int w = 0; w < n; w++) rs += vrows0[q + w];
-            ok = coli_vk_expert_group(vg0 + q, vu0 + q, vd0 + q, vrows0 + q, n,
-                                      yk0 + (size_t)base * c->hidden, xk0 + (size_t)base * c->hidden);
-            base += rs; q += n;
+        /* Issue every device's chunk first, join afterward: the three GPUs
+         * then run at the same time as each other instead of one after the
+         * other. Mirrors qwen38_core.h's q38_moe_decode -- measured there at
+         * 2.37 ms/layer sequential vs 0.63 ms/layer concurrent issue/take on
+         * this rig's 3x RX 7900 XTX (2026-09-04). Each device is still capped
+         * at 64 items per call (the descriptor-pool size eg_prepare_submit
+         * allocates once, in backend_vulkan.c), so a device whose group needs
+         * more than one chunk still serializes against ITSELF across rounds;
+         * only the three devices' matching round overlaps. A group that was
+         * successfully issued is always taken before this loop can exit or
+         * advance to the next round, win or lose, so a mid-round failure on
+         * one device never leaves another device's single in-flight slot
+         * (coli_vk_expert_group_take's precondition) stuck for the engine's
+         * next call. */
+        int q0 = 0, q1 = 0, q2 = 0, base0 = 0, base1 = 0, base2 = 0, fail = !ok;
+        while (!fail && (q0 < nvk0 || q1 < nvk1 || q2 < nvk2)) {
+            int n0 = 0, n1 = 0, n2 = 0, issued0 = 0, issued1 = 0, issued2 = 0;
+            if (q0 < nvk0) {
+                n0 = nvk0 - q0; if (n0 > 64) n0 = 64;
+                issued0 = coli_vk_expert_group_issue(vg0 + q0, vu0 + q0, vd0 + q0, vrows0 + q0, n0,
+                                                     xk0 + (size_t)base0 * c->hidden);
+                if (!issued0) fail = 1;
+            }
+            if (q1 < nvk1) {
+                n1 = nvk1 - q1; if (n1 > 64) n1 = 64;
+                issued1 = coli_vk_expert_group_issue2(vg1 + q1, vu1 + q1, vd1 + q1, vrows1 + q1, n1,
+                                                      xk1 + (size_t)base1 * c->hidden);
+                if (!issued1) fail = 1;
+            }
+            if (q2 < nvk2) {
+                n2 = nvk2 - q2; if (n2 > 64) n2 = 64;
+                issued2 = coli_vk_expert_group_issue3(vg2 + q2, vu2 + q2, vd2 + q2, vrows2 + q2, n2,
+                                                      xk2 + (size_t)base2 * c->hidden);
+                if (!issued2) fail = 1;
+            }
+            if (issued0) {
+                if (!coli_vk_expert_group_take(yk0 + (size_t)base0 * c->hidden)) fail = 1;
+                int rs = 0; for (int w = 0; w < n0; w++) rs += vrows0[q0 + w];
+                base0 += rs; q0 += n0;
+            } else if (n0 > 0) q0 = nvk0;
+            if (issued1) {
+                if (!coli_vk_expert_group_take2(yk1 + (size_t)base1 * c->hidden)) fail = 1;
+                int rs = 0; for (int w = 0; w < n1; w++) rs += vrows1[q1 + w];
+                base1 += rs; q1 += n1;
+            } else if (n1 > 0) q1 = nvk1;
+            if (issued2) {
+                if (!coli_vk_expert_group_take3(yk2 + (size_t)base2 * c->hidden)) fail = 1;
+                int rs = 0; for (int w = 0; w < n2; w++) rs += vrows2[q2 + w];
+                base2 += rs; q2 += n2;
+            } else if (n2 > 0) q2 = nvk2;
         }
-        base = 0;
-        for (int q = 0; ok && q < nvk1; ) {
-            int n = nvk1 - q; if (n > 64) n = 64;
-            int rs = 0; for (int w = 0; w < n; w++) rs += vrows1[q + w];
-            ok = coli_vk_expert_group2(vg1 + q, vu1 + q, vd1 + q, vrows1 + q, n,
-                                       yk1 + (size_t)base * c->hidden, xk1 + (size_t)base * c->hidden);
-            base += rs; q += n;
-        }
-        base = 0;
-        for (int q = 0; ok && q < nvk2; ) {
-            int n = nvk2 - q; if (n > 64) n = 64;
-            int rs = 0; for (int w = 0; w < n; w++) rs += vrows2[q + w];
-            ok = coli_vk_expert_group3(vg2 + q, vu2 + q, vd2 + q, vrows2 + q, n,
-                                       yk2 + (size_t)base * c->hidden, xk2 + (size_t)base * c->hidden);
-            base += rs; q += n;
-        }
+        ok = !fail;
         if (ok) {
             for (int r = 0; r < vtot0; r++) {
                 float *os = out + (size_t)vtok0[r] * c->hidden;

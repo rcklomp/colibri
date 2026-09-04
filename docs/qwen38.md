@@ -187,6 +187,14 @@ that only int8/VRAM residency of the dense set can move. Per-op measurements
 on this machine, and the reasoning behind the placement, are in
 `tools/hot-expert/ROME-3x7900XTX-2026-09-04.md`.
 
+In the persistent-server regime (`tools/datapoint.py`, physical-core threads,
+80 tokens, page cache evicted before load) the pristine engine already reached
+4.11 tok/s CPU and 5.34 tok/s on three GPUs for a repeated prompt; the branch
+takes those to 4.70 and 5.35, and moves the rotating-prompt median on the tier
+from 2.72 to 3.69 tok/s and the cold first request from 2.08 to 3.59 (TTFT
+18 → 7 s). The fresh-process table above overstates the serving-time gain; the
+lab record has both.
+
 Two things that did not pay: `OMP_WAIT_POLICY=passive` (1.57 tok/s: wake-up
 latency on ~2,000 parallel regions per token costs more than the spinning),
 and reading the routed experts through the GPU without preloading.

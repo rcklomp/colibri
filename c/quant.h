@@ -526,7 +526,32 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * comment above for the derivation and exhaustive-validation record). No
  * table, no gather -- vpgatherdd measured SLOWER than scalar table lookup on
  * Zen 2, so this sidesteps that weakness instead of working around it. */
+#if defined(__F16C__)
+/* F16C variant: an e4m3 magnitude (0 eeee mmm) shifted left by 7 is a valid
+ * fp16 bit pattern (exponent 0eeee, mantissa mmm0000000) whose value is the
+ * e4m3 value times 2^-8 -- for normals AND subnormals, since both formats put
+ * the same 0.mmm behind their minimum exponent (2^-6 vs 2^-14). vcvtph2ps is
+ * exact, so multiplying by 256 afterwards reproduces the f32 bits of the LUT
+ * for all 254 finite codes; the two NaN codes are forced to fp16 NaN before
+ * the convert so the propagate-NaN policy above is preserved. Measured on
+ * Zen 2 (EPYC 7F32, 16 threads, Qwen3.8 expert shapes streaming from DRAM):
+ * 0.203 -> 0.145 ms per expert (1.4x) inside matmul_fp8, which was ALU-bound
+ * at a quarter of DRAM bandwidth with the bit-manipulation decode below.
+ * Exhaustively checked against E4M3_LUT; matmul outputs are bit-identical. */
 static inline __m256 e4m3x8_to_f32x8(__m128i b8) {
+    __m128i h    = _mm_cvtepu8_epi16(b8);
+    __m128i mag  = _mm_and_si128(h, _mm_set1_epi16(0x7F));
+    __m128i sign = _mm_slli_epi16(_mm_and_si128(h, _mm_set1_epi16(0x80)), 8);
+    __m128i nan  = _mm_and_si128(_mm_cmpeq_epi16(mag, _mm_set1_epi16(0x7F)), _mm_set1_epi16(0x7C00));
+    __m128i h16  = _mm_or_si128(_mm_or_si128(_mm_slli_epi16(mag, 7), sign), nan);
+    return _mm256_mul_ps(_mm256_cvtph_ps(h16), _mm256_set1_ps(256.0f));
+}
+#define E4M3_HAVE_F16C_DECODE 1
+static inline __m256 e4m3x8_to_f32x8_bits(__m128i b8)
+#else
+static inline __m256 e4m3x8_to_f32x8(__m128i b8)
+#endif
+{
     __m256i b = _mm256_cvtepu8_epi32(b8);
     __m256i sign = _mm256_slli_epi32(_mm256_and_si256(b, _mm256_set1_epi32(0x80)), 24);
     __m256i exp4 = _mm256_and_si256(_mm256_srli_epi32(b, 3), _mm256_set1_epi32(0xF));
@@ -546,6 +571,14 @@ static inline __m256 e4m3x8_to_f32x8(__m128i b8) {
 }
 #endif
 
+/* Threading note (EPYC 7F32, 8c/16t, 2026-09-04): this kernel is ALU-bound
+ * and prefers one thread per physical core -- OMP_NUM_THREADS=8 with
+ * OMP_PLACES=cores took Qwen3.8 routed experts from 231 to 142 ms/token.
+ * Capping only this kernel's team inside a 16-thread pool was measured and
+ * rejected (1.70 vs 1.90 tok/s): the eight idle pool threads spin on the
+ * sibling hyperthreads and slow the eight that work. A second FMA chain per
+ * block was likewise measured and rejected (no change at either thread count),
+ * so the loop below is deliberately the plain one. */
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);

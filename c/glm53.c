@@ -1027,12 +1027,19 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             KMV(decay, &l->kfb, low);
             KMV(gate, &l->kgb, lowg);
         }
-        /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
-        for (int h = 0; h < H; h++)
+        /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias))
+         *
+         * exp(A_log[h]) dipende solo dal peso: fuori dal ciclo su d si calcola
+         * 64 volte per token invece di 8.192 (G3: i trascendentali sono ~1 ms
+         * dei 2,3 ms per chiamata). Stesso expf sullo stesso ingresso, quindi
+         * stessi bit. */
+        for (int h = 0; h < H; h++) {
+            const float alpha = expf(l->alog[h]);
             for (int d = 0; d < D; d++) {
                 int i = h * D + d;
-                decay[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (decay[i] + l->dt[i]));
+                decay[i] = c->gate_lb * sigmoidf_(alpha * (decay[i] + l->dt[i]));
             }
+        }
         for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
         coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
                       H, D, D, c->conv_k, 1e-6f, scratch);

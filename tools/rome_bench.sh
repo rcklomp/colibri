@@ -29,6 +29,7 @@ CONFIG_NAME="$2"
 # Engine-specific configuration
 case "$ENGINE" in
   qwen38)
+    # CPU path: Q38_VULKAN deliberately unset.
     ENGINE_BIN="${COLIBRI_SRC}/c/qwen38"
     MODEL_SNAP="${HOME}/models/Qwen3.8-Flash-Next-FP8"
     THREADS=8
@@ -36,18 +37,46 @@ case "$ENGINE" in
     MAX_NEW=80
     ;;
   qwen38-vk)
+    # The GPU expert tier is gated on Q38_VULKAN=1 (qwen38_core.h:989), and
+    # dev2/dev3 additionally on COLI_VK_DEV2/3 being SET -- unset means "don't
+    # try", not "auto" (:1001). Without these the qwen38-vk binary runs as a
+    # plain CPU engine and silently reports CPU numbers.
     ENGINE_BIN="${COLIBRI_SRC}/c/qwen38-vk"
     MODEL_SNAP="${HOME}/models/Qwen3.8-Flash-Next-FP8"
     THREADS=8
     CAP=512
     MAX_NEW=80
+    export Q38_VULKAN=1 COLI_VK_DEV2=auto COLI_VK_DEV3=auto
+    # The shader path defaults to "shaders/qmatmul.spv" RELATIVE TO CWD, and
+    # this script runs datapoint.py from the repo root where no such directory
+    # exists (they live in c/shaders). Absolute, so CWD stops mattering.
+    export COLI_VK_SHADERS="${COLIBRI_SRC}/c/shaders"
     ;;
   glm53)
+    # 182 GiB int4 checkpoint. Vulkan is gated on COLI_VULKAN=1 (glm53.c:2118)
+    # and dev2/dev3 on COLI_VK_DEV2/3 as above.
     ENGINE_BIN="${COLIBRI_SRC}/c/glm53"
-    MODEL_SNAP="${HOME}/models/GLM-4-Flow-1B-int4-q8"
+    MODEL_SNAP="${HOME}/models/GLM-5.3-Flash-colibri-int4-g64"
     THREADS=8
     CAP=512
     MAX_NEW=64
+    export COLI_VULKAN=1 COLI_VK_DEV2=auto COLI_VK_DEV3=auto
+    export COLI_VK_SHADERS="${COLIBRI_SRC}/c/shaders"   # see qwen38-vk note above
+    # COLI_USAGE_PATH is read at startup to fill the tier (glm53.c:2137) AND
+    # rewritten by a destructor at exit (:1563) with this run's accumulated
+    # counts. Pointing it at ~/.glm53_explain.bin directly would therefore let
+    # each measurement mutate the histogram the next one preloads from, so
+    # runs would not be comparable. Copy it per run and use the copy, leaving
+    # the canonical file untouched.
+    GLM_HIST_SRC="${HOME}/.glm53_explain.bin"
+    GLM_HIST="/tmp/rome_bench_glm_hist_$$.bin"
+    if [ ! -f "$GLM_HIST_SRC" ]; then
+      echo "Error: GLM histogram $GLM_HIST_SRC not found; the tier would preload empty" >&2
+      exit 1
+    fi
+    cp "$GLM_HIST_SRC" "$GLM_HIST"
+    export COLI_USAGE_PATH="$GLM_HIST"
+    trap 'rm -f "$GLM_HIST"' EXIT
     ;;
   *)
     echo "Unknown engine: $ENGINE" >&2
@@ -122,6 +151,46 @@ OUTPUT=$(python3 c/tools/datapoint.py \
 }
 
 echo "$OUTPUT"
+
+# Assert the configuration we asked for is the one that actually came up.
+# datapoint.py prints a "| GPU |" row only when the engine reports a device,
+# so its absence on a Vulkan config means the tier never initialised and the
+# numbers are CPU numbers. Failing here is the point: a mislabelled row in the
+# record is worse than no row (this fired for real on 2026-09-04, when a
+# qwen38-vk run with Q38_VULKAN unset was written up as "3 GPUs").
+# Assert on the ENGINE's own preload lines, not on datapoint.py's "| GPU |"
+# row: that row comes from the SERVE hwinfo frame, which qwen38 does not send
+# even with the tier fully up, so it is a false negative.
+tier_fail() {
+  echo "Error: $ENGINE ran with NO GPU expert tier -- these would be CPU numbers." >&2
+  echo "       $1" >&2
+  echo "       Check Q38_VULKAN/COLI_VULKAN, COLI_VK_DEV2/3, COLI_VK_SHADERS," >&2
+  echo "       and (glm53) COLI_USAGE_PATH. Refusing to record." >&2
+  exit 1
+}
+case "$ENGINE" in
+  qwen38-vk)
+    echo "$OUTPUT" | grep -q 'Vulkan tier preloaded' \
+      || tier_fail "no '[qwen38] Vulkan tier preloaded' line (qwen38_core.h:1054)."
+    n=$(echo "$OUTPUT" | sed -n 's/.*Vulkan tier preloaded \([0-9][0-9]*\) of.*/\1/p' | head -1)
+    [ -n "$n" ] && [ "$n" -gt 0 ] || tier_fail "tier preloaded 0 experts."
+    echo "[rome_bench] GPU tier confirmed up ($n experts):"
+    ;;
+  glm53)
+    echo "$OUTPUT" | grep -q 'no usage history loaded' \
+      && tier_fail "glm53 reported 'tier empty' (glm53.c:1611): COLI_USAGE_PATH did not load."
+    echo "$OUTPUT" | grep -q '\[VK\] preload:' \
+      || tier_fail "no '[VK] preload:' line (glm53.c:1669)."
+    # The recorded GLM configuration is all three devices; a silently missing
+    # dev2/dev3 is the documented way this box produces a wrong GLM baseline.
+    for d in dev2 dev3; do
+      echo "$OUTPUT" | grep -q "\[VK\] $d ready" \
+        || tier_fail "$d never came up; this is not the recorded 3-GPU configuration."
+    done
+    echo "[rome_bench] GPU tier confirmed up (3 devices):"
+    ;;
+esac
+echo "$OUTPUT" | grep -E 'Vulkan tier preloaded|\[VK\] (preload|dev[23] ready)' | sed 's/^/    /'
 
 # Extract rotating median tok/s from the Workload summary table.
 # Row shape: | **rotating prompts (primary)** | n | median tok/s | sigma | p95 | hit |

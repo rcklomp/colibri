@@ -1755,6 +1755,9 @@ int main(int argc, char **argv) {
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);
+#ifdef Q38_VK_TIER
+    q38vk_preload(&m);   /* needs the histogram rt_load just read */
+#endif
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     /* coli serve mode: speak the gateway wire protocol instead of argv

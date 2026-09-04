@@ -401,6 +401,10 @@ checkpoint layout and the text-only capability boundary.
 | `Q38_NATIVE_FP8` | `1` (on) | Keep routed E4M3 expert bytes and their F32 128×128 block scales native in the LRU. `=0` restores expanded-FP32 slots for A/B validation. |
 | `Q38_NATIVE_BF16` | `1` (on) | Keep resident and routed BF16 matrices in two-byte storage while retaining FP32 activations/accumulation. `=0` restores the expanded-FP32 reference. |
 | `Q38_PREFILL_BATCH` | `1` (on) | Route prompt rows in bounded expert-major chunks and batch resident shared-expert/DeltaNet projections. `=0` restores row-at-a-time prompt execution for A/B diagnosis; decode is unchanged. |
+| `Q38_MMAP_POPULATE` | `1` (on, Linux) | Prefault (`MADV_POPULATE_READ`) a mapped expert's three ranges on the thread that binds it, so page faults are not taken inside the parallel matmul where every other thread waits at the barrier. `=0` restores lazy faulting. Measured +10% decode on a 16-thread EPYC with the checkpoint in the page cache. |
+| `Q38_DENSE_MULTI` | `1` (on) | Run the DeltaNet (`qkv`,`z`,`b`,`a`) and attention (`q`,`k`,`v`,`indexer`) projections of one input as a single OpenMP region instead of four; bit-identical rows. `=0` for A/B. |
+| `Q38_VULKAN` | `0` (off) | `qwen38-vk` build only: bring up the Vulkan routed-expert tier (native FP8, `fmt=8`). `COLI_VK_DEV2`/`COLI_VK_DEV3` (`auto` or an index) add devices; `COLI_VK_SHADERS` locates `qmatmul.spv`. |
+| `Q38_VK_PRELOAD` | `1` (on) | `qwen38-vk`: fill the VRAM tier hottest-first from the `.coli_usage` histogram before the first request. `=0` fills lazily on first use, which puts each 4.7 MB upload inside decode (measured 1.40 vs 2.77 tok/s on 3× RX 7900 XTX). |
 | `COLI_TIMERS` | `0` (off) | Set to `1` for the detailed Qwen3.8 phase breakdown on stderr. The shared per-request `PROF` frame is emitted regardless. |
 
 ## DeepSeek V4 engine (`deepseek_v4`)

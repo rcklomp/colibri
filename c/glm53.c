@@ -1368,6 +1368,24 @@ static int piece_mappable(const GModel *m, const ERef *ref, int q) {
  * Reported by prof_print. Wall time here is what tells apart "the madvise calls
  * themselves cost the regression" from "they cost little but slow everything
  * else down" -- the two hypotheses G1 left open. */
+/* G3 per-op timer state and helpers (tools/hot-expert/ROADMAP-2026-09.md).
+ * Declared this early because ffn_layer, run_layers and forward_span all
+ * read them; the report and the reset live next to run_layers. Gated on
+ * COLI_TIMERS=1 (the name rome_bench.sh already exports) so the default path
+ * pays nothing -- not even the clock reads. */
+static int g_optime = -1;
+static double g_ot_kda, g_ot_mla, g_ot_ffn_dense, g_ot_ffn_moe, g_ot_hc, g_ot_head, g_ot_layers;
+static long   g_on_kda, g_on_mla, g_on_ffn_dense, g_on_ffn_moe, g_on_hc, g_on_head, g_on_layers;
+static double g_ot_router, g_ot_shared; static long g_on_router;   /* MoE sub-split */
+static inline int optime_on(void) {
+    if (g_optime < 0) g_optime = getenv("COLI_TIMERS") && atoi(getenv("COLI_TIMERS"));
+    return g_optime;
+}
+static inline double optime_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
 static double g_t_pop; static long g_n_pop; static double g_b_pop;
 static double g_t_pop_max;
 static long g_n_bind_contig, g_n_bind_split;   /* mmap binds: 1 advise vs 6 */
@@ -1826,6 +1844,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     float *score = malloc((size_t)c->n_experts * sizeof(float));
     if (!chosen || !weight || !score) { fprintf(stderr, "OOM nel router\n"); exit(1); }
 
+    const double t_router0 = optime_on() ? optime_now() : 0.0;
     /* --- primo tempo: il router, per ogni token --- */
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
@@ -1857,6 +1876,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
     }
     free(score);
+    if (optime_on()) { g_ot_router += optime_now() - t_router0; g_on_router++; }
 
     /* --- secondo e terzo tempo, a blocchi che stanno in cache ---
      *
@@ -1873,9 +1893,11 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
+    const double t_shared0 = optime_on() ? optime_now() : 0.0;
     for (int t = 0; t < tokens; t++)
         mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
              &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+    if (optime_on()) g_ot_shared += optime_now() - t_shared0;
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
@@ -2456,6 +2478,46 @@ static void session_close(const GModel *m, GSession *s) {
  * `next` e' il secondo banco, della stessa misura: il passaggio li scambia a
  * ogni sito, quindi alla fine il risultato puo' essere in uno o nell'altro, e
  * la funzione restituisce quale. */
+/* G3 per-op report: where a decode token goes, split KDA / MLA / dense FFN /
+ * MoE FFN (router / shared expert / [PROF] expert groups and CPU experts) /
+ * mHC+norm plumbing / lm_head. Summed over layers; the CLI zeroes everything
+ * after prefill so a --greedy run prints decode-only figures, which is the
+ * regime the per-op table describes. State and helpers are declared with the
+ * [PROF] counters, above ffn_layer. */
+static void optime_reset(void) {
+    g_ot_kda = g_ot_mla = g_ot_ffn_dense = g_ot_ffn_moe = g_ot_hc = g_ot_head = g_ot_layers = 0.0;
+    g_on_kda = g_on_mla = g_on_ffn_dense = g_on_ffn_moe = g_on_hc = g_on_head = g_on_layers = 0;
+    g_ot_router = g_ot_shared = 0.0; g_on_router = 0;
+    /* The [PROF] sub-split of the MoE bucket must describe the same window,
+     * so it is zeroed here too -- only under COLI_TIMERS=1, so the default
+     * [PROF] line keeps its whole-run meaning. */
+    g_t_pop = g_b_pop = g_t_pop_max = 0.0; g_n_pop = 0;
+    g_n_bind_contig = g_n_bind_split = g_n_bind_gpu = g_n_bind_cpu = 0;
+    g_map_serve = g_map_copy = 0;
+#ifdef COLI_VULKAN
+    g_t_eg = g_t_cpu = 0.0; g_n_eg = g_n_eg_disp = g_n_cpu = g_n_devloss = 0;
+#endif
+}
+__attribute__((destructor)) static void optime_print(void) {
+    if (!optime_on() || !g_on_layers) return;
+    const double sum = g_ot_kda + g_ot_mla + g_ot_ffn_dense + g_ot_ffn_moe + g_ot_hc;
+    fprintf(stderr, "[OPTIME] forwards=%ld layers=%.3fs head=%.3fs (n=%ld)\n",
+            g_on_layers, g_ot_layers, g_ot_head, g_on_head);
+    fprintf(stderr, "[OPTIME] kda=%.3fs n=%ld (%.3f ms/call) | mla=%.3fs n=%ld (%.3f ms/call)\n",
+            g_ot_kda, g_on_kda, g_on_kda ? 1e3 * g_ot_kda / g_on_kda : 0.0,
+            g_ot_mla, g_on_mla, g_on_mla ? 1e3 * g_ot_mla / g_on_mla : 0.0);
+    fprintf(stderr, "[OPTIME] ffn_dense=%.3fs n=%ld (%.3f ms/call) | ffn_moe=%.3fs n=%ld (%.3f ms/call)\n",
+            g_ot_ffn_dense, g_on_ffn_dense, g_on_ffn_dense ? 1e3 * g_ot_ffn_dense / g_on_ffn_dense : 0.0,
+            g_ot_ffn_moe, g_on_ffn_moe, g_on_ffn_moe ? 1e3 * g_ot_ffn_moe / g_on_ffn_moe : 0.0);
+    fprintf(stderr, "[OPTIME] hc+norm=%.3fs n=%ld (%.3f ms/site) | layers-sum=%.3fs unaccounted=%.3fs\n",
+            g_ot_hc, g_on_hc, g_on_hc ? 1e3 * g_ot_hc / g_on_hc : 0.0, sum, g_ot_layers - sum);
+    fprintf(stderr, "[OPTIME] moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
+                    "eg and cpu experts are the [PROF] line; the rest of ffn_moe is bind+dispatch+accumulate\n",
+            g_ot_router, g_ot_shared, g_on_router,
+            g_on_router ? 1e3 * g_ot_router / g_on_router : 0.0,
+            g_on_router ? 1e3 * g_ot_shared / g_on_router : 0.0);
+}
+
 static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                          int n, int start, int begin, int end) {
     const Cfg *c = &m->c;
@@ -2469,12 +2531,15 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
         fprintf(stderr, "OOM nei temporanei del passaggio\n"); exit(1);
     }
 
+    const int timed = optime_on();
+    const double t_layers0 = timed ? optime_now() : 0.0;
     for (int i = begin; i < end; i++) {
         GLayer *l = &m->layer[i];
         for (int site = 0; site < 2; site++) {
             const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
             const float *base = site ? l->hc_ffn_base : l->hc_attn_base;
             const float *scale = site ? l->hc_ffn_scale : l->hc_attn_scale;
+            double t0 = timed ? optime_now() : 0.0;
             for (int t = 0; t < n; t++)
                 coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
                             comb + (size_t)t * H * H, streams + (size_t)t * H * D,
@@ -2482,24 +2547,37 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             for (int t = 0; t < n; t++)
                 rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
                     site ? l->post_ln : l->in_ln, D, c->eps);
+            if (timed) { g_ot_hc += optime_now() - t0; g_on_hc++; t0 = optime_now(); }
             if (!site) {
                 GLayerState *st = &s->layer[i];
                 /* Lo stato non si azzera a ogni chiamata: e' della
                  * conversazione, e azzerarlo qui vorrebbe dire ricominciare
                  * la ricorrenza a ogni token generato. */
-                if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
-                else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
-                               s->kda_scratch);
+                if (c->is_full[i]) {
+                    mla_layer(c, l, normed, n, branch, st, start);
+                    if (timed) { g_ot_mla += optime_now() - t0; g_on_mla++; }
+                } else {
+                    kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
+                              s->kda_scratch);
+                    if (timed) { g_ot_kda += optime_now() - t0; g_on_kda++; }
+                }
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
+                if (timed) {
+                    if (i < c->first_dense) { g_ot_ffn_dense += optime_now() - t0; g_on_ffn_dense++; }
+                    else                    { g_ot_ffn_moe   += optime_now() - t0; g_on_ffn_moe++; }
+                }
             }
+            if (timed) t0 = optime_now();
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
                              comb + (size_t)t * H * H, H, D);
+            if (timed) g_ot_hc += optime_now() - t0;   /* same site: counted once above */
             float *swap = streams; streams = next; next = swap;
         }
     }
+    if (timed) { g_ot_layers += optime_now() - t_layers0; g_on_layers++; }
     free(comb); free(post); free(branch); free(normed); free(collapsed);
     return streams;
 }
@@ -2657,8 +2735,10 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
+    const double t_head0 = optime_on() ? optime_now() : 0.0;
     for (int t = 0; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
+    if (optime_on()) { g_ot_head += optime_now() - t_head0; g_on_head++; }
 
     free(normed); free(collapsed);
     free(next); free(streams);
@@ -3335,6 +3415,7 @@ int main(int argc, char **argv) {
          * tempo totale: caricamento e prefill costano quanto costano, e
          * confonderli col decode ha gia' fatto sbagliare un confronto. */
         const double decode_start = now_s();
+        if (optime_on()) optime_reset();   /* the per-op table describes decode only */
         int produced = 0;
         /* `rows` dice quante righe ha l'ultimo blocco di logit: il prefill ne
          * restituisce una per posizione, un passo incrementale una sola. In

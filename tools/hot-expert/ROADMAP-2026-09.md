@@ -39,16 +39,27 @@ already landed for Qwen; G3 is the fork in the road; G4 is the real project.
 |---|---|---|---|---|---|---|
 | G0 | Persistent-engine baseline (`datapoint.py --engine glm53`): cold, warm-identical, rotating | GLM has only fresh-process numbers | none; it is the yardstick | half day | Haiku | four numbers in the record |
 | G1 | Prefault mmap'd experts at bind, and a populate-whole-mapping-at-load knob, ported from `qwen38_core.h` (`q38_populate_range`) into `glm53.c`'s `expert_read` mmap path | Qwen: fault stalls made the CPU expert path 4–6× slower than its kernel; GLM's CPU share is ~1/3 of its experts | first request and rotating prompts; unknown magnitude, measure | 1 day | Sonnet | teacher_forcing identical; rotating median and cold TTFT vs G0 |
+| G1b | **Done** — root-caused G1's regression (record §G1b): it was prefaulting the 32% of binds that the GPU then serves from VRAM; `mmap_lock` contention ruled out (1 thread ≈ 8 threads per call). Fixed, still net-negative on this box (7.5 thread-s of `madvise` to save 0.76), kept off by default because every fault here is minor — on a RAM-constrained box the sign flips | G1 | — | done | Opus | bit-identical; measured |
 | G2 | Check whether `glm53` dispatches dev0/dev2/dev3 expert groups sequentially; if so, issue-all/take-all with the CPU share in between, as in `q38_moe_decode` | Qwen: 2.37 vs 0.63 ms per layer | 0 if already concurrent; up to −50 ms/token if not | half day to 1 day | Sonnet | teacher_forcing identical; tok/s vs G0 |
-| G3 | Per-op profile of GLM decode on this box: `perf` flat + the `[ATTN]`/`[PROF]` timers, split KDA / MLA / expert group / CPU experts / dense | Sep 2 profile: KDA 3.25 ms × 2074 calls ≈ 110 ms of a 300 ms token; MLA 64 ms | none; it decides G4 | half day | Opus | a table like the Qwen one in the record |
-| **gate** | Fable reads G3 and picks the KDA approach: (a) AVX2 vectorize the scalar inner loop (per token × head × position over L=512), (b) move KDA's recurrence to the GPU via a new shader, or (c) both, split by layer | the audit called KDA "deepest bottleneck, big effort" | — | one session | Fable | a one-page spec with the numerics oracle named |
-| G4 | Implement the chosen KDA path | G3 | the largest GLM item; if KDA halves, ~−55 ms/token → ~3.8–4.0 tok/s | 2–4 days | Opus | teacher_forcing within the documented near-tie tolerance; per-op timer for KDA before/after |
+| G3 | **Done 2026-09-04** — per-op profile, record §G3: `[OPTIME]` timers (the `[ATTN]` timer never existed in the tree) + `perf` flat. Decode token 373 ms fresh-process: MoE 199 (CPU experts 115 at 27% of DRAM bandwidth, router 41 single-thread scalar, GPU groups 22, shared 20), KDA 78, MLA 55, mHC 35. **69% of the token runs on one core** (60.8% of cycles are libgomp spin). | supersedes the Sep 2 numbers: KDA is 21% of the token, not 37% | — | done | Opus | table in the record: **met** |
+| **gate** | **Done** — Fable read G3: the roadmap's KDA description was wrong on three counts (inner loops already AVX2-vectorized; the "L=512 scalar loop" is MLA's; not bandwidth-bound at 15× its floor). Chosen: **CPU** — head-parallel `coli_kda_step`, `expf(alog)` hoisted, ring conv window; **no shader**. | G3 §KDA decomposition: 0.9 ms DRAM + ~1 ms transcendentals + ~0.4 ms memmove = the measured 2.3 | — | done | Fable | `G4-KDA-SPEC-2026-09-04.md`: **written** |
+| G4 | Implement `G4-KDA-SPEC-2026-09-04.md`: parallelize `coli_kda_step` over heads with per-thread scratch, hoist `expf(alog[h])`, ring-index the conv window. `delta_attention.h` is shared with `kimi_k3`/`qwen36`: both must rebuild and pass their oracle. | G3: 78 ms/token, 2.30 ms/call, single thread | 78 → ~15 ms/token (−63) | 1 day | Opus | **bit-identical** teacher_forcing *and* last_logits vs pristine (`diff`), standard + 690-token prompts; `[OPTIME] kda` 2.30 → ≤0.6 ms/call; rotating median vs G2's 1.69–1.71, twice |
 | G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h` (mirror of Qwen commit `2d3cf7e`) | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | nothing at short prompts; matters at 8k+ | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; qsa/dsa-index timer |
 | G6 | Make the dev2/dev3 preload loops stop on the VRAM budget, not only on a count cap | an unlimited cap put 91 GB "in VRAM" and evicted the page cache | safety, not speed | half day | Sonnet | `COLI_VK_EXPERTS2` unset fills to budget − reserve and no further |
+| G7 | Router: parallelize the 288-row f32 dot-product loop in `ffn_layer` across rows (keep each row's summation order) | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token | hours | Sonnet | bit-identical teacher_forcing + last_logits; `[OPTIME] moe split: router` |
+| G8 | MLA: parallelize the 64-head loops in `mla_layer` (absorb `mv_rows`, the attention core, `kvb_v`) | G3: 55 ms/token at 151 tokens of context, 5.0 ms/call, single thread, **O(context)** (4.1 ms at 87 tokens) | −45 ms/token now; grows with context | 1 day | Sonnet | bit-identical per head; `[OPTIME] mla` at 151 and 690 tokens |
+| G9 | Overlap the CPU expert share with the in-flight GPU groups — G2's deliberately deferred half: issue dev0/2/3, compute the CPU experts, then take | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token | half day | Sonnet | bit-identical; `[PROF] eg` no longer serial with `cpu` |
+| G10 | mHC: drop the two per-call `malloc`s in `coli_hc_pre`, vectorize/parallelize the ~400k-MAC mix over the 4-stream residual. **Shared header** (`hyper_connections.h`, DeepSeek V4): rebuild and re-oracle both | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token | 1 day | Sonnet | bit-identical if summation order kept; `[OPTIME] hc+norm` |
+| G11 | CPU int4 expert kernel `matmul_i4_grouped`: it streams 2.19 GB/token at 19 GB/s on 8 threads against 70.9 GB/s DRAM — ALU/decode-bound at 27% of bandwidth, Qwen's pre-F16C diagnosis | G3: **115 ms/token, the largest single bucket** (31%) | −60 to −80 ms/token | 2–3 days | Opus | teacher_forcing + last_logits vs pristine; `[PROF] cpu` and `[OPTIME] ffn_moe`; rotating median |
 
-Target for the track: from 3.2 to about 4 tok/s on rotating prompts, with
-G4 carrying most of it. If G3 shows KDA is already near its bandwidth floor,
-stop after G5 and say so.
+Target for the track, rewritten from the profile: G3 measured 373 ms per
+decode token fresh-process (585 ms rotating, G2's 1.71 tok/s). G4 and
+G7–G10 are ~−195 ms of it with no new kernel and no numerics change; G11 is
+the one kernel and the largest bucket. Order by ms-per-day: **G7 (hours),
+G9, G4, G8, G10, then G11.** Expected roughly 1.8–2× on the rotating median
+from G4+G7–G10 alone; the fresh-process split is the evidence, the rotating
+median through `rome_bench.sh` is the gate for each. The KDA shader is off
+the list until these are done (spec, last section).
 
 ## Track Q: Qwen3.8 (today 5.35 repeated / 3.69 rotating / 3.59 cold, 3 GPUs, 8 threads)
 
@@ -79,7 +90,7 @@ Q4 measured as accepted tokens per second.
 - **Week 1 (Sonnet/Haiku, can run as parallel sessions on the rig one at a
   time):** C0, C2, G0, G1, G2, Q0, Q5. Each is a day or less and each has a
   numeric gate.
-- **Week 2 (Opus):** C1 merge; G3 profile; Q1; G5; G6.
+- **Week 2 (Opus):** ~~C1 merge~~ (blocked: `2d3cf7e` SIGFPE in `test_qwen38_prefix` and the tiny-check needs torch the rig lacks — see record §C1); ~~G3 profile~~ (done); then G7 → G9 → G4 → G8 → G10 (Sonnet/Opus, each hours to a day, each bit-identical); Q1; G5; G6; G11 last (the only kernel).
 - **Fable session (one):** read G3, pick the KDA approach; write the Q3 and
   Q4 designs against each other. Output: three one-page specs with oracles.
 - **Weeks 3–5 (Opus, two parallel lines because the code paths are

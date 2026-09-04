@@ -66,7 +66,15 @@ are FP32; BF16 matrices use FP32 accumulation, while native FP8 uses FP32 dot
 products within each 128-column block and FP64 accumulation across the scaled
 blocks. The bounded per-layer cache therefore spends about one quarter of the
 previous memory per FP8 expert. Context state grows by about 54 KiB per token.
-There is currently no Qwen3.8 GPU backend.
+
+The default `qwen38` target is CPU-only. An opt-in Vulkan routed-expert tier
+exists as the `qwen38-vk` target (`make -C c qwen38-vk VK=1`, run with
+`Q38_VULKAN=1`, plus `COLI_VK_DEV2=auto COLI_VK_DEV3=auto` for more GPUs):
+experts stay native FP8 (`fmt=8`) in VRAM, are preloaded hottest-first from
+`.coli_usage` before the first request, and every device's group is issued
+before any is joined so the GPUs and the CPU share run concurrently. Dense
+weights, DeltaNet, QSA and the LM head stay on the CPU. See **Measured on a
+3× RX 7900 XTX box** below for what that is worth.
 
 ## What stays on disk
 
@@ -152,6 +160,36 @@ of 512 experts in each of 48 layers, 4.7 MiB each: 2.2 GiB of expert weights
 when nothing is cached and roughly half that at the cap-32 hit rate, so at this
 cache size the engine spends about two thirds of every request waiting on the
 disk, and the planner labels cold expert reads as the expected bottleneck.
+
+## Measured on a 3× RX 7900 XTX box (2026-09-04)
+
+EPYC 7F32 (8 cores / 16 threads, Zen 2: AVX2+FMA+F16C, no AVX-512), 8×32 GB
+DDR4-2400 (92 GB/s measured read), three Radeon RX 7900 XTX (RDNA3, 24 GB
+each, RADV, Vulkan 1.4), NVMe. The whole 173 GiB checkpoint fits in the page
+cache, so on this machine the disk is not the wall: every number below is
+with the shards resident, expert cap 512, a 48-token prompt and 64 greedy
+tokens (128 where noted), same output text in every run. Per-token phases are
+`COLI_TIMERS=1` values.
+
+| configuration | decode tok/s | routed experts | resident BF16 | notes |
+|---|---:|---:|---:|---|
+| CPU, 16 threads, before this work | 1.45 | 383–395 ms | 156–162 ms | 45% of cycles were libgomp barrier spin: 15 threads idling while one served page faults on freshly bound mmap'd experts |
+| CPU, 16 threads, prefault + F16C decode + fused dense | 1.90–1.93 | 231 ms | 125–129 ms | prefault alone ≈ +10%, dense fusion ≈ +2% |
+| CPU, 8 threads pinned one per core | 2.35 | 142 ms | 144 ms | the FP8 kernel is ALU-bound and SMT siblings fight for the same units; BF16 dense loses a little bandwidth |
+| `qwen38-vk`, 3 GPUs, lazy tier fill (old behaviour) | 1.40 | 109 ms | 204 ms | uploads land inside decode and the driver's spinning steals cores from the dense matmuls |
+| `qwen38-vk`, 3 GPUs, heat-ranked preload + concurrent issue/take | 2.77 (64 tok) / 3.38 (128 tok) | 69–104 ms | 133–145 ms | 9,396–11,244 experts (all with history) preloaded in 24–28 s; TTFT 8.5 s vs 13.4 s CPU |
+| same, `OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close` | **4.05** (128 tok) | 60 ms | 114 ms | recommended launch here: the CPU only streams the dense set, and eight threads leave the driver threads their own hyperthreads |
+
+Where the rest of a token goes on the CPU path: the resident BF16 matrices
+are 8.5 GB per token and stream at DRAM speed (the LM head alone reads 1.27
+GB in 12.5 ms, 100 GB/s), so ~85 ms of every token is a bandwidth floor
+that only int8/VRAM residency of the dense set can move. Per-op measurements
+on this machine, and the reasoning behind the placement, are in
+`tools/hot-expert/ROME-3x7900XTX-2026-09-04.md`.
+
+Two things that did not pay: `OMP_WAIT_POLICY=passive` (1.57 tok/s: wake-up
+latency on ~2,000 parallel regions per token costs more than the spinning),
+and reading the routed experts through the GPU without preloading.
 
 ## Performance telemetry
 

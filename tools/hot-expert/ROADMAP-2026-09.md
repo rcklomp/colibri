@@ -43,7 +43,7 @@ already landed for Qwen; G3 is the fork in the road; G4 is the real project.
 | G2 | Check whether `glm53` dispatches dev0/dev2/dev3 expert groups sequentially; if so, issue-all/take-all with the CPU share in between, as in `q38_moe_decode` | Qwen: 2.37 vs 0.63 ms per layer | 0 if already concurrent; up to −50 ms/token if not | half day to 1 day | Sonnet | teacher_forcing identical; tok/s vs G0 |
 | G3 | **Done 2026-09-04** — per-op profile, record §G3: `[OPTIME]` timers (the `[ATTN]` timer never existed in the tree) + `perf` flat. Decode token 373 ms fresh-process: MoE 199 (CPU experts 115 at 27% of DRAM bandwidth, router 41 single-thread scalar, GPU groups 22, shared 20), KDA 78, MLA 55, mHC 35. **69% of the token runs on one core** (60.8% of cycles are libgomp spin). | supersedes the Sep 2 numbers: KDA is 21% of the token, not 37% | — | done | Opus | table in the record: **met** |
 | **gate** | **Done** — Fable read G3: the roadmap's KDA description was wrong on three counts (inner loops already AVX2-vectorized; the "L=512 scalar loop" is MLA's; not bandwidth-bound at 15× its floor). Chosen: **CPU** — head-parallel `coli_kda_step`, `expf(alog)` hoisted, ring conv window; **no shader**. | G3 §KDA decomposition: 0.9 ms DRAM + ~1 ms transcendentals + ~0.4 ms memmove = the measured 2.3 | — | done | Fable | `G4-KDA-SPEC-2026-09-04.md`: **written** |
-| G4 | Implement `G4-KDA-SPEC-2026-09-04.md`: parallelize `coli_kda_step` over heads with per-thread scratch, hoist `expf(alog[h])`, ring-index the conv window. `delta_attention.h` is shared with `kimi_k3`/`qwen36`: both must rebuild and pass their oracle. | G3: 78 ms/token, 2.30 ms/call, single thread | 78 → ~15 ms/token (−63) | 1 day | Opus | **bit-identical** teacher_forcing *and* last_logits vs pristine (`diff`), standard + 690-token prompts; `[OPTIME] kda` 2.30 → ≤0.6 ms/call; rotating median vs G2's 1.69–1.71, twice |
+| G4 | Implement `G4-KDA-SPEC-2026-09-04.md` in three measured commits — see **Executing G4** below: (1) hoist `expf(alog[h])`, (2) OpenMP over the 64 heads with per-thread scratch, (3) OpenMP over the conv channels. No ring index, no shader. | G3: 78 ms/token, 2.30 ms/call, single thread; decomposition 0.9 DRAM + 1.0 transcendentals + 0.4 memmove | 78 → ~12 ms/token (−65) | 1 day | Sonnet (Opus only if the oracle disagrees) | each commit **bit-identical** teacher_forcing *and* last_logits vs pristine (`diff`), standard + constructed long prompt; `[OPTIME] kda` 2.30 → ≤0.6 ms/call; rotating median vs G2's 1.69–1.71, twice |
 | G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h` (mirror of Qwen commit `2d3cf7e`) | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | nothing at short prompts; matters at 8k+ | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; qsa/dsa-index timer |
 | G6 | Make the dev2/dev3 preload loops stop on the VRAM budget, not only on a count cap | an unlimited cap put 91 GB "in VRAM" and evicted the page cache | safety, not speed | half day | Sonnet | `COLI_VK_EXPERTS2` unset fills to budget − reserve and no further |
 | G7 | Router: parallelize the 288-row f32 dot-product loop in `ffn_layer` across rows (keep each row's summation order) | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token | hours | Sonnet | bit-identical teacher_forcing + last_logits; `[OPTIME] moe split: router` |
@@ -60,6 +60,77 @@ G9, G4, G8, G10, then G11.** Expected roughly 1.8–2× on the rotating median
 from G4+G7–G10 alone; the fresh-process split is the evidence, the rotating
 median through `rome_bench.sh` is the gate for each. The KDA shader is off
 the list until these are done (spec, last section).
+
+### Executing G4 (read this, then the spec; nothing here needs re-deriving)
+
+**Facts, verified 2026-09-04.** `c/delta_attention.h` is included by
+`c/glm53.c` **only** — `kimi_k3.c` has its own `kda_forward`, `qwen36.c`
+none — so despite its docstring it is not shared in practice; nothing else
+compiles it and there is no sibling oracle to run. `glm53.c`'s only calls are
+`coli_kda_step` (in `kda_layer`) and `coli_kda_scratch_floats` (session
+open, `s->kda_scratch = malloc(...)`). `kda_state`/`kda_window` are
+`calloc`'d once per session per KDA layer and never reset mid-session; they
+are also exported as raw byte spans for segment migration
+(`ColiSegmentStateSpan` table, grep `st->kda_window,`) — **which is why the
+conv window keeps its `[channel][kernel]` layout and there is no ring
+index: a position counter would change that span's meaning.** There is no
+690-token document on the rig; construct the long prompt (below). The rig
+has no `kimi_k3`/`qwen36` checkpoint and no torch, so "rebuild clean" is the
+whole of what can be checked for them.
+
+**Three commits, in this order, each built, oracled and timed before the
+next.** Run everything with the G3 environment (record §G3): 3 GPUs,
+`COLI_USAGE_PATH` pointing at a *copy* of `~/.glm53_explain.bin`,
+`OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close`, cap 512.
+
+1. **Hoist the constant.** In `kda_layer` (`glm53.c`, grep `expf(l->alog[h])`)
+   the decay loop computes `expf(l->alog[h])` inside the `d` loop: 8,192
+   calls per token for 64 distinct values. Compute it once per `h` in the
+   outer loop into a local and use that. `alog` is a weight; same `expf` of
+   the same input is the same bits. No struct change.
+2. **Heads in parallel.** In `coli_kda_step` (`delta_attention.h`), put
+   `#pragma omp parallel for schedule(static)` (guarded `#ifdef _OPENMP`) on
+   the `for (int head ...)` loop. Every buffer that loop touches is disjoint
+   per head **except `memory`**, which is one `v_dim` buffer shared by all
+   heads — a shared `memory` under parallelism corrupts every head's
+   read-back while still producing plausible tokens (`README.md` explains
+   why that is the failure the `teacher_forcing` line exists for). Give each
+   thread its own: `memory = scratch + 3*width + omp_get_thread_num()*v_dim`,
+   and grow `coli_kda_scratch_floats()` from `mixed + v_dim` to
+   `mixed + T*v_dim` with `T = omp_get_max_threads()` under `_OPENMP`, else
+   1. `glm53`'s allocation follows automatically. Do not add `num_threads()`
+   caps (measured and rejected on Qwen, record §"tried and rejected"). The
+   arithmetic and its order inside a head do not change.
+3. **Conv channels in parallel.** Same pragma on the
+   `for (int channel = 0; channel < 3 * width; channel++)` loop above it;
+   each channel's `window` slice and `mixed[channel]` are disjoint. The
+   per-channel `memmove` stays (it is 12 bytes; spread eight ways it stops
+   mattering) — this is what replaces the ring index.
+
+**Oracle, per commit.** Build the pristine binary from the previous commit
+into `/tmp` exactly as record §G2 does (`git show <sha>:c/glm53.c`, same
+gcc line, `-I.`), run both with `--greedy 0 --logits 512` on the same
+histogram copy, and `diff` the outputs: identical or the commit does not
+land. Two prompts: the standard one from §G1, and a long one built as
+`python3 -c "print((open('/home/ronald/bench/prompt_glm.txt').read().strip()+' ')*30)"`
+(~700 tokens: many tokens through the recurrence and the conv window).
+
+**Measure, per commit.** `COLI_TIMERS=1 ./glm53 --model ... --prompt "$P"
+--greedy 128 512` and read `[OPTIME] kda ... ms/call`; put before/after in
+the commit body. Expected: step 1 alone ~2.30 → ~2.15; step 2 to ~0.5;
+step 3 to ~0.35–0.45. Gate ≤ 0.6.
+
+**Gate, once.** `./tools/rome_bench.sh glm53 g4-run1` and `g4-run2`;
+rotating median against G2's 1.69–1.71 in the record; both numbers in the
+final commit body and one row in the record. Rebuild `kimi_k3` and `qwen36`
+too and say in the body that they compiled (they cannot be exercised here).
+
+**Stop conditions.** If any `diff` is non-empty, stop and report the first
+divergent position — do not loosen the oracle to a tolerance, this change
+has no legitimate numerics delta. If step 2 lands and `[OPTIME] kda` is not
+below 0.8 ms/call, stop and report before step 3; that would mean the
+decomposition in §G3 is wrong somewhere and the profile needs another look
+(Opus), not more parallelism.
 
 ## Track Q: Qwen3.8 (today 5.35 repeated / 3.69 rotating / 3.59 cold, 3 GPUs, 8 threads)
 

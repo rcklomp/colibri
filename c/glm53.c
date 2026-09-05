@@ -1891,6 +1891,36 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
     swiglu_clamped(sg, su, g->rows, limit);
     matmul_i4_grouped(out, sg, d->q4, d->s, 1, d->columns, d->rows, d->gs);
 }
+
+/* G9: run CPU-only experts that were deferred past the GPU issue point (see
+ * ffn_layer's dispatch block), so their compute overlaps the fence wait
+ * instead of finishing entirely before it -- G2 issued the three devices
+ * concurrently with each other; this is the "CPU share in between" half of
+ * the same idea, deliberately left for later there. Same per-token
+ * scale/accumulate as the immediate path, just replayed against saved Mat
+ * triples instead of the single (gate,up,down,eid) the classify loop had at
+ * hand. Only ever called with experts collected while can_defer held (single
+ * block, no eviction risk between classifying and running them). */
+static void ffn_moe_run_deferred_cpu(const Mat *cpu_gate, const Mat *cpu_up, const Mat *cpu_down,
+                                     const int *cpu_eid, int n_cpu_deferred,
+                                     const int *chosen, const float *weight, int tokens, int topk,
+                                     const float *x, int hidden, float limit,
+                                     float *sg, float *su, float *tmp, float *out) {
+    for (int j = 0; j < n_cpu_deferred; j++) {
+        const int eid = cpu_eid[j];
+        for (int t = 0; t < tokens; t++) {
+            float scale = 0.0f;
+            for (int k = 0; k < topk; k++)
+                if (chosen[(size_t)t * topk + k] == eid) { scale = weight[(size_t)t * topk + k]; break; }
+            if (scale == 0.0f) continue;
+            double _tc = prof_now_s();
+            mlp3_cpu(tmp, x + (size_t)t * hidden, &cpu_gate[j], &cpu_up[j], &cpu_down[j], limit, sg, su);
+            g_t_cpu += prof_now_s() - _tc; g_n_cpu++;
+            float *dst = out + (size_t)t * hidden;
+            for (int d = 0; d < hidden; d++) dst[d] += scale * tmp[d];
+        }
+    }
+}
 #endif
 
 static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
@@ -2033,6 +2063,24 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         vrows2 = malloc((size_t)maxres * sizeof(int)); vtok2 = malloc((size_t)maxres * sizeof(int)); vw2 = malloc((size_t)maxres * sizeof(float));
         xk2 = malloc((size_t)maxres * c->hidden * sizeof(float));
     }
+    /* G9: CPU-only experts get deferred here instead of computed immediately,
+     * so they can run after the GPU groups are issued (overlapping the fence
+     * wait) instead of entirely before it. Safe only when the whole routing
+     * fits in one block: n_union <= block means expert_read for a LATER
+     * block can never evict a slot this block's deferred compute still
+     * needs. cache->cap is 512 in every measured config on this rig and
+     * n_union <= topk*tokens, so this always holds for decode; a smaller cap
+     * or a larger prefill batch falls back to today's immediate-compute path
+     * untouched, exactly as before this change. */
+    const int can_defer = g_vk_ready && (n_union <= block);
+    Mat *cpu_gate = NULL, *cpu_up = NULL, *cpu_down = NULL;
+    int *cpu_eid = NULL, n_cpu_deferred = 0, cpu_deferred_done = 0;
+    if (can_defer) {
+        cpu_gate = malloc((size_t)maxres * sizeof(Mat));
+        cpu_up   = malloc((size_t)maxres * sizeof(Mat));
+        cpu_down = malloc((size_t)maxres * sizeof(Mat));
+        cpu_eid  = malloc((size_t)maxres * sizeof(int));
+    }
 #endif
     for (int base = 0; base < n_union; base += block) {
         const int here = base + block <= n_union ? block : n_union - base;
@@ -2104,6 +2152,14 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                     g_n_eg++;
                     continue;
                 }
+                if (can_defer) {
+                    cpu_gate[n_cpu_deferred] = gate;
+                    cpu_up[n_cpu_deferred] = up;
+                    cpu_down[n_cpu_deferred] = down;
+                    cpu_eid[n_cpu_deferred] = eid;
+                    n_cpu_deferred++;
+                    continue;
+                }
 #endif
             for (int t = 0; t < tokens; t++) {
                 float scale = 0.0f;
@@ -2149,6 +2205,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
          * (coli_vk_expert_group_take's precondition) stuck for the engine's
          * next call. */
         int q0 = 0, q1 = 0, q2 = 0, base0 = 0, base1 = 0, base2 = 0, fail = !ok;
+        int first_round = 1;
         while (!fail && (q0 < nvk0 || q1 < nvk1 || q2 < nvk2)) {
             int n0 = 0, n1 = 0, n2 = 0, issued0 = 0, issued1 = 0, issued2 = 0;
             if (q0 < nvk0) {
@@ -2169,6 +2226,21 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                                                       xk2 + (size_t)base2 * c->hidden);
                 if (!issued2) fail = 1;
             }
+            /* G9: the three devices' fences are now signalled but not yet
+             * waited on -- run the deferred CPU-only experts in this gap,
+             * once, on whichever round first issues anything, so their
+             * compute overlaps the take/fence-wait below instead of having
+             * finished entirely beforehand. Unconditional on this round's
+             * own success: an issue failure elsewhere doesn't change that
+             * these still have to run, and a device that DID issue is still
+             * in flight regardless. */
+            if (first_round && can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
+                ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
+                                         chosen, weight, tokens, topk, x, c->hidden,
+                                         c->swiglu_limit, sg, su, tmp, out);
+                cpu_deferred_done = 1;
+            }
+            first_round = 0;
             if (issued0) {
                 if (!coli_vk_expert_group_take(yk0 + (size_t)base0 * c->hidden)) fail = 1;
                 int rs = 0; for (int w = 0; w < n0; w++) rs += vrows0[q0 + w];
@@ -2210,6 +2282,16 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         g_t_eg += prof_now_s() - _te0;
         free(yk0); free(yk1); free(yk2);
     }
+    if (can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
+        /* Nothing was GPU-resident this layer (nvk0=nvk1=nvk2=0, so the
+         * dispatch block above was never entered and the while loop's
+         * overlap hook never ran) -- no GPU work to overlap with, but these
+         * still have to run. */
+        ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
+                                 chosen, weight, tokens, topk, x, c->hidden,
+                                 c->swiglu_limit, sg, su, tmp, out);
+    }
+    free(cpu_gate); free(cpu_up); free(cpu_down); free(cpu_eid);
 #endif
     free(to_read); free(slot_of); free(union_ids);
     free(tmp); free(su); free(sg); free(weight); free(chosen);

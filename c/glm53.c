@@ -1884,12 +1884,79 @@ static void vk_preload_tier(GModel *m) {
     free(cand); if (tmp.own) free(tmp.own);
     fprintf(stderr, "[VK] preload: %d heat-ranked experts resident (of %d candidates)\n", loaded, (int)n);
 }
-/* pure-CPU expert MLP (bypasses mv/Vulkan for non-resident experts) */
+/* pure-CPU expert MLP (bypasses mv/Vulkan for non-resident experts)
+ *
+ * G11: the three matmuls used to be three separate `#pragma omp parallel for`
+ * regions with the swiglu running SERIAL between the second and the third —
+ * three fork/joins and one single-threaded stretch per expert, ~70 experts per
+ * decode token. They are now one parallel region with three worksharing
+ * constructs: gate and up share one (they are independent and read the same
+ * x), then the swiglu is shared across the same team, then down. Two implicit
+ * barriers replace two fork/joins, and the swiglu stops being serial.
+ *
+ * Bit-identical by construction: every output element is still one
+ * `coli_i4_row` over the same groups in the same order — only which thread
+ * runs it, and how the team is entered, changed. Verified against the pristine
+ * binary on both prompts, not assumed.
+ *
+ * GLM53_EXPERT_SPLIT=1 restores the old three-region path for A/B measurement;
+ * it is not a numerics knob, both paths produce the same bits. */
+static int g_expert_split = -1;
+static int expert_split_on(void) {
+    if (g_expert_split < 0)
+        g_expert_split = getenv("GLM53_EXPERT_SPLIT") ? atoi(getenv("GLM53_EXPERT_SPLIT")) : 0;
+    return g_expert_split;
+}
 static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, const Mat *d, float limit, float *sg, float *su) {
-    matmul_i4_grouped(sg, x, g->q4, g->s, 1, g->columns, g->rows, g->gs);
-    matmul_i4_grouped(su, x, u->q4, u->s, 1, u->columns, u->rows, u->gs);
-    swiglu_clamped(sg, su, g->rows, limit);
-    matmul_i4_grouped(out, sg, d->q4, d->s, 1, d->columns, d->rows, d->gs);
+    if (expert_split_on()) {
+        matmul_i4_grouped(sg, x, g->q4, g->s, 1, g->columns, g->rows, g->gs);
+        matmul_i4_grouped(su, x, u->q4, u->s, 1, u->columns, u->rows, u->gs);
+        swiglu_clamped(sg, su, g->rows, limit);
+        matmul_i4_grouped(out, sg, d->q4, d->s, 1, d->columns, d->rows, d->gs);
+        return;
+    }
+    /* fmt is checked by the caller's classify loop (int4 experts only), but be
+     * explicit: anything else falls back rather than silently misreading. */
+    if (g->fmt != 4 || u->fmt != 4 || d->fmt != 4) {
+        matmul_i4_grouped(sg, x, g->q4, g->s, 1, g->columns, g->rows, g->gs);
+        matmul_i4_grouped(su, x, u->q4, u->s, 1, u->columns, u->rows, u->gs);
+        swiglu_clamped(sg, su, g->rows, limit);
+        matmul_i4_grouped(out, sg, d->q4, d->s, 1, d->columns, d->rows, d->gs);
+        return;
+    }
+    const int Ig = g->columns, Og = g->rows, Id = d->columns, Od = d->rows;
+    const int grb = (Ig + 1) / 2, gng = (Ig + g->gs - 1) / g->gs;
+    const int urb = (u->columns + 1) / 2, ung = (u->columns + u->gs - 1) / u->gs;
+    const int drb = (Id + 1) / 2, dng = (Id + d->gs - 1) / d->gs;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int z = 0; z < 2 * Og; z++) {
+            if (z < Og)
+                sg[z] = coli_i4_row(g->q4 + (int64_t)z * grb, g->s + (int64_t)z * gng, x, Ig, g->gs);
+            else {
+                const int o = z - Og;
+                su[o] = coli_i4_row(u->q4 + (int64_t)o * urb, u->s + (int64_t)o * ung, x, u->columns, u->gs);
+            }
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < Og; i++) {
+            float gv = sg[i] > limit ? limit : sg[i];
+            float uv = su[i] < -limit ? -limit : (su[i] > limit ? limit : su[i]);
+            sg[i] = siluf_(gv) * uv;
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int o = 0; o < Od; o++)
+            out[o] = coli_i4_row(d->q4 + (int64_t)o * drb, d->s + (int64_t)o * dng, sg, Id, d->gs);
+    }
 }
 
 /* G9: run CPU-only experts that were deferred past the GPU issue point (see

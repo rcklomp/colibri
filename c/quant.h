@@ -164,6 +164,44 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+/* ---- one output row of the grouped int4 matvec (fmt=4) -------------------
+ * Byte-for-byte the body of matmul_i4_grouped's o-loop, lifted so a caller can
+ * drive the rows from its own worksharing construct instead of paying a fresh
+ * `parallel for` per matrix. Added by G11: an expert is three of these matmuls
+ * with a swiglu between, and issuing them as three separate parallel regions
+ * costs a fork/join each plus two serial stretches. matmul_i4_grouped itself is
+ * deliberately NOT refactored to call this -- G10 showed that even a
+ * semantically null edit to a hot function can move GCC's codegen and with it
+ * the low bits of the result, and that function is on the qwen38 path too. */
+static inline float coli_i4_row(const uint8_t *w, const float *scl,
+                                const float *xs, int I, int gs){
+    float a=0;
+    for(int g=0; g*gs<I; g++){
+        int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+        float sc=scl[g];
+        int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+        __m256 acc=_mm256_setzero_ps();
+        for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+            __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i nib=_mm_unpacklo_epi8(lo,hi);
+            __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+            __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+        /* same pinned fmaf as matmul_i4_grouped, and for the same reason */
+        a=fmaf(hsum256(acc),sc,a);
+#endif
+        for(; i<base+glen; i+=2){
+            if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+            else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+        }
+    }
+    return a;
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){

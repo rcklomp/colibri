@@ -39,8 +39,9 @@ was only 93% warm. Read **§RP1-CORRECTION first**: it inverts the ranking.
 **KDA (53.3 ms/token, 32.9%) is now the largest bucket, not the CPU experts
 (40.3, 24.8%)**, and 35.0 ms/token of KDA is GPU submits.
 
-Status 2026-09-05: G0–G4, G7, G8, G9, G10 and the before-G11 re-profile
-(RP1) done; G5/G6/G11 open, G12 **done** (reopened after Fable gate 2 and landed — record §G12). The old header number (3.17
+Status 2026-09-05: G0–G4, G7–G12 and both re-profiles (RP1, RP2) done;
+G5/G6 open, **G13 is next** (record §RP2). Two profiles now exist because
+`COLI_KDA_GPU=2` ships off: **159.08 ms/token knob-off, 137.19 knob-on**. The old header number (3.17
 tok/s "fresh-process") is superseded twice over — G0 established the
 persistent baseline this track is actually gated on (1.65–1.66), and
 G2+G4+G7+G8+G9+G10 moved it to 2.60–2.75. G3 replaced the whole ordering
@@ -229,10 +230,33 @@ by guess; where a position is a judgment call rather than a number, it says so.
    was right that it needs a kernel; what changed is that the kernel is now
    worth it and mostly already exists as a pattern.
 
-   **Next item is G5/G6, or a re-profile:** KDA was the largest bucket at 53.3
-   ms/token and G12 took ~19–22 of that out, so the ranking that ordered this
-   list is stale again. RP1's own lesson was that the ordering, not the item,
-   is what a re-profile buys.
+   **The re-profile happened — see RP2, record §RP2.** −21.9 ms/token
+   confirmed from outside G12's own campaign.
+4b. ~~**RP2 — re-profile after G11 and G12.**~~ **DONE 09-05** (record §RP2).
+   Measured in **both knob positions**, because `COLI_KDA_GPU=2` ships off:
+   **knob-off 159.08 ms/token** (KDA 53.35, 33.5%, largest) and **knob-on
+   137.19** (CPU int4 experts 38.28, 27.9%, largest). Confirmed G12's −21.9
+   and G11 part 1's −1.99 from outside their own campaigns; routing
+   bit-identical to RP1-CORRECTION, so RP1's histogram confound is gone.
+   Changed the standing procedure: **assert 100% page residency before every
+   run, not once per campaign** — every `glm53` process drops the model to
+   91.6347% and it does not come back. `tools/hot-expert/profile_run.sh`.
+
+4c. **G13 — the shared expert's three submits.** ← **next.** The largest
+   bucket with an unexploited structure: **14.2 ms/token in both knob
+   positions**, 0.342 ms/call × 42 layers, and it has been called
+   "round-trip-dominated" since §G3. It runs through the generic `mlp3`
+   (`glm53.c:997`): `mv(gate)`, `mv(up)`, a **CPU** `swiglu_clamped`,
+   `mv(down)` — three submit+wait round trips with a host round trip in the
+   middle. The fused `gate_up` shader chained on-device into `down` already
+   exists and is measured on the routed expert groups
+   (`backend_vulkan.c:70`, `:826` `coli_vk_gate_up`); the shared expert
+   simply never got it. **A port inside one file, not a kernel — and
+   bit-identical if it reuses the routed experts' own shader.** −4 to −9
+   ms/token, 1 day, **Sonnet**. **Gate: measure this op's own
+   submit+wait with `VK_PROF` first and set the go/no-go from that** — §G12's
+   round-trip figures are for a different op, which is why the range is wide.
+
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.
    Bit-identical, but only after reverting the malloc-removal half of the
@@ -296,8 +320,9 @@ with two speeds, not a one-line reminder:
   (predicted 36%, measured 56.35%) and that **the spin is load-bearing**
   (`OMP_WAIT_POLICY=passive` costs 7.5%), and that **only 57% of the
   core-time in the CPU-expert window is in the kernel**. None of that was
-  visible from the cheap `[OPTIME]` reads. One more is scheduled: **after
-  G11 lands**, before ordering G5 against whatever is left.
+  visible from the cheap `[OPTIME]` reads. **That next one is also done —
+  §RP2, after G11 and G12**, and it hardened the procedure a second time
+  (below).
   **RP1 then had to be corrected by exactly the repeat-measurement this
   cadence exists to force** (§RP1-CORRECTION): its CPU-expert bucket was
   1.86× too high because `fincore` was spot-checked on the tail shards
@@ -309,6 +334,20 @@ with two speeds, not a one-line reminder:
   A/B paired and twice. The internal `[OPTIME]`/`[PROF]` timers hold to
   0.3% where fresh-process tok/s scatters ±10% on GPU-submit jitter, so for
   a CPU-side change the timers are the instrument and the wall-clock is not.
+  **RP2 then hardened it again, by tripping over the same class of error one
+  level up** (§RP2). RP1-CORRECTION's rule was "assert 100% across all 62
+  shards"; RP2 obeyed it, asserted once at the top of the campaign, and was
+  caught minutes later by its own guard finding the model at **91.71%
+  resident, 51 of 62 shards short**. Every `glm53` process drops residency
+  from 100.0000% to **91.6347%** — reproducibly, to four decimals — because
+  it transiently allocates enough anon memory to force reclaim, and the
+  ~15 GiB never comes back; `free` then shows 59 GiB free, so nothing looks
+  wrong unless you look at the model's own pages. **RP1 checked the wrong
+  files; RP2 checked at the wrong time.** Standing rule now: **re-warm and
+  assert before EVERY run**, report residency after each, and use
+  `tools/hot-expert/profile_run.sh` rather than re-deriving it.
+  **And profile in both knob positions** whenever a shipped knob changes a
+  bucket: RP2's two profiles put a different bucket at the top.
 
 Every figure in this document comes from a machine where 69% of the decode
 token was single-threaded when G3 was taken. Fix several of those buckets

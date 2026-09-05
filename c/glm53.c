@@ -1039,6 +1039,7 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *beta = malloc((size_t)H * sizeof(float));
     float *low = malloc((size_t)D * sizeof(float));
     float *core = malloc((size_t)P * sizeof(float));
+    float *normed_gpu = malloc((size_t)P * sizeof(float));   /* G12 gpu==3 bisection */
     float *lowg = malloc((size_t)D * sizeof(float));
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
@@ -1050,6 +1051,46 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
          * i due intermedi non tornano mai in RAM: due round trip invece di
          * quattro. */
         const double _tk0 = optime_on() ? optime_now() : 0.0;
+#ifdef COLI_VULKAN
+        /* G12 full chain: projections -> decay -> recurrence -> head norm -> ko
+         * in ONE submit. Everything between the first projection and ko stays on
+         * the device, so this replaces the whole per-token body below, both round
+         * trips and all three CPU stages. Falls through on any refusal. */
+        if ((gpu == 2 || gpu == 3) && !g_kda_cpu_on()) {
+            Mat *cw[8] = { (Mat *)&l->kq, (Mat *)&l->kk, (Mat *)&l->kv, (Mat *)&l->kfa,
+                           (Mat *)&l->kb, (Mat *)&l->kga, (Mat *)&l->kfb, (Mat *)&l->kgb };
+            const int csrc[8] = { -1, -1, -1, -1, -1, -1, 3, 5 };
+            ColiVkMM it[8];
+            int ok = 1;
+            for (int q = 0; q < 8 && ok; q++) {
+                if (cw[q]->fmt != 1 && cw[q]->fmt != 4) ok = 0;
+                it[q].tensor = (ColiVkTensor **)&cw[q]->vk;
+                it[q].weights = (cw[q]->fmt == 4) ? (const void *)cw[q]->q4 : (const void *)cw[q]->q8;
+                it[q].scales = cw[q]->s; it[q].fmt = cw[q]->fmt; it[q].O = cw[q]->rows;
+                it[q].gs = cw[q]->gs; it[q].out = NULL; it[q].I = 0; it[q].src = csrc[q];
+            }
+            Mat *ko = (Mat *)&l->ko;
+            /* gpu==3 bisects: chain through the head norm, ko on the CPU. */
+            const int stop_at_norm = (gpu == 3);
+            float *chain_dst = stop_at_norm ? normed_gpu : out + (size_t)t * c->hidden;
+            if (ok && coli_vk_kda_layer(layer, it, 8, row, c->hidden,
+                                        (ColiVkTensor **)&ko->vk,
+                                        (ko->fmt == 4) ? (const void *)ko->q4 : (const void *)ko->q8,
+                                        ko->s, ko->fmt, ko->gs, ko->rows,
+                                        c->gate_lb, 1e-6f, c->eps,
+                                        stop_at_norm, chain_dst)) {
+                if (stop_at_norm) KMV(out + (size_t)t * c->hidden, &l->ko, normed_gpu);
+                if (optime_on()) {
+                    /* one fused stage: attribute it to proj so kda's total stays
+                     * comparable, and leave the other four buckets at zero rather
+                     * than inventing a split the timers cannot see. */
+                    g_kt_proj += optime_now() - _tk0;
+                    g_kn_batched++; g_kn_calls++;
+                }
+                continue;
+            }
+        }
+#endif
         int batched = 0;
         if (!g_kda_cpu_on()) {
             const Mat *bw[8] = { &l->kq, &l->kk, &l->kv, &l->kfa, &l->kb, &l->kga,
@@ -1116,6 +1157,7 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         KMV(out + (size_t)t * c->hidden, &l->ko, normed);
         if (optime_on()) { g_kt_ko += optime_now() - _tk4; g_kn_calls++; }
     }
+    free(normed_gpu);
     free(lowg); free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
 }
 
@@ -2704,10 +2746,15 @@ static GSession *session_open(const GModel *m, int cap) {
             /* G12: hand the (zero) state and the immutable conv taps to dev0 once.
              * Per layer, so a device that runs out of room falls back for that
              * layer alone rather than silently mixing two recurrences. */
+            /* COLI_KDA_GPU=1 runs only the recurrence on dev0 (two submits still);
+             * =2 runs the whole layer as one submit. kda_gpu carries the mode so a
+             * layer that could not take its weights stays on the CPU entirely. */
             if (kda_gpu_on() && !g_kda_cpu_on())
                 st->kda_gpu = coli_vk_kda_init(i, c->kda_heads, c->kda_hd, c->kda_hd,
                                                c->conv_k, st->kda_state, st->kda_window,
-                                               m->layer[i].conv);
+                                               m->layer[i].conv, m->layer[i].alog,
+                                               m->layer[i].dt, m->layer[i].onorm)
+                            ? kda_gpu_on() : 0;
 #endif
         }
     }

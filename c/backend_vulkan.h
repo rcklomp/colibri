@@ -97,7 +97,17 @@ int  coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I);
  * (GLSL exp, tree-reduced norms); gated by a drift oracle and COLI_KDA_GPU.
  * All three return 0 on any unsupported shape, leaving the CPU path intact. */
 int  coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
-                      const float *state, const float *window, const float *conv_w);
+                      const float *state, const float *window, const float *conv_w,
+                      const float *alog, const float *dt, const float *onorm);
+/* The whole layer in ONE submit: projections -> decay -> recurrence -> head
+ * norm -> ko, with only `out` returning to the host. Returns 0 -> caller keeps
+ * its existing two-submit path. */
+int  coli_vk_kda_layer(int layer, ColiVkMM *proj, int nproj,
+                       const float *x, int I,
+                       ColiVkTensor **ko, const void *kow, const float *kos,
+                       int ko_fmt, int ko_gs, int ko_O,
+                       float gate_lb, float norm_eps, float head_eps,
+                       int stop_after_norm, float *out);
 int  coli_vk_kda_step(int layer, const float *qkv, const float *gate,
                       const float *beta, float norm_eps, float *out);
 int  coli_vk_kda_sync(int layer, float *state, float *window);

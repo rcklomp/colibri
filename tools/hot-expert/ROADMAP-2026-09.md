@@ -63,7 +63,7 @@ from the original plan.
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
 | G10 | **DONE** 09-05 (record §G10) — parallelised the ~400k-MAC mix and the destination×column combine over independent rows/columns, each one's own reduction untouched (G7's pattern). **The malloc removal did not survive contact**: dropping `coli_hc_pre`'s two per-call `malloc`s needed `hc`'s range knowable at compile time, which measurably changed GCC's rounding in the small hc-bounded reductions (~1.9e-4 on `last_logits`, `teacher_forcing` unaffected) — bisected across five different compiler-flag mitigations, none restored bit-identity; **kept the mallocs, shipped the parallelism**. `[OPTIME] hc+norm` 0.393 → **0.097 ms/site** (4.05×). Rotating 2.33/2.35 → **2.60/2.75**. Bit-identical both prompts. Shared header (DeepSeek V4): rebuilt clean, not re-measured (no rig checkpoint) | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token; beat it (−26.6 ms/token measured, +11–17% gate) | done | Sonnet | bit-identical: **met** (mallocs kept); tok/s vs G9: **met** (+11–17%) |
 | G11 | **PART 1 DONE** 09-05 (record §G11) — expert path fused: one OMP region with three worksharing constructs instead of three regions with a serial swiglu between, bit-identical, **−2.25 ms/token on `ffn_moe` (−3.2%)**, ~140 fewer OMP regions/token. **Part 2 (the kernel) is NOT worth doing as scoped** — see §RP1-CORRECTION. The bucket is **40.3 ms/token, not 74.8 and not 115**. Microbenchmarked before touching the engine (`g11_bench.c`, `g11_path.c`, both sized to defeat the 128 MB L3): the isolated kernel does 21.95 GB/s at 8 threads; a bit-trick nibble→float decode is *exactly* bit-identical but only 1.03×; a second accumulator breaks the FMA dependency chain for **1.30×** but is not bit-identical; four accumulators is worse than two. **Once the path is fused the faster kernel is worth only ~1.06×** — so nothing numerics-changing shipped | §RP1-CORRECTION: **40.3 ms/token, and no longer the largest bucket — KDA is, at 53.3** | part 1 delivered **−2.25 ms/token**; part 2 judged **not worth 2–3 days** for ~1.06× on a 40 ms bucket behind an env knob | part 1 done | Opus | bit-identical both prompts: **met**; `[PROF] cpu` −4.0% across 4 paired runs (fresh-process tok/s cannot resolve 1%: ±10% GPU-submit jitter) |
-| G12 | **BLOCKED** 09-05, **skip, don't fund now** (record §G12) — checked before writing anything: `ko`'s input (`normed`) only exists after `coli_kda_step` + norm/gate, both CPU, both strictly between the projections and `ko` in the same token/layer. Folding into one submit needs the recurrence *on the GPU* — a real shader, not a plumbing port. The G9-style workaround (fold with independent work) doesn't apply either: `tokens=1` in decode (confirmed) and each layer feeds the next via the residual stream, so there is no independent GPU work to overlap `ko`'s wait with. Ruled out the one alternative that would have been pure plumbing (descriptor/cmd-buffer cache clobbering from the interleaved batched path) via a `VK_PROF=1` diagnostic: rebind+re-record are 0.61+1.24 µs/call, negligible; submit+wait (23.1+220.7 µs/call) is the real, unavoidable-without-a-kernel cost. **This is not a new question**: `G4-KDA-SPEC-2026-09-04.md` already priced this exact kernel (~9 ms/token for 2–4 days, trigger "revisit only after items 1–6 of the G3 list are done, if KDA is then the largest remaining bucket") — G11 (one of those six) is still not started, so the trigger hasn't been reached — G10 has since landed. Decided: skip rather than re-ask Fable now; re-check at the post-G9/G10 re-profile milestone, due now that both have landed | G4 §sub-split: proj 0.660 + ko 0.400 ms/call are submits, 47% of KDA before the fix and 66% of what remains | −0.4 ms/call ≈ −14 ms/token, **not reachable this way** | n/a — needs a GPU kernel to be real | Opus (if the trigger is ever reached) | not a Sonnet item; tied to the same trigger as the original KDA-shader rejection |
+| G12 | **REOPENED 09-05 at the second Fable gate — spec written: `G12-KDA-GPU-SPEC-2026-09-05.md`.** The KDA recurrence (decay, step, per-head norm) moves onto dev0 so one layer's eight projections, the recurrence and `ko` record into ONE submit where the engine pays two. Reverses `G4-KDA-SPEC` on that spec's own revisit condition, which §RP1-CORRECTION made true for the first time: items 1–6 done/closed and KDA the largest bucket (53.3 ms/token). Only the recurrence shader is new — the chained-submit pattern is `coli_vk_attn_qprep`, ported. **Not bit-identical** (GLSL `exp`, recurrent state): ships behind `COLI_KDA_GPU=1`, off by default, with a 1000-step shader-only drift test and long-horizon greedy identity as the oracle. GPU-resident state is re-synced to the CPU spans only at segment export/import. The earlier blocked reasoning stands as written in record §G12; it was correct that this needs a kernel | §RP1-CORRECTION: KDA 53.3 ms/token, 32.9 %, largest; 35.0 of it GPU submits | **−15 to −22 ms/token** (one round trip −8.3, CPU recurrence −18.6, three dispatches +5–10). The roadmap's earlier "up to −35" counted matvec compute that stays | 2–4 days, 3 commits | **Opus** (new kernel + non-identical oracle) | Stage 1: rel err ≤ 1e-5 over 1000 steps; Stage 2: greedy identical through 128 tokens on every bench prompt, cosine ≥ 0.99999 at 8/64/128; `[OPTIME] kda` 1.577 → **< 1.0 ms/call** go, > 1.2 stop |
 
 Target for the track, rewritten from the profile: G3 measured 373 ms per
 decode token fresh-process (585 ms rotating, G2's 1.71 tok/s). G4 and
@@ -175,7 +175,8 @@ Q4 measured as accepted tokens per second.
 G7, G8, G9, G10. Blocked: C1 (needs the `2d3cf7e` divisor guarded first);
 G12 (needs a GPU kernel to be real, not a plumbing fix — skipped, not
 escalated, same trigger as the original KDA-shader rejection). Not started:
-C2, G5, G6, all of track Q; G11 part 1 done, part 2 closed. GLM rotating median went
+C2, G5, G6, all of track Q; G11 part 1 done, part 2 closed; **G12 reopened with
+a spec (second Fable gate)**. GLM rotating median went
 1.65–1.66 (G0) → 1.71/1.69 (G2) → 1.84/1.83 (G4) → 2.01/2.05 (G7) →
 2.19/2.17 (G8) → 2.33/2.35 (G9) → **2.60/2.75** (G10); fresh-process
 decode 373.4 → **162.1 ms/token** (§RP1-CORRECTION; RP1's own 199.4 was
@@ -191,10 +192,10 @@ by guess; where a position is a judgment call rather than a number, it says so.
 
 > **Read §RP1-CORRECTION before using this list.** As of 09-05 the largest
 > remaining bucket is **KDA (53.3 ms/token, 32.9%)**, of which **35.0 is GPU
-> submits**, not the CPU experts (40.3). That is the substantive condition
-> `G4-KDA-SPEC-2026-09-04.md` set for revisiting the GPU recurrence shader —
-> and the reason §G12 was skipped no longer holds in the same way. **The next
-> real decision on this track is a Fable call, not another Sonnet/Opus item.**
+> submits**, not the CPU experts (40.3). That fired the revisit condition in
+> `G4-KDA-SPEC-2026-09-04.md`, and **the second Fable gate has ruled: yes** —
+> `G12-KDA-GPU-SPEC-2026-09-05.md`, record §"Fable gate 2". **G12 is the next
+> item, Opus executes it, sized at −15 to −22 ms/token.**
 
 1. ~~**G7 — router.**~~ **DONE 09-05** (record §G7). 0.998 → 0.137 ms/call,
    rotating 1.84/1.83 → **2.01/2.05**. Bit-identical.
@@ -207,16 +208,17 @@ by guess; where a position is a judgment call rather than a number, it says so.
    went from serial with `cpu` (16.249s combined) to nested inside it
    (eg=11.749s ⊇ cpu=11.193s), rotating 2.19/2.17 → **2.33/2.35**.
    Bit-identical. Beat the −22 ms/token estimate (fresh-process +13.3%).
-4. ~~**G12 — fold `ko`.**~~ **BLOCKED 09-05, skipped** (record §G12). Not a
-   Sonnet-tier plumbing fix as specified: `ko`'s input only exists after
-   the CPU recurrence, which would need to move to the GPU (a real
-   kernel, Opus) to actually share a submit. Not escalated to Fable —
-   `G4-KDA-SPEC-2026-09-04.md` already priced this exact kernel and set
-   its trigger ("revisit only after items 1–6 of the G3 list are done, if
-   KDA is then the largest remaining bucket"); G11 alone isn't done yet
-   (G10 has since landed), so the trigger isn't reached. The post-G9/G10
-   re-profile milestone below is now due — check there for real, not by
-   re-deriving it here. Nothing shipped, no code changed.
+4. **G12 — the KDA recurrence on the GPU.** ← **next.** Reopened at the
+   second Fable gate on the first gate's own revisit condition, which
+   §RP1-CORRECTION made true (KDA 53.3 ms/token, largest; items 1–6 closed).
+   Spec: `G12-KDA-GPU-SPEC-2026-09-05.md`. One recurrence shader is new;
+   the chained submit is `coli_vk_attn_qprep`, ported. Behind
+   `COLI_KDA_GPU`, off by default, not bit-identical — the oracle is a
+   1000-step shader drift test plus long-horizon greedy identity, and the
+   go/no-go is `[OPTIME] kda` 1.577 → < 1.0 ms/call. **−15 to −22
+   ms/token**, 2–4 days, Opus. The earlier blocked analysis (record §G12)
+   was right that it needs a kernel; what changed is that the kernel is now
+   worth it and mostly already exists as a pattern.
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.
    Bit-identical, but only after reverting the malloc-removal half of the

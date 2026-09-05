@@ -216,10 +216,13 @@ by guess; where a position is a judgment call rather than a number, it says so.
    the indexer never flattens, and RP1 re-measured it at **1.958 µs per
    context token per call** (was fitted at 2.09) = 0.0215 ms/ctx-token
    across 11 layers: **2.3 ms/token at ctx 106**, 44 at 2k, 176 at 8k, 706
-   at 32k. It overtakes the *entire* CPU-expert bucket at **ctx ≈ 3.5k**.
-   **Its real priority is a product question** — what context length does
-   the deployment see? At 2k it is worth little; at 32k it dwarfs
-   everything else in this table.
+   at 32k. It overtakes the *entire* CPU-expert bucket at **ctx ≈ 3.5k**,
+   and MLA's own attention core — the comparison §G8 was actually
+   ranking — at **ctx ≈ 10k**, not the 3.5k §G8 stated (that figure used an
+   idealised 8× rather than G8's measured 3.08×; RP1 corrects it, and it
+   moves G5 *further out*). **Its real priority is a product question** —
+   what context length does the deployment see? At 2k it is worth little;
+   at 32k it dwarfs everything else in this table.
 7. **G11 — the int4 expert kernel and its path.** ← next. 2–3 days.
    **Re-sized by RP1: −25 to −45 ms/token, not −60 to −80** — the bucket is
    74.8 ms/token, not 115, so the old estimate exceeded the whole bucket.

@@ -1001,6 +1001,58 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
     mv(out, d, sg);
 }
 
+/* G13: mlp3() on the GPU path is three separate submit+wait round trips
+ * (mv(gate), mv(up), mv(down)), one call per token -- the shared expert
+ * calls it `tokens` times per layer, always (never cached, never skipped).
+ *
+ * The routed-expert fused kernel (coli_vk_expert_group / coli_vk_gate_up)
+ * looked like the fix -- one submit for gate+up+down together -- but its
+ * shader computes silu(gate)*up with NO CLAMP: it has no `limit` push
+ * constant at all (c/shaders/qmatmul_gate_up.comp). GLM-5.3's swiglu_limit
+ * is 10.0, not the disabled default, and it is regularly exceeded in
+ * practice: routing the shared expert through that kernel and diffing
+ * against the pristine (clamped) CPU path failed the --logits oracle
+ * outright on the very first run. That the routed experts have used this
+ * same unclamped kernel since the expert-group path first landed is a
+ * pre-existing characteristic of the shipped GPU path, not a bug this item
+ * introduces or is in scope to fix -- no oracle had ever caught it because
+ * no prior change put a clamped and an unclamped computation of the SAME
+ * op side by side. Out of scope for a one-day port; left as a finding.
+ *
+ * What DOES fuse without touching numerics: coli_vk_matmul_pair, already
+ * shipping for exactly this shape in c/kimi_k3.c's vk_expert_apply ("w1/w3
+ * in one paired submit, SiTU-GLU on CPU, w2 down"). It runs the SAME plain
+ * matmul shader coli_vk_matmul/mv() already use (no fused activation), just
+ * two dispatches (gate, up) in one command buffer / one submit / one fence
+ * wait instead of two. swiglu_clamped and the down projection are UNCHANGED
+ * from mlp3 -- only the gate+up round trip merges. 3 submits/call -> 2.
+ *
+ * Bit-identical: same shader, same push constants, same per-row math as the
+ * two mv() calls it replaces; batching independent dispatches into one
+ * command buffer changes nothing about what either one computes. Returns 0
+ * on any unmet precondition (mirrors mv()'s own fmt==1||fmt==4 GPU gate,
+ * plus gate/up must share fmt+gs, which coli_vk_matmul_pair requires and
+ * quantize_loaded already guarantees under one GLM53_BITS setting) and the
+ * caller's existing mlp3() runs exactly as before. */
+static int shared_gate_up_gpu(const GLayer *l, const float *x, float *sg, float *su) {
+    if (!g_vk_ready) return 0;
+    Mat *g = (Mat *)&l->rg, *u = (Mat *)&l->ru;   /* vk cache write, as mv() does */
+    if (!(g->fmt == 1 || g->fmt == 4) || !(u->fmt == 1 || u->fmt == 4)) return 0;
+    if (g->fmt != u->fmt || g->gs != u->gs || g->columns != u->columns) return 0;
+    return coli_vk_matmul_pair((ColiVkTensor **)&g->vk, sg,
+                               g->fmt == 4 ? (const void *)g->q4 : (const void *)g->q8, g->s, g->rows,
+                               (ColiVkTensor **)&u->vk, su,
+                               u->fmt == 4 ? (const void *)u->q4 : (const void *)u->q8, u->s, u->rows,
+                               g->fmt, x, 1, g->columns, g->gs);
+}
+
+static void mlp3_shared(float *out, const float *x, const GLayer *l,
+                        float limit, float *sg, float *su) {
+    if (!shared_gate_up_gpu(l, x, sg, su)) { mv(sg, &l->rg, x); mv(su, &l->ru, x); }
+    swiglu_clamped(sg, su, l->rg.rows, limit);
+    mv(out, &l->rd, sg);
+}
+
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
 static int vk_batch_mv_chain(const Mat *const *ws, float *const *os, const int *srcs,
                              int n, const float *xin, int I);
@@ -2139,8 +2191,8 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
     const double t_shared0 = optime_on() ? optime_now() : 0.0;
     for (int t = 0; t < tokens; t++)
-        mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
-             &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+        mlp3_shared(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden, l,
+                   c->swiglu_limit, sg, su);
     if (optime_on()) g_ot_shared += optime_now() - t_shared0;
 
     if (!m->streaming) {

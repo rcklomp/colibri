@@ -1183,7 +1183,19 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             }
         }
         /* la query entra nello spazio del latente una volta per testa, invece
-         * che il latente nello spazio della query una volta per posizione */
+         * che il latente nello spazio della query una volta per posizione.
+         *
+         * Le teste sono indipendenti: ognuna scrive la propria fetta di
+         * absorbed[] e legge la propria fetta di queries[], nessuno stato
+         * condiviso. mv_rows ha gia' un proprio #pragma omp parallel for
+         * (quant.h) sulle proprie L righe -- annidarlo qui dentro collassa a
+         * un thread per chiamata (default max-active-levels=1 su GCC/libgomp
+         * su questa macchina, verificato empiricamente G8 2026-09-05), quindi
+         * non e' un rischio di overselling, solo un'occasione oggi sprecata:
+         * 64 team OpenMP minuscoli per token invece di uno solo. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++)
             mv_rows(absorbed + ((size_t)t * H + h) * L, &l->kvb_kt,
                     queries + ((size_t)t * H + h) * QK, h * L, L);
@@ -1213,12 +1225,37 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     if (optime_on()) { g_mt_index += optime_now() - _tm1; }
     const double _tm2 = optime_on() ? optime_now() : 0.0;
     float *context = malloc((size_t)H * V * sizeof(float));
-    float *pooled = malloc((size_t)L * sizeof(float));
-    float *score = malloc((size_t)width * sizeof(float));
+    /* score/pooled are the one thing 64 independent heads would share if run
+     * concurrently -- each gets its own slice of a pool sized per thread,
+     * the same fix as KDA's per-thread `memory` (G4): a shared slice would
+     * corrupt every head's softmax while still emitting plausible tokens.
+     * coli_kda_threads() (delta_attention.h, included above) already has the
+     * #ifdef _OPENMP guard this needs. */
+    const int nthreads_mla = coli_kda_threads();
+    float *pooled_pool = malloc((size_t)nthreads_mla * L * sizeof(float));
+    float *score_pool = malloc((size_t)nthreads_mla * width * sizeof(float));
     const float scale = 1.0f / sqrtf((float)QK);
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
+        /* Heads are independent: each reads its own absorbed[] query and
+         * writes its own context[] slice. mv_rows's own #pragma omp parallel
+         * for (quant.h) collapses to one thread per call inside this region
+         * -- max-active-levels defaults to 1 on this box's GCC/libgomp
+         * (checked empirically, G8 2026-09-05) -- so nesting is not a
+         * hazard, only a currently-wasted opportunity: two tiny OMP teams
+         * spun up per head per token today (this loop's mv_rows call and the
+         * absorb loop's above), which is what G3 actually measured. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
+#ifdef _OPENMP
+            float *pooled = pooled_pool + (size_t)omp_get_thread_num() * L;
+            float *score = score_pool + (size_t)omp_get_thread_num() * width;
+#else
+            float *pooled = pooled_pool;
+            float *score = score_pool;
+#endif
             const float *q = absorbed + ((size_t)t * H + h) * L;
             float top = -INFINITY;
             int used = 0;
@@ -1251,7 +1288,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(out + (size_t)t * c->hidden, &l->o, context);
     }
     if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
-    free(score); free(pooled);
+    free(score_pool); free(pooled_pool);
 
     free(context); free(selected); free(valid); free(head_w);
     free(iq); free(absorbed); free(queries); free(qa);

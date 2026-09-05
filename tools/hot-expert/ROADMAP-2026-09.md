@@ -32,17 +32,24 @@ nobody has to remember them.
 
 ## Track G: GLM-5.3 — 2.60–2.75 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
 
-Fresh-process decode is **162.1 ms/token, down from G3's 373.4 (2.30×)** —
-re-profiled 09-05 (**§RP1**) and then **corrected** (**§RP1-CORRECTION**),
-because RP1's own CPU-expert bucket was inflated 1.86× by a page cache that
-was only 93% warm. Read **§RP1-CORRECTION first**: it inverts the ranking.
-**KDA (53.3 ms/token, 32.9%) is now the largest bucket, not the CPU experts
-(40.3, 24.8%)**, and 35.0 ms/token of KDA is GPU submits.
+Fresh-process decode is **156.77 ms/token knob-off and 134.90 knob-on**, down
+from G3's 373.4 (**2.38× / 2.77×**) — re-profiled three times (**§RP1**,
+corrected by **§RP1-CORRECTION**, then **§RP2** and **§RP3**). Two figures
+exist because `COLI_KDA_GPU=2` (G12) is not bit-identical and ships off.
 
-Status 2026-09-06: G0–G4, G7–G13 and both re-profiles (RP1, RP2) done;
-SPEC-PROBE answered no; G5/G6 open, no item currently next (re-profile due).
-Two profiles exist because `COLI_KDA_GPU=2` ships off: **159.08 ms/token
-knob-off, 137.19 knob-on** (before G13's −3.4 ms/token). The old header number (3.17
+**Read §RP3 before planning anything.** The leaders are KDA (53.4 knob-off) and
+the CPU int4 experts (38.6, and the leader knob-on at 28.6%), and *both are
+already blocked*: KDA is solved by G12 and merely not switched on, and the CPU
+experts are VRAM-bound rather than tier-bound, examined and declined twice.
+Everything below MLA is ≤ 11 ms/token, which puts a 30% win at ~2% of the
+token against a serving gate with a 3–4% noise floor.
+
+Status 2026-09-06: G0–G4, G7–G13 and three re-profiles (RP1, RP2, RP3) done;
+SPEC-PROBE answered no; G5/G6 open. **RP3 found nothing to reorder, and that
+is the finding**: every individually remaining item on this track is now worth
+less than the serving gate can resolve (record §RP3). Two profiles exist
+because `COLI_KDA_GPU=2` ships off: **156.77 ms/token knob-off, 134.90
+knob-on**. The old header number (3.17
 tok/s "fresh-process") is superseded twice over — G0 established the
 persistent baseline this track is actually gated on (1.65–1.66), and
 G2+G4+G7+G8+G9+G10 moved it to 2.60–2.75. G3 replaced the whole ordering
@@ -280,18 +287,41 @@ by guess; where a position is a judgment call rather than a number, it says so.
    If the tier ever holds the whole model the linear term vanishes and this
    family becomes strongly attractive. Revisit on a VRAM capacity change.
 
-4e. **Nothing is queued.** G13 was the last item with a specific, measured
-   target. What remains: **G5** (parked on a product question — what context
-   length does the deployment see — not on evidence), **G6** (safety, not
-   speed, half a day whenever the preload path is next touched), **C1**
-   (blocked, blocks nothing), and **track Q** (untouched). None of these is
-   "next" in the sense G7–G13 were. **The honest next action is a re-profile**
-   (Haiku's cheap `[OPTIME]` read at minimum, a full RP3 if G5/G6 or track Q
-   are about to start) — G13 moved the shared-expert bucket, so the ranking
-   that ordered this list is stale by exactly the amount RP2 already flagged
-   plus G13's −3.4. RP1's own lesson, restated a third time: the ordering is
-   what a re-profile buys, not the next item on a list written before the
-   last one landed.
+4e. ~~**RP3 — re-profile after G13.**~~ **DONE 09-06** (record §RP3).
+   **156.77 ms/token knob-off, 134.90 knob-on.** Confirmed G13 from outside
+   its own campaign (shared expert −3.43 / −3.19 against its claimed −3.4),
+   routing bit-identical for the third campaign running, residency landing on
+   91.6347% to four decimals again on a changed binary. **The ranking is
+   unchanged, position for position, in both knob positions** — G13 shrank #4
+   without reordering anything. Two thirds of G13's win reached the total; the
+   ~1.0 ms/token shortfall sits mostly in a CPU-expert bucket that rose ~1% in
+   both configs with non-overlapping within-campaign ranges — **flagged, not
+   explained**, and to be re-checked at RP4 against a different change rather
+   than theorised about now.
+
+4f. **The track has run out of items the gate can measure.** This is RP3's
+   real result and it is a decision the roadmap has to make rather than defer.
+   MLA is #3 in both positions (23.6 / 24.1) and already had G8; **everything
+   below it is ≤ 11 ms/token**, so a 30% win — the order G7, G10 and G13
+   actually achieved — is worth ~3 ms/token, about **2% of the token, against
+   a serving gate whose demonstrated noise floor is 3–4%** (§G13, §G11 part 1).
+   G13 was the last item big enough to justify a gate run, and even it came
+   back inconclusive. Three honest options, in the record:
+
+   1. **Accept `[OPTIME]`-only validation** for further small items and demote
+      the serving gate to a regression check. Defensible — timers hold to ~1%
+      — but it ships changes whose end-to-end effect is asserted, not shown.
+   2. **Attack a blocked leader**, which for both of them means VRAM capacity,
+      not code. A fourth card or expert-density work unblocks the CPU expert
+      bucket (28.6% knob-on) *and* satisfies §SPEC-PROBE's reversal condition
+      in one move — the only remaining change on this box worth more than a
+      few percent.
+   3. **Switch to track Q.** Qwen3.8 is untouched, has never had a
+      G3-equivalent profile, and Q0/Q5 are a day between them.
+
+   **Recommendation: 2 if the hardware budget allows it, otherwise 3.** Option
+   1 is the one to avoid drifting into by default — it is how a track starts
+   accumulating unfalsifiable wins.
 
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.

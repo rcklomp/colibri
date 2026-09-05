@@ -157,7 +157,7 @@ report's mechanisms that Colibri does not use yet.
 | Q1 | Fuse the gated-residual read and write into one pass each with the group RMSNorm folded in (tech report §2.2, "traversed once per block in each direction") | `q38_gr_read` makes several passes over the 4×2560 widened stream plus three small matmuls, ×2 per layer ×48 | −10 to −20 ms/token | 1–2 days | Opus | logits within 1e-5 of pristine, greedy text identical |
 | Q2 | FP8 storage for the widened residual stream (tech report §2.2: "halves the bytes moved, almost no loss in quality") | the residual is FP32 today; the report says the gates bound its range | −10 to −15 ms/token of memory traffic; **changes numerics** | 1–2 days | Opus | env-gated; report the logit cosine and the tiny-check result; ship off by default unless within the near-tie tolerance |
 | Q3 | Dense set off DRAM: a BF16 `fmt` in `qmatmul.comp` (numerics-preserving) and a per-layer hybrid where the dense projections run on the GPU and DeltaNet/QSA stay on the CPU | resident BF16 114–137 ms/token at the CPU's 100 GB/s floor; GPU int8 GEMV 132–400 GB/s effective; submit+fence 55 µs; 4 tensors per submit measured | −70 to −90 ms/token → ~5 tok/s rotating | design 1 session + 3–5 days | **Fable** (design: what moves, submit plan per layer, VRAM split with the expert tier) then Opus (implement) | logits within 1e-5 (BF16 fmt) ; rotating median; VRAM accounting in the record |
-| Q4 | MTP speculative decoding: load the MTP module, draft up to 4 tokens per step reusing the QSA top-k indices, verify in one forward, accept the matching prefix (tech report Table 4: 4.06 mean accepted) | decode is bandwidth-bound: the dense 8.5 GB is read once per verify step, experts ~4×; ≈ 2.4× tokens per second at equal bytes | the largest multiplier; measured only by accepted tokens per second on rotating prompts, never on a repeated prompt | spec 1 session + 5–8 days | **Fable** (spec: tensor contract from the checkpoint, verify semantics for DeltaNet state rollback and QSA index reuse, acceptance metric) then Opus (draft head + verify path) and Sonnet (harness: accepted-length histogram, identity of the accepted text against plain greedy) | accepted text == greedy text for 1k tokens; accepted length ≥ 3.5 on the datapoint prompts; rotating tok/s |
+| Q4 | **⚠ RE-GATE BEFORE STARTING — see record §SPEC-PROBE.** The same family was measured on GLM-5.3 and capped at ~1.2× *optimistic*, because the experts that miss the GPU tier are the cold ones and adjacent tokens never share them: the CPU expert count was **identical at every block size 1→16**. Qwen3.8 (173 GiB) has the same doesn't-fit-in-VRAM shape, so the estimate in this row is not safe. **Run the chunk probe on qwen38 first — half a day — before spending the 5–8.** Original row: MTP speculative decoding: load the MTP module, draft up to 4 tokens per step reusing the QSA top-k indices, verify in one forward, accept the matching prefix (tech report Table 4: 4.06 mean accepted) | decode is bandwidth-bound: the dense 8.5 GB is read once per verify step, experts ~4×; ≈ 2.4× tokens per second at equal bytes | the largest multiplier; measured only by accepted tokens per second on rotating prompts, never on a repeated prompt | spec 1 session + 5–8 days | **Fable** (spec: tensor contract from the checkpoint, verify semantics for DeltaNet state rollback and QSA index reuse, acceptance metric) then Opus (draft head + verify path) and Sonnet (harness: accepted-length histogram, identity of the accepted text against plain greedy) | accepted text == greedy text for 1k tokens; accepted length ≥ 3.5 on the datapoint prompts; rotating tok/s |
 | Q5 | 4-accumulator BF16 matmul for prefill rows (S>1 only) | 9.0 → 5.1 ms at S=32 in isolation | TTFT, not decode | half day | Sonnet | greedy text identical; TTFT on the 690-token document |
 | Q6 | (later) int8/int4 expert conversion for VRAM density | fp8-emul 1.7× slower than int8 on the GPU; halves VRAM per expert | ~−9 ms/token plus a larger resident tier | 3+ days, second checkpoint on disk | Opus | numerics vs tiny-check; hit rate on rotating |
 
@@ -256,6 +256,24 @@ by guess; where a position is a judgment call rather than a number, it says so.
    ms/token, 1 day, **Sonnet**. **Gate: measure this op's own
    submit+wait with `VK_PROF` first and set the go/no-go from that** — §G12's
    round-trip figures are for a different op, which is why the range is wide.
+
+4d. ~~**SPEC-PROBE — is the AngelSpec family (DFlash/DFlash2/DFly/DFlare/
+   DSpark/MTP) worth it here?**~~ **ANSWERED 09-05, no** (record §SPEC-PROBE).
+   They all share one operation — verify K tokens in one forward — so the
+   ceiling was measurable with **no drafter at all**, via
+   `GLM53_PREFILL_CHUNK`. **The CPU expert count is 35 252 at every block size
+   from 1 to 16, exactly**: the experts that miss the GPU tier are the cold
+   ones, and adjacent tokens never share a cold expert. GPU expert calls over
+   the same tokens dedup −49%, which is the same fact from the other side.
+   Verify-of-K costs 0.912·K singles, so it needs **>91% acceptance to break
+   even**; published GLM-5.3 DFlash2 acceptance is 3.85/8 = 48% → **0.53×**.
+   Optimistic ceiling with a purpose-built verify: ~1.23×. **Declined — the
+   drafter was never the binding constraint.**
+
+   **Reversal condition:** this is a conclusion about the machine, not the
+   technique. It rests on ~21% of expert activations streaming from system RAM.
+   If the tier ever holds the whole model the linear term vanishes and this
+   family becomes strongly attractive. Revisit on a VRAM capacity change.
 
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.

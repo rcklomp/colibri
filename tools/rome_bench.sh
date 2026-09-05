@@ -29,8 +29,17 @@ for kv in $EXTRA_ENV; do
   esac
 done
 
-# Run the benchmark on the remote box via SSH
-ssh "$REMOTE_HOST" bash -s "$ENGINE" "$CONFIG_NAME" "$EXTRA_ENV" << 'REMOTE_SCRIPT'
+# Run the benchmark on the remote box via SSH.
+#
+# ssh does NOT preserve argument boundaries: it joins everything after the host
+# into one string and hands it to the remote shell, which re-splits on
+# whitespace. Passing "$CONFIG_NAME" "$EXTRA_ENV" therefore only worked by
+# accident -- a config name containing a space silently became a config name
+# plus an env assignment. printf %q quotes each argument so the remote shell
+# reconstructs exactly the three we sent.
+REMOTE_ARGV=$(printf '%q %q %q' "$ENGINE" "$CONFIG_NAME" "$EXTRA_ENV")
+# shellcheck disable=SC2086  # deliberately split: %q already quoted each field
+ssh "$REMOTE_HOST" bash -s $REMOTE_ARGV << 'REMOTE_SCRIPT'
 set -eu
 
 COLIBRI_SRC="${HOME}/src/colibri"

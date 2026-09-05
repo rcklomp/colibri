@@ -1840,10 +1840,22 @@ int coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
     /* one v per thread; q/k/decay staged in a 1024-entry LDS array; hist[8] */
     if (heads < 1 || k_dim < 1 || v_dim < 1 || kernel < 1) return 0;
     if (v_dim > 128 || k_dim > 1024 || kernel > 8) return 0;
-    if (G.kda[layer].state) return 1;                       /* already resident */
     const size_t width = (size_t)heads * (size_t)k_dim;
     const size_t sb = (size_t)heads * k_dim * v_dim * sizeof(float);
     const size_t wb = 3u * width * (size_t)kernel * sizeof(float);
+    if (G.kda[layer].state) {
+        /* Buffers exist, so this is a NEW SESSION on a warm engine. The state and
+         * the conv window belong to the CONVERSATION and must be re-seeded from
+         * the caller's freshly zeroed copies; the conv taps, alog, dt and onorm
+         * are model weights and stay. Returning early here without re-seeding let
+         * request N+1 continue request N's recurrence -- invisible to every
+         * fresh-process oracle (one request per process) and caught only by the
+         * serving harness, where warm-identical came back BELOW rotating. */
+        if (G.kda[layer].sbytes != sb || G.kda[layer].wbytes != wb) return 0;
+        memcpy(G.kda[layer].state_p, state, sb);
+        memcpy(G.kda[layer].window_p, window, wb);
+        return 1;
+    }
     const size_t ab = (size_t)heads * sizeof(float);          /* alog  */
     const size_t db = width * sizeof(float);                  /* dt    */
     const size_t ob = (size_t)v_dim * sizeof(float);          /* onorm */

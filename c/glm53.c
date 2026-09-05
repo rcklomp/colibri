@@ -1881,6 +1881,20 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     /* --- primo tempo: il router, per ogni token --- */
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
+        /* Le 288 righe sono indipendenti: ognuna legge la propria riga di
+         * l->router e scrive il proprio score[e], nessun accumulatore
+         * condiviso. Parallelizzare su e non tocca l'ordine della somma su d
+         * per nessuna riga -- cambia solo in che ordine le righe vengono
+         * calcolate, non il valore di nessuna di esse. `score` e' un unico
+         * buffer riusato a ogni t (non ha una dimensione per token), quindi
+         * qui dentro e non sul ciclo esterno: parallelizzare su t farebbe
+         * scrivere thread diversi nello stesso buffer per t diversi. G3
+         * (2026-09-04): 0.98 ms/call, un thread solo, riduzione scalare che
+         * GCC non vettorizza da sé -- 1.2 GMAC/s contro gli 8 core
+         * disponibili. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int e = 0; e < c->n_experts; e++) {
             const float *w = l->router + (size_t)e * c->hidden;
             float sum = 0.0f;

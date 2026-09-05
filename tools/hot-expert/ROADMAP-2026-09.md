@@ -39,9 +39,10 @@ was only 93% warm. Read **§RP1-CORRECTION first**: it inverts the ranking.
 **KDA (53.3 ms/token, 32.9%) is now the largest bucket, not the CPU experts
 (40.3, 24.8%)**, and 35.0 ms/token of KDA is GPU submits.
 
-Status 2026-09-05: G0–G4, G7–G12 and both re-profiles (RP1, RP2) done;
-G5/G6 open, **G13 is next** (record §RP2). Two profiles now exist because
-`COLI_KDA_GPU=2` ships off: **159.08 ms/token knob-off, 137.19 knob-on**. The old header number (3.17
+Status 2026-09-06: G0–G4, G7–G13 and both re-profiles (RP1, RP2) done;
+SPEC-PROBE answered no; G5/G6 open, no item currently next (re-profile due).
+Two profiles exist because `COLI_KDA_GPU=2` ships off: **159.08 ms/token
+knob-off, 137.19 knob-on** (before G13's −3.4 ms/token). The old header number (3.17
 tok/s "fresh-process") is superseded twice over — G0 established the
 persistent baseline this track is actually gated on (1.65–1.66), and
 G2+G4+G7+G8+G9+G10 moved it to 2.60–2.75. G3 replaced the whole ordering
@@ -64,6 +65,7 @@ from the original plan.
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
 | G10 | **DONE** 09-05 (record §G10) — parallelised the ~400k-MAC mix and the destination×column combine over independent rows/columns, each one's own reduction untouched (G7's pattern). **The malloc removal did not survive contact**: dropping `coli_hc_pre`'s two per-call `malloc`s needed `hc`'s range knowable at compile time, which measurably changed GCC's rounding in the small hc-bounded reductions (~1.9e-4 on `last_logits`, `teacher_forcing` unaffected) — bisected across five different compiler-flag mitigations, none restored bit-identity; **kept the mallocs, shipped the parallelism**. `[OPTIME] hc+norm` 0.393 → **0.097 ms/site** (4.05×). Rotating 2.33/2.35 → **2.60/2.75**. Bit-identical both prompts. Shared header (DeepSeek V4): rebuilt clean, not re-measured (no rig checkpoint) | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token; beat it (−26.6 ms/token measured, +11–17% gate) | done | Sonnet | bit-identical: **met** (mallocs kept); tok/s vs G9: **met** (+11–17%) |
 | G11 | **PART 1 DONE** 09-05 (record §G11) — expert path fused: one OMP region with three worksharing constructs instead of three regions with a serial swiglu between, bit-identical, **−2.25 ms/token on `ffn_moe` (−3.2%)**, ~140 fewer OMP regions/token. **Part 2 (the kernel) is NOT worth doing as scoped** — see §RP1-CORRECTION. The bucket is **40.3 ms/token, not 74.8 and not 115**. Microbenchmarked before touching the engine (`g11_bench.c`, `g11_path.c`, both sized to defeat the 128 MB L3): the isolated kernel does 21.95 GB/s at 8 threads; a bit-trick nibble→float decode is *exactly* bit-identical but only 1.03×; a second accumulator breaks the FMA dependency chain for **1.30×** but is not bit-identical; four accumulators is worse than two. **Once the path is fused the faster kernel is worth only ~1.06×** — so nothing numerics-changing shipped | §RP1-CORRECTION: **40.3 ms/token, and no longer the largest bucket — KDA is, at 53.3** | part 1 delivered **−2.25 ms/token**; part 2 judged **not worth 2–3 days** for ~1.06× on a 40 ms bucket behind an env knob | part 1 done | Opus | bit-identical both prompts: **met**; `[PROF] cpu` −4.0% across 4 paired runs (fresh-process tok/s cannot resolve 1%: ±10% GPU-submit jitter) |
+| G13 | **DONE 09-06 (record §G13).** Fused the shared expert's `mv(gate)`+`mv(up)` into one GPU submit via `coli_vk_matmul_pair` (already production code in `kimi_k3.c`). The routed-expert fused kernel was tried first and rejected: `qmatmul_gate_up.comp` computes `silu(gate)*up` with **no clamp**, and GLM-5.3's `swiglu_limit=10.0` is regularly exceeded — a pre-existing gap in the routed-expert GPU path, never caught before because no earlier change diffed a clamped and an unclamped computation of the same op; out of scope to fix here. `swiglu_clamped` and `down` stay unchanged. **3 submits/call → 2**, bit-identical (`--logits` exact on both G4 prompts, greedy text identical for 128 tokens). `[OPTIME] shared` 0.373 → **0.291 ms/call (−22%)**, ×42 = **−3.4 ms/token**, reproduced 3× within 1% | RP2: shared expert 14.2 ms/token in both knob positions, three round trips + a host round trip, called "round-trip-dominated" since §G3 | **−3.4 ms/token, delivered** | 1 commit | Sonnet | bit-identical: **met**; serving gate: **inconclusive at ~2.1% of the token (same class as G11 part 1), reported as such** |
 | G12 | **DONE 09-05 (record §G12 stages 1, 2a, 2b, 2c).** The KDA recurrence, its gating and its output norm run on dev0, and a layer's projections + recurrence + `ko` record into **one submit instead of two** (`COLI_KDA_GPU=2`). **`[OPTIME] kda` 1.48–1.57 → 0.93 ms/call — the < 1.0 gate is met**, repeating to three decimals; **−18.7 to −21.9 ms/token**, inside the spec's own −15 to −22 band; fresh-process +13.5%; **serving gate +11.7%** rotating (2.90 vs 2.595, paired alternating) with warm-identical agreeing at +11.1%. **The gate also found a shipping bug the numerics oracles could not**: `coli_vk_kda_init` kept the previous conversation's recurrence across sessions, so request N+1 of a warm engine continued request N — visible only as an *inverted* warm-identical column, because every oracle here runs one request per process (record §Stage 2c; `tools/hot-expert/tworeq.py` is now the oracle for that class). Greedy text identical through 128 decode tokens and 0 `teacher_forcing` mismatches across 1260 prefill positions. **Stays off by default**: the logit cosine is 0.99992 at 1260 positions and the cause is irreducible — GLSL `exp()` vs libm `expf()`, ~1.1M calls/token; matching the CPU's norm-reduction order exactly was tested and changed nothing (2.6e-7) while costing 3.6% | §RP1-CORRECTION: KDA was the largest bucket at 53.3 ms/token, 35.0 of it GPU submits | **−18.7 to −21.9 ms/token, delivered** (opt-in) | 3 commits | Opus | `kda` < 1.0 ms/call: **met at 0.93**; greedy identity: **met** |
 
 Target for the track, rewritten from the profile: G3 measured 373 ms per
@@ -242,20 +244,23 @@ by guess; where a position is a judgment call rather than a number, it says so.
    run, not once per campaign** — every `glm53` process drops the model to
    91.6347% and it does not come back. `tools/hot-expert/profile_run.sh`.
 
-4c. **G13 — the shared expert's three submits.** ← **next.** The largest
-   bucket with an unexploited structure: **14.2 ms/token in both knob
-   positions**, 0.342 ms/call × 42 layers, and it has been called
-   "round-trip-dominated" since §G3. It runs through the generic `mlp3`
-   (`glm53.c:997`): `mv(gate)`, `mv(up)`, a **CPU** `swiglu_clamped`,
-   `mv(down)` — three submit+wait round trips with a host round trip in the
-   middle. The fused `gate_up` shader chained on-device into `down` already
-   exists and is measured on the routed expert groups
-   (`backend_vulkan.c:70`, `:826` `coli_vk_gate_up`); the shared expert
-   simply never got it. **A port inside one file, not a kernel — and
-   bit-identical if it reuses the routed experts' own shader.** −4 to −9
-   ms/token, 1 day, **Sonnet**. **Gate: measure this op's own
-   submit+wait with `VK_PROF` first and set the go/no-go from that** — §G12's
-   round-trip figures are for a different op, which is why the range is wide.
+4c. ~~**G13 — the shared expert's three submits.**~~ **DONE 09-06** (record
+   §G13). The routed experts' own fused kernel turned out to be the wrong
+   template: `qmatmul_gate_up.comp` computes `silu(gate)*up` with **no
+   clamp**, and GLM-5.3's `swiglu_limit=10.0` is regularly exceeded in
+   practice — wiring the shared expert through it failed `--logits`
+   outright. **That gap is pre-existing in the routed-expert GPU path since
+   G0-era and was never caught, because no earlier change ever diffed a
+   clamped and an unclamped computation of the same op** — recorded as a
+   finding, out of scope to fix here. Shipped instead: `coli_vk_matmul_pair`
+   (already production code in `kimi_k3.c`), fusing only gate+up into one
+   submit and leaving `swiglu_clamped` + `down` untouched. **3 submits/call
+   → 2**, bit-identical (`--logits` exact on both G4 prompts, greedy text
+   identical for 128 tokens). `[OPTIME] shared` **0.373 → 0.291 ms/call
+   (−22%), × 42 = −3.4 ms/token**, reproduced 3× within 1%. Serving gate
+   **inconclusive** at ~2.1% of the token — same situation as G11 part 1,
+   and reported as such rather than rounded to a headline number the gate
+   cannot actually support.
 
 4d. ~~**SPEC-PROBE — is the AngelSpec family (DFlash/DFlash2/DFly/DFlare/
    DSpark/MTP) worth it here?**~~ **ANSWERED 09-05, no** (record §SPEC-PROBE).
@@ -274,6 +279,19 @@ by guess; where a position is a judgment call rather than a number, it says so.
    technique. It rests on ~21% of expert activations streaming from system RAM.
    If the tier ever holds the whole model the linear term vanishes and this
    family becomes strongly attractive. Revisit on a VRAM capacity change.
+
+4e. **Nothing is queued.** G13 was the last item with a specific, measured
+   target. What remains: **G5** (parked on a product question — what context
+   length does the deployment see — not on evidence), **G6** (safety, not
+   speed, half a day whenever the preload path is next touched), **C1**
+   (blocked, blocks nothing), and **track Q** (untouched). None of these is
+   "next" in the sense G7–G13 were. **The honest next action is a re-profile**
+   (Haiku's cheap `[OPTIME]` read at minimum, a full RP3 if G5/G6 or track Q
+   are about to start) — G13 moved the shared-expert bucket, so the ranking
+   that ordered this list is stale by exactly the amount RP2 already flagged
+   plus G13's −3.4. RP1's own lesson, restated a third time: the ordering is
+   what a re-profile buys, not the next item on a list written before the
+   last one landed.
 
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.

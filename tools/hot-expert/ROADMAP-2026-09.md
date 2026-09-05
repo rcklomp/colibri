@@ -40,7 +40,7 @@ was only 93% warm. Read **§RP1-CORRECTION first**: it inverts the ranking.
 (40.3, 24.8%)**, and 35.0 ms/token of KDA is GPU submits.
 
 Status 2026-09-05: G0–G4, G7, G8, G9, G10 and the before-G11 re-profile
-(RP1) done; G5/G6/G11 open, G12 blocked (skipped, not escalated — record §G12). The old header number (3.17
+(RP1) done; G5/G6/G11 open, G12 **done** (reopened after Fable gate 2 and landed — record §G12). The old header number (3.17
 tok/s "fresh-process") is superseded twice over — G0 established the
 persistent baseline this track is actually gated on (1.65–1.66), and
 G2+G4+G7+G8+G9+G10 moved it to 2.60–2.75. G3 replaced the whole ordering
@@ -63,7 +63,7 @@ from the original plan.
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
 | G10 | **DONE** 09-05 (record §G10) — parallelised the ~400k-MAC mix and the destination×column combine over independent rows/columns, each one's own reduction untouched (G7's pattern). **The malloc removal did not survive contact**: dropping `coli_hc_pre`'s two per-call `malloc`s needed `hc`'s range knowable at compile time, which measurably changed GCC's rounding in the small hc-bounded reductions (~1.9e-4 on `last_logits`, `teacher_forcing` unaffected) — bisected across five different compiler-flag mitigations, none restored bit-identity; **kept the mallocs, shipped the parallelism**. `[OPTIME] hc+norm` 0.393 → **0.097 ms/site** (4.05×). Rotating 2.33/2.35 → **2.60/2.75**. Bit-identical both prompts. Shared header (DeepSeek V4): rebuilt clean, not re-measured (no rig checkpoint) | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token; beat it (−26.6 ms/token measured, +11–17% gate) | done | Sonnet | bit-identical: **met** (mallocs kept); tok/s vs G9: **met** (+11–17%) |
 | G11 | **PART 1 DONE** 09-05 (record §G11) — expert path fused: one OMP region with three worksharing constructs instead of three regions with a serial swiglu between, bit-identical, **−2.25 ms/token on `ffn_moe` (−3.2%)**, ~140 fewer OMP regions/token. **Part 2 (the kernel) is NOT worth doing as scoped** — see §RP1-CORRECTION. The bucket is **40.3 ms/token, not 74.8 and not 115**. Microbenchmarked before touching the engine (`g11_bench.c`, `g11_path.c`, both sized to defeat the 128 MB L3): the isolated kernel does 21.95 GB/s at 8 threads; a bit-trick nibble→float decode is *exactly* bit-identical but only 1.03×; a second accumulator breaks the FMA dependency chain for **1.30×** but is not bit-identical; four accumulators is worse than two. **Once the path is fused the faster kernel is worth only ~1.06×** — so nothing numerics-changing shipped | §RP1-CORRECTION: **40.3 ms/token, and no longer the largest bucket — KDA is, at 53.3** | part 1 delivered **−2.25 ms/token**; part 2 judged **not worth 2–3 days** for ~1.06× on a 40 ms bucket behind an env knob | part 1 done | Opus | bit-identical both prompts: **met**; `[PROF] cpu` −4.0% across 4 paired runs (fresh-process tok/s cannot resolve 1%: ±10% GPU-submit jitter) |
-| G12 | **DONE 09-05 (record §G12 stages 1, 2a, 2b).** The KDA recurrence, its gating and its output norm run on dev0, and a layer's projections + recurrence + `ko` record into **one submit instead of two** (`COLI_KDA_GPU=2`). **`[OPTIME] kda` 1.48–1.57 → 0.93 ms/call — the < 1.0 gate is met**, repeating to three decimals; **−18.7 to −21.9 ms/token**, inside the spec's own −15 to −22 band; fresh-process +13.5%. Greedy text identical through 128 decode tokens and 0 `teacher_forcing` mismatches across 1260 prefill positions. **Stays off by default**: the logit cosine is 0.99992 at 1260 positions and the cause is irreducible — GLSL `exp()` vs libm `expf()`, ~1.1M calls/token; matching the CPU's norm-reduction order exactly was tested and changed nothing (2.6e-7) while costing 3.6% | §RP1-CORRECTION: KDA was the largest bucket at 53.3 ms/token, 35.0 of it GPU submits | **−18.7 to −21.9 ms/token, delivered** (opt-in) | 3 commits | Opus | `kda` < 1.0 ms/call: **met at 0.93**; greedy identity: **met** |
+| G12 | **DONE 09-05 (record §G12 stages 1, 2a, 2b, 2c).** The KDA recurrence, its gating and its output norm run on dev0, and a layer's projections + recurrence + `ko` record into **one submit instead of two** (`COLI_KDA_GPU=2`). **`[OPTIME] kda` 1.48–1.57 → 0.93 ms/call — the < 1.0 gate is met**, repeating to three decimals; **−18.7 to −21.9 ms/token**, inside the spec's own −15 to −22 band; fresh-process +13.5%; **serving gate +11.7%** rotating (2.90 vs 2.595, paired alternating) with warm-identical agreeing at +11.1%. **The gate also found a shipping bug the numerics oracles could not**: `coli_vk_kda_init` kept the previous conversation's recurrence across sessions, so request N+1 of a warm engine continued request N — visible only as an *inverted* warm-identical column, because every oracle here runs one request per process (record §Stage 2c; `tools/hot-expert/tworeq.py` is now the oracle for that class). Greedy text identical through 128 decode tokens and 0 `teacher_forcing` mismatches across 1260 prefill positions. **Stays off by default**: the logit cosine is 0.99992 at 1260 positions and the cause is irreducible — GLSL `exp()` vs libm `expf()`, ~1.1M calls/token; matching the CPU's norm-reduction order exactly was tested and changed nothing (2.6e-7) while costing 3.6% | §RP1-CORRECTION: KDA was the largest bucket at 53.3 ms/token, 35.0 of it GPU submits | **−18.7 to −21.9 ms/token, delivered** (opt-in) | 3 commits | Opus | `kda` < 1.0 ms/call: **met at 0.93**; greedy identity: **met** |
 
 Target for the track, rewritten from the profile: G3 measured 373 ms per
 decode token fresh-process (585 ms rotating, G2's 1.71 tok/s). G4 and
@@ -208,7 +208,16 @@ by guess; where a position is a judgment call rather than a number, it says so.
    went from serial with `cpu` (16.249s combined) to nested inside it
    (eg=11.749s ⊇ cpu=11.193s), rotating 2.19/2.17 → **2.33/2.35**.
    Bit-identical. Beat the −22 ms/token estimate (fresh-process +13.3%).
-4. **G12 — the KDA recurrence on the GPU.** ← **next.** Reopened at the
+4. ~~**G12 — the KDA recurrence on the GPU.**~~ **DONE 09-05** (record §G12
+   stages 1, 2a, 2b, 2c). `[OPTIME] kda` **1.48–1.57 → 0.93 ms/call**, gate
+   met; serving gate **+11.7%** (2.90 vs 2.595 rotating). Ships behind
+   `COLI_KDA_GPU=2`, off by default: cosine 0.99992 at 1260 positions, cause
+   irreducible (GLSL `exp()`). The gate run exposed a session-state bug the
+   single-request oracles were structurally unable to see — see §Stage 2c, and
+   run `tools/hot-expert/tworeq.py` for anything that relocates per-conversation
+   state.
+
+   *Original entry, kept for the reasoning that selected it:* reopened at the
    second Fable gate on the first gate's own revisit condition, which
    §RP1-CORRECTION made true (KDA 53.3 ms/token, largest; items 1–6 closed).
    Spec: `G12-KDA-GPU-SPEC-2026-09-05.md`. One recurrence shader is new;
@@ -219,6 +228,11 @@ by guess; where a position is a judgment call rather than a number, it says so.
    ms/token**, 2–4 days, Opus. The earlier blocked analysis (record §G12)
    was right that it needs a kernel; what changed is that the kernel is now
    worth it and mostly already exists as a pattern.
+
+   **Next item is G5/G6, or a re-profile:** KDA was the largest bucket at 53.3
+   ms/token and G12 took ~19–22 of that out, so the ranking that ordered this
+   list is stale again. RP1's own lesson was that the ordering, not the item,
+   is what a re-profile buys.
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.
    Bit-identical, but only after reverting the malloc-removal half of the

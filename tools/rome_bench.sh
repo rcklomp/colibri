@@ -4,9 +4,15 @@
 # sets GLM caps (COLI_VK_EXPERTS2/3=1695, .glm53_explain.bin), runs datapoint.py,
 # and appends a row to the record.
 #
-# Usage: rome_bench.sh [engine] [config-name]
+# Usage: rome_bench.sh [engine] [config-name] [KEY=VAL ...]
 # Engines: qwen38-vk (default), qwen38, glm53
 # Gate: two consecutive runs of the same config within 3%
+#
+# Trailing KEY=VAL arguments are exported around the measurement, so a knob that
+# ships off by default can be benched in the recorded regime without editing
+# this script or hand-rolling a one-off (added for G12's COLI_KDA_GPU). They are
+# echoed into the run log and belong in the config-name too, because the
+# datapoint row records the name, not the environment.
 
 set -eu
 
@@ -14,9 +20,17 @@ set -eu
 ENGINE="${1:-qwen38-vk}"
 CONFIG_NAME="${2:-baseline}"
 REMOTE_HOST="rome"
+shift 2 || true
+EXTRA_ENV="$*"                     # KEY=VAL pairs, exported remotely
+for kv in $EXTRA_ENV; do
+  case "$kv" in
+    [A-Za-z_]*=*) ;;
+    *) echo "rome_bench: extra args must be KEY=VAL, got '$kv'" >&2; exit 2 ;;
+  esac
+done
 
 # Run the benchmark on the remote box via SSH
-ssh "$REMOTE_HOST" bash -s "$ENGINE" "$CONFIG_NAME" << 'REMOTE_SCRIPT'
+ssh "$REMOTE_HOST" bash -s "$ENGINE" "$CONFIG_NAME" "$EXTRA_ENV" << 'REMOTE_SCRIPT'
 set -eu
 
 COLIBRI_SRC="${HOME}/src/colibri"
@@ -25,6 +39,7 @@ RECORD_PATH="${COLIBRI_SRC}/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md"
 # Engine parameters passed from local script
 ENGINE="$1"
 CONFIG_NAME="$2"
+EXTRA_ENV="${3:-}"
 
 # Engine-specific configuration
 case "$ENGINE" in
@@ -131,6 +146,12 @@ export OMP_PROC_BIND=close
 export COLI_VK_EXPERTS2=1695
 export COLI_VK_EXPERTS3=1695
 export COLI_TIMERS=1
+
+# Caller-supplied knobs, last so they can override the defaults above.
+if [ -n "${EXTRA_ENV:-}" ]; then
+  echo "[rome_bench] extra env: $EXTRA_ENV"
+  for kv in $EXTRA_ENV; do export "${kv?}"; done
+fi
 
 # Run datapoint.py in persistent mode
 echo "[rome_bench] Running datapoint.py..."

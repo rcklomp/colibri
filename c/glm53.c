@@ -964,6 +964,12 @@ static double g_ot_router, g_ot_shared; static long g_on_router;   /* MoE sub-sp
  * total 2%, so the 2.2 ms/call is somewhere other than the recurrence. */
 static double g_kt_proj, g_kt_decay, g_kt_step, g_kt_norm, g_kt_ko;
 static long g_kn_calls, g_kn_batched;
+/* G5 evidence: mla_layer sub-split. The DSA indexer re-pools the whole prefix
+ * on every call and mla_layer runs once per decode token, so `index` is the
+ * O(context)-per-token term G5 would cache away. Reported per call AND per
+ * token of context so linear-vs-quadratic is readable off two runs. */
+static double g_mt_proj, g_mt_index, g_mt_attn;
+static long g_mn_calls; static double g_mn_seen;
 static inline int optime_on(void) {
     if (g_optime < 0) g_optime = getenv("COLI_TIMERS") && atoi(getenv("COLI_TIMERS"));
     return g_optime;
@@ -1142,6 +1148,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *head_w = malloc((size_t)tokens * IH * sizeof(float));
     unsigned char *valid = malloc((size_t)seen);
     memset(valid, 1, (size_t)seen);
+    const double _tm0 = optime_on() ? optime_now() : 0.0;
 
     for (int t = 0; t < tokens; t++) {
         const int at = base + t;          /* posizione assoluta nella cache */
@@ -1183,6 +1190,8 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
     }
 
+    if (optime_on()) { g_mt_proj += optime_now() - _tm0; }
+    const double _tm1 = optime_on() ? optime_now() : 0.0;
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
     if (coli_sparse_index_select_range(selected, iq, ik, gates, head_w, l->ikpa, valid,
@@ -1201,6 +1210,8 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     }
     /* Attenzione nello spazio del latente. La scala resta 1/sqrt(qk_nope):
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
+    if (optime_on()) { g_mt_index += optime_now() - _tm1; }
+    const double _tm2 = optime_on() ? optime_now() : 0.0;
     float *context = malloc((size_t)H * V * sizeof(float));
     float *pooled = malloc((size_t)L * sizeof(float));
     float *score = malloc((size_t)width * sizeof(float));
@@ -1239,6 +1250,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         }
         mv(out + (size_t)t * c->hidden, &l->o, context);
     }
+    if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
     free(score); free(pooled);
 
     free(context); free(selected); free(valid); free(head_w);
@@ -2511,6 +2523,7 @@ static void optime_reset(void) {
     g_ot_router = g_ot_shared = 0.0; g_on_router = 0;
     g_kt_proj = g_kt_decay = g_kt_step = g_kt_norm = g_kt_ko = 0.0;
     g_kn_calls = g_kn_batched = 0;
+    g_mt_proj = g_mt_index = g_mt_attn = 0.0; g_mn_calls = 0; g_mn_seen = 0.0;
     /* The [PROF] sub-split of the MoE bucket must describe the same window,
      * so it is zeroed here too -- only under COLI_TIMERS=1, so the default
      * [PROF] line keeps its whole-run meaning. */
@@ -2543,6 +2556,14 @@ __attribute__((destructor)) static void optime_print(void) {
                 g_kt_step,  1e3 * g_kt_step  / g_kn_calls,
                 g_kt_norm,  1e3 * g_kt_norm  / g_kn_calls,
                 g_kt_ko,    1e3 * g_kt_ko    / g_kn_calls);
+    if (g_mn_calls)
+        fprintf(stderr, "[OPTIME] mla split (n=%ld, mean ctx=%.0f): proj=%.3fs (%.3f ms) "
+                        "index=%.3fs (%.3f ms) attn=%.3fs (%.3f ms) | index/ctx=%.4f us\n",
+                g_mn_calls, g_mn_seen / (double)g_mn_calls,
+                g_mt_proj,  1e3 * g_mt_proj  / g_mn_calls,
+                g_mt_index, 1e3 * g_mt_index / g_mn_calls,
+                g_mt_attn,  1e3 * g_mt_attn  / g_mn_calls,
+                1e6 * g_mt_index / g_mn_seen);
     fprintf(stderr, "[OPTIME] moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
                     "eg and cpu experts are the [PROF] line; the rest of ffn_moe is bind+dispatch+accumulate\n",
             g_ot_router, g_ot_shared, g_on_router,

@@ -169,32 +169,53 @@ G5–G12, all of track Q. GLM rotating median went 1.65–1.66 (G0) → 1.71/1.6
 G3's profile replaced its rationale, and the four items it added (G7–G10)
 are each cheaper than anything that was on it.
 
-**Next, in order, with the reason each is where it is:**
+**Next, in order.** Positions below are from measured evidence, not ranking
+by guess; where a position is a judgment call rather than a number, it says so.
 
-1. **G7 — router.** Hours, bit-identical, −36 ms/token, helps at every prompt
-   length. Nothing depends on it and nothing it depends on. Cheapest thing on
-   the board.
-2. **Then measure long context before choosing** between G5, G8 and G11 —
-   see the note below. This is a measurement, not an item; half an hour.
-3. **G9, G12** — half a day each, bit-identical, both fall straight out of
-   the G2 and G4 sub-splits (the deferred CPU/GPU overlap; one submit per KDA
-   layer instead of two).
-4. **G8, G10** — a day each, bit-identical. G10 touches a header shared with
-   DeepSeek V4, so it re-oracles both.
-5. **G11 last** — the only real kernel, 2–3 days, and the largest single
-   bucket (115 ms/token at 27% of DRAM bandwidth).
-6. **C1** whenever someone guards the divisor; it blocks nothing else.
-7. **Track Q** is untouched. Q0 and Q5 are still the cheap entries there, and
-   the Fable session for Q3/Q4 has not happened.
+1. **G7 — router.** Hours, bit-identical, −36 ms/token, helps at every context
+   length. Nothing depends on it. Uncontested.
+2. **G8 — MLA heads.** −45 ms/token at short context, and per the long-context
+   section of the record it is *also* the largest long-context cost: `attn` is
+   ~650 ms/token from 2k context upward, flat, single-threaded. Second on both
+   axes, which no other item manages.
+3. **G9, then G12.** Half a day each, bit-identical, −22 and −14 ms/token, both
+   falling straight out of the G2 and G4 sub-splits. Order between them is
+   arbitrary.
+4. **G10 — mHC.** A day, −28 ms/token. Shared header with DeepSeek V4, so it
+   re-oracles both engines.
+5. **G5 — pooled-key cache.** Now placed on evidence rather than deferred: the
+   indexer is exactly 2.09 µs per token of context and never flattens, worth
+   ~188 ms/token at 8k and ~735 at 32k. It sits *after* G8 because before G8
+   the attention core is 3.5× larger at 8k; after G8 the indexer becomes MLA's
+   dominant term above ~3.5k context. **Its real priority is a product
+   question** — what context length does the deployment see? At 2k it is worth
+   little; at 32k it is the largest item in this table.
+6. **G11 — the int4 expert kernel.** 2–3 days, −60 to −80 ms/token, the only
+   real kernel and the largest single short-context bucket. Late by judgment,
+   not by measurement: its ms-per-day is the lowest of the set, and after
+   G7–G10 land the profile it would be tuned against has changed. **Re-run the
+   G3 profile before starting it.**
+7. **G6 — preload VRAM budget.** Not a speed item and not rankable here. Do it
+   whenever the preload path is next touched, or immediately if anyone might
+   run with an unset cap — it is the guard against the incident that put 91 GB
+   "in VRAM" and evicted the page cache.
+8. **C1** whenever someone guards the `2d3cf7e` divisor. Blocks nothing else.
+9. **Track Q** is untouched. Q0 and Q5 are a day between them.
 
-> **Before G5 or G8, measure long context.** Every number in this roadmap is
-> from prompts of 26–37 tokens with 64 completions. `rome_bench.sh` cannot
-> see an O(context²) term by construction, so the ranking above is blind to
-> exactly the thing G5 fixes. The only evidence either way is G3's MLA
-> growing 4.10 → 5.01 ms/call from 87 → 151 tokens. One `COLI_TIMERS=1` run
-> at ~2k and one at ~8k settles whether G5 leapfrogs everything or stays
-> where it is — and the `[OPTIME]` timers from G3 already exist to report it.
-> Do not rank G5 on the short-prompt numbers.
+**Re-derive this order after three or four land.** Every figure above comes
+from a machine where 69% of the decode token is single-threaded. Fix several
+of those and the remaining numbers shift — a plan built on stale figures is
+exactly what G3 had to tear up.
+
+> **Long context was measured on 2026-09-05** — see the record's long-context
+> section. Short version: the indexer really is O(context²) per generation
+> (2.09 µs per context token, never flattens), but the attention core is
+> larger below ~27k context and is *bounded* at 2051 tokens of work, so **G8
+> beats G5 at every context length anyone is likely to run here**, and G5's
+> turn arrives after G8 lands. One thing is still derived rather than
+> measured: that `attn` flattens above 2k. It follows from a constant bound in
+> the code; a ~4k run would confirm it, and if it does not flatten, G5 moves
+> ahead of G8.
 
 The rig serialises benchmarks, so parallel sessions must share `C0`'s script
 and never benchmark at the same time; code work can overlap freely.

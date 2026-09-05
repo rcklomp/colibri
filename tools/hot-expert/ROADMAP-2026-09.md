@@ -30,14 +30,15 @@ nobody has to remember them.
 | C1 | **BLOCKED** 09-04 | Merge `perf/rome-cpu-path` into `hot-expert-tier`. **Gate failed** (record §C1): `test_qwen38_prefix` passes on `hot-expert-tier` and SIGFPEs on the branch — bisected to `2d3cf7e`, unguarded `m->max_t / c->idx_ratio` at `qwen38_core.h:2417`, deterministic 3/3. Also `qwen38-tiny-check` cannot run here at all (needs torch, absent). Branch is now ~19 commits, not five. **Unblock:** guard the divisor, then re-run | Opus (review) | not met; do not merge until it is |
 | C2 | not started | Add `qwen38` to the record's steady-state table for GLM as well (G0 below) so both engines have the same four numbers | Haiku | table filled |
 
-## Track G: GLM-5.3 — 2.33–2.35 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
+## Track G: GLM-5.3 — 2.60–2.75 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
 
-Status 2026-09-05: G0–G4, G7, G8 and G9 done; G5/G6/G10/G11/G12 open. The old
-header number (3.17 tok/s "fresh-process") is superseded twice over — G0
-established the persistent baseline this track is actually gated on
-(1.65–1.66), and G2+G4+G7+G8+G9 moved it to 2.33–2.35. G3 replaced the whole
-ordering rationale with a measured profile; the items below G4 come from it,
-not from the original plan.
+Status 2026-09-05: G0–G4, G7, G8, G9 and G10 done; G5/G6/G11 open, G12
+blocked (skipped, not escalated — record §G12). The old header number (3.17
+tok/s "fresh-process") is superseded twice over — G0 established the
+persistent baseline this track is actually gated on (1.65–1.66), and
+G2+G4+G7+G8+G9+G10 moved it to 2.60–2.75. G3 replaced the whole ordering
+rationale with a measured profile; the items below G4 come from it, not
+from the original plan.
 
 | id | item | evidence | expected | effort | tier | gate |
 |---|---|---|---|---|---|---|
@@ -53,7 +54,7 @@ not from the original plan.
 | G7 | **DONE** 09-05 (record §G7) — parallelised the 288-row router score, inner (expert) loop not outer (token) loop: `score` has no per-token dimension, so parallelising over tokens would race. `[OPTIME] moe split: router` 0.998 → **0.137 ms/call** (7.3×). Rotating 1.84/1.83 → **2.01/2.05**. Bit-identical both prompts | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token; got exactly that | done | Sonnet | bit-identical: **met**; tok/s vs G4: **met** (+9–12%) |
 | G8 | **DONE** 09-05 (record §G8) — parallelised both per-head loops. Checked nested-OMP oversubscription empirically before writing anything (a compiled probe: `max_active_levels=1` on this box, so nesting collapses safely). Per-thread `score`/`pooled` scratch, same class of fix as G4's KDA. `[OPTIME] mla` 5.013 → **2.066 ms/call** (2.43×). Rotating 2.01/2.05 → **2.19/2.17**. Bit-identical both prompts | G3: 55 ms/token at 151 tokens of context, 5.0 ms/call, single thread, **O(context)** (4.1 ms at 87 tokens) | −32.4 ms/token at ctx=88; correction in the record re: context-shape | done | Sonnet | bit-identical: **met**; tok/s vs G7: **met** (+6–9%) |
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
-| G10 | mHC: drop the two per-call `malloc`s in `coli_hc_pre`, vectorize/parallelize the ~400k-MAC mix over the 4-stream residual. **Shared header** (`hyper_connections.h`, DeepSeek V4): rebuild and re-oracle both | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token | 1 day | Sonnet | bit-identical if summation order kept; `[OPTIME] hc+norm` |
+| G10 | **DONE** 09-05 (record §G10) — parallelised the ~400k-MAC mix and the destination×column combine over independent rows/columns, each one's own reduction untouched (G7's pattern). **The malloc removal did not survive contact**: dropping `coli_hc_pre`'s two per-call `malloc`s needed `hc`'s range knowable at compile time, which measurably changed GCC's rounding in the small hc-bounded reductions (~1.9e-4 on `last_logits`, `teacher_forcing` unaffected) — bisected across five different compiler-flag mitigations, none restored bit-identity; **kept the mallocs, shipped the parallelism**. `[OPTIME] hc+norm` 0.393 → **0.097 ms/site** (4.05×). Rotating 2.33/2.35 → **2.60/2.75**. Bit-identical both prompts. Shared header (DeepSeek V4): rebuilt clean, not re-measured (no rig checkpoint) | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token; beat it (−26.6 ms/token measured, +11–17% gate) | done | Sonnet | bit-identical: **met** (mallocs kept); tok/s vs G9: **met** (+11–17%) |
 | G11 | CPU int4 expert kernel `matmul_i4_grouped`: it streams 2.19 GB/token at 19 GB/s on 8 threads against 70.9 GB/s DRAM — ALU/decode-bound at 27% of bandwidth, Qwen's pre-F16C diagnosis | G3: **115 ms/token, the largest single bucket** (31%) | −60 to −80 ms/token | 2–3 days | Opus | teacher_forcing + last_logits vs pristine; `[PROF] cpu` and `[OPTIME] ffn_moe`; rotating median |
 | G12 | **BLOCKED** 09-05, **skip, don't fund now** (record §G12) — checked before writing anything: `ko`'s input (`normed`) only exists after `coli_kda_step` + norm/gate, both CPU, both strictly between the projections and `ko` in the same token/layer. Folding into one submit needs the recurrence *on the GPU* — a real shader, not a plumbing port. The G9-style workaround (fold with independent work) doesn't apply either: `tokens=1` in decode (confirmed) and each layer feeds the next via the residual stream, so there is no independent GPU work to overlap `ko`'s wait with. Ruled out the one alternative that would have been pure plumbing (descriptor/cmd-buffer cache clobbering from the interleaved batched path) via a `VK_PROF=1` diagnostic: rebind+re-record are 0.61+1.24 µs/call, negligible; submit+wait (23.1+220.7 µs/call) is the real, unavoidable-without-a-kernel cost. **This is not a new question**: `G4-KDA-SPEC-2026-09-04.md` already priced this exact kernel (~9 ms/token for 2–4 days, trigger "revisit only after items 1–6 of the G3 list are done, if KDA is then the largest remaining bucket") — G10 and G11 (two of those six) are still not started, so the trigger hasn't been reached. Decided: skip rather than re-ask Fable now; re-check at the post-G9/G10 re-profile milestone | G4 §sub-split: proj 0.660 + ko 0.400 ms/call are submits, 47% of KDA before the fix and 66% of what remains | −0.4 ms/call ≈ −14 ms/token, **not reachable this way** | n/a — needs a GPU kernel to be real | Opus (if the trigger is ever reached) | not a Sonnet item; tied to the same trigger as the original KDA-shader rejection |
 
@@ -164,14 +165,15 @@ Q4 measured as accepted tokens per second.
 ## Sequencing across both tracks
 
 **State on 2026-09-05.** Done: C0, G0, G1, G1b, G2, G3, the Fable gate, G4,
-G7, G8, G9. Blocked: C1 (needs the `2d3cf7e` divisor guarded first); G12
-(needs a GPU kernel to be real, not a plumbing fix — skipped, not escalated,
-same trigger as the original KDA-shader rejection). Not started: C2, G5,
-G6, G10, G11, all of track Q. GLM rotating median went
+G7, G8, G9, G10. Blocked: C1 (needs the `2d3cf7e` divisor guarded first);
+G12 (needs a GPU kernel to be real, not a plumbing fix — skipped, not
+escalated, same trigger as the original KDA-shader rejection). Not started:
+C2, G5, G6, G11, all of track Q. GLM rotating median went
 1.65–1.66 (G0) → 1.71/1.69 (G2) → 1.84/1.83 (G4) → 2.01/2.05 (G7) →
-2.19/2.17 (G8) → **2.33/2.35** (G9). The original week-1/week-2 plan below
-is retired: G3's profile replaced its rationale, and the four items it
-added (G7–G10) are each cheaper than anything that was on it.
+2.19/2.17 (G8) → 2.33/2.35 (G9) → **2.60/2.75** (G10). The original
+week-1/week-2 plan below is retired: G3's profile replaced its rationale,
+and the four items it added (G7–G10) are each cheaper than anything that
+was on it.
 
 **Next, in order.** Positions below are from measured evidence, not ranking
 by guess; where a position is a judgment call rather than a number, it says so.
@@ -197,8 +199,11 @@ by guess; where a position is a judgment call rather than a number, it says so.
    yet, so the trigger isn't reached. Re-check at the post-G9/G10
    re-profile milestone below, not before. Nothing shipped, no code
    changed. G10 does not depend on this.
-5. **G10 — mHC.** ← next. A day, −28 ms/token. Shared header with DeepSeek
-   V4, so it re-oracles both engines.
+5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
+   0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.
+   Bit-identical, but only after reverting the malloc-removal half of the
+   item — see record §G10 for the five compiler-flag mitigations tried and
+   why none worked; the mallocs stay, the parallelism shipped.
 6. **G5 — pooled-key cache.** Now placed on evidence rather than deferred: the
    indexer is exactly 2.09 µs per token of context and never flattens, worth
    ~188 ms/token at 8k and ~735 at 32k. It sits *after* G8 because before G8

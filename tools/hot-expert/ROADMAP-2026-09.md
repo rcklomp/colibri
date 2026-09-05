@@ -24,34 +24,37 @@ nobody has to remember them.
 
 ## Cross-cutting first (week 1, Sonnet / Haiku)
 
-| id | item | tier | gate |
-|---|---|---|---|
-| C0 | `tools/rome_bench.sh`: one script that drops caches, warms **one** model, verifies residency, pins 8 threads, sets the GLM caps (`COLI_VK_EXPERTS2/3=1695`, `.glm53_explain.bin`), runs `datapoint.py`, and appends a row to the record | Sonnet | two consecutive runs of the same config within 3% |
-| C1 | Merge `perf/rome-cpu-path` into `hot-expert-tier` (five commits, all measured) | Opus (review) | `qwen38` tiny-check and the four C unit tests that pass today still pass; `glm53` rebuilds |
-| C2 | Add `qwen38` to the record's steady-state table for GLM as well (G0 below) so both engines have the same four numbers | Haiku | table filled |
+| id | status | item | tier | gate |
+|---|---|---|---|---|
+| C0 | **DONE** 09-04 | `tools/rome_bench.sh`: drops caches, warms **one** model, verifies residency, pins 8 threads, sets the GLM caps, runs `datapoint.py`, appends a row. Asserts the GPU tier is really up and **refuses to record** otherwise — six config defects found writing it, incl. a mislabelled row it retro-corrected (record §C0) | Sonnet | 0.24% between runs, vs 3%: **met** |
+| C1 | **BLOCKED** 09-04 | Merge `perf/rome-cpu-path` into `hot-expert-tier`. **Gate failed** (record §C1): `test_qwen38_prefix` passes on `hot-expert-tier` and SIGFPEs on the branch — bisected to `2d3cf7e`, unguarded `m->max_t / c->idx_ratio` at `qwen38_core.h:2417`, deterministic 3/3. Also `qwen38-tiny-check` cannot run here at all (needs torch, absent). Branch is now ~19 commits, not five. **Unblock:** guard the divisor, then re-run | Opus (review) | not met; do not merge until it is |
+| C2 | not started | Add `qwen38` to the record's steady-state table for GLM as well (G0 below) so both engines have the same four numbers | Haiku | table filled |
 
-## Track G: GLM-5.3 (today 3.17 tok/s fresh-process, 8 threads, 3 GPUs)
+## Track G: GLM-5.3 — 1.84 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
 
-Ordered by expected gain per unit of effort. G1 and G2 are ports of what
-already landed for Qwen; G3 is the fork in the road; G4 is the real project.
+Status 2026-09-05: G0–G4 done, G5–G12 open. The old header number (3.17 tok/s
+"fresh-process") is superseded twice over — G0 established the persistent
+baseline this track is actually gated on (1.65–1.66), and G2+G4 moved it to
+1.84. G3 replaced the whole ordering rationale with a measured profile; the
+items below G4 come from it, not from the original plan.
 
 | id | item | evidence | expected | effort | tier | gate |
 |---|---|---|---|---|---|---|
-| G0 | Persistent-engine baseline (`datapoint.py --engine glm53`): cold, warm-identical, rotating | GLM has only fresh-process numbers | none; it is the yardstick | half day | Haiku | four numbers in the record |
-| G1 | Prefault mmap'd experts at bind, and a populate-whole-mapping-at-load knob, ported from `qwen38_core.h` (`q38_populate_range`) into `glm53.c`'s `expert_read` mmap path | Qwen: fault stalls made the CPU expert path 4–6× slower than its kernel; GLM's CPU share is ~1/3 of its experts | first request and rotating prompts; unknown magnitude, measure | 1 day | Sonnet | teacher_forcing identical; rotating median and cold TTFT vs G0 |
+| G0 | **DONE** 09-04 — the yardstick everything since is measured against (record §G0): rotating **1.66 / 1.65**, warm-identical 2.06 / 2.07, cold 1.23 / 1.25, cold TTFT 17.9 / 17.5 s. Not comparable to the old 3.17 fresh-process figure; different regime | GLM had only fresh-process numbers | — | done | Haiku | four numbers in the record: **met** (0.61% between runs) |
+| G1 | **DONE** 09-04 — ported, and it **regressed** (record §G1): rotating 1.65 → 1.48, cold 1.23 → 0.98, reproduced twice, bit-identical either way. Shipped **off by default** (`GLM53_MMAP_POPULATE`), the opposite of Qwen's default, because shipping it on would ship the regression. Whole-mapping-at-load (`GLM53_POPULATE_LOAD`) also off: 122 s of extra load for no measurable gain. Root cause in G1b | Qwen: fault stalls made its CPU expert path 4–6× slower than its own kernel | — | done | Sonnet | teacher_forcing identical **and** measured vs G0: **met** (the answer was "no") |
 | G1b | **Done** — root-caused G1's regression (record §G1b): it was prefaulting the 32% of binds that the GPU then serves from VRAM; `mmap_lock` contention ruled out (1 thread ≈ 8 threads per call). Fixed, still net-negative on this box (7.5 thread-s of `madvise` to save 0.76), kept off by default because every fault here is minor — on a RAM-constrained box the sign flips | G1 | — | done | Opus | bit-identical; measured |
-| G2 | Check whether `glm53` dispatches dev0/dev2/dev3 expert groups sequentially; if so, issue-all/take-all with the CPU share in between, as in `q38_moe_decode` | Qwen: 2.37 vs 0.63 ms per layer | 0 if already concurrent; up to −50 ms/token if not | half day to 1 day | Sonnet | teacher_forcing identical; tok/s vs G0 |
+| G2 | **DONE** 09-04 (record §G2) — they **were** sequential: three submit-and-wait calls back to back, so dev2 could not start until dev0's fence signalled. Replaced with round-based issue-all/take-all reusing the `_issue`/`_take` pair already in `backend_vulkan.c`. Rotating 1.65–1.66 → **1.71 / 1.69**. Byte-for-byte identical output. Ships unconditionally, no knob. **The CPU-share-in-between half was deliberately deferred** — that is G9 | Qwen: 2.37 vs 0.63 ms per layer | +3–4%, not Qwen's 73%: GLM's per-device groups are 1–2 experts, so the three submits were already short | done | Sonnet | teacher_forcing identical; tok/s vs G0: **met** |
 | G3 | **Done 2026-09-04** — per-op profile, record §G3: `[OPTIME]` timers (the `[ATTN]` timer never existed in the tree) + `perf` flat. Decode token 373 ms fresh-process: MoE 199 (CPU experts 115 at 27% of DRAM bandwidth, router 41 single-thread scalar, GPU groups 22, shared 20), KDA 78, MLA 55, mHC 35. **69% of the token runs on one core** (60.8% of cycles are libgomp spin). | supersedes the Sep 2 numbers: KDA is 21% of the token, not 37% | — | done | Opus | table in the record: **met** |
 | **gate** | **Done** — Fable read G3: the roadmap's KDA description was wrong on three counts (inner loops already AVX2-vectorized; the "L=512 scalar loop" is MLA's; not bandwidth-bound at 15× its floor). Chosen: **CPU** — parallelise `coli_kda_step`, `expf(alog)` hoisted; **no shader**. The CPU-vs-shader call held on execution; the *sizing* did not (see G4: the decomposition missed 1.05 ms/call of GPU submits, and the win came from the conv loop, not the heads). | G3 §KDA decomposition: 0.9 ms DRAM + ~1 ms transcendentals + ~0.4 ms memmove = the measured 2.3 | — | done | Fable | `G4-KDA-SPEC-2026-09-04.md`: **written** |
 | G4 | **Done 2026-09-04** (record §G4): three bit-identical commits took `[OPTIME] kda` 2.301 → 1.598 ms/call (78 → 54 ms/token) and the rotating median 1.69–1.71 → **1.84/1.83**. The ≤0.6 ms/call gate was **not** met and is unreachable this way: projections + `ko` are 1.05 ms/call of GPU submits, which G3 never attributed. Head parallelism was worth 2%; the conv-channel loop was worth 2.7×. Follow-up split out as G12. | G3 §KDA; procedure and stop condition in §"Executing G4" below, which is what caught the spec's error | — | done | Opus | rotating median: **met**; per-call gate: **not met, reason recorded** |
-| G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h` (mirror of Qwen commit `2d3cf7e`) | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | nothing at short prompts; matters at 8k+ | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; qsa/dsa-index timer |
+| G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h`. **Port the idea from Qwen `2d3cf7e`, not the code** — that is the commit C1 bisected a SIGFPE to (unguarded `m->max_t / c->idx_ratio`); a naive mirror carries the bug into GLM, whose `index_kpool`/`index_topk` can likewise be 0 in a synthetic config. Guard the divisor. Confirmed applicable 09-05: `sparse_index.h:90` re-pools **the entire prefix on every call**, and `mla_layer` is called once per decode token — O(context) per token, O(context²) per generation, exactly Qwen's shape | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | nothing at the harness's 26–37 token prompts; unmeasured past 151 tokens on this box — **see the long-context note below** | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; needs a dsa-index timer (GLM has none; `[OPTIME]` from G3 is the place to add it) |
 | G6 | Make the dev2/dev3 preload loops stop on the VRAM budget, not only on a count cap | an unlimited cap put 91 GB "in VRAM" and evicted the page cache | safety, not speed | half day | Sonnet | `COLI_VK_EXPERTS2` unset fills to budget − reserve and no further |
 | G7 | Router: parallelize the 288-row f32 dot-product loop in `ffn_layer` across rows (keep each row's summation order) | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token | hours | Sonnet | bit-identical teacher_forcing + last_logits; `[OPTIME] moe split: router` |
 | G8 | MLA: parallelize the 64-head loops in `mla_layer` (absorb `mv_rows`, the attention core, `kvb_v`) | G3: 55 ms/token at 151 tokens of context, 5.0 ms/call, single thread, **O(context)** (4.1 ms at 87 tokens) | −45 ms/token now; grows with context | 1 day | Sonnet | bit-identical per head; `[OPTIME] mla` at 151 and 690 tokens |
 | G9 | Overlap the CPU expert share with the in-flight GPU groups — G2's deliberately deferred half: issue dev0/2/3, compute the CPU experts, then take | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token | half day | Sonnet | bit-identical; `[PROF] eg` no longer serial with `cpu` |
 | G10 | mHC: drop the two per-call `malloc`s in `coli_hc_pre`, vectorize/parallelize the ~400k-MAC mix over the 4-stream residual. **Shared header** (`hyper_connections.h`, DeepSeek V4): rebuild and re-oracle both | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token | 1 day | Sonnet | bit-identical if summation order kept; `[OPTIME] hc+norm` |
-| G12 | Fold KDA's `ko` matvec into the same batched submit as the eight projections: two GPU round trips per layer per token become one | G4 §sub-split: proj 0.660 + ko 0.400 ms/call are submits, 47% of KDA before the fix and 66% of what remains | −0.4 ms/call ≈ −14 ms/token | half day | Sonnet | bit-identical; `[OPTIME] kda split` proj/ko |
 | G11 | CPU int4 expert kernel `matmul_i4_grouped`: it streams 2.19 GB/token at 19 GB/s on 8 threads against 70.9 GB/s DRAM — ALU/decode-bound at 27% of bandwidth, Qwen's pre-F16C diagnosis | G3: **115 ms/token, the largest single bucket** (31%) | −60 to −80 ms/token | 2–3 days | Opus | teacher_forcing + last_logits vs pristine; `[PROF] cpu` and `[OPTIME] ffn_moe`; rotating median |
+| G12 | Fold KDA's `ko` matvec into the same batched submit as the eight projections: two GPU round trips per layer per token become one | G4 §sub-split: proj 0.660 + ko 0.400 ms/call are submits, 47% of KDA before the fix and 66% of what remains | −0.4 ms/call ≈ −14 ms/token | half day | Sonnet | bit-identical; `[OPTIME] kda split` proj/ko |
 
 Target for the track, rewritten from the profile: G3 measured 373 ms per
 decode token fresh-process (585 ms rotating, G2's 1.71 tok/s). G4 and
@@ -159,17 +162,39 @@ Q4 measured as accepted tokens per second.
 
 ## Sequencing across both tracks
 
-- **Week 1 (Sonnet/Haiku, can run as parallel sessions on the rig one at a
-  time):** C0, C2, G0, G1, G2, Q0, Q5. Each is a day or less and each has a
-  numeric gate.
-- **Week 2 (Opus):** ~~C1 merge~~ (blocked: `2d3cf7e` SIGFPE in `test_qwen38_prefix` and the tiny-check needs torch the rig lacks — see record §C1); ~~G3 profile~~ (done); then G7 → G9 → G4 → G8 → G10 (Sonnet/Opus, each hours to a day, each bit-identical); Q1; G5; G6; G11 last (the only kernel).
-- **Fable session (one):** read G3, pick the KDA approach; write the Q3 and
-  Q4 designs against each other. Output: three one-page specs with oracles.
-- **Weeks 3–5 (Opus, two parallel lines because the code paths are
-  disjoint):** G4 on `glm53.c`; Q3 then Q4 on `qwen38_core.h` +
-  `backend_vulkan.c` + `qmatmul.comp`.
-- **Fable review (one short session):** only if a measurement contradicts a
-  spec, or before merging Q4.
+**State on 2026-09-05.** Done: C0, G0, G1, G1b, G2, G3, the Fable gate, G4.
+Blocked: C1 (needs the `2d3cf7e` divisor guarded first). Not started: C2,
+G5–G12, all of track Q. GLM rotating median went 1.65–1.66 (G0) → 1.71/1.69
+(G2) → **1.84/1.83** (G4). The original week-1/week-2 plan below is retired:
+G3's profile replaced its rationale, and the four items it added (G7–G10)
+are each cheaper than anything that was on it.
+
+**Next, in order, with the reason each is where it is:**
+
+1. **G7 — router.** Hours, bit-identical, −36 ms/token, helps at every prompt
+   length. Nothing depends on it and nothing it depends on. Cheapest thing on
+   the board.
+2. **Then measure long context before choosing** between G5, G8 and G11 —
+   see the note below. This is a measurement, not an item; half an hour.
+3. **G9, G12** — half a day each, bit-identical, both fall straight out of
+   the G2 and G4 sub-splits (the deferred CPU/GPU overlap; one submit per KDA
+   layer instead of two).
+4. **G8, G10** — a day each, bit-identical. G10 touches a header shared with
+   DeepSeek V4, so it re-oracles both.
+5. **G11 last** — the only real kernel, 2–3 days, and the largest single
+   bucket (115 ms/token at 27% of DRAM bandwidth).
+6. **C1** whenever someone guards the divisor; it blocks nothing else.
+7. **Track Q** is untouched. Q0 and Q5 are still the cheap entries there, and
+   the Fable session for Q3/Q4 has not happened.
+
+> **Before G5 or G8, measure long context.** Every number in this roadmap is
+> from prompts of 26–37 tokens with 64 completions. `rome_bench.sh` cannot
+> see an O(context²) term by construction, so the ranking above is blind to
+> exactly the thing G5 fixes. The only evidence either way is G3's MLA
+> growing 4.10 → 5.01 ms/call from 87 → 151 tokens. One `COLI_TIMERS=1` run
+> at ~2k and one at ~8k settles whether G5 leapfrogs everything or stays
+> where it is — and the `[OPTIME]` timers from G3 already exist to report it.
+> Do not rank G5 on the short-prompt numbers.
 
 The rig serialises benchmarks, so parallel sessions must share `C0`'s script
 and never benchmark at the same time; code work can overlap freely.

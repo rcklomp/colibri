@@ -101,6 +101,7 @@ int  coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
 int  coli_vk_kda_step(int layer, const float *qkv, const float *gate,
                       const float *beta, float norm_eps, float *out);
 int  coli_vk_kda_sync(int layer, float *state, float *window);
+int  coli_vk_kda_upload(int layer, const float *state, const float *window);
 
 int  coli_vk_init_dev2(const char *spv_path, int devidx);
 int  coli_vk_dev2_available(void);

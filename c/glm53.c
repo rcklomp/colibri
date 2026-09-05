@@ -638,6 +638,9 @@ typedef struct {
 typedef struct {
     float *kda_state;                     /* [teste * k * v] */
     float *kda_window;                    /* [3 * proiezione * kernel] */
+    int kda_gpu;                          /* G12: recurrence resident on dev0; the
+                                           * two host buffers above go STALE and are
+                                           * refreshed only by the migration sync */
     float *latent;                        /* [cap][kv_lora]: MLA assorbita */
     float *ikeys, *igates;                /* [cap][dim indexer] */
 } GLayerState;
@@ -1008,6 +1011,14 @@ static void mv_cpu(float *out, const Mat *w, const float *x) {
     default: matmul(out, x, w->f, 1, w->columns, w->rows); break;
     }
 }
+/* G12: run the recurrence on dev0 (G12-KDA-GPU-SPEC-2026-09-05.md). Off by
+ * default -- it is NOT bit-identical (GLSL exp, tree-reduced norms), so it
+ * ships behind a knob per CLAUDE.md. COLI_KDA_CPU takes precedence. */
+static int g_kda_gpu = -1;
+static int kda_gpu_on(void) {
+    if (g_kda_gpu < 0) g_kda_gpu = getenv("COLI_KDA_GPU") ? atoi(getenv("COLI_KDA_GPU")) : 0;
+    return g_kda_gpu;
+}
 static int g_kda_cpu = -1;
 static int g_kda_cpu_on(void) {
     if (g_kda_cpu < 0) g_kda_cpu = getenv("COLI_KDA_CPU") ? atoi(getenv("COLI_KDA_CPU")) : 0;
@@ -1019,7 +1030,8 @@ static int g_kda_cpu_on(void) {
 } while (0)
 
 static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
-                      float *out, float *state, float *window, float *scratch) {
+                      float *out, float *state, float *window, float *scratch,
+                      int layer, int gpu) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
     float *qkv = malloc((size_t)3 * P * sizeof(float));
     float *gate = malloc((size_t)P * sizeof(float));
@@ -1074,6 +1086,15 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
         if (optime_on()) { g_kt_decay += optime_now() - _tk1; }
         const double _tk2 = optime_on() ? optime_now() : 0.0;
+#ifdef COLI_VULKAN
+        /* The recurrence, and only it: decay/beta gating above and the norm+ko
+         * below still run where they did. This is the increment that measures
+         * the shader's real in-engine dispatch cost before the full chain is
+         * built -- it ADDS a round trip, so it is not expected to be a win. */
+        if (gpu && coli_vk_kda_step(layer, qkv, decay, beta, 1e-6f, core)) {
+            /* state and window advanced on the device */
+        } else
+#endif
         coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
                       H, D, D, c->conv_k, 1e-6f, scratch);
         if (optime_on()) { g_kt_step += optime_now() - _tk2; }
@@ -2679,6 +2700,15 @@ static GSession *session_open(const GModel *m, int cap) {
             if (!st->kda_state || !st->kda_window) {
                 fprintf(stderr, "OOM sullo stato KDA del layer %d\n", i); exit(1);
             }
+#ifdef COLI_VULKAN
+            /* G12: hand the (zero) state and the immutable conv taps to dev0 once.
+             * Per layer, so a device that runs out of room falls back for that
+             * layer alone rather than silently mixing two recurrences. */
+            if (kda_gpu_on() && !g_kda_cpu_on())
+                st->kda_gpu = coli_vk_kda_init(i, c->kda_heads, c->kda_hd, c->kda_hd,
+                                               c->conv_k, st->kda_state, st->kda_window,
+                                               m->layer[i].conv);
+#endif
         }
     }
     if (getenv("GLM53_VERBOSE")) {
@@ -2811,7 +2841,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                     if (timed) { g_ot_mla += optime_now() - t0; g_on_mla++; }
                 } else {
                     kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
-                              s->kda_scratch);
+                              s->kda_scratch, i, st->kda_gpu);
                     if (timed) { g_ot_kda += optime_now() - t0; g_on_kda++; }
                 }
             } else {
@@ -3747,6 +3777,36 @@ typedef struct {
     uint32_t context_tokens, position;
 } Glm53SegmentSession;
 
+/* G12 sync points. While COLI_KDA_GPU is on the recurrence lives on dev0 and
+ * st->kda_state / st->kda_window are STALE -- reading them back every token
+ * would cost ~5 ms/token over PCIe, a third of what the chain saves. These two
+ * are the only places the host copies are made to agree with the device, and
+ * they are exactly the two directions segment migration needs. */
+static void glm53_kda_sync_out(Glm53SegmentSession *session) {
+#ifdef COLI_VULKAN
+    const Cfg *c = &session->engine->model.c;
+    for (uint32_t i = session->engine->layer_begin; i < session->engine->layer_end; i++) {
+        GLayerState *st = &session->session->layer[i];
+        if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
+            coli_vk_kda_sync((int)i, st->kda_state, st->kda_window);
+    }
+#else
+    (void)session;
+#endif
+}
+static void glm53_kda_sync_in(Glm53SegmentSession *session) {
+#ifdef COLI_VULKAN
+    const Cfg *c = &session->engine->model.c;
+    for (uint32_t i = session->engine->layer_begin; i < session->engine->layer_end; i++) {
+        GLayerState *st = &session->session->layer[i];
+        if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
+            coli_vk_kda_upload((int)i, st->kda_state, st->kda_window);
+    }
+#else
+    (void)session;
+#endif
+}
+
 /* I pezzi di stato che uno snapshot deve portarsi dietro, nell'ordine in cui
  * si scrivono. Un layer DSA tiene il latente MLA e le due file dell'indexer,
  * un layer KDA la ricorrenza e la finestra della convoluzione. */
@@ -3918,6 +3978,7 @@ static int glm53_segment_session_snapshot(void *session_impl,
     if (!session || !write_fn)
         return coli_segment_adapter_error(error, error_size,
                                           "GLM-5.3 Segment snapshot needs a sink");
+    glm53_kda_sync_out(session);   /* G12: device -> host before the snapshot reads */
     ColiSegmentStateSpan spans[GLM53_SEGMENT_MAX_SPANS];
     const size_t count = glm53_segment_spans(session->engine, session, spans,
                                              GLM53_SEGMENT_MAX_SPANS);
@@ -3966,6 +4027,7 @@ static int glm53_segment_session_restore(void *session_impl,
     if (coli_segment_spans_restore(spans, count, header.payload_hash, read_fn,
                                    read_user_data, error, error_size))
         return -1;
+    glm53_kda_sync_in(session);    /* G12: host -> device after the restore writes */
     session->position = header.position;
     session->session->filled = (int)header.position;
     return 0;

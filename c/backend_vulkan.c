@@ -1834,6 +1834,15 @@ int coli_vk_kda_sync(int layer, float *state, float *window) {
     return 1;
 }
 
+/* Host -> device, the inverse of _sync: used after a segment restore has
+ * written the CPU spans, so the resident recurrence resumes from them. */
+int coli_vk_kda_upload(int layer, const float *state, const float *window) {
+    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (state)  memcpy(G.kda[layer].state_p,  state,  G.kda[layer].sbytes);
+    if (window) memcpy(G.kda[layer].window_p, window, G.kda[layer].wbytes);
+    return 1;
+}
+
 /* One token through one layer. qkv/gate/beta come from the host in this
  * standalone form (Stage 1 of the spec and the self-test); only `out` returns. */
 int coli_vk_kda_step(int layer, const float *qkv, const float *gate,

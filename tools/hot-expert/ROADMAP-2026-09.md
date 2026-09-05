@@ -30,13 +30,14 @@ nobody has to remember them.
 | C1 | **BLOCKED** 09-04 | Merge `perf/rome-cpu-path` into `hot-expert-tier`. **Gate failed** (record §C1): `test_qwen38_prefix` passes on `hot-expert-tier` and SIGFPEs on the branch — bisected to `2d3cf7e`, unguarded `m->max_t / c->idx_ratio` at `qwen38_core.h:2417`, deterministic 3/3. Also `qwen38-tiny-check` cannot run here at all (needs torch, absent). Branch is now ~19 commits, not five. **Unblock:** guard the divisor, then re-run | Opus (review) | not met; do not merge until it is |
 | C2 | not started | Add `qwen38` to the record's steady-state table for GLM as well (G0 below) so both engines have the same four numbers | Haiku | table filled |
 
-## Track G: GLM-5.3 — 1.84 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
+## Track G: GLM-5.3 — 2.01–2.05 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
 
-Status 2026-09-05: G0–G4 done, G5–G12 open. The old header number (3.17 tok/s
-"fresh-process") is superseded twice over — G0 established the persistent
-baseline this track is actually gated on (1.65–1.66), and G2+G4 moved it to
-1.84. G3 replaced the whole ordering rationale with a measured profile; the
-items below G4 come from it, not from the original plan.
+Status 2026-09-05: G0–G4 and G7 done, G5/G6/G8–G12 open. The old header
+number (3.17 tok/s "fresh-process") is superseded twice over — G0 established
+the persistent baseline this track is actually gated on (1.65–1.66), and
+G2+G4+G7 moved it to 2.01–2.05. G3 replaced the whole ordering rationale with
+a measured profile; the items below G4 come from it, not from the original
+plan.
 
 | id | item | evidence | expected | effort | tier | gate |
 |---|---|---|---|---|---|---|
@@ -49,7 +50,7 @@ items below G4 come from it, not from the original plan.
 | G4 | **Done 2026-09-04** (record §G4): three bit-identical commits took `[OPTIME] kda` 2.301 → 1.598 ms/call (78 → 54 ms/token) and the rotating median 1.69–1.71 → **1.84/1.83**. The ≤0.6 ms/call gate was **not** met and is unreachable this way: projections + `ko` are 1.05 ms/call of GPU submits, which G3 never attributed. Head parallelism was worth 2%; the conv-channel loop was worth 2.7×. Follow-up split out as G12. | G3 §KDA; procedure and stop condition in §"Executing G4" below, which is what caught the spec's error | — | done | Opus | rotating median: **met**; per-call gate: **not met, reason recorded** |
 | G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h`. **Port the idea from Qwen `2d3cf7e`, not the code** — that is the commit C1 bisected a SIGFPE to (unguarded `m->max_t / c->idx_ratio`); a naive mirror carries the bug into GLM, whose `index_kpool`/`index_topk` can likewise be 0 in a synthetic config. Guard the divisor. Confirmed applicable 09-05: `sparse_index.h:90` re-pools **the entire prefix on every call**, and `mla_layer` is called once per decode token — O(context) per token, O(context²) per generation, exactly Qwen's shape | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | nothing at the harness's 26–37 token prompts; unmeasured past 151 tokens on this box — **see the long-context note below** | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; needs a dsa-index timer (GLM has none; `[OPTIME]` from G3 is the place to add it) |
 | G6 | Make the dev2/dev3 preload loops stop on the VRAM budget, not only on a count cap | an unlimited cap put 91 GB "in VRAM" and evicted the page cache | safety, not speed | half day | Sonnet | `COLI_VK_EXPERTS2` unset fills to budget − reserve and no further |
-| G7 | Router: parallelize the 288-row f32 dot-product loop in `ffn_layer` across rows (keep each row's summation order) | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token | hours | Sonnet | bit-identical teacher_forcing + last_logits; `[OPTIME] moe split: router` |
+| G7 | **DONE** 09-05 (record §G7) — parallelised the 288-row router score, inner (expert) loop not outer (token) loop: `score` has no per-token dimension, so parallelising over tokens would race. `[OPTIME] moe split: router` 0.998 → **0.137 ms/call** (7.3×). Rotating 1.84/1.83 → **2.01/2.05**. Bit-identical both prompts | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token; got exactly that | done | Sonnet | bit-identical: **met**; tok/s vs G4: **met** (+9–12%) |
 | G8 | MLA: parallelize the 64-head loops in `mla_layer` (absorb `mv_rows`, the attention core, `kvb_v`) | G3: 55 ms/token at 151 tokens of context, 5.0 ms/call, single thread, **O(context)** (4.1 ms at 87 tokens) | −45 ms/token now; grows with context | 1 day | Sonnet | bit-identical per head; `[OPTIME] mla` at 151 and 690 tokens |
 | G9 | Overlap the CPU expert share with the in-flight GPU groups — G2's deliberately deferred half: issue dev0/2/3, compute the CPU experts, then take | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token | half day | Sonnet | bit-identical; `[PROF] eg` no longer serial with `cpu` |
 | G10 | mHC: drop the two per-call `malloc`s in `coli_hc_pre`, vectorize/parallelize the ~400k-MAC mix over the 4-stream residual. **Shared header** (`hyper_connections.h`, DeepSeek V4): rebuild and re-oracle both | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token | 1 day | Sonnet | bit-identical if summation order kept; `[OPTIME] hc+norm` |
@@ -172,9 +173,9 @@ are each cheaper than anything that was on it.
 **Next, in order.** Positions below are from measured evidence, not ranking
 by guess; where a position is a judgment call rather than a number, it says so.
 
-1. **G7 — router.** Hours, bit-identical, −36 ms/token, helps at every context
-   length. Nothing depends on it. Uncontested.
-2. **G8 — MLA heads.** −45 ms/token at short context, and per the long-context
+1. ~~**G7 — router.**~~ **DONE 09-05** (record §G7). 0.998 → 0.137 ms/call,
+   rotating 1.84/1.83 → **2.01/2.05**. Bit-identical.
+2. **G8 — MLA heads.** ← next −45 ms/token at short context, and per the long-context
    section of the record it is *also* the largest long-context cost: `attn` is
    ~650 ms/token from 2k context upward, flat, single-threaded. Second on both
    axes, which no other item manages.

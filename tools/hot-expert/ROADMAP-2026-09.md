@@ -195,8 +195,9 @@ by guess; where a position is a judgment call rather than a number, it says so.
 6. **G11 — the int4 expert kernel.** 2–3 days, −60 to −80 ms/token, the only
    real kernel and the largest single short-context bucket. Late by judgment,
    not by measurement: its ms-per-day is the lowest of the set, and after
-   G7–G10 land the profile it would be tuned against has changed. **Re-run the
-   G3 profile before starting it.**
+   G7–G10 land the profile it would be tuned against has changed. **Re-run
+   the G3 profile before starting it** — see the re-measurement cadence below,
+   this is its first scheduled milestone.
 7. **G6 — preload VRAM budget.** Not a speed item and not rankable here. Do it
    whenever the preload path is next touched, or immediately if anyone might
    run with an unset cap — it is the guard against the incident that put 91 GB
@@ -204,10 +205,38 @@ by guess; where a position is a judgment call rather than a number, it says so.
 8. **C1** whenever someone guards the `2d3cf7e` divisor. Blocks nothing else.
 9. **Track Q** is untouched. Q0 and Q5 are a day between them.
 
-**Re-derive this order after three or four land.** Every figure above comes
-from a machine where 69% of the decode token is single-threaded. Fix several
-of those and the remaining numbers shift — a plan built on stale figures is
-exactly what G3 had to tear up.
+### Keeping the profile honest: a re-measurement cadence, not a one-off
+
+G3 was expensive because it *built* the instrumentation from nothing —
+`[OPTIME]` timers, a `perf` methodology, cross-validation to 3 ms in 47 s.
+That cost is sunk: the timers are permanent, gated on `COLI_TIMERS=1`, free
+in the serving regime. Reading them again is not building them again, so
+"re-derive the order after three or four land" is now a standing procedure
+with two speeds, not a one-line reminder:
+
+- **Cheap, after every landed item (Haiku):** the *full* `[OPTIME]`
+  breakdown, not just the before/after of the one thing that changed. This
+  catches drift in buckets nobody touched and confirms the running ms
+  figures in this document are still real numbers, not stale interpolation.
+  Evidence this matters, from this branch: **G7 landed at exactly its
+  estimate** (−36 predicted, −36.2 measured) but **G8 missed by 28%** (−45
+  predicted, −32.4 measured), which by itself moved the road's projected
+  end-state from ~134 to ~147 ms/token. One of two landed items already
+  needed this; assume the next ones will too.
+- **Expensive, at milestones (Opus — profiling and its interpretation, same
+  tier as G3 itself):** a fresh `perf record` flat profile, repeated in
+  full. Two are already scheduled: **before G11** (item 6 above — two large
+  single-threaded buckets, router and MLA, are gone since G3's capture, and
+  the 60.8%-barrier-spin picture almost certainly moved with them) and
+  **once more after G9/G12/G10 all land**, before ordering G5 against G11
+  for real rather than on G3-era bucket sizes.
+
+Every figure in this document comes from a machine where 69% of the decode
+token was single-threaded when G3 was taken. Fix several of those buckets
+and the remaining numbers shift — a plan built on stale figures is exactly
+what G3 had to tear up in the first place, and letting this road quietly
+become the same kind of stale plan would be the identical mistake one level
+down.
 
 > **Long context was measured on 2026-09-05** — see the record's long-context
 > section. Short version: the indexer really is O(context²) per generation

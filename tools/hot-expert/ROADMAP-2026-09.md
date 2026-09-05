@@ -32,8 +32,13 @@ nobody has to remember them.
 
 ## Track G: GLM-5.3 — 2.60–2.75 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
 
-Status 2026-09-05: G0–G4, G7, G8, G9 and G10 done; G5/G6/G11 open, G12
-blocked (skipped, not escalated — record §G12). The old header number (3.17
+Fresh-process decode is **199.4 ms/token, down from G3's 373.4 (1.87×)** —
+re-profiled 09-05, record **§RP1**, which also shows 23.5 ms/token of that
+was a warmer routing histogram rather than code. Read §RP1 before planning
+G11 or G5: both of their roadmap numbers were re-sized by it.
+
+Status 2026-09-05: G0–G4, G7, G8, G9, G10 and the before-G11 re-profile
+(RP1) done; G5/G6/G11 open, G12 blocked (skipped, not escalated — record §G12). The old header number (3.17
 tok/s "fresh-process") is superseded twice over — G0 established the
 persistent baseline this track is actually gated on (1.65–1.66), and
 G2+G4+G7+G8+G9+G10 moved it to 2.60–2.75. G3 replaced the whole ordering
@@ -49,13 +54,13 @@ from the original plan.
 | G3 | **Done 2026-09-04** — per-op profile, record §G3: `[OPTIME]` timers (the `[ATTN]` timer never existed in the tree) + `perf` flat. Decode token 373 ms fresh-process: MoE 199 (CPU experts 115 at 27% of DRAM bandwidth, router 41 single-thread scalar, GPU groups 22, shared 20), KDA 78, MLA 55, mHC 35. **69% of the token runs on one core** (60.8% of cycles are libgomp spin). | supersedes the Sep 2 numbers: KDA is 21% of the token, not 37% | — | done | Opus | table in the record: **met** |
 | **gate** | **Done** — Fable read G3: the roadmap's KDA description was wrong on three counts (inner loops already AVX2-vectorized; the "L=512 scalar loop" is MLA's; not bandwidth-bound at 15× its floor). Chosen: **CPU** — parallelise `coli_kda_step`, `expf(alog)` hoisted; **no shader**. The CPU-vs-shader call held on execution; the *sizing* did not (see G4: the decomposition missed 1.05 ms/call of GPU submits, and the win came from the conv loop, not the heads). | G3 §KDA decomposition: 0.9 ms DRAM + ~1 ms transcendentals + ~0.4 ms memmove = the measured 2.3 | — | done | Fable | `G4-KDA-SPEC-2026-09-04.md`: **written** |
 | G4 | **Done 2026-09-04** (record §G4): three bit-identical commits took `[OPTIME] kda` 2.301 → 1.598 ms/call (78 → 54 ms/token) and the rotating median 1.69–1.71 → **1.84/1.83**. The ≤0.6 ms/call gate was **not** met and is unreachable this way: projections + `ko` are 1.05 ms/call of GPU submits, which G3 never attributed. Head parallelism was worth 2%; the conv-channel loop was worth 2.7×. Follow-up split out as G12. | G3 §KDA; procedure and stop condition in §"Executing G4" below, which is what caught the spec's error | — | done | Opus | rotating median: **met**; per-call gate: **not met, reason recorded** |
-| G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h`. **Port the idea from Qwen `2d3cf7e`, not the code** — that is the commit C1 bisected a SIGFPE to (unguarded `m->max_t / c->idx_ratio`); a naive mirror carries the bug into GLM, whose `index_kpool`/`index_topk` can likewise be 0 in a synthetic config. Guard the divisor. Confirmed applicable 09-05: `sparse_index.h:90` re-pools **the entire prefix on every call**, and `mla_layer` is called once per decode token — O(context) per token, O(context²) per generation, exactly Qwen's shape | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | nothing at the harness's 26–37 token prompts; unmeasured past 151 tokens on this box — **see the long-context note below** | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; needs a dsa-index timer (GLM has none; `[OPTIME]` from G3 is the place to add it) |
+| G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h`. **Port the idea from Qwen `2d3cf7e`, not the code** — that is the commit C1 bisected a SIGFPE to (unguarded `m->max_t / c->idx_ratio`); a naive mirror carries the bug into GLM, whose `index_kpool`/`index_topk` can likewise be 0 in a synthetic config. Guard the divisor. Confirmed applicable 09-05: `sparse_index.h:90` re-pools **the entire prefix on every call**, and `mla_layer` is called once per decode token — O(context) per token, O(context²) per generation, exactly Qwen's shape | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | RP1 re-measured it at **1.958 µs per context token per call** (11 calls/token = 0.0215 ms/ctx-token): **2.3 ms/token at ctx 106 (1.1%)**, 44 at 2k, 176 at 8k, 706 at 32k. Overtakes the *entire* CPU-expert bucket at **ctx ≈ 3.5k** | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; the dsa-index timer now exists (`[OPTIME] mla split`, added for the long-context section) |
 | G6 | Make the dev2/dev3 preload loops stop on the VRAM budget, not only on a count cap | an unlimited cap put 91 GB "in VRAM" and evicted the page cache | safety, not speed | half day | Sonnet | `COLI_VK_EXPERTS2` unset fills to budget − reserve and no further |
 | G7 | **DONE** 09-05 (record §G7) — parallelised the 288-row router score, inner (expert) loop not outer (token) loop: `score` has no per-token dimension, so parallelising over tokens would race. `[OPTIME] moe split: router` 0.998 → **0.137 ms/call** (7.3×). Rotating 1.84/1.83 → **2.01/2.05**. Bit-identical both prompts | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token; got exactly that | done | Sonnet | bit-identical: **met**; tok/s vs G4: **met** (+9–12%) |
 | G8 | **DONE** 09-05 (record §G8) — parallelised both per-head loops. Checked nested-OMP oversubscription empirically before writing anything (a compiled probe: `max_active_levels=1` on this box, so nesting collapses safely). Per-thread `score`/`pooled` scratch, same class of fix as G4's KDA. `[OPTIME] mla` 5.013 → **2.066 ms/call** (2.43×). Rotating 2.01/2.05 → **2.19/2.17**. Bit-identical both prompts | G3: 55 ms/token at 151 tokens of context, 5.0 ms/call, single thread, **O(context)** (4.1 ms at 87 tokens) | −32.4 ms/token at ctx=88; correction in the record re: context-shape | done | Sonnet | bit-identical: **met**; tok/s vs G7: **met** (+6–9%) |
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
 | G10 | **DONE** 09-05 (record §G10) — parallelised the ~400k-MAC mix and the destination×column combine over independent rows/columns, each one's own reduction untouched (G7's pattern). **The malloc removal did not survive contact**: dropping `coli_hc_pre`'s two per-call `malloc`s needed `hc`'s range knowable at compile time, which measurably changed GCC's rounding in the small hc-bounded reductions (~1.9e-4 on `last_logits`, `teacher_forcing` unaffected) — bisected across five different compiler-flag mitigations, none restored bit-identity; **kept the mallocs, shipped the parallelism**. `[OPTIME] hc+norm` 0.393 → **0.097 ms/site** (4.05×). Rotating 2.33/2.35 → **2.60/2.75**. Bit-identical both prompts. Shared header (DeepSeek V4): rebuilt clean, not re-measured (no rig checkpoint) | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token; beat it (−26.6 ms/token measured, +11–17% gate) | done | Sonnet | bit-identical: **met** (mallocs kept); tok/s vs G9: **met** (+11–17%) |
-| G11 | CPU int4 expert kernel `matmul_i4_grouped`: it streams 2.19 GB/token at 19 GB/s on 8 threads against 70.9 GB/s DRAM — ALU/decode-bound at 27% of bandwidth, Qwen's pre-F16C diagnosis | G3: **115 ms/token, the largest single bucket** (31%) | −60 to −80 ms/token | 2–3 days | Opus | teacher_forcing + last_logits vs pristine; `[PROF] cpu` and `[OPTIME] ffn_moe`; rotating median |
+| G11 | CPU int4 expert kernel `matmul_i4_grouped` **and the expert path around it**. **Re-sized by RP1 — read record §RP1 before planning this.** The bucket is **74.8 ms/token, not 115**: same tier size, but the histogram now serves 79% of activations from GPU (was 54%), so only 69.6 experts/token reach the CPU. Streaming is 0.99 GB/token at **13.2 GB/s = 19% of DRAM** (was 19.0 GB/s = 27%) — *worse*, and G9 is why: the kernel now shares bandwidth with GPU DMA and gives up a core to issue/take, which G9 paid for knowingly. **And only 57% of core-time in its own window is in the kernel**: ~12 points is thread 0 on G9 duty, the rest is the serial `swiglu_clamped` + per-token accumulate between each expert's three parallel matmuls, plus three short OMP regions per expert. Fusing the path may be worth as much as tuning the kernel | RP1: **74.8 ms/token, still the largest bucket, and its share *grew* 30.8% → 37.5%** | **−25 to −45 ms/token** (was "−60 to −80" against the old 115 ms bucket — not reachable; the whole bucket is 74.8) | 2–3 days | Opus | teacher_forcing + last_logits vs pristine; `[PROF] cpu` and `[OPTIME] ffn_moe`; rotating median |
 | G12 | **BLOCKED** 09-05, **skip, don't fund now** (record §G12) — checked before writing anything: `ko`'s input (`normed`) only exists after `coli_kda_step` + norm/gate, both CPU, both strictly between the projections and `ko` in the same token/layer. Folding into one submit needs the recurrence *on the GPU* — a real shader, not a plumbing port. The G9-style workaround (fold with independent work) doesn't apply either: `tokens=1` in decode (confirmed) and each layer feeds the next via the residual stream, so there is no independent GPU work to overlap `ko`'s wait with. Ruled out the one alternative that would have been pure plumbing (descriptor/cmd-buffer cache clobbering from the interleaved batched path) via a `VK_PROF=1` diagnostic: rebind+re-record are 0.61+1.24 µs/call, negligible; submit+wait (23.1+220.7 µs/call) is the real, unavoidable-without-a-kernel cost. **This is not a new question**: `G4-KDA-SPEC-2026-09-04.md` already priced this exact kernel (~9 ms/token for 2–4 days, trigger "revisit only after items 1–6 of the G3 list are done, if KDA is then the largest remaining bucket") — G11 (one of those six) is still not started, so the trigger hasn't been reached — G10 has since landed. Decided: skip rather than re-ask Fable now; re-check at the post-G9/G10 re-profile milestone, due now that both have landed | G4 §sub-split: proj 0.660 + ko 0.400 ms/call are submits, 47% of KDA before the fix and 66% of what remains | −0.4 ms/call ≈ −14 ms/token, **not reachable this way** | n/a — needs a GPU kernel to be real | Opus (if the trigger is ever reached) | not a Sonnet item; tied to the same trigger as the original KDA-shader rejection |
 
 Target for the track, rewritten from the profile: G3 measured 373 ms per
@@ -170,10 +175,13 @@ G12 (needs a GPU kernel to be real, not a plumbing fix — skipped, not
 escalated, same trigger as the original KDA-shader rejection). Not started:
 C2, G5, G6, G11, all of track Q. GLM rotating median went
 1.65–1.66 (G0) → 1.71/1.69 (G2) → 1.84/1.83 (G4) → 2.01/2.05 (G7) →
-2.19/2.17 (G8) → 2.33/2.35 (G9) → **2.60/2.75** (G10). The original
-week-1/week-2 plan below is retired: G3's profile replaced its rationale,
-and the four items it added (G7–G10) are each cheaper than anything that
-was on it.
+2.19/2.17 (G8) → 2.33/2.35 (G9) → **2.60/2.75** (G10); fresh-process
+decode 373.4 → **199.4 ms/token** (§RP1). The original week-1/week-2 plan
+below is retired: G3's profile replaced its rationale, and the four items
+it added (G7–G10) are each cheaper than anything that was on it. **RP1
+then re-sized what is left** — G11's expected saving and G5's per-context
+cost both changed, and 23.5 ms/token of the measured gain turned out to be
+a warmer routing histogram rather than any landed item.
 
 **Next, in order.** Positions below are from measured evidence, not ranking
 by guess; where a position is a judgment call rather than a number, it says so.
@@ -204,19 +212,24 @@ by guess; where a position is a judgment call rather than a number, it says so.
    Bit-identical, but only after reverting the malloc-removal half of the
    item — see record §G10 for the five compiler-flag mitigations tried and
    why none worked; the mallocs stay, the parallelism shipped.
-6. **G5 — pooled-key cache.** Now placed on evidence rather than deferred: the
-   indexer is exactly 2.09 µs per token of context and never flattens, worth
-   ~188 ms/token at 8k and ~735 at 32k. It sits *after* G8 because before G8
-   the attention core is 3.5× larger at 8k; after G8 the indexer becomes MLA's
-   dominant term above ~3.5k context. **Its real priority is a product
-   question** — what context length does the deployment see? At 2k it is worth
-   little; at 32k it is the largest item in this table.
-7. **G11 — the int4 expert kernel.** 2–3 days, −60 to −80 ms/token, the only
-   real kernel and the largest single short-context bucket. Late by judgment,
-   not by measurement: its ms-per-day is the lowest of the set, and after
-   G7–G10 land the profile it would be tuned against has changed. **Re-run
-   the G3 profile before starting it** — see the re-measurement cadence below,
-   this is its first scheduled milestone.
+6. **G5 — pooled-key cache.** Now placed on evidence rather than deferred:
+   the indexer never flattens, and RP1 re-measured it at **1.958 µs per
+   context token per call** (was fitted at 2.09) = 0.0215 ms/ctx-token
+   across 11 layers: **2.3 ms/token at ctx 106**, 44 at 2k, 176 at 8k, 706
+   at 32k. It overtakes the *entire* CPU-expert bucket at **ctx ≈ 3.5k**.
+   **Its real priority is a product question** — what context length does
+   the deployment see? At 2k it is worth little; at 32k it dwarfs
+   everything else in this table.
+7. **G11 — the int4 expert kernel and its path.** ← next. 2–3 days.
+   **Re-sized by RP1: −25 to −45 ms/token, not −60 to −80** — the bucket is
+   74.8 ms/token, not 115, so the old estimate exceeded the whole bucket.
+   Still the largest single bucket, and its share *grew* (30.8% → 37.5%)
+   because everything around it got faster. The pre-run profile this item
+   was gated on is **done (§RP1)**; read it first, because it moves the
+   design: 43% of the core-time in this kernel's own window is not in the
+   kernel (serial `swiglu_clamped` + accumulate between three short parallel
+   regions per expert, plus thread 0 on G9 duty), so fusing the expert path
+   may be worth as much as tuning the inner loop.
 8. **G6 — preload VRAM budget.** Not a speed item and not rankable here. Do it
    whenever the preload path is next touched, or immediately if anyone might
    run with an unset cap — it is the guard against the incident that put 91 GB
@@ -244,19 +257,28 @@ with two speeds, not a one-line reminder:
   needed this; assume the next ones will too.
 - **Expensive, at milestones (Opus — profiling and its interpretation, same
   tier as G3 itself):** a fresh `perf record` flat profile, repeated in
-  full. Two are scheduled: **before G11** (item 7 above — two large
-  single-threaded buckets, router and MLA, are gone since G3's capture, and
-  the 60.8%-barrier-spin picture almost certainly moved with them) — **due
-  now, since G9 and G10 have both landed** (G12 is settled, skipped, not
-  pending — see above) — and once more after G11 itself lands, before
-  ordering G5 against it for real rather than on G3-era bucket sizes.
+  full. The **before-G11** one is **DONE 09-05 — record §RP1**, and it
+  earned its cost: it found that the road's own arithmetic was right to
+  within a rounding error (373.4 − the five items' measured deltas = 222.9;
+  measured 199.4) but that **23.5 ms/token of the gain was the routing
+  histogram, not code** — the same-sized expert tier now serves 79% of
+  activations from GPU where G3 saw 54%. It also **re-sized G11 downward**
+  (its bucket is 74.8 ms/token, not 115, so "−60 to −80" was never
+  reachable), found that **G3's barrier-spin model stopped working**
+  (predicted 36%, measured 56.35%) and that **the spin is load-bearing**
+  (`OMP_WAIT_POLICY=passive` costs 7.5%), and that **only 57% of the
+  core-time in the CPU-expert window is in the kernel**. None of that was
+  visible from the cheap `[OPTIME]` reads. One more is scheduled: **after
+  G11 lands**, before ordering G5 against whatever is left.
 
 Every figure in this document comes from a machine where 69% of the decode
 token was single-threaded when G3 was taken. Fix several of those buckets
 and the remaining numbers shift — a plan built on stale figures is exactly
 what G3 had to tear up in the first place, and letting this road quietly
 become the same kind of stale plan would be the identical mistake one level
-down.
+down. **RP1 is the proof that this is not hypothetical:** two of the
+roadmap's own numbers (G11's expected saving, G5's per-context cost) were
+stale, and one of its headline gains turned out to be partly unearned.
 
 > **Long context was measured on 2026-09-05** — see the record's long-context
 > section. Short version: the indexer really is O(context²) per generation

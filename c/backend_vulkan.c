@@ -35,6 +35,7 @@ typedef struct {
  * kernel reads them in place. Allocated once at max_t rows, like the CUDA
  * kv_dev shadow. */
 #define VK_KV_LAYERS 160
+#define VK_KDA_LAYERS 64      /* GLM-5.3 has 34 KDA layers; headroom for the test slots */
 typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
     int rows, K, R;
@@ -82,6 +83,16 @@ static struct {
     VkPipeline pipe_nrm; VkDescriptorPool qprep_pool; VkDescriptorSet dset_qp3, dset_nrm;
     Scratch qp1, qp2;
     VkBuffer lnbuf[VK_KV_LAYERS]; VkDeviceMemory lnmem[VK_KV_LAYERS]; int lnlen[VK_KV_LAYERS];
+    /* KDA recurrence (G12): state and conv window live on the device for the whole
+     * session — 4 MB + 393 KB per layer at GLM's shape, 136 MB over 34 layers.
+     * Reading them back per call would be ~5 ms/token over PCIe, a third of the
+     * win, so the host copies go stale and re-sync only at segment export/import
+     * (coli_vk_kda_sync). conv taps are immutable, uploaded once with the rest. */
+    VkShaderModule shader_kda; VkDescriptorSetLayout dsl_kda; VkPipelineLayout plyt_kda;
+    VkPipeline pipe_kda; VkDescriptorPool kda_pool; VkDescriptorSet dset_kda;
+    struct { VkBuffer state, window, conv; void *state_p, *window_p, *conv_p;
+             size_t sbytes, wbytes, cbytes; int heads, k, v, kernel; } kda[VK_KDA_LAYERS];
+    Scratch kda_qkv, kda_gate, kda_beta, kda_out;
     Scratch att_sc;              /* attention score scratch (GPU-only) */
     Scratch att_ctx;             /* fused absorb+o: ctx stays on device (GPU-only) */
     Scratch y2;                  /* second output of the fused matmul pair (readback) */
@@ -107,6 +118,7 @@ static struct {
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 struct PCN { int S, D; float eps; };
+struct PCK { int heads, k_dim, v_dim, kernel; float norm_eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
@@ -409,6 +421,18 @@ int coli_vk_init(const char *spv_path) {
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
     /* Optional rmsnorm pipeline: enables the pair->norm->q_b single-submit chain
      * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
+    /* Optional KDA recurrence pipeline (G12). Absent -> COLI_KDA_GPU is a no-op
+     * and the engine keeps the CPU coli_kda_step, which stays the reference. */
+    char kda_path[512]; derive_dir_file(spv_path, "kda_step.spv", kda_path, sizeof(kda_path));
+    G.shader_kda = load_spv(G.dev, kda_path);
+    if (G.shader_kda) {
+        VkDescriptorPool kp; VkDescriptorSet ks;
+        if (!build_pipeline(G.dev, 7, sizeof(struct PCK), G.shader_kda,
+                            &G.dsl_kda, &G.plyt_kda, &G.pipe_kda, &kp, &ks))
+            return 0;
+        G.kda_pool = kp; G.dset_kda = ks;
+    }
+
     char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
     G.shader_nrm = load_spv(G.dev, nrm_path);
     if (G.shader_nrm) {
@@ -1770,6 +1794,100 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
 }
 
 
+/* ---- KDA recurrence on the device (G12) ---------------------------------
+ * coli_kda_step's arithmetic, one workgroup per head, with the 128x128 state
+ * tile resident on the GPU for the life of the session. NOT bit-identical to
+ * the CPU (GLSL exp, tree-reduced norms); see G12-KDA-GPU-SPEC-2026-09-05.md.
+ * Returns 0 on any unsupported shape so the caller keeps the CPU path. */
+int coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
+                     const float *state, const float *window, const float *conv_w) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS) return 0;
+    /* one v per thread; q/k/decay staged in a 1024-entry LDS array; hist[8] */
+    if (heads < 1 || k_dim < 1 || v_dim < 1 || kernel < 1) return 0;
+    if (v_dim > 128 || k_dim > 1024 || kernel > 8) return 0;
+    if (G.kda[layer].state) return 1;                       /* already resident */
+    const size_t width = (size_t)heads * (size_t)k_dim;
+    const size_t sb = (size_t)heads * k_dim * v_dim * sizeof(float);
+    const size_t wb = 3u * width * (size_t)kernel * sizeof(float);
+    void *sp, *wp, *cp;
+    float p0 = G.prio; G.prio = 1.0f;                       /* recurrence state: never evict */
+    int ok = arena_suballoc(sb, &G.kda[layer].state, &sp)
+          && arena_suballoc(wb, &G.kda[layer].window, &wp)
+          && arena_suballoc(wb, &G.kda[layer].conv, &cp);
+    G.prio = p0;
+    if (!ok) { G.kda[layer].state = VK_NULL_HANDLE; return 0; }
+    memcpy(sp, state, sb); memcpy(wp, window, wb); memcpy(cp, conv_w, wb);
+    G.kda[layer].state_p = sp; G.kda[layer].window_p = wp; G.kda[layer].conv_p = cp;
+    G.kda[layer].sbytes = sb; G.kda[layer].wbytes = wb; G.kda[layer].cbytes = wb;
+    G.kda[layer].heads = heads; G.kda[layer].k = k_dim; G.kda[layer].v = v_dim;
+    G.kda[layer].kernel = kernel;
+    return 1;
+}
+
+/* Device -> host for the two segment-migration spans. The only place the host
+ * copies are refreshed while the knob is on. */
+int coli_vk_kda_sync(int layer, float *state, float *window) {
+    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (state)  memcpy(state,  G.kda[layer].state_p,  G.kda[layer].sbytes);
+    if (window) memcpy(window, G.kda[layer].window_p, G.kda[layer].wbytes);
+    return 1;
+}
+
+/* One token through one layer. qkv/gate/beta come from the host in this
+ * standalone form (Stage 1 of the spec and the self-test); only `out` returns. */
+int coli_vk_kda_step(int layer, const float *qkv, const float *gate,
+                     const float *beta, float norm_eps, float *out) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
+    const size_t width = (size_t)heads * (size_t)K;
+    const size_t qb = 3u * width * sizeof(float), gb = width * sizeof(float);
+    const size_t bb = (size_t)heads * sizeof(float), ob = (size_t)heads * V * sizeof(float);
+    if (!scratch_reserve(&G.kda_qkv, qb) || !scratch_reserve(&G.kda_gate, gb) ||
+        !scratch_reserve(&G.kda_beta, bb) ||
+        !scratch_reserve_mt(&G.kda_out, ob, G.memtype_cached)) return 0;
+    memcpy(G.kda_qkv.ptr, qkv, qb);
+    memcpy(G.kda_gate.ptr, gate, gb);
+    memcpy(G.kda_beta.ptr, beta, bb);
+
+    VkDescriptorBufferInfo bi[7] = {
+        {.buffer = G.kda[layer].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_qkv.buf,       .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_gate.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_beta.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_out.buf,       .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[7];                     /* wr_desc caps at 6; local here */
+    for (int i = 0; i < 7; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_kda,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 7, w, 0, NULL);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "kda resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "kda beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kda);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kda, 0, 1, &G.dset_kda, 0, NULL);
+    struct PCK pc = {heads, K, V, G.kda[layer].kernel, norm_eps};
+    vkCmdPushConstants(G.cmd, G.plyt_kda, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "kda endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "kda resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kda queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] kda fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    memcpy(out, G.kda_out.ptr, ob);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* shared command buffer clobbered */
+    return 1;
+}
+
 /* q-prep chain: [q_a + kv_a pair] -> rmsnorm(q_latent) -> [q_b], recorded in ONE
  * command buffer with compute barriers — one submit+fence where the engine paid
  * three (the middle CPU norm forced two roundtrips). Only q [S,Oqb] and the kv
@@ -2034,6 +2152,7 @@ void coli_vk_shutdown(void) {
 // ---- standalone GPU-vs-CPU validation + microbench --------------------------
 #include <math.h>
 #include <time.h>
+#include "delta_attention.h"   /* coli_kda_step: the CPU reference for run_kda (G12) */
 
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9; }
@@ -2467,6 +2586,76 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
     return mq > 1e-2f || mk > 1e-3f;
 }
 
+/* KDA recurrence vs coli_kda_step, N consecutive steps from the same state.
+ * Stage 1 of G12-KDA-GPU-SPEC-2026-09-05.md: the point is not one step's error
+ * but whether it COMPOUNDS -- the state is recurrent, so a shader that is
+ * merely close diverges over a conversation. Gate: max rel err <= 1e-5 on the
+ * output every step, and on the whole state at the end. */
+static int run_kda(int slot, int heads, int k_dim, int v_dim, int kernel, int steps) {
+    const size_t width = (size_t)heads * k_dim;
+    const size_t ns = (size_t)heads * k_dim * v_dim, nw = 3 * width * kernel;
+    float *st_g = calloc(ns, 4), *st_c = calloc(ns, 4);
+    float *wi_g = calloc(nw, 4), *wi_c = calloc(nw, 4);
+    float *cw = malloc(nw * 4), *qkv = malloc(3 * width * 4);
+    float *gate = malloc(width * 4), *beta = malloc((size_t)heads * 4);
+    float *og = malloc((size_t)heads * v_dim * 4), *oc = malloc((size_t)heads * v_dim * 4);
+    float *scratch = malloc((size_t)coli_kda_scratch_floats(heads, k_dim, v_dim) * 4);
+    for (size_t i = 0; i < nw; i++) cw[i] = (rand() % 2000 - 1000) / 4000.0f;
+    for (size_t i = 0; i < ns; i++) { float v = (rand() % 2000 - 1000) / 8000.0f; st_g[i] = st_c[i] = v; }
+    const float eps = 1e-6f;
+
+    if (!coli_vk_kda_init(slot, heads, k_dim, v_dim, kernel, st_g, wi_g, cw)) {
+        printf("kda unavailable (kda_step.spv missing? shape unsupported?)\n");
+        free(st_g); free(st_c); free(wi_g); free(wi_c); free(cw); free(qkv);
+        free(gate); free(beta); free(og); free(oc); free(scratch); return 1;
+    }
+    float worst_out = 0;
+    int bad_step = -1;
+    for (int s = 0; s < steps; s++) {
+        for (size_t i = 0; i < 3 * width; i++) qkv[i] = (rand() % 2000 - 1000) / 1000.0f;
+        for (size_t i = 0; i < width; i++)  gate[i] = -(rand() % 100) / 400.0f;   /* log-decay < 0 */
+        for (int h = 0; h < heads; h++)     beta[h] = (rand() % 1000) / 1000.0f;
+        if (!coli_vk_kda_step(slot, qkv, gate, beta, eps, og)) { printf("kda step failed\n"); break; }
+        coli_kda_step(oc, st_c, wi_c, qkv, cw, gate, beta, heads, k_dim, v_dim, kernel, eps, scratch);
+        float m = 0;
+        for (size_t i = 0; i < (size_t)heads * v_dim; i++) {
+            float d = fabsf(og[i] - oc[i]) / (fabsf(oc[i]) + 1e-3f);
+            if (d > m) m = d;
+        }
+        if (m > worst_out) { worst_out = m; }
+        if (m > 1e-5f && bad_step < 0) bad_step = s;
+        /* the decisive question is whether error COMPOUNDS or saturates: the
+         * decay alpha<1 should make an error introduced at step s fade, but
+         * that is an assertion until the curve is printed. */
+        if (s == 99 || s == 199 || s == 399 || s == 799 || s == 1599 || s == steps - 1) {
+            float sd = 0;
+            for (size_t i = 0; i < ns; i++) {
+                float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+                if (d > sd) sd = d;
+            }
+            /* st_g is stale until synced; pull it for the checkpoint only */
+            coli_vk_kda_sync(slot, st_g, NULL);
+            sd = 0;
+            for (size_t i = 0; i < ns; i++) {
+                float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+                if (d > sd) sd = d;
+            }
+            printf("    step %5d: out %.3g  state %.3g\n", s + 1, m, sd);
+        }
+    }
+    coli_vk_kda_sync(slot, st_g, wi_g);
+    float ms = 0;
+    for (size_t i = 0; i < ns; i++) {
+        float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+        if (d > ms) ms = d;
+    }
+    printf("kda h=%d k=%d v=%d ker=%d steps=%d | max rel: out %.3g (first>1e-5 at step %d), state %.3g\n",
+           heads, k_dim, v_dim, kernel, steps, worst_out, bad_step, ms);
+    free(st_g); free(st_c); free(wi_g); free(wi_c); free(cw); free(qkv);
+    free(gate); free(beta); free(og); free(oc); free(scratch);
+    return worst_out > 1e-5f || ms > 1e-5f;
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -2548,6 +2737,11 @@ int main(int argc, char **argv) {
     bad |= run_expert_group(2, 6144, 2048, 32);
     /* int3-g64 expert group: correctness + the 0.86x-bytes throughput question.
      * count=1 included — it is the SHARED-expert path shape in the engine. */
+    /* G12 Stage 1: the KDA recurrence at GLM's shape, and the drift over a
+     * conversation's worth of steps. 34 layers x 128 tokens is ~4400 steps a
+     * run; 1000 is enough to see compounding if there is any. */
+    bad |= run_kda(40, 64, 128, 128, 4, 4000);       /* GLM-5.3 KDA shape, past a full generation */
+    bad |= run_kda(41, 8, 64, 64, 4, 200);           /* small shape, odd occupancy */
     bad |= run_qprep(1, 1, 6144, 1536, 576, 16384);   /* GLM q_a/kv_a/q_b decode shapes */
     bad |= run_qprep(1, 11, 6144, 1536, 576, 16384);  /* prefill batch */
     bad |= run_qprep(1, 2, 6144, 1536, 576, 16384);   /* S=2 (MTP verify) */

@@ -1,9 +1,12 @@
 #version 450
 // KDA gated-delta recurrence: one token through one layer, on the GPU.
 // Mirrors coli_kda_step() in c/delta_attention.h element for element and in the
-// same order per element; it is NOT bit-identical (GLSL exp vs libm expf, and a
-// tree reduction for the q/k norms where the CPU accumulates sequentially), so
-// it ships behind COLI_KDA_GPU and is gated by a drift oracle, not a diff.
+// same order per element; it is NOT bit-identical, so it ships behind
+// COLI_KDA_GPU and is gated by a drift oracle rather than a diff. The
+// divergence is dominated by GLSL exp() vs libm expf() -- MEASURED, by matching
+// the CPU's norm-reduction order exactly and finding it changed nothing (see
+// the note on block_sum). Removing it would mean reimplementing expf's range
+// reduction in GLSL: slower, and not worth it.
 //
 // Mapping: ONE WORKGROUP PER HEAD, thread t owns output element v = t.
 //   - the 128x128 state tile is NOT staged in LDS. On RDNA3 the tile is exactly
@@ -58,6 +61,13 @@ float conv_channel(int ch, int KER) {
     return silu(sum);
 }
 
+// Tree-reduce the q/k norm sums. This does NOT match the CPU's sequential
+// accumulation order, and that was measured rather than assumed: replicating
+// the CPU order exactly (one thread, 256 serial adds, seeded with norm_eps)
+// moved the 1260-position logit cosine from 0.9999220 to 0.9999218 -- nothing --
+// while costing 3.6% on the step (0.168 -> 0.174 ms/call). The reduction is not
+// where the divergence lives; GLSL exp() vs libm expf() is, ~512 calls per head
+// per step between the conv SiLU and the decay. So: keep the fast reduction.
 float block_sum(float v, int tid) {
     red[tid] = v;
     barrier();
@@ -87,9 +97,7 @@ void main() {
     if (tid < V) val = conv_channel(2 * width + h * V + tid, KER);
     barrier();
 
-    // ---- q/k RMS norms. The CPU seeds both sums with norm_eps and accumulates
-    // sequentially; this reduces as a tree, which is the main source of the
-    // ULP-level divergence the drift oracle measures. ----
+    // ---- q/k RMS norms (tree-reduced; see block_sum for why that is fine) ----
     float qacc = 0.0, kacc = 0.0;
     for (int i = tid; i < K; i += 128) { qacc += sq[i] * sq[i]; kacc += sk[i] * sk[i]; }
     float qsum = block_sum(qacc, tid);

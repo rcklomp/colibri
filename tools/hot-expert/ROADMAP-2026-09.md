@@ -56,7 +56,7 @@ from the original plan.
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
 | G10 | **DONE** 09-05 (record §G10) — parallelised the ~400k-MAC mix and the destination×column combine over independent rows/columns, each one's own reduction untouched (G7's pattern). **The malloc removal did not survive contact**: dropping `coli_hc_pre`'s two per-call `malloc`s needed `hc`'s range knowable at compile time, which measurably changed GCC's rounding in the small hc-bounded reductions (~1.9e-4 on `last_logits`, `teacher_forcing` unaffected) — bisected across five different compiler-flag mitigations, none restored bit-identity; **kept the mallocs, shipped the parallelism**. `[OPTIME] hc+norm` 0.393 → **0.097 ms/site** (4.05×). Rotating 2.33/2.35 → **2.60/2.75**. Bit-identical both prompts. Shared header (DeepSeek V4): rebuilt clean, not re-measured (no rig checkpoint) | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token; beat it (−26.6 ms/token measured, +11–17% gate) | done | Sonnet | bit-identical: **met** (mallocs kept); tok/s vs G9: **met** (+11–17%) |
 | G11 | CPU int4 expert kernel `matmul_i4_grouped`: it streams 2.19 GB/token at 19 GB/s on 8 threads against 70.9 GB/s DRAM — ALU/decode-bound at 27% of bandwidth, Qwen's pre-F16C diagnosis | G3: **115 ms/token, the largest single bucket** (31%) | −60 to −80 ms/token | 2–3 days | Opus | teacher_forcing + last_logits vs pristine; `[PROF] cpu` and `[OPTIME] ffn_moe`; rotating median |
-| G12 | **BLOCKED** 09-05, **skip, don't fund now** (record §G12) — checked before writing anything: `ko`'s input (`normed`) only exists after `coli_kda_step` + norm/gate, both CPU, both strictly between the projections and `ko` in the same token/layer. Folding into one submit needs the recurrence *on the GPU* — a real shader, not a plumbing port. The G9-style workaround (fold with independent work) doesn't apply either: `tokens=1` in decode (confirmed) and each layer feeds the next via the residual stream, so there is no independent GPU work to overlap `ko`'s wait with. Ruled out the one alternative that would have been pure plumbing (descriptor/cmd-buffer cache clobbering from the interleaved batched path) via a `VK_PROF=1` diagnostic: rebind+re-record are 0.61+1.24 µs/call, negligible; submit+wait (23.1+220.7 µs/call) is the real, unavoidable-without-a-kernel cost. **This is not a new question**: `G4-KDA-SPEC-2026-09-04.md` already priced this exact kernel (~9 ms/token for 2–4 days, trigger "revisit only after items 1–6 of the G3 list are done, if KDA is then the largest remaining bucket") — G10 and G11 (two of those six) are still not started, so the trigger hasn't been reached. Decided: skip rather than re-ask Fable now; re-check at the post-G9/G10 re-profile milestone | G4 §sub-split: proj 0.660 + ko 0.400 ms/call are submits, 47% of KDA before the fix and 66% of what remains | −0.4 ms/call ≈ −14 ms/token, **not reachable this way** | n/a — needs a GPU kernel to be real | Opus (if the trigger is ever reached) | not a Sonnet item; tied to the same trigger as the original KDA-shader rejection |
+| G12 | **BLOCKED** 09-05, **skip, don't fund now** (record §G12) — checked before writing anything: `ko`'s input (`normed`) only exists after `coli_kda_step` + norm/gate, both CPU, both strictly between the projections and `ko` in the same token/layer. Folding into one submit needs the recurrence *on the GPU* — a real shader, not a plumbing port. The G9-style workaround (fold with independent work) doesn't apply either: `tokens=1` in decode (confirmed) and each layer feeds the next via the residual stream, so there is no independent GPU work to overlap `ko`'s wait with. Ruled out the one alternative that would have been pure plumbing (descriptor/cmd-buffer cache clobbering from the interleaved batched path) via a `VK_PROF=1` diagnostic: rebind+re-record are 0.61+1.24 µs/call, negligible; submit+wait (23.1+220.7 µs/call) is the real, unavoidable-without-a-kernel cost. **This is not a new question**: `G4-KDA-SPEC-2026-09-04.md` already priced this exact kernel (~9 ms/token for 2–4 days, trigger "revisit only after items 1–6 of the G3 list are done, if KDA is then the largest remaining bucket") — G11 (one of those six) is still not started, so the trigger hasn't been reached — G10 has since landed. Decided: skip rather than re-ask Fable now; re-check at the post-G9/G10 re-profile milestone, due now that both have landed | G4 §sub-split: proj 0.660 + ko 0.400 ms/call are submits, 47% of KDA before the fix and 66% of what remains | −0.4 ms/call ≈ −14 ms/token, **not reachable this way** | n/a — needs a GPU kernel to be real | Opus (if the trigger is ever reached) | not a Sonnet item; tied to the same trigger as the original KDA-shader rejection |
 
 Target for the track, rewritten from the profile: G3 measured 373 ms per
 decode token fresh-process (585 ms rotating, G2's 1.71 tok/s). G4 and
@@ -195,10 +195,10 @@ by guess; where a position is a judgment call rather than a number, it says so.
    kernel, Opus) to actually share a submit. Not escalated to Fable —
    `G4-KDA-SPEC-2026-09-04.md` already priced this exact kernel and set
    its trigger ("revisit only after items 1–6 of the G3 list are done, if
-   KDA is then the largest remaining bucket"); G10 and G11 aren't done
-   yet, so the trigger isn't reached. Re-check at the post-G9/G10
-   re-profile milestone below, not before. Nothing shipped, no code
-   changed. G10 does not depend on this.
+   KDA is then the largest remaining bucket"); G11 alone isn't done yet
+   (G10 has since landed), so the trigger isn't reached. The post-G9/G10
+   re-profile milestone below is now due — check there for real, not by
+   re-deriving it here. Nothing shipped, no code changed.
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.
    Bit-identical, but only after reverting the malloc-removal half of the
@@ -244,12 +244,12 @@ with two speeds, not a one-line reminder:
   needed this; assume the next ones will too.
 - **Expensive, at milestones (Opus — profiling and its interpretation, same
   tier as G3 itself):** a fresh `perf record` flat profile, repeated in
-  full. Two are already scheduled: **before G11** (item 6 above — two large
+  full. Two are scheduled: **before G11** (item 7 above — two large
   single-threaded buckets, router and MLA, are gone since G3's capture, and
-  the 60.8%-barrier-spin picture almost certainly moved with them) and
-  **once more after G9 and G10 land** (G12 is settled, skipped, not
-  pending — see above), before ordering G5 against G11
-  for real rather than on G3-era bucket sizes.
+  the 60.8%-barrier-spin picture almost certainly moved with them) — **due
+  now, since G9 and G10 have both landed** (G12 is settled, skipped, not
+  pending — see above) — and once more after G11 itself lands, before
+  ordering G5 against it for real rather than on G3-era bucket sizes.
 
 Every figure in this document comes from a machine where 69% of the decode
 token was single-threaded when G3 was taken. Fix several of those buckets

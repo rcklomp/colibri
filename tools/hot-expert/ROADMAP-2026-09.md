@@ -242,7 +242,8 @@ with two speeds, not a one-line reminder:
   full. Two are already scheduled: **before G11** (item 6 above — two large
   single-threaded buckets, router and MLA, are gone since G3's capture, and
   the 60.8%-barrier-spin picture almost certainly moved with them) and
-  **once more after G9/G12/G10 all land**, before ordering G5 against G11
+  **once more after G9 and G10 land** (G12 is settled, skipped, not
+  pending — see above), before ordering G5 against G11
   for real rather than on G3-era bucket sizes.
 
 Every figure in this document comes from a machine where 69% of the decode

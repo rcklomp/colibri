@@ -315,8 +315,9 @@ static int vk_tile_env(void) {
 #define VK_TILE_R 8
 /* rows -> workgroup rows for the tiled pipeline */
 #define VK_TILES(S) ((uint32_t)(((S) + VK_TILE_R - 1) / VK_TILE_R))
-static inline int vk_tile_ok(VkPipeline tile, int fmt, int S) {
-    return tile != VK_NULL_HANDLE && S > 1 && (fmt == 1 || fmt == 4);
+static inline int vk_tile_ok4(VkPipeline tile, int fmt, int S, int I) {
+    /* P4c: the tiled shaders read x as vec4 and whole packed words */
+    return tile != VK_NULL_HANDLE && S > 1 && (fmt == 1 || fmt == 4) && (I % 8) == 0;
 }
 
 /* "…/qmatmul.spv" -> "…/qmatmul<suffix>" (sibling of the main shader). */
@@ -721,7 +722,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        const int tiled = vk_tile_ok(G.pipe_t, fmt, S);   /* P4: S rows per weight read */
+        const int tiled = vk_tile_ok4(G.pipe_t, fmt, S, I);   /* P4: S rows per weight read */
         vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tiled ? G.pipe_t : G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
@@ -891,7 +892,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    const int tiled_gu = vk_tile_ok(G.pipe_gu_t, fmt, S);
+    const int tiled_gu = vk_tile_ok4(G.pipe_gu_t, fmt, S, D);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tiled_gu ? G.pipe_gu_t : G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs};   // PC.I = input D, PC.O = moe_inter I
@@ -990,7 +991,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     {
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok(G.pipe_gu_t, fmt, rows[c]) ? G.pipe_gu_t : G.pipe_gu;
+            VkPipeline want = vk_tile_ok4(G.pipe_gu_t, fmt, rows[c], D) ? G.pipe_gu_t : G.pipe_gu;
             if (want != cur) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
             struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
@@ -1003,7 +1004,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     {
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok(G.pipe_t, dfmt, rows[c]) ? G.pipe_t : G.pipe;
+            VkPipeline want = vk_tile_ok4(G.pipe_t, dfmt, rows[c], I) ? G.pipe_t : G.pipe;
             if (want != cur) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
             struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
@@ -1351,7 +1352,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok(G2.pipe_gu_t, fmt, rows[c]) ? G2.pipe_gu_t : G2.pipe_gu;
+            VkPipeline want = vk_tile_ok4(G2.pipe_gu_t, fmt, rows[c], D) ? G2.pipe_gu_t : G2.pipe_gu;
             if (want != cur) { vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
             struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
             vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
@@ -1363,7 +1364,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok(G2.pipe_t, dfmt, rows[c]) ? G2.pipe_t : G2.pipe;
+            VkPipeline want = vk_tile_ok4(G2.pipe_t, dfmt, rows[c], I) ? G2.pipe_t : G2.pipe;
             if (want != cur) { vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
             struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
             vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt, 0, 1, &G2.dn[c], 0, NULL);
@@ -1701,7 +1702,7 @@ static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok(G3.pipe_gu_t, fmt, rows[c]) ? G3.pipe_gu_t : G3.pipe_gu;
+            VkPipeline want = vk_tile_ok4(G3.pipe_gu_t, fmt, rows[c], D) ? G3.pipe_gu_t : G3.pipe_gu;
             if (want != cur) { vkCmdBindPipeline(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
             struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
             vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt_gu, 0, 1, &G3.gu[c], 0, NULL);
@@ -1713,7 +1714,7 @@ static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok(G3.pipe_t, dfmt, rows[c]) ? G3.pipe_t : G3.pipe;
+            VkPipeline want = vk_tile_ok4(G3.pipe_t, dfmt, rows[c], I) ? G3.pipe_t : G3.pipe;
             if (want != cur) { vkCmdBindPipeline(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
             struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
             vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt, 0, 1, &G3.dn[c], 0, NULL);
@@ -1896,7 +1897,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    const int tiled_p = vk_tile_ok(G.pipe_t, fmt, S);
+    const int tiled_p = vk_tile_ok4(G.pipe_t, fmt, S, I);
     const uint32_t ys = tiled_p ? VK_TILES(S) : (uint32_t)S;
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tiled_p ? G.pipe_t : G.pipe);
     struct PC pc1 = {fmt, S, I, O1, t1->rowWords, t1->gs};

@@ -1,13 +1,13 @@
 #version 450
-// P4 / P4b: qmatmul_gate_up.comp for a TILE of R input rows per workgroup,
-// activations staged in shared memory in 32 KB slices. See qmatmul_tile.comp
-// for the design and the bit-identity argument; this is the fused
-// gate+up+silu variant with two weight streams. Formats 1 and 4 only; the
-// host dispatches it only for those and only for an expert with > 1 row.
+// P4: qmatmul_gate_up.comp for a TILE of R input rows per workgroup. See
+// qmatmul_tile.comp for the design and the bit-identity argument; this is the
+// fused gate+up+silu variant with the same two weight streams as the per-row
+// shader. Formats 1 (int8, per-row scales) and 4 (grouped int4) only; the host
+// dispatches it only for those and only when an expert has more than one row.
 #extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 0) readonly buffer X  { vec4 x4[]; };   // v3: 16-byte loads; host gates I % 8 == 0
 layout(std430, binding = 1) readonly buffer WG { uint  wg[]; };
 layout(std430, binding = 2) readonly buffer SG { float gscale[]; };
 layout(std430, binding = 3) readonly buffer WU { uint  wu[]; };
@@ -22,8 +22,6 @@ layout(push_constant) uniform P {
 } p;
 
 const int R = 8;
-const int SLICE = 1024;
-shared float xsh[R * SLICE];
 
 float i8(uint w, int l) { int b = int((w >> (uint(l) * 8u)) & 0xffu); if (b >= 128) b -= 256; return float(b); }
 float i4(uint w, int l) { return float(int((w >> (uint(l) * 4u)) & 0xfu) - 8); }
@@ -39,63 +37,53 @@ void main() {
     int nsg    = nth / sgsize;
     int stride = int(gl_NumWorkGroups.x) * nsg;
 
-    for (int ob = int(gl_WorkGroupID.x) * nsg; ob < p.O; ob += stride) {   // uniform
-        int o = ob + sg;
-        bool live = o < p.O;
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
         uint rb = uint(o) * uint(p.rowWords);
         float g[R], u[R];
         for (int r = 0; r < R; r++) { g[r] = 0.0; u[r] = 0.0; }
-
-        for (int sb = 0; sb < p.I; sb += SLICE) {
-            int sl = min(SLICE, p.I - sb);
-            barrier();
-            for (int t = tid; t < rows * sl; t += nth) {
-                int r = t / sl, j = t - r * sl;
-                xsh[r * SLICE + j] = x[(s0 + r) * p.I + sb + j];
-            }
-            barrier();
-            if (live) {
-                if (p.fmt == 1) {
-                    int wb = sb / 4, we = (sb + sl + 3) / 4;
-                    for (int wi = wb + lane; wi < we; wi += sgsize) {
-                        uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 4, il = i0 - sb;
-                        for (int k = 0; k < 4; k++) {
-                            int i = i0 + k;
-                            if (i < p.I) {
-                                float gv = i8(gp, k), uv = i8(upk, k);
-                                for (int r = 0; r < R; r++)
-                                    if (r < rows) { float xv = xsh[r * SLICE + il + k]; g[r] += xv * gv; u[r] += xv * uv; }
-                            }
-                        }
+        if (p.fmt == 1) {
+            int words = (p.I + 3) / 4;
+            int I4 = p.I / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)];
+                float g0 = i8(gp, 0), g1 = i8(gp, 1), g2 = i8(gp, 2), g3 = i8(gp, 3);
+                float u0 = i8(upk, 0), u1 = i8(upk, 1), u2 = i8(upk, 2), u3 = i8(upk, 3);
+                for (int r = 0; r < R; r++) {
+                    if (r < rows) {
+                        vec4 xv = x4[(s0 + r) * I4 + wi];
+                        g[r] += xv.x * g0; u[r] += xv.x * u0; g[r] += xv.y * g1; u[r] += xv.y * u1;
+                        g[r] += xv.z * g2; u[r] += xv.z * u2; g[r] += xv.w * g3; u[r] += xv.w * u3;
                     }
-                } else { // fmt 4
-                    int ng = (p.I + p.gs - 1) / p.gs;
-                    uint sbase = uint(o) * uint(ng);
-                    int wb = sb / 8, we = (sb + sl + 7) / 8;
-                    for (int wi = wb + lane; wi < we; wi += sgsize) {
-                        uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 8, il = i0 - sb;
-                        float ga[R], ua[R];
-                        for (int r = 0; r < R; r++) { ga[r] = 0.0; ua[r] = 0.0; }
-                        for (int k = 0; k < 8; k++) {
-                            int i = i0 + k;
-                            if (i < p.I) {
-                                float gv = i4(gp, k), uv = i4(upk, k);
-                                for (int r = 0; r < R; r++)
-                                    if (r < rows) { float xv = xsh[r * SLICE + il + k]; ga[r] += xv * gv; ua[r] += xv * uv; }
-                            }
-                        }
-                        float sc_g = gscale[sbase + uint(i0 / p.gs)], sc_u = uscale[sbase + uint(i0 / p.gs)];
-                        for (int r = 0; r < R; r++) { g[r] += ga[r] * sc_g; u[r] += ua[r] * sc_u; }
+                }
+            }
+        } else { // fmt 4
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            int I4 = p.I / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 8;
+                float g0 = i4(gp, 0), g1 = i4(gp, 1), g2 = i4(gp, 2), g3 = i4(gp, 3);
+                float g4 = i4(gp, 4), g5 = i4(gp, 5), g6 = i4(gp, 6), g7 = i4(gp, 7);
+                float u0 = i4(upk, 0), u1 = i4(upk, 1), u2 = i4(upk, 2), u3 = i4(upk, 3);
+                float u4 = i4(upk, 4), u5 = i4(upk, 5), u6 = i4(upk, 6), u7 = i4(upk, 7);
+                float sc_g = gscale[sb + uint(i0 / p.gs)], sc_u = uscale[sb + uint(i0 / p.gs)];
+                for (int r = 0; r < R; r++) {
+                    if (r < rows) {
+                        vec4 xa = x4[(s0 + r) * I4 + wi * 2], xb = x4[(s0 + r) * I4 + wi * 2 + 1];
+                        float ga = 0.0, ua = 0.0;
+                        ga += xa.x * g0; ua += xa.x * u0; ga += xa.y * g1; ua += xa.y * u1;
+                        ga += xa.z * g2; ua += xa.z * u2; ga += xa.w * g3; ua += xa.w * u3;
+                        ga += xb.x * g4; ua += xb.x * u4; ga += xb.y * g5; ua += xb.y * u5;
+                        ga += xb.z * g6; ua += xb.z * u6; ga += xb.w * g7; ua += xb.w * u7;
+                        g[r] += ga * sc_g; u[r] += ua * sc_u;
                     }
                 }
             }
         }
-        if (live) {
-            for (int r = 0; r < R; r++) {
-                float gt = subgroupAdd(g[r]), ut = subgroupAdd(u[r]);
-                if (p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }
-                if (lane == 0 && r < rows) hid[(s0 + r) * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;
-            }
+        for (int r = 0; r < R; r++) {
+            float gt = subgroupAdd(g[r]), ut = subgroupAdd(u[r]);
+            if (p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }
+            if (lane == 0 && r < rows) hid[(s0 + r) * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;
         }
     }
 }

@@ -1206,24 +1206,30 @@ static void kda_layer_rows(const Cfg *c, const GLayer *l, const float *x, int S,
         for (int h = 0; h < H; h++) bt[h] = sigmoidf_(bt[h]);
     }
     if (optime_on()) { g_kt_decay += optime_now() - _t1; }
-    /* C */
+    /* C -- the state stays where it lives. On the device (gpu != 0) each
+     * token is one coli_vk_kda_step submit, the same shader and the same
+     * round-trip count as the per-token chain; reading the 4 MB state back
+     * per layer per chunk instead (kda_sync from the host-visible arena is
+     * a memcpy from write-combined memory) cost 11 s on a 21-token prompt
+     * (p2c gate 2026-09-06: 3.1 s -> 14.6 s). On the CPU (gpu == 0) it is
+     * the per-token code in the per-token order: bit-identical. */
     const double _t2 = optime_on() ? optime_now() : 0.0;
-#ifdef COLI_VULKAN
-    if (gpu) coli_vk_kda_sync(layer, state, window);
-#else
+#ifndef COLI_VULKAN
     (void)layer; (void)gpu;
 #endif
     for (int t = 0; t < S; t++) {
         memcpy(qkv,         q + (size_t)t * P, (size_t)P * sizeof(float));
         memcpy(qkv + P,     k + (size_t)t * P, (size_t)P * sizeof(float));
         memcpy(qkv + 2 * P, v + (size_t)t * P, (size_t)P * sizeof(float));
+#ifdef COLI_VULKAN
+        if (gpu && coli_vk_kda_step(layer, qkv, decay + (size_t)t * P, beta + (size_t)t * H,
+                                    1e-6f, core + (size_t)t * P))
+            continue;   /* state and window advanced on the device */
+#endif
         coli_kda_step(core + (size_t)t * P, state, window, qkv, l->conv,
                       decay + (size_t)t * P, beta + (size_t)t * H,
                       H, D, D, c->conv_k, 1e-6f, scratch);
     }
-#ifdef COLI_VULKAN
-    if (gpu) coli_vk_kda_upload(layer, state, window);
-#endif
     if (optime_on()) { g_kt_step += optime_now() - _t2; }
     /* D */
     const double _t3 = optime_on() ? optime_now() : 0.0;

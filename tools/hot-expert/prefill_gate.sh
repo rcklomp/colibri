@@ -79,18 +79,30 @@ for side in pristine candidate; do
   python3 "$HERE/ttft_serve.py" --engine "$bin" --sizes 30,300,1000 --repeat 2 --warm \
       --tag "$TAG-$side" --json "$OUT/ttft.jsonl" | tee "$OUT/ttft_$side.txt" | grep -v "^\[resid"
 done
-python3 - "$OUT/ttft.jsonl" "$TAG" <<'PY'
+# MIN_SPEEDUP (default 1.0): the candidate's median TTFT speedup at EVERY size
+# must reach it and its decode sanity window must stay within 10% of the
+# pristine's, or the gate exits 3. p2c (2026-09-06) passed the oracle and was
+# 0.65x on the serve path; a chain that only checked the oracle served it.
+python3 - "$OUT/ttft.jsonl" "$TAG" "${MIN_SPEEDUP:-1.0}" <<'PY' && SP=0 || SP=3
 import json, sys, statistics as st
 recs=[json.loads(l) for l in open(sys.argv[1])]
-tag=sys.argv[2]
+tag=sys.argv[2]; need=float(sys.argv[3]); ok=True
 def rows(side): return [r for r in recs if r["tag"]==f"{tag}-{side}" and r["kind"]=="ttft" and r["ttft_s"]]
-print(f"{'size':>6} {'pristine ttft (both runs)':>28} {'candidate ttft (both runs)':>28} {'speedup':>8}")
+def fmt(rs): return " / ".join("%.1fs" % r["ttft_s"] for r in rs)
+print("%6s %28s %28s %8s %12s" % ("size", "pristine ttft (both runs)", "candidate ttft (both runs)", "speedup", "decode p/c"))
 for size in sorted({r["target"] for r in rows("pristine")}):
-    p=[r["ttft_s"] for r in rows("pristine") if r["target"]==size]
-    c=[r["ttft_s"] for r in rows("candidate") if r["target"]==size]
+    p=[r for r in rows("pristine") if r["target"]==size]
+    c=[r for r in rows("candidate") if r["target"]==size]
     if p and c:
-        print(f"{size:>6} {' / '.join(f'{x:.1f}s' for x in p):>28} {' / '.join(f'{x:.1f}s' for x in c):>28} {st.median(p)/st.median(c):7.2f}x")
+        sp=st.median(x["ttft_s"] for x in p)/st.median(x["ttft_s"] for x in c)
+        dp=st.median(x.get("decode_tps") or 0 for x in p); dc=st.median(x.get("decode_tps") or 0 for x in c)
+        print("%6d %28s %28s %7.2fx %5.1f/%-5.1f" % (size, fmt(p), fmt(c), sp, dp, dc))
+        if sp < need or (dp > 0 and dc < 0.9 * dp): ok=False
+    else: ok=False
+print("speedup gate:", "PASS" if ok else "FAIL (need >= %gx at every size and decode within 10%%)" % need)
+sys.exit(0 if ok else 1)
 PY
 
-echo "=== prefill_gate $TAG: teacher_forcing $([ $TF = 0 ] && echo PASS || echo FAIL), logits $([ $LG = 0 ] && echo PASS || echo FAIL); outputs in $OUT"
-[ $TF = 0 ] && [ $LG = 0 ] && exit 0 || exit 1
+echo "=== prefill_gate $TAG: teacher_forcing $([ $TF = 0 ] && echo PASS || echo FAIL), logits $([ $LG = 0 ] && echo PASS || echo FAIL), speedup $([ $SP = 0 ] && echo PASS || echo FAIL); outputs in $OUT"
+[ $TF = 0 ] && [ $LG = 0 ] || exit 1
+exit $SP

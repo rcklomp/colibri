@@ -350,6 +350,7 @@ def main():
                "accept_s": (ev["accept"] - ev["submit"]) if ev["accept"] else None,
                "ttft_s": (ev["first"] - ev["submit"]) if ev["first"] else None,
                "gen": ev["ntok"], "cancelled": ev["cancelled"], "error": ev["error"],
+               "decode_tps": ((ev["ntok"] - 1) / (ev["done"] - ev["first"])) if ev["first"] and ev["ntok"] > 1 else None,
                "tools": bool(args.tools), "t": time.time()}
         records.append(rec)
         if args.json:

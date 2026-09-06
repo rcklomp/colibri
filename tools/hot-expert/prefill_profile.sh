@@ -26,7 +26,11 @@ if pgrep -x glm53 >/dev/null; then echo "REFUSED: a glm53 is running (one engine
 
 export OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close
 export COLI_VULKAN=1 COLI_VK_DEV2=auto COLI_VK_DEV3=auto
-export COLI_VK_SHADERS="$(dirname "$BIN")/shaders"
+# shaders live in the repo's c/shaders, not beside the binary (a pristine copy
+# in ~/bench ran without Vulkan on 2026-09-06 and produced CPU-only numbers)
+HERE=$(cd "$(dirname "$0")" && pwd)
+export COLI_VK_SHADERS="${COLI_VK_SHADERS:-$HERE/../../c/shaders}"
+[ -f "$COLI_VK_SHADERS/qmatmul.comp" ] || { echo "REFUSED: no shaders at $COLI_VK_SHADERS -- the run would be CPU-only"; exit 3; }
 export COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695
 export COLI_KDA_GPU=${COLI_KDA_GPU:-2}
 export COLI_TIMERS=1 GLM53_VERBOSE=1 GLM53_PREFILL_CHUNK=$CHUNK

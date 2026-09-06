@@ -131,6 +131,17 @@ def load_tools(path):
 
 
 # ---------------------------------------------------------------- engine mode
+def shaders_dir(exe):
+    """The compiled shaders live in the repo's c/shaders, not beside the binary:
+    a pristine copy in ~/bench ran WITHOUT Vulkan (p0self, 2026-09-06) and every
+    number it produced was a CPU-only number. Refuse rather than measure that."""
+    for d in (os.path.normpath(os.path.join(HERE, "..", "..", "c", "shaders")),
+              os.path.join(os.path.dirname(os.path.abspath(exe)), "shaders")):
+        if os.path.isfile(os.path.join(d, "qmatmul.comp")):
+            return d
+    sys.exit("REFUSED: no shaders directory found (c/shaders) -- the engine would run without Vulkan")
+
+
 def engine_env(exe):
     """The serving env (~/start_glm53.sh) for anything not already exported, so a
     bare invocation measures the configuration the gateway actually runs: 8
@@ -140,7 +151,7 @@ def engine_env(exe):
     d = {"OMP_NUM_THREADS": "8", "OMP_PLACES": "cores", "OMP_PROC_BIND": "close",
          "COLI_VULKAN": "1", "COLI_VK_DEV2": "auto", "COLI_VK_DEV3": "auto",
          "COLI_VK_EXPERTS2": "1695", "COLI_VK_EXPERTS3": "1695",
-         "COLI_VK_SHADERS": os.path.join(os.path.dirname(exe), "shaders"),
+         "COLI_VK_SHADERS": shaders_dir(exe),
          "COLI_KDA_GPU": "2",
          # the engine prints "REUSE <id> <reused> <prompt_tokens>" on stderr per
          # turn -- the authoritative answer to "did the prefix get reused?"

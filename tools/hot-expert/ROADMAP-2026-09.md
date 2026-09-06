@@ -37,19 +37,21 @@ from G3's 373.4 (**2.38× / 2.77×**) — re-profiled three times (**§RP1**,
 corrected by **§RP1-CORRECTION**, then **§RP2** and **§RP3**). Two figures
 exist because `COLI_KDA_GPU=2` (G12) is not bit-identical and ships off.
 
-**Read §RP3 before planning anything.** The leaders are KDA (53.4 knob-off) and
-the CPU int4 experts (38.6, and the leader knob-on at 28.6%), and *both are
-already blocked*: KDA is solved by G12 and merely not switched on, and the CPU
-experts are VRAM-bound rather than tier-bound, examined and declined twice.
-Everything below MLA is ≤ 11 ms/token, which puts a 30% win at ~2% of the
-token against a serving gate with a 3–4% noise floor.
+**Read §G14 and item 4f before planning anything.** RP3 called the two leading
+buckets blocked and recommended buying VRAM; that was wrong, and item 4f
+records why. The CPU int4 expert bucket (38.6 ms/token, and the leader knob-on
+at 28.6%) is **not** blocked — it is **~57% memory and ~43% arithmetic in situ**,
+and the arithmetic half has now been attacked to exhaustion (G14: everything
+faster than +10% changes the model's output). **The memory half is untouched,
+and `fmt=5` int3 experts attack it without new hardware — that is item 4h.**
+KDA remains solved-but-opt-in via G12.
 
-Status 2026-09-06: G0–G4, G7–G13 and three re-profiles (RP1, RP2, RP3) done;
-SPEC-PROBE answered no; G5/G6 open. **RP3 found nothing to reorder, and that
-is the finding**: every individually remaining item on this track is now worth
-less than the serving gate can resolve (record §RP3). Two profiles exist
+Status 2026-09-06: G0–G4, G7–G14 and three re-profiles (RP1, RP2, RP3) done;
+SPEC-PROBE answered no; G5/G6 open; **G15 (int3 experts) is next — item 4h**.
+RP3 found nothing to reorder and concluded the track was out of measurable
+items; **that conclusion was wrong and is corrected in 4f**. Two profiles exist
 because `COLI_KDA_GPU=2` ships off: **156.77 ms/token knob-off, 134.90
-knob-on**. The old header number (3.17
+knob-on** (both before G14's ~2.5%, which is opt-in). The old header number (3.17
 tok/s "fresh-process") is superseded twice over — G0 established the
 persistent baseline this track is actually gated on (1.65–1.66), and
 G2+G4+G7+G8+G9+G10 moved it to 2.60–2.75. G3 replaced the whole ordering
@@ -72,6 +74,7 @@ from the original plan.
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
 | G10 | **DONE** 09-05 (record §G10) — parallelised the ~400k-MAC mix and the destination×column combine over independent rows/columns, each one's own reduction untouched (G7's pattern). **The malloc removal did not survive contact**: dropping `coli_hc_pre`'s two per-call `malloc`s needed `hc`'s range knowable at compile time, which measurably changed GCC's rounding in the small hc-bounded reductions (~1.9e-4 on `last_logits`, `teacher_forcing` unaffected) — bisected across five different compiler-flag mitigations, none restored bit-identity; **kept the mallocs, shipped the parallelism**. `[OPTIME] hc+norm` 0.393 → **0.097 ms/site** (4.05×). Rotating 2.33/2.35 → **2.60/2.75**. Bit-identical both prompts. Shared header (DeepSeek V4): rebuilt clean, not re-measured (no rig checkpoint) | G3: 35 ms/token, 0.39 ms/site × 90 sites, single thread | −28 ms/token; beat it (−26.6 ms/token measured, +11–17% gate) | done | Sonnet | bit-identical: **met** (mallocs kept); tok/s vs G9: **met** (+11–17%) |
 | G11 | **PART 1 DONE** 09-05 (record §G11) — expert path fused: one OMP region with three worksharing constructs instead of three regions with a serial swiglu between, bit-identical, **−2.25 ms/token on `ffn_moe` (−3.2%)**, ~140 fewer OMP regions/token. **Part 2 (the kernel) is NOT worth doing as scoped** — see §RP1-CORRECTION. The bucket is **40.3 ms/token, not 74.8 and not 115**. Microbenchmarked before touching the engine (`g11_bench.c`, `g11_path.c`, both sized to defeat the 128 MB L3): the isolated kernel does 21.95 GB/s at 8 threads; a bit-trick nibble→float decode is *exactly* bit-identical but only 1.03×; a second accumulator breaks the FMA dependency chain for **1.30×** but is not bit-identical; four accumulators is worse than two. **Once the path is fused the faster kernel is worth only ~1.06×** — so nothing numerics-changing shipped | §RP1-CORRECTION: **40.3 ms/token, and no longer the largest bucket — KDA is, at 53.3** | part 1 delivered **−2.25 ms/token**; part 2 judged **not worth 2–3 days** for ~1.06× on a 40 ms bucket behind an env knob | part 1 done | Opus | bit-identical both prompts: **met**; `[PROF] cpu` −4.0% across 4 paired runs (fresh-process tok/s cannot resolve 1%: ±10% GPU-submit jitter) |
+| G14 | **DONE 09-06 (record §G14).** Four alternative int4 expert kernels, each measured *in the engine* against a pristine binary. Only the float one (bit-trick decode + 4 accumulators) preserved the output: **1.095×** on the CPU expert path, greedy text identical over 128 tokens, `teacher_forcing` exact over 1232 positions, `last_logits` relL2 3.0e-6 short. Ships as `GLM53_I4_FAST`, off by default (not bit-identical; §G10 set that bar). The three quantised-activation variants (int8 1.32×, int16 1.075×, mixed) **all changed the greedy text** and were removed — removal itself worth 4% on the survivor, 64 KB of dead stack arrays in a function called ~70×/token. **Two findings worth more than the kernel:** a probe can size throughput on synthetic data but *not accuracy* (bench said relL2 3.9e-3, engine said 0.144); and isolated-to-in-engine attenuation is 0.55–0.65×, so in situ this path is **~57% memory / 43% arithmetic**, not the ALU-bound thing §G3's isolated figure suggests | §G3's "27% of bandwidth"; §RP3's wrongly-blocked bucket (item 4f) | arithmetic half now exhausted; **memory half is item 4h** | 3 commits | Opus | knob OFF bit-identical: **met**; knob ON greedy identity: **met**; serving gate: below floor, not run |
 | G13 | **DONE 09-06 (record §G13).** Fused the shared expert's `mv(gate)`+`mv(up)` into one GPU submit via `coli_vk_matmul_pair` (already production code in `kimi_k3.c`). The routed-expert fused kernel was tried first and rejected: `qmatmul_gate_up.comp` computes `silu(gate)*up` with **no clamp**, and GLM-5.3's `swiglu_limit=10.0` is regularly exceeded — a pre-existing gap in the routed-expert GPU path, never caught before because no earlier change diffed a clamped and an unclamped computation of the same op; out of scope to fix here. `swiglu_clamped` and `down` stay unchanged. **3 submits/call → 2**, bit-identical (`--logits` exact on both G4 prompts, greedy text identical for 128 tokens). `[OPTIME] shared` 0.373 → **0.291 ms/call (−22%)**, ×42 = **−3.4 ms/token**, reproduced 3× within 1% | RP2: shared expert 14.2 ms/token in both knob positions, three round trips + a host round trip, called "round-trip-dominated" since §G3 | **−3.4 ms/token, delivered** | 1 commit | Sonnet | bit-identical: **met**; serving gate: **inconclusive at ~2.1% of the token (same class as G11 part 1), reported as such** |
 | G12 | **DONE 09-05 (record §G12 stages 1, 2a, 2b, 2c).** The KDA recurrence, its gating and its output norm run on dev0, and a layer's projections + recurrence + `ko` record into **one submit instead of two** (`COLI_KDA_GPU=2`). **`[OPTIME] kda` 1.48–1.57 → 0.93 ms/call — the < 1.0 gate is met**, repeating to three decimals; **−18.7 to −21.9 ms/token**, inside the spec's own −15 to −22 band; fresh-process +13.5%; **serving gate +11.7%** rotating (2.90 vs 2.595, paired alternating) with warm-identical agreeing at +11.1%. **The gate also found a shipping bug the numerics oracles could not**: `coli_vk_kda_init` kept the previous conversation's recurrence across sessions, so request N+1 of a warm engine continued request N — visible only as an *inverted* warm-identical column, because every oracle here runs one request per process (record §Stage 2c; `tools/hot-expert/tworeq.py` is now the oracle for that class). Greedy text identical through 128 decode tokens and 0 `teacher_forcing` mismatches across 1260 prefill positions. **Stays off by default**: the logit cosine is 0.99992 at 1260 positions and the cause is irreducible — GLSL `exp()` vs libm `expf()`, ~1.1M calls/token; matching the CPU's norm-reduction order exactly was tested and changed nothing (2.6e-7) while costing 3.6% | §RP1-CORRECTION: KDA was the largest bucket at 53.3 ms/token, 35.0 of it GPU submits | **−18.7 to −21.9 ms/token, delivered** (opt-in) | 3 commits | Opus | `kda` < 1.0 ms/call: **met at 0.93**; greedy identity: **met** |
 
@@ -299,29 +302,80 @@ by guess; where a position is a judgment call rather than a number, it says so.
    explained**, and to be re-checked at RP4 against a different change rather
    than theorised about now.
 
-4f. **The track has run out of items the gate can measure.** This is RP3's
-   real result and it is a decision the roadmap has to make rather than defer.
-   MLA is #3 in both positions (23.6 / 24.1) and already had G8; **everything
-   below it is ≤ 11 ms/token**, so a 30% win — the order G7, G10 and G13
-   actually achieved — is worth ~3 ms/token, about **2% of the token, against
-   a serving gate whose demonstrated noise floor is 3–4%** (§G13, §G11 part 1).
-   G13 was the last item big enough to justify a gate run, and even it came
-   back inconclusive. Three honest options, in the record:
+4f. ~~**The track has run out of items the gate can measure.**~~
+   **WRONG, and corrected on 09-06 — read this before trusting anything above
+   it.** RP3 concluded both leading buckets were blocked and recommended a VRAM
+   capacity change, i.e. buying hardware to escape the one problem this engine
+   exists to solve. Colibri's premise is a large MoE in RAM with only the hot
+   experts in VRAM; "the CPU expert path is VRAM-bound" is the **problem
+   statement**, not a terminus.
 
-   1. **Accept `[OPTIME]`-only validation** for further small items and demote
-      the serving gate to a regression check. Defensible — timers hold to ~1%
-      — but it ships changes whose end-to-end effect is asserted, not shown.
-   2. **Attack a blocked leader**, which for both of them means VRAM capacity,
-      not code. A fourth card or expert-density work unblocks the CPU expert
-      bucket (28.6% knob-on) *and* satisfies §SPEC-PROBE's reversal condition
-      in one move — the only remaining change on this box worth more than a
-      few percent.
-   3. **Switch to track Q.** Qwen3.8 is untouched, has never had a
-      G3-equivalent profile, and Q0/Q5 are a day between them.
+   The error was concrete and checkable: RP3 said that bucket had been
+   "examined and declined twice". It had not. §G11 part 2 declined three
+   *float-domain* variants of the existing algorithm and §SPEC-PROBE declined
+   speculative decoding, which is not that path at all. **Nobody had tried a
+   different algorithm** — while §G3 had been saying since the first profile
+   that `matmul_i4_grouped` is "ALU/decode-bound at 27% of bandwidth".
+   The lesson is narrower than "re-profile more often": **a bucket is only
+   blocked if what was declined is the same kind of thing as what is being
+   proposed.**
 
-   **Recommendation: 2 if the hardware budget allows it, otherwise 3.** Option
-   1 is the one to avoid drifting into by default — it is how a track starts
-   accumulating unfalsifiable wins.
+4g. ~~**G14 — a different algorithm for the CPU expert kernel.**~~ **DONE 09-06**
+   (record §G14). Four kernels built, each measured *in the engine* against a
+   pristine binary. Only one preserved the output:
+
+   | mode | isolated | in engine | greedy text | verdict |
+   |---|---:|---:|---|---|
+   | int8, `maddubs` | 1.7–2.3× | 1.32× | **differs** | rejected |
+   | int16, `madd_epi16` | — | 1.075× | **differs** | rejected |
+   | int8 gate/up, float down | — | — | **differs** | rejected |
+   | **float, bit-trick + 4 acc** | 1.26–1.65× | **1.095×** | **identical** | **shipped**, `GLM53_I4_FAST` |
+
+   GLM-5.3 does not tolerate quantised activations: one outlier in a group of
+   64 — the thing `swiglu_limit=10.0` exists to clamp — crushes the other 63.
+   The three rejected kernels were then **removed**, which was itself worth 4%
+   on the survivor (64 KB of dead stack arrays in a function called ~70× per
+   token). §G11 was right to decline this kernel and G14-PROBE's −16 ms/token
+   projection was wrong: it extrapolated an isolated microbenchmark.
+
+   **Two findings worth more than the kernel:**
+   - **A probe can size throughput on synthetic data; it cannot size accuracy.**
+     The microbenchmark reported relL2 3.9e−3 on uniform random data; the engine
+     showed 0.144. Instruction mix and memory traffic survive synthetic data;
+     the activation distribution does not.
+   - **In situ this path is much closer to memory-bound than §G3's isolated
+     figure implies.** Isolated-to-in-engine attenuation is 0.55–0.65×
+     consistently, because the engine streams **985 MB/token of cold expert
+     weights** out of mmap where the bench cycled 406 MB with cache hits.
+     Solving `time = mem + alu` from the two measured points puts the bucket at
+     roughly **43% arithmetic, 57% memory**.
+
+4h. **G15 — int3 experts. ← next, and it is in-premise.** If the bucket is bound
+   by streamed bytes, the lever is *fewer bytes*. `fmt=5` (int3-g64, 24 B per
+   64-group) is **already implemented** in `upload_tensor`, `scale_floats` and
+   the fused gate_up shader. An expert slot goes **13.5 → 10.5 MiB**, which does
+   two things at once:
+
+   - **22% fewer bytes streamed** per CPU expert. Worth only **1.14×** on the
+     bucket, not 1.22×, because just over half of it is memory — −4.8 ms/token.
+   - **~28% more experts resident** in the same 72 GB, so fewer activations
+     reach the CPU path at all. If the tier goes 79% → 84–86%, that is
+     **−13 to −16 ms/token** combined, i.e. **8–12% of the token** and
+     comfortably gate-resolvable.
+
+   Most of the win is the tier-density half, not the bytes half — worth knowing
+   before anyone optimises the wrong one.
+
+   **Gate: the numerics probe comes FIRST, and it needs no converter, no shader
+   and no new kernel.** int3 weights are a real precision drop across *every*
+   expert, including the 79% served from GPU — a much bigger risk than anything
+   in G14, which only ever touched summation order or activations. Simulate int3
+   on the existing int4 weights (dequantise, re-quantise to 8 levels with a
+   fresh group scale, `matmul_i4_sim3`), run CPU-only so the GPU tier cannot
+   mask it, and take greedy identity plus `teacher_forcing`. **If GLM-5.3 does
+   not survive int3, the item is dead regardless of the speed** — and G14 is the
+   standing argument for asking that question before building anything.
+   Opus. 1 day for the probe, several more only if it passes.
 
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.

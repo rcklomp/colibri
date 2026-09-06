@@ -40,7 +40,7 @@ bytes. --tools FILE renders a real tool list (Open WebUI's 34 builtin tools as
 dumped from its request) into the chat template -- the ~6 000-token prompt
 that made "hi" a 30-minute request.
 """
-import argparse, json, os, subprocess, sys, threading, time, urllib.request
+import argparse, json, os, subprocess, sys, threading, time, urllib.request, urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TEXT = os.path.join(HERE, "ROME-3x7900XTX-2026-09-04.md")
@@ -278,6 +278,13 @@ class HttpDriver:
             self.headers["Authorization"] = "Bearer " + key
         self.tools = load_tools(args.tools)
         self.model = args.model_id
+        if not self.model:
+            # ask the gateway rather than guess (2026-09-06: 'glm53' vs the
+            # served 'glm-5.3-flash' turned every request into a 404)
+            req = urllib.request.Request(args.url.rstrip("/") + "/v1/models", headers=self.headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.model = json.load(r)["data"][0]["id"]
+            print(f"[http] model id from /v1/models: {self.model}", flush=True)
 
     def run(self, messages, gen, slot=None, cancel_after=None):
         body = {"model": self.model, "messages": messages, "stream": True,
@@ -311,8 +318,15 @@ class HttpDriver:
                     if cancel_after is not None and time.time() - ev["submit"] >= cancel_after:
                         ev["cancelled"] = True
                         break   # closing the socket is how a browser cancels
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read(300).decode("utf-8", "replace")
+            except Exception:
+                pass
+            ev["error"] = f"HTTP {e.code}: {body.strip()}"
         except Exception as e:
-            ev["error"] = type(e).__name__
+            ev["error"] = f"{type(e).__name__}: {e}"
         ev["done"] = time.time()
         return ev
 
@@ -359,7 +373,7 @@ def main():
     ap.add_argument("--warm", action="store_true", help="re-warm the shards if below --min-resident")
     ap.add_argument("--allow-other-engines", action="store_true")
     ap.add_argument("--api-key")
-    ap.add_argument("--model-id", default="glm53")
+    ap.add_argument("--model-id", default=None, help="HTTP mode: served model id (default: the first entry of /v1/models)")
     ap.add_argument("--json", help="append one JSON record per measurement to this file")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()

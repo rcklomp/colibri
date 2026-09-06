@@ -282,6 +282,137 @@ static inline float coli_i4_row_i8(const uint8_t *w, const float *scl,
     return a;
 }
 
+/* ---- G14c: float domain, bit-trick decode + 4 accumulators ---------------
+ * The precision-free option. §G11 measured this shape at 1.26-1.65x isolated
+ * with relL2 1.6e-7 -- FLOAT REASSOCIATION NOISE, not a quantisation change --
+ * and then declined it at "~1.06x once the path is fused". The int8/int16 work
+ * above suggests that in-path figure was understated: the isolated-to-in-engine
+ * attenuation measured for the int8 kernel was ~0.6x (2.3x -> 1.32x), which
+ * would put this at ~1.2x rather than 1.06x.
+ *
+ * Two changes against coli_i4_row, both cheap:
+ *  - nib2ps: OR the nibble into the mantissa of 2^23 and subtract 2^23+8,
+ *    which is EXACTLY (float)(n-8) for n in 0..15 -- so the decode itself stays
+ *    bit-exact, replacing cvtepu8_epi32 + sub_epi32 + cvtepi32_ps with
+ *    or_si256 + sub_ps.
+ *  - four independent accumulators, so the FMA dependency chain does not
+ *    serialise. This is the ONLY part that is not bit-identical: it changes the
+ *    summation order, nothing else. */
+static inline float coli_i4_row_f4(const uint8_t *w, const float *scl,
+                                   const float *xs, int I, int gs){
+    float a=0;
+    const int ng=(I+gs-1)/gs;
+    for(int g=0; g<ng; g++){
+        int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+        float sc=scl[g];
+        int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F);
+        const __m256i magic_i=_mm256_set1_epi32(0x4B000000);   /* 8388608.0f */
+        const __m256  magic_f=_mm256_set1_ps(8388608.0f+8.0f);
+        __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
+        __m256 a2=_mm256_setzero_ps(), a3=_mm256_setzero_ps();
+        for(; i+32<=base+glen; i+=32){
+            __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));  /* 32 nibbles */
+            __m128i lo=_mm_and_si128(by,m4);
+            __m128i hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i n0=_mm_unpacklo_epi8(lo,hi);     /* i    .. i+15 */
+            __m128i n1=_mm_unpackhi_epi8(lo,hi);     /* i+16 .. i+31 */
+            __m256 w0=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(n0), magic_i)), magic_f);
+            __m256 w1=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(_mm_srli_si128(n0,8)), magic_i)), magic_f);
+            __m256 w2=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(n1), magic_i)), magic_f);
+            __m256 w3=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(_mm_srli_si128(n1,8)), magic_i)), magic_f);
+            a0=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),    w0, a0);
+            a1=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8),  w1, a1);
+            a2=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+16), w2, a2);
+            a3=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+24), w3, a3);
+        }
+        __m256 acc=_mm256_add_ps(_mm256_add_ps(a0,a1),_mm256_add_ps(a2,a3));
+        a=fmaf(hsum256(acc),sc,a);
+#endif
+        for(; i<base+glen; i+=2){
+            if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+            else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+        }
+    }
+    return a;
+}
+
+/* ---- G14b: int16 activations, madd_epi16 ---------------------------------
+ * The int8 path above is fast and changes the output text (record §G14):
+ * one outlier in a group of 64 crushes the other 63. This keeps the integer
+ * domain -- no float convert in the inner loop, which is where the win came
+ * from -- but carries the activation at int16, so quantisation error drops by
+ * 2^8 and outliers stop mattering.
+ *
+ * Two consequences of int16 vs int8, both good besides the precision:
+ *   - madd_epi16 is signed x signed, so the nibble is sign-corrected ONCE at
+ *     unpack (cvtepu8_epi16 then -8) and the sum((n-8)q) = sum(nq) - 8*sum(q)
+ *     bias trick, and its per-group xsum, disappear entirely.
+ *   - 16 lanes per register instead of 32, so expect roughly half the speedup
+ *     of the int8 path over baseline. Still no cvtepi32_ps in the loop.
+ * Range: |w*q| <= 8*32767, madd sums two -> 524272, and a 64-group accumulates
+ * 32 of those -> 1.7e7. int32 throughout, no saturation. */
+static inline void coli_i4_quant_act16(const float *x, int I, int gs,
+                                       int16_t *xq, float *xs){
+    const int ng=(I+gs-1)/gs;
+    for(int g=0; g<ng; g++){
+        int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+        float amax=0;
+        for(int i=base;i<base+glen;i++){ float a=fabsf(x[i]); if(a>amax) amax=a; }
+        float sc=amax/32767.0f; if(sc<1e-20f) sc=1e-20f;
+        xs[g]=sc;
+        const float inv=1.0f/sc;
+        for(int i=base;i<base+glen;i++){
+            int v=(int)lrintf(x[i]*inv);
+            if(v>32767) v=32767;
+            if(v<-32768) v=-32768;
+            xq[i]=(int16_t)v;
+        }
+    }
+}
+
+static inline float coli_i4_row_i16(const uint8_t *w, const float *scl,
+                                    const int16_t *xq, const float *xs,
+                                    int I, int gs){
+    float a=0;
+    const int ng=(I+gs-1)/gs;
+    for(int g=0; g<ng; g++){
+        int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+        int32_t dot=0; int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F);
+        const __m256i eight=_mm256_set1_epi16(8);
+        __m256i acc=_mm256_setzero_si256();
+        for(; i+16<=base+glen; i+=16){
+            __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));  /* 16 nibbles */
+            __m128i lo=_mm_and_si128(by,m4);
+            __m128i hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i nib=_mm_unpacklo_epi8(lo,hi);        /* natural order */
+            __m256i w16=_mm256_sub_epi16(_mm256_cvtepu8_epi16(nib), eight);
+            __m256i x16=_mm256_loadu_si256((const __m256i*)(xq+i));
+            acc=_mm256_add_epi32(acc,_mm256_madd_epi16(w16,x16));
+        }
+        __m128i s128=_mm_add_epi32(_mm256_castsi256_si128(acc),
+                                   _mm256_extracti128_si256(acc,1));
+        s128=_mm_hadd_epi32(s128,s128); s128=_mm_hadd_epi32(s128,s128);
+        dot=_mm_cvtsi128_si32(s128);
+#endif
+        for(; i<base+glen; i++){
+            uint8_t byte=w[i>>1];
+            int nib=(i&1)?(byte>>4):(byte&0xF);
+            dot += (nib-8) * (int)xq[i];
+        }
+        a += (float)dot * (scl[g]*xs[g]);
+    }
+    return a;
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){

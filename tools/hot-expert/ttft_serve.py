@@ -199,8 +199,12 @@ class EngineDriver:
             return cancel_after is not None and time.time() - ev["submit"] >= cancel_after
 
         try:
-            self.eng.generate(prompt, gen, 0.0, 1.0, on_text, cache_slot=slot,
-                              cancelled=cancelled, on_accept=on_accept)
+            stats = self.eng.generate(prompt, gen, 0.0, 1.0, on_text, cache_slot=slot,
+                                      cancelled=cancelled, on_accept=on_accept)
+            # an engine without an ACCEPT frame (glm53 2026-09) reports the
+            # prompt length only in the DONE STAT fields generate() returns
+            if ev["prompt_tokens"] is None and isinstance(stats, dict):
+                ev["prompt_tokens"] = stats.get("prompt_tokens")
         except Exception as e:  # ClientCancelled is the expected outcome of --cancel
             ev["error"] = type(e).__name__
             ev["cancelled"] = "Cancel" in type(e).__name__
@@ -277,7 +281,8 @@ class HttpDriver:
 
 # ---------------------------------------------------------------- report
 def fmt(ev, label):
-    acc = (ev["accept"] - ev["submit"]) if ev["accept"] else float("nan")
+    # no ACCEPT frame -> "accept" was set on the first DATA and says nothing
+    acc = (ev["accept"] - ev["submit"]) if ev["accept"] and ev["accept"] != ev["first"] else float("nan")
     ttft = (ev["first"] - ev["submit"]) if ev["first"] else float("nan")
     dec = ""
     if ev["first"] and ev["ntok"] > 1:

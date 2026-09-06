@@ -202,6 +202,53 @@ static inline float coli_i4_row(const uint8_t *w, const float *scl,
     return a;
 }
 
+/* ---- P3 (PREFILL-ROADMAP): coli_i4_row for FOUR activation rows at once.
+ * The weight row is loaded and its nibbles decoded ONCE per 16-wide chunk and
+ * applied to four rows held in four independent accumulators. Per row the
+ * sequence of operations -- fmadd on the same lanes in the same order, then
+ * hsum256, then the pinned fmaf with the group scale, then the scalar tail --
+ * is exactly coli_i4_row's, so out[r] is bit-identical to coli_i4_row on row
+ * r. What changes is only that the decode (the compute-bound part, G14) is
+ * paid once per four rows instead of once per row. Rows are xs + r*ldx. */
+static inline void coli_i4_rows4(const uint8_t *w, const float *scl,
+                                 const float *xs, int64_t ldx, int I, int gs, float out[4]){
+    float a0=0,a1=0,a2=0,a3=0;
+    const float *x0=xs, *x1=xs+ldx, *x2=xs+2*ldx, *x3=xs+3*ldx;
+    for(int g=0; g*gs<I; g++){
+        int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+        float sc=scl[g];
+        int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+        __m256 c0=_mm256_setzero_ps(), c1=_mm256_setzero_ps(), c2=_mm256_setzero_ps(), c3=_mm256_setzero_ps();
+        for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+            __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i nib=_mm_unpacklo_epi8(lo,hi);
+            __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+            __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+            c0=_mm256_fmadd_ps(_mm256_loadu_ps(x0+i),   w0, c0);
+            c0=_mm256_fmadd_ps(_mm256_loadu_ps(x0+i+8), w1, c0);
+            c1=_mm256_fmadd_ps(_mm256_loadu_ps(x1+i),   w0, c1);
+            c1=_mm256_fmadd_ps(_mm256_loadu_ps(x1+i+8), w1, c1);
+            c2=_mm256_fmadd_ps(_mm256_loadu_ps(x2+i),   w0, c2);
+            c2=_mm256_fmadd_ps(_mm256_loadu_ps(x2+i+8), w1, c2);
+            c3=_mm256_fmadd_ps(_mm256_loadu_ps(x3+i),   w0, c3);
+            c3=_mm256_fmadd_ps(_mm256_loadu_ps(x3+i+8), w1, c3); }
+        a0=fmaf(hsum256(c0),sc,a0); a1=fmaf(hsum256(c1),sc,a1);
+        a2=fmaf(hsum256(c2),sc,a2); a3=fmaf(hsum256(c3),sc,a3);
+#endif
+        for(; i<base+glen; i+=2){
+            if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                float wa=(float)((int)(byte&0xF)-8), wb=(float)((int)(byte>>4)-8);
+                a0+=(x0[i]*wa+x0[i+1]*wb)*sc; a1+=(x1[i]*wa+x1[i+1]*wb)*sc;
+                a2+=(x2[i]*wa+x2[i+1]*wb)*sc; a3+=(x3[i]*wa+x3[i+1]*wb)*sc; }
+            else { uint8_t byte=w[i>>1]; float wa=(float)((int)(byte&0xF)-8);
+                a0+=x0[i]*wa*sc; a1+=x1[i]*wa*sc; a2+=x2[i]*wa*sc; a3+=x3[i]*wa*sc; }
+        }
+    }
+    out[0]=a0; out[1]=a1; out[2]=a2; out[3]=a3;
+}
+
 /* ---- G14c: float domain, bit-trick decode + 4 accumulators ---------------
  * The precision-free option. §G11 measured this shape at 1.26-1.65x isolated
  * with relL2 1.6e-7 -- FLOAT REASSOCIATION NOISE, not a quantisation change --

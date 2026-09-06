@@ -2385,6 +2385,117 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
     }
 }
 
+/* P3 (PREFILL-ROADMAP P3): one CPU expert for S rows at once. Same three
+ * stages and the same OpenMP shape as mlp3_cpu's default path; each output
+ * row is computed for all S activation rows, four at a time through
+ * coli_i4_rows4 (weights decoded once per four rows), the remainder through
+ * coli_i4_row. Row r of out is bit-identical to mlp3_cpu on row r of x.
+ * Only the default path (fmt 4, no split, no I4_FAST) has a rows version;
+ * the caller falls back to the per-row loop otherwise. sg/su: S * g->rows. */
+static int mlp3_cpu_rows_ok(const Mat *g, const Mat *u, const Mat *d) {
+    return !expert_split_on() && !i4_fast_on() &&
+           g->fmt == 4 && u->fmt == 4 && d->fmt == 4 &&
+           u->columns == g->columns && u->rows == g->rows && u->gs == g->gs;
+}
+static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const Mat *u,
+                          const Mat *d, float limit, float *sg, float *su) {
+    const int Ig = g->columns, Og = g->rows, Id = d->columns, Od = d->rows;
+    const int grb = (Ig + 1) / 2, gng = (Ig + g->gs - 1) / g->gs;
+    const int drb = (Id + 1) / 2, dng = (Id + d->gs - 1) / d->gs;
+    const int S4 = S & ~3;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int z = 0; z < 2 * Og; z++) {
+            const int o = z < Og ? z : z - Og;
+            const Mat *w = z < Og ? g : u;
+            float *dst = z < Og ? sg : su;
+            const uint8_t *wr = w->q4 + (int64_t)o * grb;
+            const float *sr = w->s + (int64_t)o * gng;
+            float o4[4];
+            int r = 0;
+            for (; r < S4; r += 4) {
+                coli_i4_rows4(wr, sr, x + (int64_t)r * Ig, Ig, Ig, w->gs, o4);
+                dst[(size_t)r * Og + o] = o4[0]; dst[(size_t)(r + 1) * Og + o] = o4[1];
+                dst[(size_t)(r + 2) * Og + o] = o4[2]; dst[(size_t)(r + 3) * Og + o] = o4[3];
+            }
+            for (; r < S; r++)
+                dst[(size_t)r * Og + o] = coli_i4_row(wr, sr, x + (int64_t)r * Ig, Ig, w->gs);
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < S * Og; i++) {
+            float gv = sg[i] > limit ? limit : sg[i];
+            float uv = su[i] < -limit ? -limit : (su[i] > limit ? limit : su[i]);
+            sg[i] = siluf_(gv) * uv;
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int o = 0; o < Od; o++) {
+            const uint8_t *wr = d->q4 + (int64_t)o * drb;
+            const float *sr = d->s + (int64_t)o * dng;
+            float o4[4];
+            int r = 0;
+            for (; r < S4; r += 4) {
+                coli_i4_rows4(wr, sr, sg + (int64_t)r * Id, Id, Id, d->gs, o4);
+                out[(size_t)r * Od + o] = o4[0]; out[(size_t)(r + 1) * Od + o] = o4[1];
+                out[(size_t)(r + 2) * Od + o] = o4[2]; out[(size_t)(r + 3) * Od + o] = o4[3];
+            }
+            for (; r < S; r++)
+                out[(size_t)r * Od + o] = coli_i4_row(wr, sr, sg + (int64_t)r * Id, Id, d->gs);
+        }
+    }
+}
+
+/* Scratch for the rows path, allocated once per ffn_layer call when the
+ * chunk has more than one row: gathered activations, per-row outputs and
+ * the S x inter gate/up slabs. NULL members = rows path off. */
+typedef struct { float *xr, *tr, *sgr, *sur; int cap; } CpuRows;
+
+/* Run one CPU expert on every row of the chunk that chose it: gather those
+ * rows, one mlp3_cpu_rows, scatter with the routing weights. Accumulation
+ * into out is the same per-row `dst[d] += scale * tmp[d]` as the per-token
+ * loop, in the same t order. Returns the number of rows served. */
+static int cpu_expert_rows(const CpuRows *cr, int eid, const int *chosen, const float *weight,
+                           int tokens, int topk, const float *x, int hidden,
+                           const Mat *gate, const Mat *up, const Mat *down, float limit,
+                           float *out) {
+    int nr = 0;
+    static _Thread_local int   *tidx = NULL; static _Thread_local float *tsc = NULL;
+    static _Thread_local int tcap = 0;
+    if (tcap < tokens) {
+        tidx = realloc(tidx, (size_t)tokens * sizeof(int));
+        tsc = realloc(tsc, (size_t)tokens * sizeof(float));
+        if (!tidx || !tsc) { fprintf(stderr, "OOM nel MoE (righe)\n"); exit(1); }
+        tcap = tokens;
+    }
+    for (int t = 0; t < tokens; t++) {
+        float scale = 0.0f;
+        for (int k = 0; k < topk; k++)
+            if (chosen[(size_t)t * topk + k] == eid) { scale = weight[(size_t)t * topk + k]; break; }
+        if (scale == 0.0f) continue;
+        memcpy(cr->xr + (size_t)nr * hidden, x + (size_t)t * hidden, (size_t)hidden * sizeof(float));
+        tidx[nr] = t; tsc[nr] = scale; nr++;
+    }
+    if (nr < 1) return 0;
+    double _tc = prof_now_s();
+    mlp3_cpu_rows(cr->tr, cr->xr, nr, gate, up, down, limit, cr->sgr, cr->sur);
+    g_t_cpu += prof_now_s() - _tc; g_n_cpu += nr;
+    for (int r = 0; r < nr; r++) {
+        float *dst = out + (size_t)tidx[r] * hidden;
+        const float *src = cr->tr + (size_t)r * hidden;
+        const float scale = tsc[r];
+        for (int d = 0; d < hidden; d++) dst[d] += scale * src[d];
+    }
+    return nr;
+}
+
 /* G9: run CPU-only experts that were deferred past the GPU issue point (see
  * ffn_layer's dispatch block), so their compute overlaps the fence wait
  * instead of finishing entirely before it -- G2 issued the three devices
@@ -2398,9 +2509,15 @@ static void ffn_moe_run_deferred_cpu(const Mat *cpu_gate, const Mat *cpu_up, con
                                      const int *cpu_eid, int n_cpu_deferred,
                                      const int *chosen, const float *weight, int tokens, int topk,
                                      const float *x, int hidden, float limit,
-                                     float *sg, float *su, float *tmp, float *out) {
+                                     float *sg, float *su, float *tmp, float *out,
+                                     const CpuRows *cr) {
     for (int j = 0; j < n_cpu_deferred; j++) {
         const int eid = cpu_eid[j];
+        if (cr && cr->xr && mlp3_cpu_rows_ok(&cpu_gate[j], &cpu_up[j], &cpu_down[j])) {
+            cpu_expert_rows(cr, eid, chosen, weight, tokens, topk, x, hidden,
+                            &cpu_gate[j], &cpu_up[j], &cpu_down[j], limit, out);
+            continue;
+        }
         for (int t = 0; t < tokens; t++) {
             float scale = 0.0f;
             for (int k = 0; k < topk; k++)
@@ -2528,6 +2645,19 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     float *su = malloc((shared_w > (size_t)wide ? shared_w : (size_t)wide) * sizeof(float));
     float *tmp = malloc((size_t)c->hidden * sizeof(float));
     if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
+    /* P3: rows scratch for the CPU experts of a chunk (tokens x hidden twice,
+     * tokens x moe_inter twice); off for a single row or GLM53_PREFILL_UNBATCHED. */
+    CpuRows cpu_rows = { NULL, NULL, NULL, NULL, 0 };
+    if (tokens > 1 && !g_prefill_unbatched()) {
+        cpu_rows.xr = malloc((size_t)tokens * c->hidden * sizeof(float));
+        cpu_rows.tr = malloc((size_t)tokens * c->hidden * sizeof(float));
+        cpu_rows.sgr = malloc((size_t)tokens * c->moe_inter * sizeof(float));
+        cpu_rows.sur = malloc((size_t)tokens * c->moe_inter * sizeof(float));
+        cpu_rows.cap = tokens;
+        if (!cpu_rows.xr || !cpu_rows.tr || !cpu_rows.sgr || !cpu_rows.sur) {
+            fprintf(stderr, "OOM nel MoE (righe)\n"); exit(1);
+        }
+    }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
     const double t_shared0 = optime_on() ? optime_now() : 0.0;
@@ -2549,7 +2679,8 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float *dst = out + (size_t)t * c->hidden;
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
-        free(tmp); free(su); free(sg); free(weight); free(chosen);
+        free(cpu_rows.xr); free(cpu_rows.tr); free(cpu_rows.sgr); free(cpu_rows.sur);
+    free(tmp); free(su); free(sg); free(weight); free(chosen);
         return;
     }
 
@@ -2687,6 +2818,13 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                     continue;
                 }
 #endif
+#ifdef COLI_VULKAN
+            if (g_vk_ready && cpu_rows.xr && mlp3_cpu_rows_ok(&gate, &up, &down)) {
+                cpu_expert_rows(&cpu_rows, eid, chosen, weight, tokens, topk, x, c->hidden,
+                                &gate, &up, &down, c->swiglu_limit, out);
+                continue;
+            }
+#endif
             for (int t = 0; t < tokens; t++) {
                 float scale = 0.0f;
                 for (int k = 0; k < topk; k++)
@@ -2763,7 +2901,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             if (first_round && can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
                 ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
                                          chosen, weight, tokens, topk, x, c->hidden,
-                                         c->swiglu_limit, sg, su, tmp, out);
+                                         c->swiglu_limit, sg, su, tmp, out, &cpu_rows);
                 cpu_deferred_done = 1;
             }
             first_round = 0;
@@ -2815,11 +2953,12 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
          * still have to run. */
         ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
                                  chosen, weight, tokens, topk, x, c->hidden,
-                                 c->swiglu_limit, sg, su, tmp, out);
+                                 c->swiglu_limit, sg, su, tmp, out, &cpu_rows);
     }
     free(cpu_gate); free(cpu_up); free(cpu_down); free(cpu_eid);
 #endif
     free(to_read); free(slot_of); free(union_ids);
+    free(cpu_rows.xr); free(cpu_rows.tr); free(cpu_rows.sgr); free(cpu_rows.sur);
     free(tmp); free(su); free(sg); free(weight); free(chosen);
 #ifdef COLI_VULKAN
     free(vg0); free(vu0); free(vd0); free(vrows0); free(vtok0); free(vw0); free(xk0);

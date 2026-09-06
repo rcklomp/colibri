@@ -1,0 +1,48 @@
+#version 450
+// KDA output norm (G12), mirroring kda_layer in c/glm53.c:
+//   inv        = 1/sqrt(mean(core[h,:]^2) + eps)
+//   normed[h,d]= core[h,d] * inv * onorm[d] * sigmoid(gate[h*D+d])
+// One workgroup per head. Feeds ko directly inside the same command buffer, so
+// neither `core` nor `normed` ever reaches the host.
+//
+// The CPU sums the squares sequentially and this tree-reduces. That difference
+// was measured on the recurrence's own norms and is not where the divergence
+// lives (see kda_step.comp): GLSL exp() vs libm expf() dominates.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer Core   { float core[]; };    // [heads*v_dim]
+layout(std430, binding = 1) readonly  buffer Gate   { float gate[]; };    // [heads*v_dim]
+layout(std430, binding = 2) readonly  buffer Onorm  { float onorm[]; };   // [v_dim]
+layout(std430, binding = 3) writeonly buffer Normed { float normed[]; };  // [heads*v_dim]
+
+layout(push_constant) uniform P {
+    int heads, v_dim;
+    float eps;
+} p;
+
+shared float red[128];
+
+float sigm(float x) {
+    return x >= 0.0 ? 1.0 / (1.0 + exp(-x)) : exp(x) / (1.0 + exp(x));
+}
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    if (h >= p.heads) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int D = p.v_dim;
+    uint base = uint(h) * uint(D);
+
+    float acc = 0.0;
+    for (int d = tid; d < D; d += 128) { float v = core[base + uint(d)]; acc += v * v; }
+    red[tid] = acc;
+    barrier();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float inv = 1.0 / sqrt(red[0] / float(D) + p.eps);
+    for (int d = tid; d < D; d += 128)
+        normed[base + uint(d)] = core[base + uint(d)] * inv * onorm[d] * sigm(gate[base + uint(d)]);
+}

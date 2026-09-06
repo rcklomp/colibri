@@ -35,6 +35,7 @@ typedef struct {
  * kernel reads them in place. Allocated once at max_t rows, like the CUDA
  * kv_dev shadow. */
 #define VK_KV_LAYERS 160
+#define VK_KDA_LAYERS 64      /* GLM-5.3 has 34 KDA layers; headroom for the test slots */
 typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
     int rows, K, R;
@@ -82,6 +83,24 @@ static struct {
     VkPipeline pipe_nrm; VkDescriptorPool qprep_pool; VkDescriptorSet dset_qp3, dset_nrm;
     Scratch qp1, qp2;
     VkBuffer lnbuf[VK_KV_LAYERS]; VkDeviceMemory lnmem[VK_KV_LAYERS]; int lnlen[VK_KV_LAYERS];
+    /* KDA recurrence (G12): state and conv window live on the device for the whole
+     * session — 4 MB + 393 KB per layer at GLM's shape, 136 MB over 34 layers.
+     * Reading them back per call would be ~5 ms/token over PCIe, a third of the
+     * win, so the host copies go stale and re-sync only at segment export/import
+     * (coli_vk_kda_sync). conv taps are immutable, uploaded once with the rest. */
+    VkShaderModule shader_kda; VkDescriptorSetLayout dsl_kda; VkPipelineLayout plyt_kda;
+    VkPipeline pipe_kda; VkDescriptorPool kda_pool; VkDescriptorSet dset_kda;
+    /* chain stages (G12): decay/beta gating and the per-head output norm, so a
+     * layer's projections + recurrence + ko record into ONE command buffer. */
+    VkShaderModule shader_kdec, shader_khn;
+    VkDescriptorSetLayout dsl_kdec, dsl_khn;
+    VkPipelineLayout plyt_kdec, plyt_khn;
+    VkPipeline pipe_kdec, pipe_khn;
+    VkDescriptorPool kchain_pool; VkDescriptorSet dset_kdec, dset_khn, dset_kko;
+    struct { VkBuffer state, window, conv, alog, dt, onorm;
+             void *state_p, *window_p, *conv_p, *alog_p, *dt_p, *onorm_p;
+             size_t sbytes, wbytes, cbytes; int heads, k, v, kernel; } kda[VK_KDA_LAYERS];
+    Scratch kda_qkv, kda_gate, kda_beta, kda_out;
     Scratch att_sc;              /* attention score scratch (GPU-only) */
     Scratch att_ctx;             /* fused absorb+o: ctx stays on device (GPU-only) */
     Scratch y2;                  /* second output of the fused matmul pair (readback) */
@@ -107,6 +126,9 @@ static struct {
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 struct PCN { int S, D; float eps; };
+struct PCK { int heads, k_dim, v_dim, kernel; float norm_eps; };
+struct PCKD { int heads, k_dim; float gate_lb; };      /* kda_decay */
+struct PCKN { int heads, v_dim; float eps; };          /* kda_headnorm */
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
@@ -409,6 +431,41 @@ int coli_vk_init(const char *spv_path) {
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
     /* Optional rmsnorm pipeline: enables the pair->norm->q_b single-submit chain
      * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
+    /* Optional KDA recurrence pipeline (G12). Absent -> COLI_KDA_GPU is a no-op
+     * and the engine keeps the CPU coli_kda_step, which stays the reference. */
+    char kda_path[512]; derive_dir_file(spv_path, "kda_step.spv", kda_path, sizeof(kda_path));
+    G.shader_kda = load_spv(G.dev, kda_path);
+    if (G.shader_kda) {
+        VkDescriptorPool kp; VkDescriptorSet ks;
+        if (!build_pipeline(G.dev, 7, sizeof(struct PCK), G.shader_kda,
+                            &G.dsl_kda, &G.plyt_kda, &G.pipe_kda, &kp, &ks))
+            return 0;
+        G.kda_pool = kp; G.dset_kda = ks;
+        /* the other two chain stages; either missing -> no chain, step-only path */
+        char d_path[512], n_path[512];
+        derive_dir_file(spv_path, "kda_decay.spv", d_path, sizeof(d_path));
+        derive_dir_file(spv_path, "kda_headnorm.spv", n_path, sizeof(n_path));
+        G.shader_kdec = load_spv(G.dev, d_path);
+        G.shader_khn  = load_spv(G.dev, n_path);
+        if (G.shader_kdec && G.shader_khn) {
+            VkDescriptorPool p1, p2; VkDescriptorSet s1, s2;
+            if (!build_pipeline(G.dev, 4, sizeof(struct PCKD), G.shader_kdec,
+                                &G.dsl_kdec, &G.plyt_kdec, &G.pipe_kdec, &p1, &s1) ||
+                !build_pipeline(G.dev, 4, sizeof(struct PCKN), G.shader_khn,
+                                &G.dsl_khn, &G.plyt_khn, &G.pipe_khn, &p2, &s2))
+                return 0;
+            G.dset_kdec = s1; G.dset_khn = s2;
+            /* one more 4-binding matmul set for the chain's ko */
+            VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
+            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+            VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.kchain_pool), "kchain descPool");
+            VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = G.kchain_pool, .descriptorSetCount = 1, .pSetLayouts = &G.dsl};
+            VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_kko), "kchain descSet");
+        }
+    }
+
     char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
     G.shader_nrm = load_spv(G.dev, nrm_path);
     if (G.shader_nrm) {
@@ -1028,14 +1085,14 @@ static int arena_suballoc_d2(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&
         !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
     t->dev = 1;
     size_t stride = (size_t)t->rowWords * 4;
-    size_t cpu_rb = fmt == 1 ? (size_t)I
+    size_t cpu_rb = (fmt == 1 || fmt == 8) ? (size_t)I
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);
     t->wbytes = stride * (size_t)O;
@@ -1359,14 +1416,14 @@ static int arena_suballoc_d3(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor_d3(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&
         !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
     t->dev = 2;
     size_t stride = (size_t)t->rowWords * 4;
-    size_t cpu_rb = fmt == 1 ? (size_t)I
+    size_t cpu_rb = (fmt == 1 || fmt == 8) ? (size_t)I
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);
     t->wbytes = stride * (size_t)O;
@@ -1770,6 +1827,317 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
 }
 
 
+/* ---- KDA recurrence on the device (G12) ---------------------------------
+ * coli_kda_step's arithmetic, one workgroup per head, with the 128x128 state
+ * tile resident on the GPU for the life of the session. NOT bit-identical to
+ * the CPU (GLSL exp, tree-reduced norms); see G12-KDA-GPU-SPEC-2026-09-05.md.
+ * Returns 0 on any unsupported shape so the caller keeps the CPU path. */
+int coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
+                     const float *state, const float *window, const float *conv_w,
+                     const float *alog, const float *dt, const float *onorm) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS) return 0;
+    /* one v per thread; q/k/decay staged in a 1024-entry LDS array; hist[8] */
+    if (heads < 1 || k_dim < 1 || v_dim < 1 || kernel < 1) return 0;
+    if (v_dim > 128 || k_dim > 1024 || kernel > 8) return 0;
+    const size_t width = (size_t)heads * (size_t)k_dim;
+    const size_t sb = (size_t)heads * k_dim * v_dim * sizeof(float);
+    const size_t wb = 3u * width * (size_t)kernel * sizeof(float);
+    if (G.kda[layer].state) {
+        /* Buffers exist, so this is a NEW SESSION on a warm engine. The state and
+         * the conv window belong to the CONVERSATION and must be re-seeded from
+         * the caller's freshly zeroed copies; the conv taps, alog, dt and onorm
+         * are model weights and stay. Returning early here without re-seeding let
+         * request N+1 continue request N's recurrence -- invisible to every
+         * fresh-process oracle (one request per process) and caught only by the
+         * serving harness, where warm-identical came back BELOW rotating. */
+        if (G.kda[layer].sbytes != sb || G.kda[layer].wbytes != wb) return 0;
+        memcpy(G.kda[layer].state_p, state, sb);
+        memcpy(G.kda[layer].window_p, window, wb);
+        return 1;
+    }
+    const size_t ab = (size_t)heads * sizeof(float);          /* alog  */
+    const size_t db = width * sizeof(float);                  /* dt    */
+    const size_t ob = (size_t)v_dim * sizeof(float);          /* onorm */
+    void *sp, *wp, *cp, *ap = NULL, *dp = NULL, *op = NULL;
+    float p0 = G.prio; G.prio = 1.0f;                       /* recurrence state: never evict */
+    int ok = arena_suballoc(sb, &G.kda[layer].state, &sp)
+          && arena_suballoc(wb, &G.kda[layer].window, &wp)
+          && arena_suballoc(wb, &G.kda[layer].conv, &cp);
+    /* the chain stages' per-layer weights; absent -> step-only path still works */
+    if (ok && alog && dt && onorm)
+        ok = arena_suballoc(ab, &G.kda[layer].alog, &ap)
+          && arena_suballoc(db, &G.kda[layer].dt, &dp)
+          && arena_suballoc(ob, &G.kda[layer].onorm, &op);
+    G.prio = p0;
+    if (!ok) { G.kda[layer].state = VK_NULL_HANDLE; return 0; }
+    memcpy(sp, state, sb); memcpy(wp, window, wb); memcpy(cp, conv_w, wb);
+    if (ap) { memcpy(ap, alog, ab); memcpy(dp, dt, db); memcpy(op, onorm, ob); }
+    G.kda[layer].alog_p = ap; G.kda[layer].dt_p = dp; G.kda[layer].onorm_p = op;
+    G.kda[layer].state_p = sp; G.kda[layer].window_p = wp; G.kda[layer].conv_p = cp;
+    G.kda[layer].sbytes = sb; G.kda[layer].wbytes = wb; G.kda[layer].cbytes = wb;
+    G.kda[layer].heads = heads; G.kda[layer].k = k_dim; G.kda[layer].v = v_dim;
+    G.kda[layer].kernel = kernel;
+    return 1;
+}
+
+/* Device -> host for the two segment-migration spans. The only place the host
+ * copies are refreshed while the knob is on. */
+int coli_vk_kda_sync(int layer, float *state, float *window) {
+    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (state)  memcpy(state,  G.kda[layer].state_p,  G.kda[layer].sbytes);
+    if (window) memcpy(window, G.kda[layer].window_p, G.kda[layer].wbytes);
+    return 1;
+}
+
+/* ---- the whole KDA layer in ONE submit (G12) ----------------------------
+ * projections -> decay/beta gating -> recurrence -> head norm -> ko, recorded
+ * into one command buffer with compute barriers between stages. The engine
+ * pays two submit+fence round trips per layer per token today (one for the
+ * batched projections, one for ko, with the CPU recurrence between them); this
+ * pays one, and the recurrence, the gating and the norm stop touching the CPU.
+ *
+ * Only `out` [ko_O] returns to the host. Everything between the projections
+ * and ko lives in G.y.
+ *
+ * Returns 0 -> caller runs its existing path, unchanged. */
+int coli_vk_kda_layer(int layer, ColiVkMM *proj, int nproj,
+                      const float *x, int I,
+                      ColiVkTensor **ko, const void *kow, const float *kos,
+                      int ko_fmt, int ko_gs, int ko_O,
+                      float gate_lb, float norm_eps, float head_eps,
+                      int stop_after_norm, float *out) {
+    if (!G.ready || !G.shader_kda || !G.pipe_kdec || !G.pipe_khn) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (!G.kda[layer].alog_p) return 0;              /* chain weights not resident */
+    if (nproj != 8 || I < 1 || ko_O < 1) return 0;
+    const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
+    const int width = heads * K;
+
+    /* same two-stage rule as coli_vk_matmul_multi: independents first, then the
+     * chained ones, one level deep. */
+    int nchained = 0;
+    for (int c = 0; c < nproj; c++) {
+        const int src = proj[c].src;
+        if (src < 0) { if (nchained) return 0; continue; }
+        if (src >= c || proj[src].src >= 0) return 0;
+        nchained++;
+    }
+    for (int c = 0; c < nproj; c++) {
+        const int iw = proj[c].src < 0 ? I : proj[proj[c].src].O;
+        if (iw < 1) return 0;
+        proj[c].I = iw;
+        if (!upload_tensor(proj[c].tensor, proj[c].weights, proj[c].scales,
+                           proj[c].fmt, iw, proj[c].O, proj[c].gs)) return 0;
+    }
+    if (!upload_tensor(ko, kow, kos, ko_fmt, heads * V, ko_O, ko_gs)) return 0;
+
+    /* G.y layout: the 8 projection outputs, then core, normed, out. */
+    size_t yoff[VK_MM_MAX], ytot = 0;
+    for (int c = 0; c < nproj; c++) {
+        yoff[c] = ytot;
+        ytot += ((size_t)proj[c].O * sizeof(float) + 255) & ~(size_t)255;
+    }
+    /* the recurrence wants q|k|v as one [3*width] run; that holds only if each
+     * projection's output is already 256-aligned, which it is at GLM's shape
+     * (width*4 = 32768). Check rather than assume. */
+    if (yoff[1] - yoff[0] != (size_t)width * sizeof(float) ||
+        yoff[2] - yoff[1] != (size_t)width * sizeof(float)) return 0;
+    if (proj[0].O != width || proj[1].O != width || proj[2].O != width) return 0;
+    if (proj[4].O != heads || proj[6].O != width || proj[7].O != width) return 0;
+    const size_t yoff_core   = ytot; ytot += ((size_t)heads * V * 4 + 255) & ~(size_t)255;
+    const size_t yoff_normed = ytot; ytot += ((size_t)heads * V * 4 + 255) & ~(size_t)255;
+    const size_t yoff_out    = ytot; ytot += ((size_t)ko_O * 4 + 255) & ~(size_t)255;
+
+    const size_t xb = (size_t)I * sizeof(float);
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, ytot, G.memtype_cached)) return 0;
+    memcpy(G.x.ptr, x, xb);
+
+    if (!G.mm_pool) return 0;                        /* projection sets live there */
+
+    /* ---- descriptors: 8 projections, decay, step, headnorm, ko ---- */
+    for (int c = 0; c < nproj; c++) {
+        ColiVkTensor *t = *proj[c].tensor;
+        const int src = proj[c].src;
+        VkDescriptorBufferInfo bi[4] = {
+            src < 0 ? (VkDescriptorBufferInfo){.buffer = G.x.buf, .range = VK_WHOLE_SIZE}
+                    : (VkDescriptorBufferInfo){.buffer = G.y.buf, .offset = yoff[src],
+                                               .range = (VkDeviceSize)proj[src].O * sizeof(float)},
+            {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = G.y.buf, .offset = yoff[c], .range = (VkDeviceSize)proj[c].O * sizeof(float)}};
+        wr_desc(G.mm_set[c], 4, bi);
+    }
+    const VkDeviceSize wsz = (VkDeviceSize)width * sizeof(float);
+    const VkDeviceSize hv  = (VkDeviceSize)heads * V * sizeof(float);
+    VkDescriptorBufferInfo bd[4] = {                                  /* decay */
+        {.buffer = G.y.buf, .offset = yoff[6], .range = wsz},             /* decay in place */
+        {.buffer = G.y.buf, .offset = yoff[4], .range = (VkDeviceSize)heads * 4}, /* beta  */
+        {.buffer = G.kda[layer].alog, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].dt,   .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_kdec, 4, bd);
+
+    VkDescriptorBufferInfo bs[7] = {                                  /* step */
+        {.buffer = G.kda[layer].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff[0], .range = 3 * wsz},         /* q|k|v run */
+        {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff[6], .range = wsz},             /* gated decay */
+        {.buffer = G.y.buf, .offset = yoff[4], .range = (VkDeviceSize)heads * 4},
+        {.buffer = G.y.buf, .offset = yoff_core, .range = hv}};
+    VkWriteDescriptorSet w7[7];
+    for (int i = 0; i < 7; i++) w7[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_kda,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bs[i]};
+    vkUpdateDescriptorSets(G.dev, 7, w7, 0, NULL);
+
+    VkDescriptorBufferInfo bn[4] = {                                  /* head norm */
+        {.buffer = G.y.buf, .offset = yoff_core,   .range = hv},
+        {.buffer = G.y.buf, .offset = yoff[7],     .range = wsz},         /* gate */
+        {.buffer = G.kda[layer].onorm, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff_normed, .range = hv}};
+    wr_desc(G.dset_khn, 4, bn);
+
+    ColiVkTensor *kt = *ko;
+    VkDescriptorBufferInfo bk[4] = {                                  /* ko */
+        {.buffer = G.y.buf, .offset = yoff_normed, .range = hv},
+        {.buffer = kt->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = kt->sbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff_out, .range = (VkDeviceSize)ko_O * sizeof(float)}};
+    wr_desc(G.dset_kko, 4, bk);
+
+    /* ---- one command buffer ---- */
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    #define KDA_BARRIER() vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, \
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL)
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "kchain resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "kchain beginCmd");
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    int barrier_done = 0;
+    for (int c = 0; c < nproj; c++) {
+        ColiVkTensor *t = *proj[c].tensor;
+        if (proj[c].src >= 0 && !barrier_done) { KDA_BARRIER(); barrier_done = 1; }
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.mm_set[c], 0, NULL);
+        struct PC pc = {proj[c].fmt, 1, proj[c].I, proj[c].O, t->rowWords, t->gs};
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd, (uint32_t)((proj[c].O + 7) / 8), 1, 1);
+    }
+    KDA_BARRIER();
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kdec);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kdec, 0, 1, &G.dset_kdec, 0, NULL);
+    struct PCKD pcd = {heads, K, gate_lb};
+    vkCmdPushConstants(G.cmd, G.plyt_kdec, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcd), &pcd);
+    vkCmdDispatch(G.cmd, (uint32_t)((width + 255) / 256), 1, 1);
+    KDA_BARRIER();
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kda);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kda, 0, 1, &G.dset_kda, 0, NULL);
+    struct PCK pck = {heads, K, V, G.kda[layer].kernel, norm_eps};
+    vkCmdPushConstants(G.cmd, G.plyt_kda, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pck), &pck);
+    vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+    KDA_BARRIER();
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_khn);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_khn, 0, 1, &G.dset_khn, 0, NULL);
+    struct PCKN pcn = {heads, V, head_eps};
+    vkCmdPushConstants(G.cmd, G.plyt_khn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcn), &pcn);
+    vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+    KDA_BARRIER();
+
+    if (!stop_after_norm) {
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset_kko, 0, NULL);
+        struct PC pck2 = {ko_fmt, 1, heads * V, ko_O, kt->rowWords, kt->gs};
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pck2), &pck2);
+        vkCmdDispatch(G.cmd, (uint32_t)((ko_O + 7) / 8), 1, 1);
+    }
+    VKCHECK(vkEndCommandBuffer(G.cmd), "kchain endCmd");
+    #undef KDA_BARRIER
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "kchain resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kchain queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] kda chain fence wait failed — disabling GPU offload\n");
+        G.ready = 0; G.cmd_ready = 0; G.bound_tensor = NULL; return 0;
+    }
+    if (stop_after_norm)   /* bisection: hand `normed` back, caller runs ko */
+        memcpy(out, (const uint8_t *)G.y.ptr + yoff_normed, (size_t)heads * V * sizeof(float));
+    else
+        memcpy(out, (const uint8_t *)G.y.ptr + yoff_out, (size_t)ko_O * sizeof(float));
+    G.cmd_ready = 0; G.bound_tensor = NULL;
+    return 1;
+}
+
+/* Host -> device, the inverse of _sync: used after a segment restore has
+ * written the CPU spans, so the resident recurrence resumes from them. */
+int coli_vk_kda_upload(int layer, const float *state, const float *window) {
+    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (state)  memcpy(G.kda[layer].state_p,  state,  G.kda[layer].sbytes);
+    if (window) memcpy(G.kda[layer].window_p, window, G.kda[layer].wbytes);
+    return 1;
+}
+
+/* One token through one layer. qkv/gate/beta come from the host in this
+ * standalone form (Stage 1 of the spec and the self-test); only `out` returns. */
+int coli_vk_kda_step(int layer, const float *qkv, const float *gate,
+                     const float *beta, float norm_eps, float *out) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
+    const size_t width = (size_t)heads * (size_t)K;
+    const size_t qb = 3u * width * sizeof(float), gb = width * sizeof(float);
+    const size_t bb = (size_t)heads * sizeof(float), ob = (size_t)heads * V * sizeof(float);
+    if (!scratch_reserve(&G.kda_qkv, qb) || !scratch_reserve(&G.kda_gate, gb) ||
+        !scratch_reserve(&G.kda_beta, bb) ||
+        !scratch_reserve_mt(&G.kda_out, ob, G.memtype_cached)) return 0;
+    memcpy(G.kda_qkv.ptr, qkv, qb);
+    memcpy(G.kda_gate.ptr, gate, gb);
+    memcpy(G.kda_beta.ptr, beta, bb);
+
+    VkDescriptorBufferInfo bi[7] = {
+        {.buffer = G.kda[layer].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_qkv.buf,       .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_gate.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_beta.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_out.buf,       .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[7];                     /* wr_desc caps at 6; local here */
+    for (int i = 0; i < 7; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_kda,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 7, w, 0, NULL);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "kda resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "kda beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kda);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kda, 0, 1, &G.dset_kda, 0, NULL);
+    struct PCK pc = {heads, K, V, G.kda[layer].kernel, norm_eps};
+    vkCmdPushConstants(G.cmd, G.plyt_kda, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "kda endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "kda resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kda queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] kda fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    memcpy(out, G.kda_out.ptr, ob);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* shared command buffer clobbered */
+    return 1;
+}
+
 /* q-prep chain: [q_a + kv_a pair] -> rmsnorm(q_latent) -> [q_b], recorded in ONE
  * command buffer with compute barriers — one submit+fence where the engine paid
  * three (the middle CPU norm forced two roundtrips). Only q [S,Oqb] and the kv
@@ -2034,6 +2402,7 @@ void coli_vk_shutdown(void) {
 // ---- standalone GPU-vs-CPU validation + microbench --------------------------
 #include <math.h>
 #include <time.h>
+#include "delta_attention.h"   /* coli_kda_step: the CPU reference for run_kda (G12) */
 
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9; }
@@ -2467,6 +2836,76 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
     return mq > 1e-2f || mk > 1e-3f;
 }
 
+/* KDA recurrence vs coli_kda_step, N consecutive steps from the same state.
+ * Stage 1 of G12-KDA-GPU-SPEC-2026-09-05.md: the point is not one step's error
+ * but whether it COMPOUNDS -- the state is recurrent, so a shader that is
+ * merely close diverges over a conversation. Gate: max rel err <= 1e-5 on the
+ * output every step, and on the whole state at the end. */
+static int run_kda(int slot, int heads, int k_dim, int v_dim, int kernel, int steps) {
+    const size_t width = (size_t)heads * k_dim;
+    const size_t ns = (size_t)heads * k_dim * v_dim, nw = 3 * width * kernel;
+    float *st_g = calloc(ns, 4), *st_c = calloc(ns, 4);
+    float *wi_g = calloc(nw, 4), *wi_c = calloc(nw, 4);
+    float *cw = malloc(nw * 4), *qkv = malloc(3 * width * 4);
+    float *gate = malloc(width * 4), *beta = malloc((size_t)heads * 4);
+    float *og = malloc((size_t)heads * v_dim * 4), *oc = malloc((size_t)heads * v_dim * 4);
+    float *scratch = malloc((size_t)coli_kda_scratch_floats(heads, k_dim, v_dim) * 4);
+    for (size_t i = 0; i < nw; i++) cw[i] = (rand() % 2000 - 1000) / 4000.0f;
+    for (size_t i = 0; i < ns; i++) { float v = (rand() % 2000 - 1000) / 8000.0f; st_g[i] = st_c[i] = v; }
+    const float eps = 1e-6f;
+
+    if (!coli_vk_kda_init(slot, heads, k_dim, v_dim, kernel, st_g, wi_g, cw, NULL, NULL, NULL)) {
+        printf("kda unavailable (kda_step.spv missing? shape unsupported?)\n");
+        free(st_g); free(st_c); free(wi_g); free(wi_c); free(cw); free(qkv);
+        free(gate); free(beta); free(og); free(oc); free(scratch); return 1;
+    }
+    float worst_out = 0;
+    int bad_step = -1;
+    for (int s = 0; s < steps; s++) {
+        for (size_t i = 0; i < 3 * width; i++) qkv[i] = (rand() % 2000 - 1000) / 1000.0f;
+        for (size_t i = 0; i < width; i++)  gate[i] = -(rand() % 100) / 400.0f;   /* log-decay < 0 */
+        for (int h = 0; h < heads; h++)     beta[h] = (rand() % 1000) / 1000.0f;
+        if (!coli_vk_kda_step(slot, qkv, gate, beta, eps, og)) { printf("kda step failed\n"); break; }
+        coli_kda_step(oc, st_c, wi_c, qkv, cw, gate, beta, heads, k_dim, v_dim, kernel, eps, scratch);
+        float m = 0;
+        for (size_t i = 0; i < (size_t)heads * v_dim; i++) {
+            float d = fabsf(og[i] - oc[i]) / (fabsf(oc[i]) + 1e-3f);
+            if (d > m) m = d;
+        }
+        if (m > worst_out) { worst_out = m; }
+        if (m > 1e-5f && bad_step < 0) bad_step = s;
+        /* the decisive question is whether error COMPOUNDS or saturates: the
+         * decay alpha<1 should make an error introduced at step s fade, but
+         * that is an assertion until the curve is printed. */
+        if (s == 99 || s == 199 || s == 399 || s == 799 || s == 1599 || s == steps - 1) {
+            float sd = 0;
+            for (size_t i = 0; i < ns; i++) {
+                float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+                if (d > sd) sd = d;
+            }
+            /* st_g is stale until synced; pull it for the checkpoint only */
+            coli_vk_kda_sync(slot, st_g, NULL);
+            sd = 0;
+            for (size_t i = 0; i < ns; i++) {
+                float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+                if (d > sd) sd = d;
+            }
+            printf("    step %5d: out %.3g  state %.3g\n", s + 1, m, sd);
+        }
+    }
+    coli_vk_kda_sync(slot, st_g, wi_g);
+    float ms = 0;
+    for (size_t i = 0; i < ns; i++) {
+        float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+        if (d > ms) ms = d;
+    }
+    printf("kda h=%d k=%d v=%d ker=%d steps=%d | max rel: out %.3g (first>1e-5 at step %d), state %.3g\n",
+           heads, k_dim, v_dim, kernel, steps, worst_out, bad_step, ms);
+    free(st_g); free(st_c); free(wi_g); free(wi_c); free(cw); free(qkv);
+    free(gate); free(beta); free(og); free(oc); free(scratch);
+    return worst_out > 1e-5f || ms > 1e-5f;
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -2548,6 +2987,11 @@ int main(int argc, char **argv) {
     bad |= run_expert_group(2, 6144, 2048, 32);
     /* int3-g64 expert group: correctness + the 0.86x-bytes throughput question.
      * count=1 included — it is the SHARED-expert path shape in the engine. */
+    /* G12 Stage 1: the KDA recurrence at GLM's shape, and the drift over a
+     * conversation's worth of steps. 34 layers x 128 tokens is ~4400 steps a
+     * run; 1000 is enough to see compounding if there is any. */
+    bad |= run_kda(40, 64, 128, 128, 4, 4000);       /* GLM-5.3 KDA shape, past a full generation */
+    bad |= run_kda(41, 8, 64, 64, 4, 200);           /* small shape, odd occupancy */
     bad |= run_qprep(1, 1, 6144, 1536, 576, 16384);   /* GLM q_a/kv_a/q_b decode shapes */
     bad |= run_qprep(1, 11, 6144, 1536, 576, 16384);  /* prefill batch */
     bad |= run_qprep(1, 2, 6144, 1536, 576, 16384);   /* S=2 (MTP verify) */

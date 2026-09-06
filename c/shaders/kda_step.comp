@@ -1,0 +1,131 @@
+#version 450
+// KDA gated-delta recurrence: one token through one layer, on the GPU.
+// Mirrors coli_kda_step() in c/delta_attention.h element for element and in the
+// same order per element; it is NOT bit-identical, so it ships behind
+// COLI_KDA_GPU and is gated by a drift oracle rather than a diff. The
+// divergence is dominated by GLSL exp() vs libm expf() -- MEASURED, by matching
+// the CPU's norm-reduction order exactly and finding it changed nothing (see
+// the note on block_sum). Removing it would mean reimplementing expf's range
+// reduction in GLSL: slower, and not worth it.
+//
+// Mapping: ONE WORKGROUP PER HEAD, thread t owns output element v = t.
+//   - the 128x128 state tile is NOT staged in LDS. On RDNA3 the tile is exactly
+//     the whole 64 KB LDS budget, leaving nothing for the reductions, and it
+//     buys nothing: for a fixed k the 128 threads read state[k*V + 0..V-1],
+//     which is 512 contiguous bytes and already perfectly coalesced.
+//   - memory[v] and result[v] are therefore per-thread REGISTERS, not shared
+//     arrays, and pass one needs no cross-thread communication at all.
+//   - LDS holds only what every thread must read: the head's post-conv q and k,
+//     its decay row, and a reduction scratch. ~4 KB at GLM's shape.
+//
+// Requires v_dim <= 128 (one v per thread); the caller checks and falls back to
+// the CPU path otherwise, rather than silently computing something else.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0)          buffer State  { float state[]; };   // [heads*K*V] rw
+layout(std430, binding = 1)          buffer Window { float window[]; };  // [3*width*KER] rw
+layout(std430, binding = 2) readonly buffer Qkv    { float qkv[]; };     // [3*width]
+layout(std430, binding = 3) readonly buffer Conv   { float conv_w[]; };  // [3*width*KER]
+layout(std430, binding = 4) readonly buffer Gate   { float gate[]; };    // [heads*K] pre-gated
+layout(std430, binding = 5) readonly buffer Beta   { float beta[]; };    // [heads] pre-sigmoid
+layout(std430, binding = 6) writeonly buffer Out   { float outv[]; };    // [heads*V]
+
+layout(push_constant) uniform P {
+    int heads, k_dim, v_dim, kernel;
+    float norm_eps;
+} p;
+
+const int MAXK = 1024;      // per-head q/k/decay staged in LDS
+shared float sq[MAXK];
+shared float sk[MAXK];
+shared float sd[MAXK];
+shared float red[128];
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+
+// One conv channel: shift the kernel-tap history left, append this token's
+// projection, dot with the taps, SiLU. The window shift is a register rename
+// here; on the CPU it is a 12-byte memmove per channel (24,576 of them a call).
+float conv_channel(int ch, int KER) {
+    uint wbase = uint(ch) * uint(KER);
+    uint cbase = wbase;
+    float hist[8];
+    for (int t = 0; t < KER - 1; t++) hist[t] = window[wbase + uint(t + 1)];
+    hist[KER - 1] = qkv[ch];
+    float sum = 0.0;
+    for (int t = 0; t < KER; t++) {
+        window[wbase + uint(t)] = hist[t];
+        sum += conv_w[cbase + uint(t)] * hist[t];
+    }
+    return silu(sum);
+}
+
+// Tree-reduce the q/k norm sums. This does NOT match the CPU's sequential
+// accumulation order, and that was measured rather than assumed: replicating
+// the CPU order exactly (one thread, 256 serial adds, seeded with norm_eps)
+// moved the 1260-position logit cosine from 0.9999220 to 0.9999218 -- nothing --
+// while costing 3.6% on the step (0.168 -> 0.174 ms/call). The reduction is not
+// where the divergence lives; GLSL exp() vs libm expf() is, ~512 calls per head
+// per step between the conv SiLU and the decay. So: keep the fast reduction.
+float block_sum(float v, int tid) {
+    red[tid] = v;
+    barrier();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    if (h >= p.heads) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int K = p.k_dim, V = p.v_dim, KER = p.kernel;
+    int width = p.heads * K;
+
+    // ---- short causal conv + SiLU, this head's 2*K + V channels ----
+    // Channel groups match coli_kda_step's `mixed` layout exactly:
+    //   q: [h*K, h*K+K)   k: [width + h*K, ...)   v: [2*width + h*V, ...)
+    for (int i = tid; i < K; i += 128) {
+        sq[i] = conv_channel(h * K + i, KER);
+        sk[i] = conv_channel(width + h * K + i, KER);
+        sd[i] = gate[h * K + i];
+    }
+    float val = 0.0;
+    if (tid < V) val = conv_channel(2 * width + h * V + tid, KER);
+    barrier();
+
+    // ---- q/k RMS norms (tree-reduced; see block_sum for why that is fine) ----
+    float qacc = 0.0, kacc = 0.0;
+    for (int i = tid; i < K; i += 128) { qacc += sq[i] * sq[i]; kacc += sk[i] * sk[i]; }
+    float qsum = block_sum(qacc, tid);
+    barrier();
+    float ksum = block_sum(kacc, tid);
+    barrier();
+    float query_norm = (1.0 / sqrt(float(K))) / sqrt(qsum + p.norm_eps);
+    float key_norm   = 1.0 / sqrt(ksum + p.norm_eps);
+
+    if (tid >= V) return;
+    uint base = uint(h) * uint(K) * uint(V);
+    float bh = beta[h];
+
+    // ---- pass one: decay the state, read what it predicts for this key ----
+    float mem = 0.0;
+    for (int k = 0; k < K; k++) {
+        uint idx = base + uint(k) * uint(V) + uint(tid);
+        float r = state[idx] * exp(sd[k]);
+        state[idx] = r;
+        mem += (sk[k] * key_norm) * r;
+    }
+    // ---- pass two: write the correction, read the answer out ----
+    float res = 0.0;
+    for (int k = 0; k < K; k++) {
+        uint idx = base + uint(k) * uint(V) + uint(tid);
+        float r = state[idx] + (sk[k] * key_norm) * (val - mem) * bh;
+        state[idx] = r;
+        res += (sq[k] * query_norm) * r;
+    }
+    outv[uint(h) * uint(V) + uint(tid)] = res;
+}

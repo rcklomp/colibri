@@ -638,6 +638,9 @@ typedef struct {
 typedef struct {
     float *kda_state;                     /* [teste * k * v] */
     float *kda_window;                    /* [3 * proiezione * kernel] */
+    int kda_gpu;                          /* G12: recurrence resident on dev0; the
+                                           * two host buffers above go STALE and are
+                                           * refreshed only by the migration sync */
     float *latent;                        /* [cap][kv_lora]: MLA assorbita */
     float *ikeys, *igates;                /* [cap][dim indexer] */
 } GLayerState;
@@ -951,6 +954,34 @@ static float sigmoidf_(float x) {
 }
 static float siluf_(float x) { return x / (1.0f + expf(-x)); }
 
+/* G3/G4 per-op timer state and helpers (tools/hot-expert/ROADMAP-2026-09.md).
+ * Declared here, above kda_layer, because every timed site from kda_layer
+ * down to forward_span reads them; the report and the reset live next to
+ * run_layers. Gated on COLI_TIMERS=1 (the name rome_bench.sh already
+ * exports) so the default path pays nothing -- not even the clock reads. */
+static int g_optime = -1;
+static double g_ot_kda, g_ot_mla, g_ot_ffn_dense, g_ot_ffn_moe, g_ot_hc, g_ot_head, g_ot_layers;
+static long   g_on_kda, g_on_mla, g_on_ffn_dense, g_on_ffn_moe, g_on_hc, g_on_head, g_on_layers;
+static double g_ot_router, g_ot_shared; static long g_on_router;   /* MoE sub-split */
+/* G4 diagnosis: kda_layer sub-split. Parallelising the 64 heads moved the
+ * total 2%, so the 2.2 ms/call is somewhere other than the recurrence. */
+static double g_kt_proj, g_kt_decay, g_kt_step, g_kt_norm, g_kt_ko;
+static long g_kn_calls, g_kn_batched;
+/* G5 evidence: mla_layer sub-split. The DSA indexer re-pools the whole prefix
+ * on every call and mla_layer runs once per decode token, so `index` is the
+ * O(context)-per-token term G5 would cache away. Reported per call AND per
+ * token of context so linear-vs-quadratic is readable off two runs. */
+static double g_mt_proj, g_mt_index, g_mt_attn;
+static long g_mn_calls; static double g_mn_seen;
+static inline int optime_on(void) {
+    if (g_optime < 0) g_optime = getenv("COLI_TIMERS") && atoi(getenv("COLI_TIMERS"));
+    return g_optime;
+}
+static inline double optime_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
 /* SwiGLU clampata: il gate ha solo il tetto, up e' limitato da entrambi i lati.
  * Vale sia per l'MLP denso che per gli esperti -- il testo di GLM-5.3 NON usa
  * la SiLU semplice, ed e' un errore che darebbe un modello che parla bene e
@@ -970,6 +1001,58 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
     mv(out, d, sg);
 }
 
+/* G13: mlp3() on the GPU path is three separate submit+wait round trips
+ * (mv(gate), mv(up), mv(down)), one call per token -- the shared expert
+ * calls it `tokens` times per layer, always (never cached, never skipped).
+ *
+ * The routed-expert fused kernel (coli_vk_expert_group / coli_vk_gate_up)
+ * looked like the fix -- one submit for gate+up+down together -- but its
+ * shader computes silu(gate)*up with NO CLAMP: it has no `limit` push
+ * constant at all (c/shaders/qmatmul_gate_up.comp). GLM-5.3's swiglu_limit
+ * is 10.0, not the disabled default, and it is regularly exceeded in
+ * practice: routing the shared expert through that kernel and diffing
+ * against the pristine (clamped) CPU path failed the --logits oracle
+ * outright on the very first run. That the routed experts have used this
+ * same unclamped kernel since the expert-group path first landed is a
+ * pre-existing characteristic of the shipped GPU path, not a bug this item
+ * introduces or is in scope to fix -- no oracle had ever caught it because
+ * no prior change put a clamped and an unclamped computation of the SAME
+ * op side by side. Out of scope for a one-day port; left as a finding.
+ *
+ * What DOES fuse without touching numerics: coli_vk_matmul_pair, already
+ * shipping for exactly this shape in c/kimi_k3.c's vk_expert_apply ("w1/w3
+ * in one paired submit, SiTU-GLU on CPU, w2 down"). It runs the SAME plain
+ * matmul shader coli_vk_matmul/mv() already use (no fused activation), just
+ * two dispatches (gate, up) in one command buffer / one submit / one fence
+ * wait instead of two. swiglu_clamped and the down projection are UNCHANGED
+ * from mlp3 -- only the gate+up round trip merges. 3 submits/call -> 2.
+ *
+ * Bit-identical: same shader, same push constants, same per-row math as the
+ * two mv() calls it replaces; batching independent dispatches into one
+ * command buffer changes nothing about what either one computes. Returns 0
+ * on any unmet precondition (mirrors mv()'s own fmt==1||fmt==4 GPU gate,
+ * plus gate/up must share fmt+gs, which coli_vk_matmul_pair requires and
+ * quantize_loaded already guarantees under one GLM53_BITS setting) and the
+ * caller's existing mlp3() runs exactly as before. */
+static int shared_gate_up_gpu(const GLayer *l, const float *x, float *sg, float *su) {
+    if (!g_vk_ready) return 0;
+    Mat *g = (Mat *)&l->rg, *u = (Mat *)&l->ru;   /* vk cache write, as mv() does */
+    if (!(g->fmt == 1 || g->fmt == 4) || !(u->fmt == 1 || u->fmt == 4)) return 0;
+    if (g->fmt != u->fmt || g->gs != u->gs || g->columns != u->columns) return 0;
+    return coli_vk_matmul_pair((ColiVkTensor **)&g->vk, sg,
+                               g->fmt == 4 ? (const void *)g->q4 : (const void *)g->q8, g->s, g->rows,
+                               (ColiVkTensor **)&u->vk, su,
+                               u->fmt == 4 ? (const void *)u->q4 : (const void *)u->q8, u->s, u->rows,
+                               g->fmt, x, 1, g->columns, g->gs);
+}
+
+static void mlp3_shared(float *out, const float *x, const GLayer *l,
+                        float limit, float *sg, float *su) {
+    if (!shared_gate_up_gpu(l, x, sg, su)) { mv(sg, &l->rg, x); mv(su, &l->ru, x); }
+    swiglu_clamped(sg, su, l->rg.rows, limit);
+    mv(out, &l->rd, sg);
+}
+
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
 static int vk_batch_mv_chain(const Mat *const *ws, float *const *os, const int *srcs,
                              int n, const float *xin, int I);
@@ -979,6 +1062,14 @@ static void mv_cpu(float *out, const Mat *w, const float *x) {
     case 1: matmul_q(out, x, w->q8, w->s, 1, w->columns, w->rows); break;
     default: matmul(out, x, w->f, 1, w->columns, w->rows); break;
     }
+}
+/* G12: run the recurrence on dev0 (G12-KDA-GPU-SPEC-2026-09-05.md). Off by
+ * default -- it is NOT bit-identical (GLSL exp, tree-reduced norms), so it
+ * ships behind a knob per CLAUDE.md. COLI_KDA_CPU takes precedence. */
+static int g_kda_gpu = -1;
+static int kda_gpu_on(void) {
+    if (g_kda_gpu < 0) g_kda_gpu = getenv("COLI_KDA_GPU") ? atoi(getenv("COLI_KDA_GPU")) : 0;
+    return g_kda_gpu;
 }
 static int g_kda_cpu = -1;
 static int g_kda_cpu_on(void) {
@@ -991,7 +1082,8 @@ static int g_kda_cpu_on(void) {
 } while (0)
 
 static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
-                      float *out, float *state, float *window, float *scratch) {
+                      float *out, float *state, float *window, float *scratch,
+                      int layer, int gpu) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
     float *qkv = malloc((size_t)3 * P * sizeof(float));
     float *gate = malloc((size_t)P * sizeof(float));
@@ -999,6 +1091,7 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *beta = malloc((size_t)H * sizeof(float));
     float *low = malloc((size_t)D * sizeof(float));
     float *core = malloc((size_t)P * sizeof(float));
+    float *normed_gpu = malloc((size_t)P * sizeof(float));   /* G12 gpu==3 bisection */
     float *lowg = malloc((size_t)D * sizeof(float));
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
@@ -1009,6 +1102,47 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
          * da kfa e kga, quindi entrano nello STESSO submit dietro una barriera e
          * i due intermedi non tornano mai in RAM: due round trip invece di
          * quattro. */
+        const double _tk0 = optime_on() ? optime_now() : 0.0;
+#ifdef COLI_VULKAN
+        /* G12 full chain: projections -> decay -> recurrence -> head norm -> ko
+         * in ONE submit. Everything between the first projection and ko stays on
+         * the device, so this replaces the whole per-token body below, both round
+         * trips and all three CPU stages. Falls through on any refusal. */
+        if ((gpu == 2 || gpu == 3) && !g_kda_cpu_on()) {
+            Mat *cw[8] = { (Mat *)&l->kq, (Mat *)&l->kk, (Mat *)&l->kv, (Mat *)&l->kfa,
+                           (Mat *)&l->kb, (Mat *)&l->kga, (Mat *)&l->kfb, (Mat *)&l->kgb };
+            const int csrc[8] = { -1, -1, -1, -1, -1, -1, 3, 5 };
+            ColiVkMM it[8];
+            int ok = 1;
+            for (int q = 0; q < 8 && ok; q++) {
+                if (cw[q]->fmt != 1 && cw[q]->fmt != 4) ok = 0;
+                it[q].tensor = (ColiVkTensor **)&cw[q]->vk;
+                it[q].weights = (cw[q]->fmt == 4) ? (const void *)cw[q]->q4 : (const void *)cw[q]->q8;
+                it[q].scales = cw[q]->s; it[q].fmt = cw[q]->fmt; it[q].O = cw[q]->rows;
+                it[q].gs = cw[q]->gs; it[q].out = NULL; it[q].I = 0; it[q].src = csrc[q];
+            }
+            Mat *ko = (Mat *)&l->ko;
+            /* gpu==3 bisects: chain through the head norm, ko on the CPU. */
+            const int stop_at_norm = (gpu == 3);
+            float *chain_dst = stop_at_norm ? normed_gpu : out + (size_t)t * c->hidden;
+            if (ok && coli_vk_kda_layer(layer, it, 8, row, c->hidden,
+                                        (ColiVkTensor **)&ko->vk,
+                                        (ko->fmt == 4) ? (const void *)ko->q4 : (const void *)ko->q8,
+                                        ko->s, ko->fmt, ko->gs, ko->rows,
+                                        c->gate_lb, 1e-6f, c->eps,
+                                        stop_at_norm, chain_dst)) {
+                if (stop_at_norm) KMV(out + (size_t)t * c->hidden, &l->ko, normed_gpu);
+                if (optime_on()) {
+                    /* one fused stage: attribute it to proj so kda's total stays
+                     * comparable, and leave the other four buckets at zero rather
+                     * than inventing a split the timers cannot see. */
+                    g_kt_proj += optime_now() - _tk0;
+                    g_kn_batched++; g_kn_calls++;
+                }
+                continue;
+            }
+        }
+#endif
         int batched = 0;
         if (!g_kda_cpu_on()) {
             const Mat *bw[8] = { &l->kq, &l->kk, &l->kv, &l->kfa, &l->kb, &l->kga,
@@ -1027,15 +1161,37 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             KMV(decay, &l->kfb, low);
             KMV(gate, &l->kgb, lowg);
         }
-        /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
-        for (int h = 0; h < H; h++)
+        if (optime_on()) { g_kt_proj += optime_now() - _tk0; g_kn_batched += batched ? 1 : 0; }
+        const double _tk1 = optime_on() ? optime_now() : 0.0;
+        /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias))
+         *
+         * exp(A_log[h]) dipende solo dal peso: fuori dal ciclo su d si calcola
+         * 64 volte per token invece di 8.192 (G3: i trascendentali sono ~1 ms
+         * dei 2,3 ms per chiamata). Stesso expf sullo stesso ingresso, quindi
+         * stessi bit. */
+        for (int h = 0; h < H; h++) {
+            const float alpha = expf(l->alog[h]);
             for (int d = 0; d < D; d++) {
                 int i = h * D + d;
-                decay[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (decay[i] + l->dt[i]));
+                decay[i] = c->gate_lb * sigmoidf_(alpha * (decay[i] + l->dt[i]));
             }
+        }
         for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
+        if (optime_on()) { g_kt_decay += optime_now() - _tk1; }
+        const double _tk2 = optime_on() ? optime_now() : 0.0;
+#ifdef COLI_VULKAN
+        /* The recurrence, and only it: decay/beta gating above and the norm+ko
+         * below still run where they did. This is the increment that measures
+         * the shader's real in-engine dispatch cost before the full chain is
+         * built -- it ADDS a round trip, so it is not expected to be a win. */
+        if (gpu && coli_vk_kda_step(layer, qkv, decay, beta, 1e-6f, core)) {
+            /* state and window advanced on the device */
+        } else
+#endif
         coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
                       H, D, D, c->conv_k, 1e-6f, scratch);
+        if (optime_on()) { g_kt_step += optime_now() - _tk2; }
+        const double _tk3 = optime_on() ? optime_now() : 0.0;
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
          * low-rank, poi la proiezione di uscita. */
         float *normed = qkv;                         /* riuso: 3P >= P */
@@ -1048,8 +1204,12 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             for (int d = 0; d < D; d++)
                 dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gate[(size_t)h * D + d]);
         }
+        if (optime_on()) { g_kt_norm += optime_now() - _tk3; }
+        const double _tk4 = optime_on() ? optime_now() : 0.0;
         KMV(out + (size_t)t * c->hidden, &l->ko, normed);
+        if (optime_on()) { g_kt_ko += optime_now() - _tk4; g_kn_calls++; }
     }
+    free(normed_gpu);
     free(lowg); free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
 }
 
@@ -1103,6 +1263,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *head_w = malloc((size_t)tokens * IH * sizeof(float));
     unsigned char *valid = malloc((size_t)seen);
     memset(valid, 1, (size_t)seen);
+    const double _tm0 = optime_on() ? optime_now() : 0.0;
 
     for (int t = 0; t < tokens; t++) {
         const int at = base + t;          /* posizione assoluta nella cache */
@@ -1137,13 +1298,27 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             }
         }
         /* la query entra nello spazio del latente una volta per testa, invece
-         * che il latente nello spazio della query una volta per posizione */
+         * che il latente nello spazio della query una volta per posizione.
+         *
+         * Le teste sono indipendenti: ognuna scrive la propria fetta di
+         * absorbed[] e legge la propria fetta di queries[], nessuno stato
+         * condiviso. mv_rows ha gia' un proprio #pragma omp parallel for
+         * (quant.h) sulle proprie L righe -- annidarlo qui dentro collassa a
+         * un thread per chiamata (default max-active-levels=1 su GCC/libgomp
+         * su questa macchina, verificato empiricamente G8 2026-09-05), quindi
+         * non e' un rischio di overselling, solo un'occasione oggi sprecata:
+         * 64 team OpenMP minuscoli per token invece di uno solo. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++)
             mv_rows(absorbed + ((size_t)t * H + h) * L, &l->kvb_kt,
                     queries + ((size_t)t * H + h) * QK, h * L, L);
         for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
     }
 
+    if (optime_on()) { g_mt_proj += optime_now() - _tm0; }
+    const double _tm1 = optime_on() ? optime_now() : 0.0;
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
     if (coli_sparse_index_select_range(selected, iq, ik, gates, head_w, l->ikpa, valid,
@@ -1162,13 +1337,40 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     }
     /* Attenzione nello spazio del latente. La scala resta 1/sqrt(qk_nope):
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
+    if (optime_on()) { g_mt_index += optime_now() - _tm1; }
+    const double _tm2 = optime_on() ? optime_now() : 0.0;
     float *context = malloc((size_t)H * V * sizeof(float));
-    float *pooled = malloc((size_t)L * sizeof(float));
-    float *score = malloc((size_t)width * sizeof(float));
+    /* score/pooled are the one thing 64 independent heads would share if run
+     * concurrently -- each gets its own slice of a pool sized per thread,
+     * the same fix as KDA's per-thread `memory` (G4): a shared slice would
+     * corrupt every head's softmax while still emitting plausible tokens.
+     * coli_kda_threads() (delta_attention.h, included above) already has the
+     * #ifdef _OPENMP guard this needs. */
+    const int nthreads_mla = coli_kda_threads();
+    float *pooled_pool = malloc((size_t)nthreads_mla * L * sizeof(float));
+    float *score_pool = malloc((size_t)nthreads_mla * width * sizeof(float));
     const float scale = 1.0f / sqrtf((float)QK);
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
+        /* Heads are independent: each reads its own absorbed[] query and
+         * writes its own context[] slice. mv_rows's own #pragma omp parallel
+         * for (quant.h) collapses to one thread per call inside this region
+         * -- max-active-levels defaults to 1 on this box's GCC/libgomp
+         * (checked empirically, G8 2026-09-05) -- so nesting is not a
+         * hazard, only a currently-wasted opportunity: two tiny OMP teams
+         * spun up per head per token today (this loop's mv_rows call and the
+         * absorb loop's above), which is what G3 actually measured. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
+#ifdef _OPENMP
+            float *pooled = pooled_pool + (size_t)omp_get_thread_num() * L;
+            float *score = score_pool + (size_t)omp_get_thread_num() * width;
+#else
+            float *pooled = pooled_pool;
+            float *score = score_pool;
+#endif
             const float *q = absorbed + ((size_t)t * H + h) * L;
             float top = -INFINITY;
             int used = 0;
@@ -1200,7 +1402,8 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         }
         mv(out + (size_t)t * c->hidden, &l->o, context);
     }
-    free(score); free(pooled);
+    if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+    free(score_pool); free(pooled_pool);
 
     free(context); free(selected); free(valid); free(head_w);
     free(iq); free(absorbed); free(queries); free(qa);
@@ -1345,6 +1548,74 @@ static int piece_mappable(const GModel *m, const ERef *ref, int q) {
     return (ref->off[q] & 3) == 0;
 }
 
+/* Port of qwen38_core.h's q38_populate_range: same MADV_POPULATE_READ
+ * primitive, same call shape (prefault on the thread that binds an expert
+ * instead of inside the matmul that first touches it), but the opposite
+ * default. Ported and A/B'd on the 2026-09-04 rig against G0
+ * (tools/hot-expert/ROME-3x7900XTX-2026-09-04.md): where this helped Qwen's
+ * CPU expert path 4-6x (fault stalls were 45% of decode as libgomp barrier
+ * spin, fifteen threads idling on the one taking the fault), it measured a
+ * REGRESSION on GLM's -- rotating median 1.65-1.66 -> 1.48 tok/s, cold
+ * decode 1.23-1.25 -> 0.98-0.99, reproduced twice each way, isolated by
+ * toggling only this knob with everything else held fixed. teacher_forcing
+ * and last_logits are bit-identical to pristine either way (this changes
+ * only when pages fault, never what gets read), so the difference is real
+ * runtime cost, not a shortcut. Root cause not profiled here (out of scope
+ * for a port) -- candidates are GLM's much higher call frequency (this fires
+ * on every expert_read cache miss inside the per-token dispatch loop, not a
+ * bounded one-time loader like Qwen's) and/or mmap_lock contention from
+ * eight threads calling madvise concurrently on the SAME per-file mapping.
+ * Default OFF (opt-in only) until that regression is understood; do not flip
+ * this to default-on without a new measurement. */
+/* G1b instrumentation: how many advises, how long inside them, how many bytes.
+ * Reported by prof_print. Wall time here is what tells apart "the madvise calls
+ * themselves cost the regression" from "they cost little but slow everything
+ * else down" -- the two hypotheses G1 left open. */
+static double g_t_pop; static long g_n_pop; static double g_b_pop;
+static double g_t_pop_max;
+static long g_n_bind_contig, g_n_bind_split;   /* mmap binds: 1 advise vs 6 */
+static long g_n_bind_gpu, g_n_bind_cpu;        /* binds whose expert is/isn't VRAM-resident */
+
+/* Is this expert served from VRAM? Defined with the tier below (it needs
+ * vk_reg_at); declared here because expert_read has to ask before it decides
+ * whether prefaulting the expert's host pages is worth anything. */
+#ifdef COLI_VULKAN
+static int glm53_expert_on_gpu(int layer, int eid);
+#else
+#define glm53_expert_on_gpu(layer, eid) 0
+#endif
+static void glm53_populate_range(const uint8_t *p, int64_t nbytes) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+    static int on = -1;
+    if (on < 0) on = (getenv("GLM53_MMAP_POPULATE") && atoi(getenv("GLM53_MMAP_POPULATE")));
+    if (!on || !p || nbytes <= 0) return;
+    static long page = 0;
+    if (!page) page = sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t)p & ~((uintptr_t)page - 1);
+    uintptr_t e = ((uintptr_t)p + (uintptr_t)nbytes + (uintptr_t)page - 1) & ~((uintptr_t)page - 1);
+    struct timespec _t0, _t1;
+    clock_gettime(CLOCK_MONOTONIC, &_t0);
+    (void)madvise((void *)a, (size_t)(e - a), MADV_POPULATE_READ);
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    double _dt = (double)(_t1.tv_sec - _t0.tv_sec) + (double)(_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    g_t_pop += _dt;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    g_n_pop++;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    g_b_pop += (double)(e - a);
+    if (_dt > g_t_pop_max) g_t_pop_max = _dt;   /* racy, indicative only */
+#else
+    (void)p; (void)nbytes;
+#endif
+}
+
 static void expert_map_init(GModel *m) {
     if (getenv("GLM53_NO_MMAP") || !m->eref) return;
     const Cfg *c = &m->c;
@@ -1363,6 +1634,18 @@ static void expert_map_init(GModel *m) {
                 g_fmap[fd] = (uint8_t *)pm;
                 g_fmaplen[fd] = (size_t)st.st_size;
                 files++;
+                /* GLM53_POPULATE_LOAD: fault the whole shard in right here,
+                 * instead of leaving it to the first per-expert bind. Default
+                 * OFF, unlike the per-bind prefault above -- this is new and
+                 * unmeasured on this box, and the record already has one
+                 * incident of an eager, unbounded preload thrashing the page
+                 * cache (91 GB "resident" from an uncapped dev2/dev3 loop).
+                 * The 182 GiB checkpoint fits the 247 GB box alone, per the
+                 * "one model at a time" discipline in CLAUDE.md, but that is
+                 * exactly the assumption a bad interaction could violate, so
+                 * this stays opt-in until it has its own A/B on record. */
+                if (getenv("GLM53_POPULATE_LOAD") && atoi(getenv("GLM53_POPULATE_LOAD")))
+                    glm53_populate_range((const uint8_t *)pm, (int64_t)st.st_size);
             }
         }
     if (!files) return;
@@ -1466,6 +1749,44 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
         if (ok) {
             for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
                 slot->piece[p] = g_fmap[ref->fd[p]] + ref->off[p];
+            /* Prefault on the thread that binds this expert, not inside the
+             * matmul that first touches it -- see glm53_populate_range above.
+             *
+             * But ONLY if the CPU is the one that will read it. An expert that
+             * is VRAM-resident is still bound here (expert_mats builds its
+             * views unconditionally) and then served from its GPU tensors, so
+             * its host pages are never touched at all: faulting the whole
+             * ~14 MB slot in for it is pure waste. That waste is what G1
+             * measured as a regression -- see the record.
+             *
+             * ref->contig decides one advice for the whole slot vs six small
+             * ones; measured contig=0 on this checkpoint, so in practice it is
+             * always the six. */
+            const int on_gpu = glm53_expert_on_gpu(layer, eid);
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+            g_n_bind_gpu += on_gpu ? 1 : 0;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+            g_n_bind_cpu += on_gpu ? 0 : 1;
+            if (!on_gpu) {
+                if (ref->contig) {
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+                    g_n_bind_contig++;
+                    glm53_populate_range(slot->piece[0], m->e_slot);
+                } else {
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+                    g_n_bind_split++;
+                    for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+                        glm53_populate_range(slot->piece[p], m->e_len[p]);
+                }
+            }
             slot->mapped = 1;
             slot->eid = eid;
 #ifdef _OPENMP
@@ -1560,10 +1881,20 @@ static double prof_now_s(void) { struct timespec _ts; clock_gettime(CLOCK_MONOTO
 __attribute__((destructor)) static void prof_print(void) {
     fprintf(stderr, "[PROF] eg=%.3fs(disp=%ld experts=%ld) cpu=%.3fs(n=%ld) devloss=%ld\n",
             g_t_eg, g_n_eg_disp, g_n_eg, g_t_cpu, g_n_cpu, g_n_devloss);
+    fprintf(stderr, "[PROF] mmap serve=%ld copy=%ld | binds gpu=%ld cpu=%ld (contig=%ld split=%ld)\n",
+            g_map_serve, g_map_copy, g_n_bind_gpu, g_n_bind_cpu,
+            g_n_bind_contig, g_n_bind_split);
+    if (g_n_pop)
+        fprintf(stderr, "[PROF] populate n=%ld t=%.3fs (%.1f us/call, max %.1f us) bytes=%.2f GB\n",
+                g_n_pop, g_t_pop, g_t_pop / (double)g_n_pop * 1e6,
+                g_t_pop_max * 1e6, g_b_pop / 1e9);
     const char *p2 = getenv("COLI_USAGE_PATH");
     if (p2 && g_eusage) { FILE *f = fopen(p2, "wb"); if (f) { fwrite(g_eusage, sizeof(uint64_t), (size_t)g_vk_NL * g_vk_E, f); fclose(f); } }
 }
 static void **vk_reg_at(int layer, int eid) { return (void **)g_vkreg + ((size_t)layer * g_vk_E + eid) * 3; }
+static int glm53_expert_on_gpu(int layer, int eid) {
+    return g_vk_ready && g_vkreg && vk_reg_at(layer, eid)[0] != NULL;
+}
 typedef struct { uint64_t u; int layer, eid; } VkCand;
 static int vk_cand_cmp(const void *a, const void *b) {
     uint64_t ua = ((const VkCand *)a)->u, ub = ((const VkCand *)b)->u;
@@ -1631,9 +1962,33 @@ static void vk_preload_tier(GModel *m) {
             reg[0] = t[0]; reg[1] = t[1]; reg[2] = t[2]; loaded++; g_vk_n++;
         } else { for (int q = 0; q < 3; q++) if (t[q]) coli_vk_tensor_free(t[q]); break; }
     }
+    /* G6: how much VRAM to leave unused on the EXPERT-ONLY devices. dev0 keeps
+     * 3.0 GB because it also holds the dense set (~3.78 GB), the KV mirror and
+     * every scratch buffer; dev2/dev3 hold experts and nothing else, so their
+     * only other consumers are command buffers, descriptor pools and a ~1 MB
+     * expert-group scratch. 3.0 GB there is not caution, it is a re-tuning:
+     * measured on this rig it stops the tier at 1600 of the 1695 every recorded
+     * number was taken with, which would silently change routing and invalidate
+     * the baseline. This guard exists to stop a RUNAWAY -- an unset cap
+     * spilling into host RAM over ReBAR -- not to resize the tier. */
+    double tier_reserve = 1.0;
+    { const char *r = getenv("COLI_VK_TIER_RESERVE_GB");
+      if (r) { double v = atof(r); if (v >= 0.0) tier_reserve = v; } }
     if (g_vk_budget2 > 0 && coli_vk_dev2_available()) {
         int loaded2 = 0;
         for (int i = 0; i < (int)n && (g_vk_budget2 <= 0 || loaded2 < g_vk_budget2); i++) {
+            /* G6: stop on the VRAM budget, not only on the count cap. dev0's
+             * loop has always done this; dev2/dev3 did not, and that is how an
+             * unset cap put 91 GB "in VRAM" and evicted the page cache. These
+             * are HOST_VISIBLE allocations that spill to host RAM over ReBAR,
+             * so they do NOT fail at the VRAM limit -- without this check the
+             * loop happily keeps succeeding into system memory. Same 3 GB
+             * reserve and same every-8 cadence as dev0. */
+            if ((loaded2 & 7) == 0) { double u, b;
+                if (coli_vk_mem_budget2(&u, &b) && (b - u) < tier_reserve) {
+                    fprintf(stderr, "[VK] preload dev2: stopping on VRAM budget "
+                            "(%.1f of %.1f GB used, %.1f reserve)\n", u, b, tier_reserve);
+                    break; } }
             int layer = cand[i].layer, eid = cand[i].eid;
             void **reg = vk_reg_at(layer, eid);
             if (reg[0]) continue;
@@ -1651,6 +2006,11 @@ static void vk_preload_tier(GModel *m) {
     if (g_vk_budget3 > 0 && coli_vk_dev3_available()) {
         int loaded3 = 0;
         for (int i = 0; i < (int)n && (g_vk_budget3 <= 0 || loaded3 < g_vk_budget3); i++) {
+            if ((loaded3 & 7) == 0) { double u, b;            /* G6, as dev2 above */
+                if (coli_vk_mem_budget3(&u, &b) && (b - u) < tier_reserve) {
+                    fprintf(stderr, "[VK] preload dev3: stopping on VRAM budget "
+                            "(%.1f of %.1f GB used, %.1f reserve)\n", u, b, tier_reserve);
+                    break; } }
             int layer = cand[i].layer, eid = cand[i].eid;
             void **reg = vk_reg_at(layer, eid);
             if (reg[0]) continue;
@@ -1668,12 +2028,185 @@ static void vk_preload_tier(GModel *m) {
     free(cand); if (tmp.own) free(tmp.own);
     fprintf(stderr, "[VK] preload: %d heat-ranked experts resident (of %d candidates)\n", loaded, (int)n);
 }
-/* pure-CPU expert MLP (bypasses mv/Vulkan for non-resident experts) */
+/* pure-CPU expert MLP (bypasses mv/Vulkan for non-resident experts)
+ *
+ * G11: the three matmuls used to be three separate `#pragma omp parallel for`
+ * regions with the swiglu running SERIAL between the second and the third —
+ * three fork/joins and one single-threaded stretch per expert, ~70 experts per
+ * decode token. They are now one parallel region with three worksharing
+ * constructs: gate and up share one (they are independent and read the same
+ * x), then the swiglu is shared across the same team, then down. Two implicit
+ * barriers replace two fork/joins, and the swiglu stops being serial.
+ *
+ * Bit-identical by construction: every output element is still one
+ * `coli_i4_row` over the same groups in the same order — only which thread
+ * runs it, and how the team is entered, changed. Verified against the pristine
+ * binary on both prompts, not assumed.
+ *
+ * GLM53_EXPERT_SPLIT=1 restores the old three-region path for A/B measurement;
+ * it is not a numerics knob, both paths produce the same bits. */
+static int g_expert_split = -1;
+static int expert_split_on(void) {
+    if (g_expert_split < 0)
+        g_expert_split = getenv("GLM53_EXPERT_SPLIT") ? atoi(getenv("GLM53_EXPERT_SPLIT")) : 0;
+    return g_expert_split;
+}
+/* G14: the one alternative int4 expert kernel that preserved the output.
+ *
+ * Its only numeric change is summation order -- four accumulators instead of
+ * one -- because the bit-trick nibble decode is exactly (float)(n-8). Measured
+ * in the engine against a pristine binary: [PROF] cpu 11.777 -> 11.215 s with
+ * the expert count IDENTICAL at 19706 (identical text means identical routing,
+ * so it is a properly controlled pair), last_logits relL2 3.0e-6 on the short
+ * prompt, teacher_forcing exact over 1232 positions, greedy text identical over
+ * 128 tokens. Worth ~1.3% of the token -- real, safe, and below the serving
+ * gate's floor.
+ *
+ * Off by default because it is not BIT-identical, and §G10 set this track's bar
+ * for shipping on: that item reverted a working optimisation rather than accept
+ * a 1.9e-4 drift.
+ *
+ * Three quantised-activation variants (int8 maddubs at 1.32x, int16 madd_epi16
+ * at 1.075x, and int8 gate/up with a float down) were built, measured and
+ * REMOVED: all three changed the greedy text, because one outlier in a group of
+ * 64 -- the thing swiglu_limit=10.0 exists to clamp -- crushes the other 63.
+ * The numbers are in record §G14 and in commits a0af56e / be95eb5; the code is
+ * not kept, because the record is where this project keeps evidence.
+ *
+ * The finding that mattered was not the kernel: isolated-to-in-engine
+ * attenuation is 0.55-0.65x consistently, because the engine streams 985 MB of
+ * COLD expert weights per token where the microbenchmark cycles 406 MB. In situ
+ * this path is closer to memory-bound than §G3's isolated "27% of bandwidth"
+ * suggests, so the lever is FEWER BYTES (int3 experts, fmt=5) not faster
+ * arithmetic. */
+static int g_i4_fast = -1;
+static int i4_fast_on(void) {
+    if (g_i4_fast < 0) g_i4_fast = getenv("GLM53_I4_FAST") ? atoi(getenv("GLM53_I4_FAST")) : 0;
+    return g_i4_fast;
+}
+
 static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, const Mat *d, float limit, float *sg, float *su) {
-    matmul_i4_grouped(sg, x, g->q4, g->s, 1, g->columns, g->rows, g->gs);
-    matmul_i4_grouped(su, x, u->q4, u->s, 1, u->columns, u->rows, u->gs);
-    swiglu_clamped(sg, su, g->rows, limit);
-    matmul_i4_grouped(out, sg, d->q4, d->s, 1, d->columns, d->rows, d->gs);
+    if (expert_split_on()) {
+        matmul_i4_grouped(sg, x, g->q4, g->s, 1, g->columns, g->rows, g->gs);
+        matmul_i4_grouped(su, x, u->q4, u->s, 1, u->columns, u->rows, u->gs);
+        swiglu_clamped(sg, su, g->rows, limit);
+        matmul_i4_grouped(out, sg, d->q4, d->s, 1, d->columns, d->rows, d->gs);
+        return;
+    }
+    /* fmt is checked by the caller's classify loop (int4 experts only), but be
+     * explicit: anything else falls back rather than silently misreading. */
+    if (g->fmt != 4 || u->fmt != 4 || d->fmt != 4) {
+        matmul_i4_grouped(sg, x, g->q4, g->s, 1, g->columns, g->rows, g->gs);
+        matmul_i4_grouped(su, x, u->q4, u->s, 1, u->columns, u->rows, u->gs);
+        swiglu_clamped(sg, su, g->rows, limit);
+        matmul_i4_grouped(out, sg, d->q4, d->s, 1, d->columns, d->rows, d->gs);
+        return;
+    }
+    const int Ig = g->columns, Og = g->rows, Id = d->columns, Od = d->rows;
+    /* G14: the fused float path below, with the row kernel swapped for the
+     * four-accumulator bit-trick decode. Structure, swiglu and down projection
+     * are otherwise identical -- the only change is summation order inside a
+     * row. No scratch buffers: it reads x and sg directly, like coli_i4_row. */
+    if (i4_fast_on() && g->gs >= 8 && d->gs >= 8 &&
+        u->gs == g->gs && u->columns == Ig && u->rows == Og) {
+        const int grb_ = (Ig + 1) / 2, gng_ = (Ig + g->gs - 1) / g->gs;
+        const int drb_ = (Id + 1) / 2, dng_ = (Id + d->gs - 1) / d->gs;
+#ifdef _OPENMP
+        #pragma omp parallel
+#endif
+        {
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int z = 0; z < 2 * Og; z++) {
+                if (z < Og)
+                    sg[z] = coli_i4_row_f4(g->q4 + (int64_t)z * grb_,
+                                           g->s + (int64_t)z * gng_, x, Ig, g->gs);
+                else {
+                    const int o = z - Og;
+                    su[o] = coli_i4_row_f4(u->q4 + (int64_t)o * grb_,
+                                           u->s + (int64_t)o * gng_, x, Ig, u->gs);
+                }
+            }
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int i = 0; i < Og; i++) {
+                float gv = sg[i] > limit ? limit : sg[i];
+                float uv = su[i] < -limit ? -limit : (su[i] > limit ? limit : su[i]);
+                sg[i] = siluf_(gv) * uv;
+            }
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int o = 0; o < Od; o++)
+                out[o] = coli_i4_row_f4(d->q4 + (int64_t)o * drb_,
+                                        d->s + (int64_t)o * dng_, sg, Id, d->gs);
+        }
+        return;
+    }
+    const int grb = (Ig + 1) / 2, gng = (Ig + g->gs - 1) / g->gs;
+    const int urb = (u->columns + 1) / 2, ung = (u->columns + u->gs - 1) / u->gs;
+    const int drb = (Id + 1) / 2, dng = (Id + d->gs - 1) / d->gs;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int z = 0; z < 2 * Og; z++) {
+            if (z < Og)
+                sg[z] = coli_i4_row(g->q4 + (int64_t)z * grb, g->s + (int64_t)z * gng, x, Ig, g->gs);
+            else {
+                const int o = z - Og;
+                su[o] = coli_i4_row(u->q4 + (int64_t)o * urb, u->s + (int64_t)o * ung, x, u->columns, u->gs);
+            }
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < Og; i++) {
+            float gv = sg[i] > limit ? limit : sg[i];
+            float uv = su[i] < -limit ? -limit : (su[i] > limit ? limit : su[i]);
+            sg[i] = siluf_(gv) * uv;
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int o = 0; o < Od; o++)
+            out[o] = coli_i4_row(d->q4 + (int64_t)o * drb, d->s + (int64_t)o * dng, sg, Id, d->gs);
+    }
+}
+
+/* G9: run CPU-only experts that were deferred past the GPU issue point (see
+ * ffn_layer's dispatch block), so their compute overlaps the fence wait
+ * instead of finishing entirely before it -- G2 issued the three devices
+ * concurrently with each other; this is the "CPU share in between" half of
+ * the same idea, deliberately left for later there. Same per-token
+ * scale/accumulate as the immediate path, just replayed against saved Mat
+ * triples instead of the single (gate,up,down,eid) the classify loop had at
+ * hand. Only ever called with experts collected while can_defer held (single
+ * block, no eviction risk between classifying and running them). */
+static void ffn_moe_run_deferred_cpu(const Mat *cpu_gate, const Mat *cpu_up, const Mat *cpu_down,
+                                     const int *cpu_eid, int n_cpu_deferred,
+                                     const int *chosen, const float *weight, int tokens, int topk,
+                                     const float *x, int hidden, float limit,
+                                     float *sg, float *su, float *tmp, float *out) {
+    for (int j = 0; j < n_cpu_deferred; j++) {
+        const int eid = cpu_eid[j];
+        for (int t = 0; t < tokens; t++) {
+            float scale = 0.0f;
+            for (int k = 0; k < topk; k++)
+                if (chosen[(size_t)t * topk + k] == eid) { scale = weight[(size_t)t * topk + k]; break; }
+            if (scale == 0.0f) continue;
+            double _tc = prof_now_s();
+            mlp3_cpu(tmp, x + (size_t)t * hidden, &cpu_gate[j], &cpu_up[j], &cpu_down[j], limit, sg, su);
+            g_t_cpu += prof_now_s() - _tc; g_n_cpu++;
+            float *dst = out + (size_t)t * hidden;
+            for (int d = 0; d < hidden; d++) dst[d] += scale * tmp[d];
+        }
+    }
 }
 #endif
 
@@ -1698,9 +2231,24 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     float *score = malloc((size_t)c->n_experts * sizeof(float));
     if (!chosen || !weight || !score) { fprintf(stderr, "OOM nel router\n"); exit(1); }
 
+    const double t_router0 = optime_on() ? optime_now() : 0.0;
     /* --- primo tempo: il router, per ogni token --- */
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
+        /* Le 288 righe sono indipendenti: ognuna legge la propria riga di
+         * l->router e scrive il proprio score[e], nessun accumulatore
+         * condiviso. Parallelizzare su e non tocca l'ordine della somma su d
+         * per nessuna riga -- cambia solo in che ordine le righe vengono
+         * calcolate, non il valore di nessuna di esse. `score` e' un unico
+         * buffer riusato a ogni t (non ha una dimensione per token), quindi
+         * qui dentro e non sul ciclo esterno: parallelizzare su t farebbe
+         * scrivere thread diversi nello stesso buffer per t diversi. G3
+         * (2026-09-04): 0.98 ms/call, un thread solo, riduzione scalare che
+         * GCC non vettorizza da sé -- 1.2 GMAC/s contro gli 8 core
+         * disponibili. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int e = 0; e < c->n_experts; e++) {
             const float *w = l->router + (size_t)e * c->hidden;
             float sum = 0.0f;
@@ -1729,6 +2277,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
     }
     free(score);
+    if (optime_on()) { g_ot_router += optime_now() - t_router0; g_on_router++; }
 
     /* --- secondo e terzo tempo, a blocchi che stanno in cache ---
      *
@@ -1745,9 +2294,11 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
+    const double t_shared0 = optime_on() ? optime_now() : 0.0;
     for (int t = 0; t < tokens; t++)
-        mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
-             &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+        mlp3_shared(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden, l,
+                   c->swiglu_limit, sg, su);
+    if (optime_on()) g_ot_shared += optime_now() - t_shared0;
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
@@ -1798,6 +2349,24 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         vg2 = malloc((size_t)maxres * sizeof(void *)); vu2 = malloc((size_t)maxres * sizeof(void *)); vd2 = malloc((size_t)maxres * sizeof(void *));
         vrows2 = malloc((size_t)maxres * sizeof(int)); vtok2 = malloc((size_t)maxres * sizeof(int)); vw2 = malloc((size_t)maxres * sizeof(float));
         xk2 = malloc((size_t)maxres * c->hidden * sizeof(float));
+    }
+    /* G9: CPU-only experts get deferred here instead of computed immediately,
+     * so they can run after the GPU groups are issued (overlapping the fence
+     * wait) instead of entirely before it. Safe only when the whole routing
+     * fits in one block: n_union <= block means expert_read for a LATER
+     * block can never evict a slot this block's deferred compute still
+     * needs. cache->cap is 512 in every measured config on this rig and
+     * n_union <= topk*tokens, so this always holds for decode; a smaller cap
+     * or a larger prefill batch falls back to today's immediate-compute path
+     * untouched, exactly as before this change. */
+    const int can_defer = g_vk_ready && (n_union <= block);
+    Mat *cpu_gate = NULL, *cpu_up = NULL, *cpu_down = NULL;
+    int *cpu_eid = NULL, n_cpu_deferred = 0, cpu_deferred_done = 0;
+    if (can_defer) {
+        cpu_gate = malloc((size_t)maxres * sizeof(Mat));
+        cpu_up   = malloc((size_t)maxres * sizeof(Mat));
+        cpu_down = malloc((size_t)maxres * sizeof(Mat));
+        cpu_eid  = malloc((size_t)maxres * sizeof(int));
     }
 #endif
     for (int base = 0; base < n_union; base += block) {
@@ -1870,6 +2439,14 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                     g_n_eg++;
                     continue;
                 }
+                if (can_defer) {
+                    cpu_gate[n_cpu_deferred] = gate;
+                    cpu_up[n_cpu_deferred] = up;
+                    cpu_down[n_cpu_deferred] = down;
+                    cpu_eid[n_cpu_deferred] = eid;
+                    n_cpu_deferred++;
+                    continue;
+                }
 #endif
             for (int t = 0; t < tokens; t++) {
                 float scale = 0.0f;
@@ -1900,30 +2477,74 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         float *yk1 = (nvk1 > 0) ? malloc((size_t)vtot1 * c->hidden * sizeof(float)) : NULL;
         float *yk2 = (nvk2 > 0) ? malloc((size_t)vtot2 * c->hidden * sizeof(float)) : NULL;
         int ok = (nvk0 == 0 || yk0 != NULL) && (nvk1 == 0 || yk1 != NULL) && (nvk2 == 0 || yk2 != NULL);
-        int base = 0;
-        for (int q = 0; ok && q < nvk0; ) {
-            int n = nvk0 - q; if (n > 64) n = 64;
-            int rs = 0; for (int w = 0; w < n; w++) rs += vrows0[q + w];
-            ok = coli_vk_expert_group(vg0 + q, vu0 + q, vd0 + q, vrows0 + q, n,
-                                      yk0 + (size_t)base * c->hidden, xk0 + (size_t)base * c->hidden);
-            base += rs; q += n;
+        /* Issue every device's chunk first, join afterward: the three GPUs
+         * then run at the same time as each other instead of one after the
+         * other. Mirrors qwen38_core.h's q38_moe_decode -- measured there at
+         * 2.37 ms/layer sequential vs 0.63 ms/layer concurrent issue/take on
+         * this rig's 3x RX 7900 XTX (2026-09-04). Each device is still capped
+         * at 64 items per call (the descriptor-pool size eg_prepare_submit
+         * allocates once, in backend_vulkan.c), so a device whose group needs
+         * more than one chunk still serializes against ITSELF across rounds;
+         * only the three devices' matching round overlaps. A group that was
+         * successfully issued is always taken before this loop can exit or
+         * advance to the next round, win or lose, so a mid-round failure on
+         * one device never leaves another device's single in-flight slot
+         * (coli_vk_expert_group_take's precondition) stuck for the engine's
+         * next call. */
+        int q0 = 0, q1 = 0, q2 = 0, base0 = 0, base1 = 0, base2 = 0, fail = !ok;
+        int first_round = 1;
+        while (!fail && (q0 < nvk0 || q1 < nvk1 || q2 < nvk2)) {
+            int n0 = 0, n1 = 0, n2 = 0, issued0 = 0, issued1 = 0, issued2 = 0;
+            if (q0 < nvk0) {
+                n0 = nvk0 - q0; if (n0 > 64) n0 = 64;
+                issued0 = coli_vk_expert_group_issue(vg0 + q0, vu0 + q0, vd0 + q0, vrows0 + q0, n0,
+                                                     xk0 + (size_t)base0 * c->hidden);
+                if (!issued0) fail = 1;
+            }
+            if (q1 < nvk1) {
+                n1 = nvk1 - q1; if (n1 > 64) n1 = 64;
+                issued1 = coli_vk_expert_group_issue2(vg1 + q1, vu1 + q1, vd1 + q1, vrows1 + q1, n1,
+                                                      xk1 + (size_t)base1 * c->hidden);
+                if (!issued1) fail = 1;
+            }
+            if (q2 < nvk2) {
+                n2 = nvk2 - q2; if (n2 > 64) n2 = 64;
+                issued2 = coli_vk_expert_group_issue3(vg2 + q2, vu2 + q2, vd2 + q2, vrows2 + q2, n2,
+                                                      xk2 + (size_t)base2 * c->hidden);
+                if (!issued2) fail = 1;
+            }
+            /* G9: the three devices' fences are now signalled but not yet
+             * waited on -- run the deferred CPU-only experts in this gap,
+             * once, on whichever round first issues anything, so their
+             * compute overlaps the take/fence-wait below instead of having
+             * finished entirely beforehand. Unconditional on this round's
+             * own success: an issue failure elsewhere doesn't change that
+             * these still have to run, and a device that DID issue is still
+             * in flight regardless. */
+            if (first_round && can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
+                ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
+                                         chosen, weight, tokens, topk, x, c->hidden,
+                                         c->swiglu_limit, sg, su, tmp, out);
+                cpu_deferred_done = 1;
+            }
+            first_round = 0;
+            if (issued0) {
+                if (!coli_vk_expert_group_take(yk0 + (size_t)base0 * c->hidden)) fail = 1;
+                int rs = 0; for (int w = 0; w < n0; w++) rs += vrows0[q0 + w];
+                base0 += rs; q0 += n0;
+            } else if (n0 > 0) q0 = nvk0;
+            if (issued1) {
+                if (!coli_vk_expert_group_take2(yk1 + (size_t)base1 * c->hidden)) fail = 1;
+                int rs = 0; for (int w = 0; w < n1; w++) rs += vrows1[q1 + w];
+                base1 += rs; q1 += n1;
+            } else if (n1 > 0) q1 = nvk1;
+            if (issued2) {
+                if (!coli_vk_expert_group_take3(yk2 + (size_t)base2 * c->hidden)) fail = 1;
+                int rs = 0; for (int w = 0; w < n2; w++) rs += vrows2[q2 + w];
+                base2 += rs; q2 += n2;
+            } else if (n2 > 0) q2 = nvk2;
         }
-        base = 0;
-        for (int q = 0; ok && q < nvk1; ) {
-            int n = nvk1 - q; if (n > 64) n = 64;
-            int rs = 0; for (int w = 0; w < n; w++) rs += vrows1[q + w];
-            ok = coli_vk_expert_group2(vg1 + q, vu1 + q, vd1 + q, vrows1 + q, n,
-                                       yk1 + (size_t)base * c->hidden, xk1 + (size_t)base * c->hidden);
-            base += rs; q += n;
-        }
-        base = 0;
-        for (int q = 0; ok && q < nvk2; ) {
-            int n = nvk2 - q; if (n > 64) n = 64;
-            int rs = 0; for (int w = 0; w < n; w++) rs += vrows2[q + w];
-            ok = coli_vk_expert_group3(vg2 + q, vu2 + q, vd2 + q, vrows2 + q, n,
-                                       yk2 + (size_t)base * c->hidden, xk2 + (size_t)base * c->hidden);
-            base += rs; q += n;
-        }
+        ok = !fail;
         if (ok) {
             for (int r = 0; r < vtot0; r++) {
                 float *os = out + (size_t)vtok0[r] * c->hidden;
@@ -1948,6 +2569,16 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         g_t_eg += prof_now_s() - _te0;
         free(yk0); free(yk1); free(yk2);
     }
+    if (can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
+        /* Nothing was GPU-resident this layer (nvk0=nvk1=nvk2=0, so the
+         * dispatch block above was never entered and the while loop's
+         * overlap hook never ran) -- no GPU work to overlap with, but these
+         * still have to run. */
+        ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
+                                 chosen, weight, tokens, topk, x, c->hidden,
+                                 c->swiglu_limit, sg, su, tmp, out);
+    }
+    free(cpu_gate); free(cpu_up); free(cpu_down); free(cpu_eid);
 #endif
     free(to_read); free(slot_of); free(union_ids);
     free(tmp); free(su); free(sg); free(weight); free(chosen);
@@ -2268,6 +2899,20 @@ static GSession *session_open(const GModel *m, int cap) {
             if (!st->kda_state || !st->kda_window) {
                 fprintf(stderr, "OOM sullo stato KDA del layer %d\n", i); exit(1);
             }
+#ifdef COLI_VULKAN
+            /* G12: hand the (zero) state and the immutable conv taps to dev0 once.
+             * Per layer, so a device that runs out of room falls back for that
+             * layer alone rather than silently mixing two recurrences. */
+            /* COLI_KDA_GPU=1 runs only the recurrence on dev0 (two submits still);
+             * =2 runs the whole layer as one submit. kda_gpu carries the mode so a
+             * layer that could not take its weights stays on the CPU entirely. */
+            if (kda_gpu_on() && !g_kda_cpu_on())
+                st->kda_gpu = coli_vk_kda_init(i, c->kda_heads, c->kda_hd, c->kda_hd,
+                                               c->conv_k, st->kda_state, st->kda_window,
+                                               m->layer[i].conv, m->layer[i].alog,
+                                               m->layer[i].dt, m->layer[i].onorm)
+                            ? kda_gpu_on() : 0;
+#endif
         }
     }
     if (getenv("GLM53_VERBOSE")) {
@@ -2300,6 +2945,66 @@ static void session_close(const GModel *m, GSession *s) {
  * `next` e' il secondo banco, della stessa misura: il passaggio li scambia a
  * ogni sito, quindi alla fine il risultato puo' essere in uno o nell'altro, e
  * la funzione restituisce quale. */
+/* G3 per-op report: where a decode token goes, split KDA / MLA / dense FFN /
+ * MoE FFN (router / shared expert / [PROF] expert groups and CPU experts) /
+ * mHC+norm plumbing / lm_head. Summed over layers; the CLI zeroes everything
+ * after prefill so a --greedy run prints decode-only figures, which is the
+ * regime the per-op table describes. State and helpers are declared with the
+ * [PROF] counters, above ffn_layer. */
+static void optime_reset(void) {
+    g_ot_kda = g_ot_mla = g_ot_ffn_dense = g_ot_ffn_moe = g_ot_hc = g_ot_head = g_ot_layers = 0.0;
+    g_on_kda = g_on_mla = g_on_ffn_dense = g_on_ffn_moe = g_on_hc = g_on_head = g_on_layers = 0;
+    g_ot_router = g_ot_shared = 0.0; g_on_router = 0;
+    g_kt_proj = g_kt_decay = g_kt_step = g_kt_norm = g_kt_ko = 0.0;
+    g_kn_calls = g_kn_batched = 0;
+    g_mt_proj = g_mt_index = g_mt_attn = 0.0; g_mn_calls = 0; g_mn_seen = 0.0;
+    /* The [PROF] sub-split of the MoE bucket must describe the same window,
+     * so it is zeroed here too -- only under COLI_TIMERS=1, so the default
+     * [PROF] line keeps its whole-run meaning. */
+    g_t_pop = g_b_pop = g_t_pop_max = 0.0; g_n_pop = 0;
+    g_n_bind_contig = g_n_bind_split = g_n_bind_gpu = g_n_bind_cpu = 0;
+    g_map_serve = g_map_copy = 0;
+#ifdef COLI_VULKAN
+    g_t_eg = g_t_cpu = 0.0; g_n_eg = g_n_eg_disp = g_n_cpu = g_n_devloss = 0;
+#endif
+}
+__attribute__((destructor)) static void optime_print(void) {
+    if (!optime_on() || !g_on_layers) return;
+    const double sum = g_ot_kda + g_ot_mla + g_ot_ffn_dense + g_ot_ffn_moe + g_ot_hc;
+    fprintf(stderr, "[OPTIME] forwards=%ld layers=%.3fs head=%.3fs (n=%ld)\n",
+            g_on_layers, g_ot_layers, g_ot_head, g_on_head);
+    fprintf(stderr, "[OPTIME] kda=%.3fs n=%ld (%.3f ms/call) | mla=%.3fs n=%ld (%.3f ms/call)\n",
+            g_ot_kda, g_on_kda, g_on_kda ? 1e3 * g_ot_kda / g_on_kda : 0.0,
+            g_ot_mla, g_on_mla, g_on_mla ? 1e3 * g_ot_mla / g_on_mla : 0.0);
+    fprintf(stderr, "[OPTIME] ffn_dense=%.3fs n=%ld (%.3f ms/call) | ffn_moe=%.3fs n=%ld (%.3f ms/call)\n",
+            g_ot_ffn_dense, g_on_ffn_dense, g_on_ffn_dense ? 1e3 * g_ot_ffn_dense / g_on_ffn_dense : 0.0,
+            g_ot_ffn_moe, g_on_ffn_moe, g_on_ffn_moe ? 1e3 * g_ot_ffn_moe / g_on_ffn_moe : 0.0);
+    fprintf(stderr, "[OPTIME] hc+norm=%.3fs n=%ld (%.3f ms/site) | layers-sum=%.3fs unaccounted=%.3fs\n",
+            g_ot_hc, g_on_hc, g_on_hc ? 1e3 * g_ot_hc / g_on_hc : 0.0, sum, g_ot_layers - sum);
+    if (g_kn_calls)
+        fprintf(stderr, "[OPTIME] kda split (n=%ld, gpu-batched=%ld): proj=%.3fs (%.3f ms) "
+                        "decay=%.3fs (%.3f) step=%.3fs (%.3f) norm=%.3fs (%.3f) ko=%.3fs (%.3f)\n",
+                g_kn_calls, g_kn_batched,
+                g_kt_proj,  1e3 * g_kt_proj  / g_kn_calls,
+                g_kt_decay, 1e3 * g_kt_decay / g_kn_calls,
+                g_kt_step,  1e3 * g_kt_step  / g_kn_calls,
+                g_kt_norm,  1e3 * g_kt_norm  / g_kn_calls,
+                g_kt_ko,    1e3 * g_kt_ko    / g_kn_calls);
+    if (g_mn_calls)
+        fprintf(stderr, "[OPTIME] mla split (n=%ld, mean ctx=%.0f): proj=%.3fs (%.3f ms) "
+                        "index=%.3fs (%.3f ms) attn=%.3fs (%.3f ms) | index/ctx=%.4f us\n",
+                g_mn_calls, g_mn_seen / (double)g_mn_calls,
+                g_mt_proj,  1e3 * g_mt_proj  / g_mn_calls,
+                g_mt_index, 1e3 * g_mt_index / g_mn_calls,
+                g_mt_attn,  1e3 * g_mt_attn  / g_mn_calls,
+                1e6 * g_mt_index / g_mn_seen);
+    fprintf(stderr, "[OPTIME] moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
+                    "eg and cpu experts are the [PROF] line; the rest of ffn_moe is bind+dispatch+accumulate\n",
+            g_ot_router, g_ot_shared, g_on_router,
+            g_on_router ? 1e3 * g_ot_router / g_on_router : 0.0,
+            g_on_router ? 1e3 * g_ot_shared / g_on_router : 0.0);
+}
+
 static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                          int n, int start, int begin, int end) {
     const Cfg *c = &m->c;
@@ -2313,12 +3018,15 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
         fprintf(stderr, "OOM nei temporanei del passaggio\n"); exit(1);
     }
 
+    const int timed = optime_on();
+    const double t_layers0 = timed ? optime_now() : 0.0;
     for (int i = begin; i < end; i++) {
         GLayer *l = &m->layer[i];
         for (int site = 0; site < 2; site++) {
             const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
             const float *base = site ? l->hc_ffn_base : l->hc_attn_base;
             const float *scale = site ? l->hc_ffn_scale : l->hc_attn_scale;
+            double t0 = timed ? optime_now() : 0.0;
             for (int t = 0; t < n; t++)
                 coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
                             comb + (size_t)t * H * H, streams + (size_t)t * H * D,
@@ -2326,24 +3034,37 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             for (int t = 0; t < n; t++)
                 rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
                     site ? l->post_ln : l->in_ln, D, c->eps);
+            if (timed) { g_ot_hc += optime_now() - t0; g_on_hc++; t0 = optime_now(); }
             if (!site) {
                 GLayerState *st = &s->layer[i];
                 /* Lo stato non si azzera a ogni chiamata: e' della
                  * conversazione, e azzerarlo qui vorrebbe dire ricominciare
                  * la ricorrenza a ogni token generato. */
-                if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
-                else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
-                               s->kda_scratch);
+                if (c->is_full[i]) {
+                    mla_layer(c, l, normed, n, branch, st, start);
+                    if (timed) { g_ot_mla += optime_now() - t0; g_on_mla++; }
+                } else {
+                    kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
+                              s->kda_scratch, i, st->kda_gpu);
+                    if (timed) { g_ot_kda += optime_now() - t0; g_on_kda++; }
+                }
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
+                if (timed) {
+                    if (i < c->first_dense) { g_ot_ffn_dense += optime_now() - t0; g_on_ffn_dense++; }
+                    else                    { g_ot_ffn_moe   += optime_now() - t0; g_on_ffn_moe++; }
+                }
             }
+            if (timed) t0 = optime_now();
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
                              comb + (size_t)t * H * H, H, D);
+            if (timed) g_ot_hc += optime_now() - t0;   /* same site: counted once above */
             float *swap = streams; streams = next; next = swap;
         }
     }
+    if (timed) { g_ot_layers += optime_now() - t_layers0; g_on_layers++; }
     free(comb); free(post); free(branch); free(normed); free(collapsed);
     return streams;
 }
@@ -2501,8 +3222,10 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
+    const double t_head0 = optime_on() ? optime_now() : 0.0;
     for (int t = 0; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
+    if (optime_on()) { g_ot_head += optime_now() - t_head0; g_on_head++; }
 
     free(normed); free(collapsed);
     free(next); free(streams);
@@ -3179,6 +3902,7 @@ int main(int argc, char **argv) {
          * tempo totale: caricamento e prefill costano quanto costano, e
          * confonderli col decode ha gia' fatto sbagliare un confronto. */
         const double decode_start = now_s();
+        if (optime_on()) optime_reset();   /* the per-op table describes decode only */
         int produced = 0;
         /* `rows` dice quante righe ha l'ultimo blocco di logit: il prefill ne
          * restituisce una per posizione, un passo incrementale una sola. In
@@ -3256,6 +3980,36 @@ typedef struct {
     GSession *session;
     uint32_t context_tokens, position;
 } Glm53SegmentSession;
+
+/* G12 sync points. While COLI_KDA_GPU is on the recurrence lives on dev0 and
+ * st->kda_state / st->kda_window are STALE -- reading them back every token
+ * would cost ~5 ms/token over PCIe, a third of what the chain saves. These two
+ * are the only places the host copies are made to agree with the device, and
+ * they are exactly the two directions segment migration needs. */
+static void glm53_kda_sync_out(Glm53SegmentSession *session) {
+#ifdef COLI_VULKAN
+    const Cfg *c = &session->engine->model.c;
+    for (uint32_t i = session->engine->layer_begin; i < session->engine->layer_end; i++) {
+        GLayerState *st = &session->session->layer[i];
+        if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
+            coli_vk_kda_sync((int)i, st->kda_state, st->kda_window);
+    }
+#else
+    (void)session;
+#endif
+}
+static void glm53_kda_sync_in(Glm53SegmentSession *session) {
+#ifdef COLI_VULKAN
+    const Cfg *c = &session->engine->model.c;
+    for (uint32_t i = session->engine->layer_begin; i < session->engine->layer_end; i++) {
+        GLayerState *st = &session->session->layer[i];
+        if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
+            coli_vk_kda_upload((int)i, st->kda_state, st->kda_window);
+    }
+#else
+    (void)session;
+#endif
+}
 
 /* I pezzi di stato che uno snapshot deve portarsi dietro, nell'ordine in cui
  * si scrivono. Un layer DSA tiene il latente MLA e le due file dell'indexer,
@@ -3428,6 +4182,7 @@ static int glm53_segment_session_snapshot(void *session_impl,
     if (!session || !write_fn)
         return coli_segment_adapter_error(error, error_size,
                                           "GLM-5.3 Segment snapshot needs a sink");
+    glm53_kda_sync_out(session);   /* G12: device -> host before the snapshot reads */
     ColiSegmentStateSpan spans[GLM53_SEGMENT_MAX_SPANS];
     const size_t count = glm53_segment_spans(session->engine, session, spans,
                                              GLM53_SEGMENT_MAX_SPANS);
@@ -3476,6 +4231,7 @@ static int glm53_segment_session_restore(void *session_impl,
     if (coli_segment_spans_restore(spans, count, header.payload_hash, read_fn,
                                    read_user_data, error, error_size))
         return -1;
+    glm53_kda_sync_in(session);    /* G12: host -> device after the restore writes */
     session->position = header.position;
     session->session->filled = (int)header.position;
     return 0;

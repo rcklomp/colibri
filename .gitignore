@@ -146,3 +146,8 @@ c/kimi_k3_tiny/.vendor_kimi_k3/
 c/kimi_k3_tiny/.coli_usage
 c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
+
+# agent definitions are shared; the rest of .claude/ stays local
+!.claude/
+.claude/*
+!.claude/agents/

@@ -16,6 +16,18 @@
 #define Q38_PREFILL_BATCH_ROWS 32
 #define Q38_PREFILL_WORKSPACE_BYTES (64u << 20)
 
+/* Persistent GPU expert cache (fmt=8 e4m3), opt-in via Q38_VULKAN=1. Off by
+ * default: g_q38vk_ready stays 0 and every check below short-circuits to the
+ * unmodified CPU path. See the module comment in patch_qwen38_gputier.py for
+ * the residency rationale (why a persistent cache, not per-call upload). */
+#ifdef Q38_VK_TIER
+#include "backend_vulkan.h"
+static int g_q38vk_ready = 0;
+static int g_q38vk_dev2_ready = 0, g_q38vk_dev3_ready = 0;
+static int g_q38vk_NL, g_q38vk_E;
+static ColiVkTensor **g_q38vk_reg;   /* [(layer*E+eid)*3] -> {gate,up,down} */
+#endif
+
 typedef struct {
     int hidden, layers, vocab, max_positions, eos_id;
     float eps, theta;
@@ -121,6 +133,7 @@ typedef struct {
     uint64_t expert_scale_bytes;
     float **DN_rec, **DN_conv;
     float **K, **V, **IK;
+    float **IK_pooled; int *IK_pooled_count;
     int kv_len, kv_cap, max_t;
     st_tensor *ple_parts[Q38_MAX_PLE_PARTS];
     char ple_part_names[Q38_MAX_PLE_PARTS][320];
@@ -321,6 +334,62 @@ static void q38_dense_matmul(Model *m,float *y,const float *x,const Q38Weight *w
     double started=now_s();
     q38_weight_matmul(y,x,weight,S,I,O);
     q38_tm_add(m,Q38_TM_DENSE_MATMUL,started);
+}
+
+/* Several resident BF16 projections of the SAME input in ONE parallel region.
+ * Decode is a chain of one-row matmuls, and the engine paid one OpenMP
+ * fork/join per matrix: thirteen per layer, several of them for matrices with
+ * 4 or 48 output rows (gated-residual inject, DeltaNet a/b) where sixteen
+ * threads had nothing to split. Rows of every matrix are computed exactly as
+ * q38_matmul_bf16 computes them (same loads, same FMA order), so outputs are
+ * bit-identical; only the scheduling changes. Non-BF16 members (the expanded
+ * F32 A/B mode) fall back to the per-matrix path. */
+#define Q38_MM_MULTI_MAX 4
+typedef struct { float *y; const Q38Weight *w; int O; } Q38DenseItem;
+static void q38_dense_matmul_multi(Model *m,Q38DenseItem *items,int n,const float *x,int S,int I) {
+    int all_bf16=1;
+    for(int j=0;j<n;j++){
+        const Q38Weight *w=items[j].w;
+        if(!w||w->rows!=items[j].O||w->cols!=I||!w->data){
+            fprintf(stderr,"invalid multi matmul weight %d: have [%d,%d] kind=%d, need [%d,%d]\n",
+                    j,w?w->rows:0,w?w->cols:0,w?(int)w->kind:0,items[j].O,I);exit(1);
+        }
+        if(w->kind!=Q38_WEIGHT_BF16)all_bf16=0;
+    }
+#if defined(__AVX2__) && defined(__FMA__)
+    static int fused=-1;   /* Q38_DENSE_MULTI=0 restores one region per matrix for A/B */
+    if(fused<0)fused=!(getenv("Q38_DENSE_MULTI")&&!atoi(getenv("Q38_DENSE_MULTI")));
+    if(fused&&all_bf16&&n>=1&&n<=Q38_MM_MULTI_MAX){
+        double started=now_s();
+        int prefix[Q38_MM_MULTI_MAX+1];prefix[0]=0;
+        for(int j=0;j<n;j++)prefix[j+1]=prefix[j]+items[j].O;
+        int total=prefix[n];
+        #pragma omp parallel for schedule(static)
+        for(int r=0;r<total;r++){
+            int j=0;while(j+1<n&&r>=prefix[j+1])j++;
+            int o=r-prefix[j];
+            const uint16_t *w=(const uint16_t*)items[j].w->data+(int64_t)o*I;
+            float *y=items[j].y;int O=items[j].O;
+            for(int s=0;s<S;s++){
+                const float *xs=x+(int64_t)s*I;
+                __m256 vacc=_mm256_setzero_ps();int i=0;
+                for(;i+8<=I;i+=8){
+                    __m128i wh=_mm_loadu_si128((const __m128i*)(w+i));
+                    __m256 wf=q38_bf16x8_to_f32x8(wh);
+                    __m256 xf=_mm256_loadu_ps(xs+i);
+                    vacc=_mm256_fmadd_ps(xf,wf,vacc);
+                }
+                float buf[8];_mm256_storeu_ps(buf,vacc);
+                float a=buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+                for(;i<I;i++)a+=xs[i]*bf16_to_f32(w[i]);
+                y[(int64_t)s*O+o]=a;
+            }
+        }
+        q38_tm_add(m,Q38_TM_DENSE_MATMUL,started);
+        return;
+    }
+#endif
+    for(int j=0;j<n;j++)q38_dense_matmul(m,items[j].y,x,items[j].w,S,I,items[j].O);
 }
 
 static inline float q38_sigmoid(float x) {
@@ -914,7 +983,79 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
 
 static void model_init(Model *m,const char *snap,int cap,int bits) {
     model_init_range(m,snap,cap,bits,0,0,1,1);
+#ifdef Q38_VK_TIER
+    /* Vulkan is optional here exactly like in glm53.c: absent or disabled,
+     * the engine says nothing more than usual and stays on CPU. */
+    if (getenv("Q38_VULKAN") && atoi(getenv("Q38_VULKAN"))) {
+        char spv[1024];
+        const char *given = getenv("COLI_VK_SHADERS");
+        if (given && strstr(given, ".spv")) snprintf(spv, sizeof(spv), "%s", given);
+        else snprintf(spv, sizeof(spv), "%s/qmatmul.spv", given ? given : "shaders");
+        g_q38vk_ready = coli_vk_init(spv);
+        if (g_q38vk_ready) {
+            g_q38vk_NL = m->c.layers; g_q38vk_E = m->c.experts;
+            g_q38vk_reg = (ColiVkTensor **)calloc((size_t)g_q38vk_NL * g_q38vk_E * 3, sizeof(ColiVkTensor *));
+            if (!g_q38vk_reg) { g_q38vk_ready = 0; }
+            else fprintf(stderr, "[qwen38] Vulkan expert offload ready (fmt=8 e4m3, persistent cache)\n");
+            /* Optional 2nd/3rd device, same env convention as glm53: unset
+             * COLI_VK_DEV2/3 means "don't try" rather than "auto", so a
+             * single-GPU box behaves exactly as before. */
+            if (g_q38vk_ready && getenv("COLI_VK_DEV2")) {
+                const char *dv = getenv("COLI_VK_DEV2");
+                int didx = (!strcmp(dv, "auto") || !*dv) ? -1 : atoi(dv);
+                g_q38vk_dev2_ready = coli_vk_init_dev2(spv, didx);
+                if (g_q38vk_dev2_ready) fprintf(stderr, "[qwen38] Vulkan dev2 ready (expert cache)\n");
+            }
+            if (g_q38vk_ready && getenv("COLI_VK_DEV3")) {
+                const char *dv = getenv("COLI_VK_DEV3");
+                int didx = (!strcmp(dv, "auto") || !*dv) ? -1 : atoi(dv);
+                g_q38vk_dev3_ready = coli_vk_init_dev3(spv, didx);
+                if (g_q38vk_dev3_ready) fprintf(stderr, "[qwen38] Vulkan dev3 ready (expert cache)\n");
+            }
+        }
+    }
+#endif
 }
+
+#ifdef Q38_VK_TIER
+static int q38vk_expert_ensure(Model *m, int layer, int eid);
+typedef struct { uint32_t heat; int layer, eid; } Q38VkCand;
+static int q38vk_cand_cmp(const void *a, const void *b) {
+    const Q38VkCand *x = (const Q38VkCand *)a, *y = (const Q38VkCand *)b;
+    if (x->heat != y->heat) return x->heat < y->heat ? 1 : -1;
+    if (x->layer != y->layer) return x->layer - y->layer;
+    return x->eid - y->eid;
+}
+/* Fill the VRAM tier from the routing histogram (.coli_usage, loaded by
+ * q38_telemetry_init, so this runs after it) before the first request,
+ * hottest expert first, until every device reports its budget spent. Without
+ * this the tier filled lazily on first use, i.e. the upload of each miss
+ * (4.7 MB over PCIe plus the CPU slot bind) landed inside decode, untimed:
+ * the 3-GPU run of 2026-09-04 measured 1.57 tok/s against 1.48 CPU-only for
+ * exactly that reason. Q38_VK_PRELOAD=0 keeps the lazy behaviour. */
+static void q38vk_preload(Model *m) {
+    if (!g_q38vk_ready || (getenv("Q38_VK_PRELOAD") && !atoi(getenv("Q38_VK_PRELOAD")))) return;
+    Cfg *c = &m->c; int64_t n = 0;
+    Q38VkCand *cand = (Q38VkCand *)malloc((size_t)c->layers * (size_t)c->experts * sizeof(*cand));
+    if (!cand) return;
+    for (int l = 0; l < c->layers; l++) {
+        const uint32_t *h = rt_counts(l);
+        if (!h) continue;
+        for (int e = 0; e < c->experts; e++) if (h[e]) cand[n++] = (Q38VkCand){h[e], l, e};
+    }
+    if (!n) { fprintf(stderr, "[qwen38] Vulkan tier: no routing history, filling lazily\n"); free(cand); return; }
+    qsort(cand, (size_t)n, sizeof(*cand), q38vk_cand_cmp);
+    double t0 = now_s(); int64_t loaded = 0, full_streak = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (q38vk_expert_ensure(m, cand[i].layer, cand[i].eid) >= 0) { loaded++; full_streak = 0; }
+        else if (++full_streak >= 32) break;   /* every device declined 32 in a row: budgets are spent */
+    }
+    double used = 0, budget = 0; coli_vk_mem_budget(&used, &budget);
+    fprintf(stderr, "[qwen38] Vulkan tier preloaded %lld of %lld hot experts in %.1fs (dev0 %.1f/%.1f GB)\n",
+            (long long)loaded, (long long)n, now_s() - t0, used, budget);
+    free(cand);
+}
+#endif
 
 static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
                         int S,float *mixed,float *inject) {
@@ -1080,6 +1221,31 @@ static int q38_mmap_enabled(void) {
     return on;
 }
 
+/* Prefault a mapped expert range on the thread that binds it, so the page
+ * faults are taken here -- at most ten loader threads, one madvise each --
+ * instead of inside the sixteen-thread matmul that first touches the bytes.
+ * Measured on the EPYC 7F32 rig (2026-09-04): perf put 45% of decode cycles
+ * in libgomp barrier spin, i.e. fifteen threads idling while one thread
+ * served a fault (major ones go to NVMe) on a freshly bound expert; the
+ * isolated kernel ran 4-6x faster than the same kernel inside the engine.
+ * MADV_POPULATE_READ (Linux 5.14+) only maps pages, it never copies, so the
+ * mapping stays file-backed and reclaimable exactly as before. Q38_MMAP_POPULATE=0
+ * restores the lazy-fault behaviour for A/B. */
+static void q38_populate_range(const unsigned char *p, int64_t nbytes) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+    static int on = -1;
+    if (on < 0) on = !(getenv("Q38_MMAP_POPULATE") && !atoi(getenv("Q38_MMAP_POPULATE")));
+    if (!on || !p || nbytes <= 0) return;
+    static long page = 0;
+    if (!page) page = sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t)p & ~((uintptr_t)page - 1);
+    uintptr_t e = ((uintptr_t)p + (uintptr_t)nbytes + (uintptr_t)page - 1) & ~((uintptr_t)page - 1);
+    (void)madvise((void *)a, (size_t)(e - a), MADV_POPULATE_READ);   /* advisory: a failure just leaves lazy faults */
+#else
+    (void)p; (void)nbytes;
+#endif
+}
+
 /* Ritorna la base mappata dello shard, o NULL. Un fallimento si ricorda: non
  * si ritenta una mmap per ogni singolo esperto. */
 static const unsigned char *q38_shard_mapped(int fd) {
@@ -1184,6 +1350,9 @@ static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
         const unsigned char *pd=q38_mapped_range(weight[2]->fd,weight[2]->off,weight[2]->nbytes);
         if(pg&&pu&&pd){
             int sc=(int)cache->scale_count;
+            /* gate and up are adjacent in the official shards: one advice covers both */
+            q38_populate_range(pg,weight[0]->nbytes+weight[1]->nbytes);
+            q38_populate_range(pd,weight[2]->nbytes);
             q38_bind_borrowed_fp8(&slot->gate,(void*)pg,scales,c->inter,c->hidden);
             q38_bind_borrowed_fp8(&slot->up,(void*)pu,scales+sc,c->inter,c->hidden);
             q38_bind_borrowed_fp8(&slot->down,(void*)pd,scales+2*sc,c->hidden,c->inter);
@@ -1323,6 +1492,60 @@ static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
         else q38_load_expert_weight(m,nm,dst[k],os[k],is[k]);
     }
 }
+
+static Slot *q38_expert_get(Model *m,int layer,int eid);
+#ifdef Q38_VK_TIER
+static ColiVkTensor **q38vk_reg_at(int layer, int eid) {
+    return &g_q38vk_reg[((size_t)layer * (size_t)g_q38vk_E + (size_t)eid) * 3];
+}
+/* Uploads an expert once and caches the GPU tensors; returns 0 (no upload,
+ * caller falls back to CPU) once the VRAM budget margin is reached, or if
+ * this expert isn't natively FP8-resident on the CPU side. The source bytes
+ * come from the SAME Slot the CPU path already fetches -- q38_expert_get's
+ * mmap-backed data/scales pointers (see the mmap commit) are stable for the
+ * process lifetime, so there is nothing to keep alive beyond this call:
+ * coli_vk_tensor_ensure copies into VRAM immediately. */
+/* Places an expert on whichever device has room, trying dev0 then dev2 then
+ * dev3; returns the device index (matching coli_vk_tensor_dev's 0/1/2
+ * encoding) it landed on, or -1 if all available devices are full. Already
+ * resident: returns coli_vk_tensor_dev(reg[0]) immediately, no re-check. */
+static int q38vk_expert_ensure(Model *m, int layer, int eid) {
+    ColiVkTensor **reg = q38vk_reg_at(layer, eid);
+    if (reg[0]) return coli_vk_tensor_dev(reg[0]);
+    Slot *s = q38_expert_get(m, layer, eid);
+    if (!s || s->gate.kind != Q38_WEIGHT_FP8 || s->up.kind != Q38_WEIGHT_FP8 || s->down.kind != Q38_WEIGHT_FP8) return -1;
+    Cfg *c = &m->c;
+    double used = 0, budget = 0;
+    ColiVkTensor *tg = NULL, *tu = NULL, *td = NULL;
+    if (coli_vk_mem_budget(&used, &budget) && (!budget || budget - used >= 1.5)) {
+        if (coli_vk_tensor_ensure(&tg, s->gate.data, s->gate.scales, 8, c->hidden, c->inter, 128) &&
+            coli_vk_tensor_ensure(&tu, s->up.data, s->up.scales, 8, c->hidden, c->inter, 128) &&
+            coli_vk_tensor_ensure(&td, s->down.data, s->down.scales, 8, c->inter, c->hidden, 128)) {
+            reg[0] = tg; reg[1] = tu; reg[2] = td;
+            return coli_vk_tensor_dev(reg[0]);
+        }
+    }
+    if (g_q38vk_dev2_ready && coli_vk_mem_budget2(&used, &budget) && (!budget || budget - used >= 1.5)) {
+        tg = tu = td = NULL;
+        if (coli_vk_tensor_ensure2(&tg, s->gate.data, s->gate.scales, 8, c->hidden, c->inter, 128) &&
+            coli_vk_tensor_ensure2(&tu, s->up.data, s->up.scales, 8, c->hidden, c->inter, 128) &&
+            coli_vk_tensor_ensure2(&td, s->down.data, s->down.scales, 8, c->inter, c->hidden, 128)) {
+            reg[0] = tg; reg[1] = tu; reg[2] = td;
+            return coli_vk_tensor_dev(reg[0]);
+        }
+    }
+    if (g_q38vk_dev3_ready && coli_vk_mem_budget3(&used, &budget) && (!budget || budget - used >= 1.5)) {
+        tg = tu = td = NULL;
+        if (coli_vk_tensor_ensure3(&tg, s->gate.data, s->gate.scales, 8, c->hidden, c->inter, 128) &&
+            coli_vk_tensor_ensure3(&tu, s->up.data, s->up.scales, 8, c->hidden, c->inter, 128) &&
+            coli_vk_tensor_ensure3(&td, s->down.data, s->down.scales, 8, c->inter, c->hidden, 128)) {
+            reg[0] = tg; reg[1] = tu; reg[2] = td;
+            return coli_vk_tensor_dev(reg[0]);
+        }
+    }
+    return -1;
+}
+#endif
 
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
@@ -1602,10 +1825,10 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
     for(int base=0;base<S;) {
         int rows=S-base<rows_capacity?S-base:rows_capacity;
         const float *chunk=x+(int64_t)base*H;
-        q38_dense_matmul(m,qkv,chunk,&l->dn_qkv,rows,H,CD);
-        q38_dense_matmul(m,z,chunk,&l->dn_z,rows,H,V);
-        q38_dense_matmul(m,bb,chunk,&l->dn_b,rows,H,VH);
-        q38_dense_matmul(m,aa,chunk,&l->dn_a,rows,H,VH);
+        {
+            Q38DenseItem in[4]={{qkv,&l->dn_qkv,CD},{z,&l->dn_z,V},{bb,&l->dn_b,VH},{aa,&l->dn_a,VH}};
+            q38_dense_matmul_multi(m,in,4,chunk,rows,H);
+        }
 
         for(int s=0;s<rows;s++) {
             float *qkv_row=qkv+(int64_t)s*CD;
@@ -1687,8 +1910,10 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     int IQ=c->idx_qheads,ID=c->idx_dim,R=c->idx_ratio,maxsel=c->idx_budget+R-1;
     float *qp=falloc((int64_t)S*QH*2*D),*kp=falloc((int64_t)S*KVH*D),*vp=falloc((int64_t)S*KVH*D);
     float *ip=falloc((int64_t)S*(IQ+c->idx_kheads)*ID);
-    q38_dense_matmul(m,qp,x,&l->q,S,H,QH*2*D);q38_dense_matmul(m,kp,x,&l->k,S,H,KVH*D);q38_dense_matmul(m,vp,x,&l->v,S,H,KVH*D);
-    q38_dense_matmul(m,ip,x,&l->idx_qk,S,H,(IQ+c->idx_kheads)*ID);
+    {
+        Q38DenseItem in[4]={{qp,&l->q,QH*2*D},{kp,&l->k,KVH*D},{vp,&l->v,KVH*D},{ip,&l->idx_qk,(IQ+c->idx_kheads)*ID}};
+        q38_dense_matmul_multi(m,in,4,x,S,H);
+    }
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         for(int h=0;h<KVH;h++){
@@ -1708,10 +1933,23 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
         if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
+        float *pcache=(m->IK_pooled&&m->IK_pooled_count)?m->IK_pooled[layer]:NULL;
+        if(pcache) for(int b=m->IK_pooled_count[layer];b<blocks;b++){
+            float *dst=pcache+(int64_t)b*ID;
+            memset(dst,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)dst[d]+=raw[d]/R;}
+            q38_rms0(dst,dst,l->idx_kn,ID,c->eps);q38_rope(dst,ID,c->rotary_dim,b*R,c->theta);
+        }
+        if(pcache&&blocks>m->IK_pooled_count[layer])m->IK_pooled_count[layer]=blocks;
         for(int b=0;b<blocks;b++){
-            memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
-            q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,c->theta);
-            float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
+            const float *pv;
+            if(pcache){
+                pv=pcache+(int64_t)b*ID;
+            }else{
+                memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
+                q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,c->theta);
+                pv=pool;
+            }
+            float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pv[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
         }
         if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
         for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
@@ -1756,6 +1994,68 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
         float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+#ifdef Q38_VK_TIER
+        int q38vk_cpu_idx[Q38_MAX_TOPK], q38vk_cpu_n=K;
+        for(int z=0;z<K;z++) q38vk_cpu_idx[z]=z;
+        if(g_q38vk_ready&&K<=64){
+            static ColiVkTensor *bufG[3][64],*bufU[3][64],*bufD[3][64];
+            static int bufRows[3][64], bufZ[3][64], bufN[3];
+            static float *bufX[3], *bufY[3];
+            if(!bufX[0]) for(int dv=0;dv<3;dv++){ bufX[dv]=falloc(64*(int64_t)H); bufY[dv]=falloc(64*(int64_t)H); }
+            bufN[0]=bufN[1]=bufN[2]=0;
+            int placed_mask[Q38_MAX_TOPK]; for(int z=0;z<K;z++) placed_mask[z]=0;
+            for(int z=0;z<K;z++){
+                int dev=q38vk_expert_ensure(m,layer,idx[z]);
+                if(dev<0||dev>2) continue;
+                ColiVkTensor **reg=q38vk_reg_at(layer,idx[z]);
+                int n=bufN[dev]++;
+                bufG[dev][n]=reg[0]; bufU[dev][n]=reg[1]; bufD[dev][n]=reg[2];
+                bufRows[dev][n]=1; bufZ[dev][n]=z;
+                memcpy(bufX[dev]+(int64_t)n*H,xs,(size_t)H*sizeof(float));
+            }
+            phase_started=now_s();
+            /* Issue every device's group first and join afterwards: the three
+             * GPUs then work at the same time as each other AND as the CPU
+             * share below. Measured on 3x RX 7900 XTX (2026-09-04): three
+             * sequential sync groups cost 2.37 ms per layer, concurrent
+             * issue/take 0.63 ms -- 114 vs 30 ms per token at full residency. */
+            int issued[3]={0,0,0};
+            for(int dev=0;dev<3;dev++){
+                if(!bufN[dev]) continue;
+                if(dev==0) issued[0]=coli_vk_expert_group_issue(bufG[0],bufU[0],bufD[0],bufRows[0],bufN[0],bufX[0]);
+                else if(dev==1) issued[1]=coli_vk_expert_group_issue2(bufG[1],bufU[1],bufD[1],bufRows[1],bufN[1],bufX[1]);
+                else issued[2]=coli_vk_expert_group_issue3(bufG[2],bufU[2],bufD[2],bufRows[2],bufN[2],bufX[2]);
+                if(issued[dev]) for(int n=0;n<bufN[dev];n++) placed_mask[bufZ[dev][n]]=1;
+            }
+            /* CPU share while the GPUs run: experts no device holds (or whose issue failed) */
+            q38vk_cpu_n=0;
+            for(int z=0;z<K;z++) if(!placed_mask[z]) q38vk_cpu_idx[q38vk_cpu_n++]=z;
+            for(int zi=0;zi<q38vk_cpu_n;zi++){
+                int z=q38vk_cpu_idx[zi];
+                Slot *ex=q38_expert_get(m,layer,idx[z]);
+                q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
+                for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+                for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
+            }
+            for(int dev=0;dev<3;dev++){
+                if(!issued[dev]) continue;
+                int rc=dev==0?coli_vk_expert_group_take(bufY[0]):dev==1?coli_vk_expert_group_take2(bufY[1]):coli_vk_expert_group_take3(bufY[2]);
+                for(int n=0;n<bufN[dev];n++){
+                    int z=bufZ[dev][n];
+                    if(rc){ for(int d=0;d<H;d++)ys[d]+=route_gates[z]*bufY[dev][(int64_t)n*H+d]; }
+                    else {  /* the join failed: compute this device's experts on the CPU now */
+                        Slot *ex=q38_expert_get(m,layer,idx[z]);
+                        q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
+                        for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+                        for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
+                    }
+                }
+            }
+            q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+            q38vk_cpu_n=0;   /* everything is accounted for above */
+        }
+        if(q38vk_cpu_n==K){
+#endif
         Slot *selected[Q38_MAX_TOPK];
         int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
         for(int z=0;z<K;z++){
@@ -1765,6 +2065,9 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
         }
+#ifdef Q38_VK_TIER
+        }
+#endif
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();
@@ -1833,6 +2136,16 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     float *expert_gate=falloc(max_assign*I);
     float *expert_up=falloc(max_assign*I);
     float *routed_out=falloc(max_assign*H);
+#ifdef Q38_VK_TIER
+    /* Per-device batches for the GPU tier. Row budget per device batch is
+     * bounded by these scratch buffers (Q38_MAX_TOPK*Q38_PREFILL_BATCH_ROWS
+     * covers the worst case -- every expert in the group claimed by every row). */
+    static ColiVkTensor *bufG[3][64],*bufU[3][64],*bufD[3][64];
+    static int bufRows[3][64],bufFirst[3][64],bufOff[3][64],bufN[3];
+    static float *bufX[3],*bufY[3];
+    const int64_t rowcap=(int64_t)Q38_MAX_TOPK*Q38_PREFILL_BATCH_ROWS;
+    int vk_issued[3]={0,0,0},vk_take=0;
+#endif
 
     for(int base=0;base<S;) {
         int rows=S-base<rows_capacity?S-base:rows_capacity;
@@ -1934,32 +2247,116 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
         for(int unique_base=0;unique_base<unique_count;) {
             int load_count=unique_count-unique_base;
             if(load_count>load_limit)load_count=load_limit;
-            int loaded_batch=load_count>=2&&q38_expert_get_batch(
-                m,layer,unique+unique_base,load_count,batch_slots);
-            for(int offset=0;offset<load_count;offset++) {
-                int e=unique[unique_base+offset];
-                int count=group_counts[e];
-                Slot *expert=loaded_batch?batch_slots[offset]:
-                                          q38_expert_get(m,layer,e);
-                int first=group_offsets[e];
-                for(int a=0;a<count;a++) {
-                    int assignment=assignments[first+a];
-                    int row=assignment/K;
-                    memcpy(expert_input+(int64_t)a*H,
-                           x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+#ifdef Q38_VK_TIER
+            int cpu_idx[Q38_MAX_TOPK],cpu_n=load_count;
+            for(int z=0;z<load_count;z++) cpu_idx[z]=z;
+            /* Row budget per device batch: bounded by the scratch buffers
+             * below (Q38_MAX_TOPK*Q38_PREFILL_BATCH_ROWS covers the worst
+             * case -- every expert in the group claimed by every row). */
+            if(g_q38vk_ready&&load_count<=64){
+                if(!bufX[0]) for(int dv=0;dv<3;dv++){ bufX[dv]=falloc(rowcap*(int64_t)H); bufY[dv]=falloc(rowcap*(int64_t)H); }
+                bufN[0]=bufN[1]=bufN[2]=0;
+                int64_t bufTot[3]={0,0,0};
+                int placed_mask[Q38_MAX_TOPK]; for(int z=0;z<load_count;z++) placed_mask[z]=0;
+                for(int offset=0;offset<load_count;offset++){
+                    int e=unique[unique_base+offset];
+                    int dev=q38vk_expert_ensure(m,layer,e);
+                    if(dev<0||dev>2) continue;
+                    int count=group_counts[e],first=group_offsets[e];
+                    if(bufTot[dev]+count>rowcap) continue;   /* scratch exhausted: leave unplaced, CPU handles it */
+                    ColiVkTensor **reg=q38vk_reg_at(layer,e);
+                    int n=bufN[dev]++;
+                    bufG[dev][n]=reg[0]; bufU[dev][n]=reg[1]; bufD[dev][n]=reg[2];
+                    bufRows[dev][n]=count; bufFirst[dev][n]=first; bufOff[dev][n]=offset;
+                    for(int a=0;a<count;a++){
+                        int assignment=assignments[first+a];
+                        int row=assignment/K;
+                        memcpy(bufX[dev]+(bufTot[dev]+a)*H,x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+                    }
+                    bufTot[dev]+=count;
+                    placed_mask[offset]=1;
                 }
                 phase_started=now_s();
-                q38_weight_matmul(expert_gate,expert_input,&expert->gate,
-                                  count,H,I);
-                q38_weight_matmul(expert_up,expert_input,&expert->up,count,H,I);
-                for(int a=0;a<count;a++)for(int j=0;j<I;j++)
-                    expert_gate[(int64_t)a*I+j]=
-                        q38_silu(expert_gate[(int64_t)a*I+j])*
-                        expert_up[(int64_t)a*I+j];
-                q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
-                                  &expert->down,count,I,H);
-                q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                /* Issue all devices, let the CPU share below run meanwhile,
+                 * join in the vk_take block after it (same shape as decode). */
+                for(int dev=0;dev<3;dev++){
+                    vk_issued[dev]=0;
+                    if(!bufN[dev]) continue;
+                    if(dev==0) vk_issued[0]=coli_vk_expert_group_issue(bufG[0],bufU[0],bufD[0],bufRows[0],bufN[0],bufX[0]);
+                    else if(dev==1) vk_issued[1]=coli_vk_expert_group_issue2(bufG[1],bufU[1],bufD[1],bufRows[1],bufN[1],bufX[1]);
+                    else vk_issued[2]=coli_vk_expert_group_issue3(bufG[2],bufU[2],bufD[2],bufRows[2],bufN[2],bufX[2]);
+                    if(!vk_issued[dev]) for(int n=0;n<bufN[dev];n++) placed_mask[bufOff[dev][n]]=0;   /* its bucket goes to the CPU share */
+                }
+                vk_take=1;
+                cpu_n=0;
+                for(int offset=0;offset<load_count;offset++) if(!placed_mask[offset]) cpu_idx[cpu_n++]=offset;
             }
+#else
+            int cpu_idx[Q38_MAX_TOPK],cpu_n=load_count;
+            for(int z=0;z<load_count;z++) cpu_idx[z]=z;
+#endif
+            if(cpu_n>0){
+                static int unplaced[Q38_MAX_TOPK];
+                for(int zi=0;zi<cpu_n;zi++) unplaced[zi]=unique[unique_base+cpu_idx[zi]];
+                int loaded_batch=cpu_n>=2&&q38_expert_get_batch(
+                    m,layer,unplaced,cpu_n,batch_slots);
+                for(int zi=0;zi<cpu_n;zi++) {
+                    int offset=cpu_idx[zi];
+                    int e=unique[unique_base+offset];
+                    int count=group_counts[e];
+                    Slot *expert=loaded_batch?batch_slots[zi]:
+                                              q38_expert_get(m,layer,e);
+                    int first=group_offsets[e];
+                    for(int a=0;a<count;a++) {
+                        int assignment=assignments[first+a];
+                        int row=assignment/K;
+                        memcpy(expert_input+(int64_t)a*H,
+                               x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+                    }
+                    phase_started=now_s();
+                    q38_weight_matmul(expert_gate,expert_input,&expert->gate,
+                                      count,H,I);
+                    q38_weight_matmul(expert_up,expert_input,&expert->up,count,H,I);
+                    for(int a=0;a<count;a++)for(int j=0;j<I;j++)
+                        expert_gate[(int64_t)a*I+j]=
+                            q38_silu(expert_gate[(int64_t)a*I+j])*
+                            expert_up[(int64_t)a*I+j];
+                    q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
+                                      &expert->down,count,I,H);
+                    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                }
+            }
+#ifdef Q38_VK_TIER
+            if(vk_take){
+                phase_started=now_s();
+                for(int dev=0;dev<3;dev++){
+                    if(!vk_issued[dev]) continue;
+                    int rc=dev==0?coli_vk_expert_group_take(bufY[0]):dev==1?coli_vk_expert_group_take2(bufY[1]):coli_vk_expert_group_take3(bufY[2]);
+                    int64_t off=0;
+                    for(int n=0;n<bufN[dev];n++){
+                        int e=unique[unique_base+bufOff[dev][n]];
+                        int count=bufRows[dev][n],first=bufFirst[dev][n];
+                        if(rc){
+                            memcpy(routed_out+(int64_t)first*H,bufY[dev]+off*H,(size_t)count*H*sizeof(float));
+                        } else {   /* the join failed: this device's experts run on the CPU now */
+                            Slot *expert=q38_expert_get(m,layer,e);
+                            for(int a=0;a<count;a++){
+                                int assignment=assignments[first+a];
+                                memcpy(expert_input+(int64_t)a*H,x+(int64_t)(base+assignment/K)*H,(size_t)H*sizeof(float));
+                            }
+                            q38_weight_matmul(expert_gate,expert_input,&expert->gate,count,H,I);
+                            q38_weight_matmul(expert_up,expert_input,&expert->up,count,H,I);
+                            for(int a=0;a<count;a++)for(int j=0;j<I;j++)
+                                expert_gate[(int64_t)a*I+j]=q38_silu(expert_gate[(int64_t)a*I+j])*expert_up[(int64_t)a*I+j];
+                            q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,&expert->down,count,I,H);
+                        }
+                        off+=count;
+                    }
+                }
+                q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                vk_take=0;
+            }
+#endif
             unique_base+=load_count;
         }
 
@@ -2002,12 +2399,33 @@ static void reset_recurrent(Model *m) {
     memset(m->PLE_conv_state,0,(size_t)c->hc_width*(c->ple_convk-1)*c->ngram_size*sizeof(float));m->ple_history_len=0;
 }
 
+/* Blocks only grow (KV is append-only); IK_pooled_count tracks how many
+ * leading blocks per layer already have a cached pooled key, so a fresh
+ * sequence (kv_len reset to 0) must also reset this or a later request
+ * would silently reuse a different sequence's cached block. */
+static void q38_ik_pool_reset(Model *m) {
+    if(!m->IK_pooled_count) return;
+    Cfg *c=&m->c;
+    for(int i=0;i<c->layers;i++) m->IK_pooled_count[i]=0;
+}
+
 static void ensure_kv(Model *m) {
     Cfg *c=&m->c;if(m->max_t<=m->kv_cap&&m->K)return;
-    if(m->K){for(int i=0;i<c->layers;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);}free(m->K);free(m->V);free(m->IK);}
+    if(m->K){for(int i=0;i<c->layers;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);if(m->IK_pooled)free(m->IK_pooled[i]);}free(m->K);free(m->V);free(m->IK);free(m->IK_pooled);free(m->IK_pooled_count);}
     m->K=(float**)calloc((size_t)c->layers,sizeof(float*));m->V=(float**)calloc((size_t)c->layers,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers,sizeof(float*));
+    m->IK_pooled=(float**)calloc((size_t)c->layers,sizeof(float*));m->IK_pooled_count=(int*)calloc((size_t)c->layers,sizeof(int));
+    /* C1: idx_ratio is validated >0 for real configs (Q38_NEED, above), but
+     * ensure_kv also runs on models built directly -- SERVE paths and the
+     * fabricated Model in tests/test_qwen38_prefix.c, which never sets it.
+     * Dividing by a zero ratio SIGFPEs there, deterministically. The pooled
+     * indexer cache is only read from the indexer itself (see the pcache
+     * block in the QSA path), which cannot run without a ratio, so one block
+     * is enough to keep the pointer non-NULL for the free paths. For every
+     * config with idx_ratio>0 this computes exactly what it always did. */
+    int64_t max_blocks=c->idx_ratio>0?(int64_t)m->max_t/c->idx_ratio+1:1;
     for(int i=0;i<c->layers;i++)if(c->is_attn[i]){
         m->K[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->V[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->IK[i]=falloc((int64_t)m->max_t*c->idx_dim);
+        m->IK_pooled[i]=falloc(max_blocks*(int64_t)c->idx_dim);
     }
     m->kv_cap=m->max_t;
 }
@@ -2143,8 +2561,9 @@ static void q38_model_free(Model *m) {
         if(m->expert_scales)free(m->expert_scales[i].values);
         free(m->DN_rec ? m->DN_rec[i] : NULL); free(m->DN_conv ? m->DN_conv[i] : NULL);
         free(m->K ? m->K[i] : NULL); free(m->V ? m->V[i] : NULL); free(m->IK ? m->IK[i] : NULL);
+        free(m->IK_pooled ? m->IK_pooled[i] : NULL);
     }
-    free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
+    free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK); free(m->IK_pooled); free(m->IK_pooled_count);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);

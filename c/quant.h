@@ -164,6 +164,105 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+/* ---- one output row of the grouped int4 matvec (fmt=4) -------------------
+ * Byte-for-byte the body of matmul_i4_grouped's o-loop, lifted so a caller can
+ * drive the rows from its own worksharing construct instead of paying a fresh
+ * `parallel for` per matrix. Added by G11: an expert is three of these matmuls
+ * with a swiglu between, and issuing them as three separate parallel regions
+ * costs a fork/join each plus two serial stretches. matmul_i4_grouped itself is
+ * deliberately NOT refactored to call this -- G10 showed that even a
+ * semantically null edit to a hot function can move GCC's codegen and with it
+ * the low bits of the result, and that function is on the qwen38 path too. */
+static inline float coli_i4_row(const uint8_t *w, const float *scl,
+                                const float *xs, int I, int gs){
+    float a=0;
+    for(int g=0; g*gs<I; g++){
+        int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+        float sc=scl[g];
+        int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+        __m256 acc=_mm256_setzero_ps();
+        for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+            __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i nib=_mm_unpacklo_epi8(lo,hi);
+            __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+            __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+        /* same pinned fmaf as matmul_i4_grouped, and for the same reason */
+        a=fmaf(hsum256(acc),sc,a);
+#endif
+        for(; i<base+glen; i+=2){
+            if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+            else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+        }
+    }
+    return a;
+}
+
+/* ---- G14c: float domain, bit-trick decode + 4 accumulators ---------------
+ * The precision-free option. §G11 measured this shape at 1.26-1.65x isolated
+ * with relL2 1.6e-7 -- FLOAT REASSOCIATION NOISE, not a quantisation change --
+ * and then declined it at "~1.06x once the path is fused". The int8/int16 work
+ * above suggests that in-path figure was understated: the isolated-to-in-engine
+ * attenuation measured for the int8 kernel was ~0.6x (2.3x -> 1.32x), which
+ * would put this at ~1.2x rather than 1.06x.
+ *
+ * Two changes against coli_i4_row, both cheap:
+ *  - nib2ps: OR the nibble into the mantissa of 2^23 and subtract 2^23+8,
+ *    which is EXACTLY (float)(n-8) for n in 0..15 -- so the decode itself stays
+ *    bit-exact, replacing cvtepu8_epi32 + sub_epi32 + cvtepi32_ps with
+ *    or_si256 + sub_ps.
+ *  - four independent accumulators, so the FMA dependency chain does not
+ *    serialise. This is the ONLY part that is not bit-identical: it changes the
+ *    summation order, nothing else. */
+static inline float coli_i4_row_f4(const uint8_t *w, const float *scl,
+                                   const float *xs, int I, int gs){
+    float a=0;
+    const int ng=(I+gs-1)/gs;
+    for(int g=0; g<ng; g++){
+        int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+        float sc=scl[g];
+        int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F);
+        const __m256i magic_i=_mm256_set1_epi32(0x4B000000);   /* 8388608.0f */
+        const __m256  magic_f=_mm256_set1_ps(8388608.0f+8.0f);
+        __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
+        __m256 a2=_mm256_setzero_ps(), a3=_mm256_setzero_ps();
+        for(; i+32<=base+glen; i+=32){
+            __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));  /* 32 nibbles */
+            __m128i lo=_mm_and_si128(by,m4);
+            __m128i hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i n0=_mm_unpacklo_epi8(lo,hi);     /* i    .. i+15 */
+            __m128i n1=_mm_unpackhi_epi8(lo,hi);     /* i+16 .. i+31 */
+            __m256 w0=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(n0), magic_i)), magic_f);
+            __m256 w1=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(_mm_srli_si128(n0,8)), magic_i)), magic_f);
+            __m256 w2=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(n1), magic_i)), magic_f);
+            __m256 w3=_mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                        _mm256_cvtepu8_epi32(_mm_srli_si128(n1,8)), magic_i)), magic_f);
+            a0=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),    w0, a0);
+            a1=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8),  w1, a1);
+            a2=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+16), w2, a2);
+            a3=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+24), w3, a3);
+        }
+        __m256 acc=_mm256_add_ps(_mm256_add_ps(a0,a1),_mm256_add_ps(a2,a3));
+        a=fmaf(hsum256(acc),sc,a);
+#endif
+        for(; i<base+glen; i+=2){
+            if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+            else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+        }
+    }
+    return a;
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
@@ -526,7 +625,32 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * comment above for the derivation and exhaustive-validation record). No
  * table, no gather -- vpgatherdd measured SLOWER than scalar table lookup on
  * Zen 2, so this sidesteps that weakness instead of working around it. */
+#if defined(__F16C__)
+/* F16C variant: an e4m3 magnitude (0 eeee mmm) shifted left by 7 is a valid
+ * fp16 bit pattern (exponent 0eeee, mantissa mmm0000000) whose value is the
+ * e4m3 value times 2^-8 -- for normals AND subnormals, since both formats put
+ * the same 0.mmm behind their minimum exponent (2^-6 vs 2^-14). vcvtph2ps is
+ * exact, so multiplying by 256 afterwards reproduces the f32 bits of the LUT
+ * for all 254 finite codes; the two NaN codes are forced to fp16 NaN before
+ * the convert so the propagate-NaN policy above is preserved. Measured on
+ * Zen 2 (EPYC 7F32, 16 threads, Qwen3.8 expert shapes streaming from DRAM):
+ * 0.203 -> 0.145 ms per expert (1.4x) inside matmul_fp8, which was ALU-bound
+ * at a quarter of DRAM bandwidth with the bit-manipulation decode below.
+ * Exhaustively checked against E4M3_LUT; matmul outputs are bit-identical. */
 static inline __m256 e4m3x8_to_f32x8(__m128i b8) {
+    __m128i h    = _mm_cvtepu8_epi16(b8);
+    __m128i mag  = _mm_and_si128(h, _mm_set1_epi16(0x7F));
+    __m128i sign = _mm_slli_epi16(_mm_and_si128(h, _mm_set1_epi16(0x80)), 8);
+    __m128i nan  = _mm_and_si128(_mm_cmpeq_epi16(mag, _mm_set1_epi16(0x7F)), _mm_set1_epi16(0x7C00));
+    __m128i h16  = _mm_or_si128(_mm_or_si128(_mm_slli_epi16(mag, 7), sign), nan);
+    return _mm256_mul_ps(_mm256_cvtph_ps(h16), _mm256_set1_ps(256.0f));
+}
+#define E4M3_HAVE_F16C_DECODE 1
+static inline __m256 e4m3x8_to_f32x8_bits(__m128i b8)
+#else
+static inline __m256 e4m3x8_to_f32x8(__m128i b8)
+#endif
+{
     __m256i b = _mm256_cvtepu8_epi32(b8);
     __m256i sign = _mm256_slli_epi32(_mm256_and_si256(b, _mm256_set1_epi32(0x80)), 24);
     __m256i exp4 = _mm256_and_si256(_mm256_srli_epi32(b, 3), _mm256_set1_epi32(0xF));
@@ -546,6 +670,14 @@ static inline __m256 e4m3x8_to_f32x8(__m128i b8) {
 }
 #endif
 
+/* Threading note (EPYC 7F32, 8c/16t, 2026-09-04): this kernel is ALU-bound
+ * and prefers one thread per physical core -- OMP_NUM_THREADS=8 with
+ * OMP_PLACES=cores took Qwen3.8 routed experts from 231 to 142 ms/token.
+ * Capping only this kernel's team inside a 16-thread pool was measured and
+ * rejected (1.70 vs 1.90 tok/s): the eight idle pool threads spin on the
+ * sibling hyperthreads and slow the eight that work. A second FMA chain per
+ * block was likewise measured and rejected (no change at either thread count),
+ * so the loop below is deliberately the plain one. */
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);

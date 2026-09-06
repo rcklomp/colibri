@@ -165,6 +165,18 @@ below 0.8 ms/call, stop and report before step 3; that would mean the
 decomposition in §G3 is wrong somewhere and the profile needs another look
 (Opus), not more parallelism.
 
+## Before Phase Q: the prefill track (added 2026-09-06, late)
+
+The first interactive use of GLM-5.3 (Open WebUI, 2026-09-06) showed that
+every gate on this roadmap measured decode on ~40-token prompts and none
+measured time-to-first-token on a real prompt. That work has its own roadmap,
+gate and record sections: **`PREFILL-ROADMAP-2026-09.md`** (rev 5) — P0
+harness/oracle/gate landed, P1 answered (prefix reuse works on a real turn
+2), P2 landed (bit-identical, 1.05–1.10× TTFT on the serve path), P4
+(S-tiled shaders) next. Its gate is `prefill_gate.sh`; a prefill item is
+done when that script exits 0. Phase Q below stands, but interactive use of
+GLM-5.3 is gated on the prefill track, not on anything here.
+
 ## Phase Q: start here (written 2026-09-06, as track G was finalised)
 
 **Baseline is established.** `qwen38-vk`, cap 512, max-new 80, 8 threads,

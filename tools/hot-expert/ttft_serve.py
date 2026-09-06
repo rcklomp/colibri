@@ -78,11 +78,19 @@ def warm(snap):
 
 def assert_resident(args, label):
     pct, short, n = residency(args.snap)
-    if pct < args.min_resident and args.warm:
+    # A running engine holds tens of GB of anon memory next to a 181 GiB model
+    # on a 247 GB box: a fresh process evicts ~3% and the gateway's engine sits
+    # at ~91.6%. Warm up to three times (each pass recovers what the previous
+    # allocation burst evicted), then report what the serving regime actually
+    # gives -- the number is printed before EVERY request so both sides of a
+    # gate are compared at the same residency.
+    for attempt in range(3):
+        if pct >= args.min_resident or not args.warm:
+            break
         t0 = time.time()
         warm(args.snap)
         pct, short, n = residency(args.snap)
-        print(f"[resid {label}] re-warmed in {time.time()-t0:.0f}s", flush=True)
+        print(f"[resid {label}] re-warm {attempt+1} in {time.time()-t0:.0f}s -> {pct:.4f}%", flush=True)
     print(f"[resid {label}] shards={n} resident={pct:.4f}% short={short}", flush=True)
     if pct < args.min_resident:
         sys.exit(f"REFUSED: model {pct:.2f}% resident < {args.min_resident}% "
@@ -295,7 +303,8 @@ def main():
     ap.add_argument("--tools", help="JSON list of OpenAI-style tools to attach (realistic prompt)")
     ap.add_argument("--multiturn", action="store_true", help="prefix-reuse check: A then A+B, same slot")
     ap.add_argument("--cancel", type=float, metavar="SECONDS", help="CANCEL check after this many seconds")
-    ap.add_argument("--min-resident", type=float, default=99.0)
+    ap.add_argument("--min-resident", type=float, default=96.0,
+                    help="refuse below this; 100%% is unreachable with an engine up (see assert_resident)")
     ap.add_argument("--warm", action="store_true", help="re-warm the shards if below --min-resident")
     ap.add_argument("--allow-other-engines", action="store_true")
     ap.add_argument("--api-key")

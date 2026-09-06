@@ -1,10 +1,20 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 3 same day)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 4 same day)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 4 (2026-09-06, night): P2 implemented and gated twice.** The oracle
+is bit-identical and the profile shows 1.18×, but the first serve-path gate
+caught two regressions the profile could not see — a decode tax from OpenMP
+`if`-clauses (5.4 → 2.1 tok/s) and a 0.65× TTFT from reading the KDA state
+back from device memory per chunk — and the chain auto-served the second one
+because the gate treated TTFT as informational. Both fixed; the gate now exits
+non-zero below `MIN_SPEEDUP` or on a decode drop; p2d pending (§P2 in the
+record). Lesson written into P0: *a gate that can pass a regression is not a
+gate.*
 
 **Rev 3 (2026-09-06, evening): P0 and P1 are done** — the serve-path
 baseline is measured (§P0/P1 in the record), prefix reuse turns out to *work*
@@ -120,7 +130,11 @@ instruments in `tools/hot-expert/`:
    multi-turn check (submit A, then A+B: was the prefix reused?). Residency is
    asserted before every run and the engine is verified idle (`pgrep`) before
    and after. Refuses to run otherwise.
-3. `prefill_gate.sh <pristine-binary> <candidate-binary>` — the **gate**:
+3. `prefill_gate.sh <pristine-binary> <candidate-binary>` — the **gate**
+   (exit 1 on an oracle failure, **exit 3 when the candidate's median TTFT
+   speedup is below `MIN_SPEEDUP` (default 1.0) at any size or its decode
+   sanity window drops more than 10 %** — added after p2c passed the oracle
+   at 0.65× and a chain served it):
    (a) teacher-forcing argmax **identical at every position** over the
    600-token list and (b) last-position logits cosine ≥ 1−1e-4 / argmax equal
    over the 3 000-token list, both vs pristine; (c) `ttft_serve.py` on both
@@ -142,10 +156,10 @@ cheapest possibly-decisive diagnosis second.
 |---|---|---|---|---|---|---|
 | **P0** ✅ | Oracle + serve-path TTFT harness + gate script | `ttft_serve.py`, `prefill_profile.sh`, `prefill_gate.sh` (commits `65f0c8a`…`e5e50c7`) | **baseline: 21 tok 3.1 s · 384 tok 66.7/65.6 s (171 ms/tok) · 1 230 tok 241.5/241.2 s (196 ms/tok)**, reproducible within 1 % | done | — | met: ±1 % at three sizes; pristine-vs-pristine gate run in the record |
 | **P1** ✅ | Why prefix reuse "does not fire" | measured with the engine's own `REUSE` line: a real turn 2 `[A, reply, B]` reused 408/424 tokens, **TTFT 2.74 s vs 65.45 s**; the rev-1 "same prompt twice" test was the *regenerate* case, which cannot reuse by design (the KDA state cannot rewind past prompt + reply) | reuse already works for a well-formed conversation; what Open WebUI loses it to is the single slot (side requests evict the session) and per-turn prefix changes | done | — | met; the Open WebUI-specific cause is P6's first step, with `GLM53_VERBOSE=1` now in `~/start_glm53.sh` so the server log carries REUSE lines |
-| **P2** | Batch the dense stages | in `kda_layer` / `mla_layer` / `ffn_layer`: gather the chunk's rows and call the existing S-row kernels once per weight per chunk (`coli_vk_matmul` S>1 for kq/kk/kv/kfa/kb/kga/kfb/kgb/ko, qa/kva/iwk/ikpg/iwp, qb/iwq, shared gate/up/down; router as one matmul); the KDA recurrence stays a per-token loop between the batched projections and the batched ko. The GPU shader is per-row independent (`s = WorkGroupID.y`), so rows are bit-identical to today | ~70 ms/token → ~10; **~1.5×** on prefill of any prefix | 2–4 days | Opus | `prefill_gate.sh` (a) bit-identical argmax; TTFT delta at 600 and 3 000 tokens ≥ 1.3×, both runs |
+| **P2** ⏳ | Batch the dense stages (`P2-BATCH-DENSE-SPEC-2026-09.md`; implemented `b9c193e`…`0b75c42`; oracle bit-identical; profile 206 → 175 ms/token; serve-path gate p2d pending after the kda_sync regression) | in `kda_layer` / `mla_layer` / `ffn_layer`: gather the chunk's rows and call the existing S-row kernels once per weight per chunk (`coli_vk_matmul` S>1 for kq/kk/kv/kfa/kb/kga/kfb/kgb/ko, qa/kva/iwk/ikpg/iwp, qb/iwq, shared gate/up/down; router as one matmul); the KDA recurrence stays a per-token loop between the batched projections and the batched ko. The GPU shader is per-row independent (`s = WorkGroupID.y`), so rows are bit-identical to today | ~70 ms/token → ~10; **~1.5×** on prefill of any prefix | 2–4 days | Opus | `prefill_gate.sh` (a) bit-identical argmax; TTFT delta at 600 and 3 000 tokens ≥ 1.3×, both runs |
 | **P3** | Row-batched CPU expert compute | per expert, run `mlp3_cpu` once with S = the rows that chose it (already gathered for the GPU path); port `quant.h`'s 1×4 row-tile (K2) from the Qwen engine | cpu-expert 56 → ~25–35 ms/token | 1–2 days | Sonnet (port) | `prefill_gate.sh`; TTFT delta on top of P2 |
-| **P4** | S-tiled GPU expert shader | `qmatmul_gate_up.comp` / down: one weight read per output row applied to all S rows of that expert (register tile over rows), instead of `(O/8, rows, 1)` re-reading the expert per row | eg per token drops with the chunk's dedup (×~1.6 at K=16, ×~3–4 at K=128) — the MoE bucket's floor moves | 2–4 days | Opus (shader) | `prefill_gate.sh` (b) logits within tolerance — the reduction order changes, so this ships behind a knob; TTFT delta |
-| **P5** | The sequential remainder | kda.step 13 ms/token: GPU step shader per token in one command buffer per chunk vs CPU; mla.attn 17 ms/token: vectorise the per-(token, head) dot/softmax or run it on `attention_absorb.comp` | ~30 → ~10–15 ms/token | 2–3 days | Opus | `prefill_gate.sh`; TTFT delta |
+| **P4** | S-tiled GPU matmul shaders — experts **and** dense | `qmatmul_gate_up.comp` / down / `qmatmul.comp`: one weight read per output row applied to all S rows (register tile over rows), instead of `(O/8, rows, 1)` re-reading the matrix per row. P2 showed the dense path needs it too: batched kda.proj+ko still cost 18 ms/token for ~2 of arithmetic | eg per token drops with the chunk's dedup (×~1.6 at K=16, ×~3–4 at K=128) — the MoE bucket's floor moves | 2–4 days | Opus (shader) | `prefill_gate.sh` (b) logits within tolerance — the reduction order changes, so this ships behind a knob; TTFT delta |
+| **P5** | The sequential remainder | kda.step 13 ms/token: the S per-token `kda_step` submits of one chunk recorded into one command buffer (one round trip per layer per chunk instead of S); mla.attn 27 ms/token at 500 ctx and growing: vectorise the per-(token, head) dot/softmax or run it on `attention_absorb.comp`; router 5 ms/token: vectorised dot behind a knob (order changes) | ~30 → ~10–15 ms/token | 2–3 days | Opus | `prefill_gate.sh`; TTFT delta |
 | **P6** | Make reuse survive Open WebUI | (1) read the server log's REUSE lines from a real Open WebUI two-turn chat and name what broke the match (side requests on the single slot; per-turn system-prompt changes); (2) `--kv-slots N` on the gateway — `conversation_cache_slot` already routes turns by system+first-user hash — **but** with `COLI_KDA_GPU=2` the device holds one KDA state per layer, re-seeded on every `session_open`, so either serve with the CPU recurrence (−11.7 % decode) or give each slot its own device state / `kda_sync`+`kda_upload` on slot switch; (3) keep the rendered prefix stable per turn on the gateway side | turn 2+ from Open WebUI: **minutes → seconds** (what P1 measured, delivered on the user's path) | 2–5 days | Opus; Fable for the per-slot device-state decision | a two-turn chat from Open WebUI itself shows `REUSE` ≫ 0 on turn 2 in the server log, with a title-generation request in between; `tworeq.py` identical across 3 requests in every slot |
 | **P7** | Checkpoint the stable prefix (system + tools) | snapshot the session (MLA KV + KDA state + window) at the boundary where the first user turn starts, keep it per distinct prefix, and start every *new* conversation with that prefix from the snapshot — the DeepSeek-V4 engine already does this ("prefix hint", 8th SUBMIT field, `openai_server.py`); port the pattern | first turn of every conversation with the 34-tool block: **~17 min → seconds** after one warm | 3–6 days on P6 | Opus | a fresh conversation's first turn reuses the snapshot (REUSE ≈ prefix length); TTFT independent of tool-block size; greedy text bit-identical to a cold prefill over 256 tokens |
 | P8 | Capacity (cross-ref) | int3 experts (`ROADMAP-2026-09.md` 4h / G15) | partial; tracked on the main roadmap | weeks | Opus | its own gate |

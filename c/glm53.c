@@ -2022,37 +2022,38 @@ static int expert_split_on(void) {
         g_expert_split = getenv("GLM53_EXPERT_SPLIT") ? atoi(getenv("GLM53_EXPERT_SPLIT")) : 0;
     return g_expert_split;
 }
-/* G14: alternative int4 expert kernels (record §G14). All measured in the
- * engine against a pristine binary; knob OFF is bit-identical to pristine on
- * both oracle prompts in every build, so the default path is untouched.
+/* G14: the one alternative int4 expert kernel that preserved the output.
  *
- *   1 = int8 activations, maddubs        1.32x   greedy text DIFFERS  rejected
- *   2 = int16 activations, madd_epi16    1.075x  greedy text DIFFERS  rejected
- *   3 = int8 gate/up, float down          --     greedy text DIFFERS  rejected
- *   4 = float, bit-trick + 4 accumulators 1.050x greedy IDENTICAL     usable
+ * Its only numeric change is summation order -- four accumulators instead of
+ * one -- because the bit-trick nibble decode is exactly (float)(n-8). Measured
+ * in the engine against a pristine binary: [PROF] cpu 11.777 -> 11.215 s with
+ * the expert count IDENTICAL at 19706 (identical text means identical routing,
+ * so it is a properly controlled pair), last_logits relL2 3.0e-6 on the short
+ * prompt, teacher_forcing exact over 1232 positions, greedy text identical over
+ * 128 tokens. Worth ~1.3% of the token -- real, safe, and below the serving
+ * gate's floor.
  *
- * Modes 1-3 quantise the activation and GLM-5.3 does not tolerate it: one
- * outlier in a group of 64 (the thing swiglu_limit=10.0 exists to clamp)
- * crushes the other 63, and the model says something different. They are kept
- * only as the measured record behind that conclusion -- DO NOT USE THEM.
+ * Off by default because it is not BIT-identical, and §G10 set this track's bar
+ * for shipping on: that item reverted a working optimisation rather than accept
+ * a 1.9e-4 drift.
  *
- * Mode 4 is the only one that preserves the output: its sole numeric change is
- * summation order (four accumulators instead of one), the bit-trick decode
- * being exactly (float)(n-8). last_logits relL2 3.0e-6 on the short prompt,
- * teacher_forcing exact over 1232 positions, greedy text identical over 128
- * tokens. It is worth ~1.3% of the token, which is below the serving gate's
- * floor -- real, safe and small.
+ * Three quantised-activation variants (int8 maddubs at 1.32x, int16 madd_epi16
+ * at 1.075x, and int8 gate/up with a float down) were built, measured and
+ * REMOVED: all three changed the greedy text, because one outlier in a group of
+ * 64 -- the thing swiglu_limit=10.0 exists to clamp -- crushes the other 63.
+ * The numbers are in record §G14 and in commits a0af56e / be95eb5; the code is
+ * not kept, because the record is where this project keeps evidence.
  *
- * The useful finding was not the kernel: isolated-to-in-engine attenuation is
- * 0.55-0.65x consistently, because the engine streams 985 MB/token of COLD
- * expert weights where the microbenchmark cycles 406 MB. In situ this path is
- * much closer to memory-bound than §G3's isolated "27% of bandwidth" implies,
- * so the lever is FEWER BYTES (int3 experts, fmt=5) rather than faster
- * arithmetic. See record §G14. */
-static int g_i4_int8 = -1;
-static int i4_int8_on(void) {
-    if (g_i4_int8 < 0) g_i4_int8 = getenv("GLM53_I4_INT8") ? atoi(getenv("GLM53_I4_INT8")) : 0;
-    return g_i4_int8;
+ * The finding that mattered was not the kernel: isolated-to-in-engine
+ * attenuation is 0.55-0.65x consistently, because the engine streams 985 MB of
+ * COLD expert weights per token where the microbenchmark cycles 406 MB. In situ
+ * this path is closer to memory-bound than §G3's isolated "27% of bandwidth"
+ * suggests, so the lever is FEWER BYTES (int3 experts, fmt=5) not faster
+ * arithmetic. */
+static int g_i4_fast = -1;
+static int i4_fast_on(void) {
+    if (g_i4_fast < 0) g_i4_fast = getenv("GLM53_I4_FAST") ? atoi(getenv("GLM53_I4_FAST")) : 0;
+    return g_i4_fast;
 }
 
 static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, const Mat *d, float limit, float *sg, float *su) {
@@ -2073,32 +2074,14 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
         return;
     }
     const int Ig = g->columns, Og = g->rows, Id = d->columns, Od = d->rows;
-    /* G14: same three-construct shape as the fused float path below, but the
-     * rows run integer-domain. The activation is quantised ONCE for gate AND up
-     * (they share x -- a saving the microbenchmark did not have), and once more
-     * for the down projection after the swiglu. Stack scratch: ~9 KB per
-     * activation at COLI_I4Q_MAX, no malloc in the hot path. */
-    if (i4_int8_on() && Ig <= COLI_I4Q_MAX && Id <= COLI_I4Q_MAX &&
-        g->gs >= 8 && u->gs == g->gs && d->gs >= 8 &&
-        u->columns == Ig && u->rows == Og) {
+    /* G14: the fused float path below, with the row kernel swapped for the
+     * four-accumulator bit-trick decode. Structure, swiglu and down projection
+     * are otherwise identical -- the only change is summation order inside a
+     * row. No scratch buffers: it reads x and sg directly, like coli_i4_row. */
+    if (i4_fast_on() && g->gs >= 8 && d->gs >= 8 &&
+        u->gs == g->gs && u->columns == Ig && u->rows == Og) {
         const int grb_ = (Ig + 1) / 2, gng_ = (Ig + g->gs - 1) / g->gs;
-        const int urb_ = (Ig + 1) / 2, ung_ = gng_;
         const int drb_ = (Id + 1) / 2, dng_ = (Id + d->gs - 1) / d->gs;
-        /* 1 = int8 everywhere, 2 = int16 everywhere,
-         * 3 = int8 gate/up but the DOWN projection stays on the float kernel.
-         * Mode 3 tests the hypothesis that `sg` (= silu(gate)*up, clamped at
-         * +/-10 either side, so a huge dynamic range) is the badly-conditioned
-         * activation and the hidden state is not: one large value in a group of
-         * 64 drives the rest toward zero however many bits the format has. */
-        const int mode = i4_int8_on();
-        const int m16 = (mode == 2);
-        const int dn_float = (mode == 3);
-        const int mf4 = (mode == 4);   /* float domain, bit-trick + 4 acc (G14c) */
-        int8_t xq[COLI_I4Q_MAX]; float xs[COLI_I4Q_MAXG]; int32_t xsum[COLI_I4Q_MAXG];
-        int8_t hq[COLI_I4Q_MAX]; float hs[COLI_I4Q_MAXG]; int32_t hsum[COLI_I4Q_MAXG];
-        int16_t xq16[COLI_I4Q_MAX]; int16_t hq16[COLI_I4Q_MAX];
-        if (m16) coli_i4_quant_act16(x, Ig, g->gs, xq16, xs);
-        else     coli_i4_quant_act  (x, Ig, g->gs, xq,   xs, xsum);
 #ifdef _OPENMP
         #pragma omp parallel
 #endif
@@ -2108,20 +2091,12 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
 #endif
             for (int z = 0; z < 2 * Og; z++) {
                 if (z < Og)
-                    sg[z] = mf4 ? coli_i4_row_f4(g->q4 + (int64_t)z * grb_, g->s + (int64_t)z * gng_,
-                                                 x, Ig, g->gs)
-                          : m16 ? coli_i4_row_i16(g->q4 + (int64_t)z * grb_, g->s + (int64_t)z * gng_,
-                                                  xq16, xs, Ig, g->gs)
-                                : coli_i4_row_i8 (g->q4 + (int64_t)z * grb_, g->s + (int64_t)z * gng_,
-                                                  xq, xs, xsum, Ig, g->gs);
+                    sg[z] = coli_i4_row_f4(g->q4 + (int64_t)z * grb_,
+                                           g->s + (int64_t)z * gng_, x, Ig, g->gs);
                 else {
                     const int o = z - Og;
-                    su[o] = mf4 ? coli_i4_row_f4(u->q4 + (int64_t)o * urb_, u->s + (int64_t)o * ung_,
-                                                 x, Ig, u->gs)
-                          : m16 ? coli_i4_row_i16(u->q4 + (int64_t)o * urb_, u->s + (int64_t)o * ung_,
-                                                  xq16, xs, Ig, u->gs)
-                                : coli_i4_row_i8 (u->q4 + (int64_t)o * urb_, u->s + (int64_t)o * ung_,
-                                                  xq, xs, xsum, Ig, u->gs);
+                    su[o] = coli_i4_row_f4(u->q4 + (int64_t)o * grb_,
+                                           u->s + (int64_t)o * gng_, x, Ig, u->gs);
                 }
             }
 #ifdef _OPENMP
@@ -2132,28 +2107,12 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
                 float uv = su[i] < -limit ? -limit : (su[i] > limit ? limit : su[i]);
                 sg[i] = siluf_(gv) * uv;
             }
-            /* the swiglu loop's implicit barrier orders this; `single` adds its
-             * own before the down rows read hq/hs/hsum */
-#ifdef _OPENMP
-            #pragma omp single
-#endif
-            { if (dn_float || mf4) { /* nothing to quantise: down runs on floats */ }
-              else if (m16) coli_i4_quant_act16(sg, Id, d->gs, hq16, hs);
-              else          coli_i4_quant_act  (sg, Id, d->gs, hq,   hs, hsum); }
 #ifdef _OPENMP
             #pragma omp for schedule(static)
 #endif
             for (int o = 0; o < Od; o++)
-                out[o] = mf4
-                       ? coli_i4_row_f4 (d->q4 + (int64_t)o * drb_, d->s + (int64_t)o * dng_,
-                                         sg, Id, d->gs)
-                       : dn_float
-                       ? coli_i4_row    (d->q4 + (int64_t)o * drb_, d->s + (int64_t)o * dng_,
-                                         sg, Id, d->gs)
-                       : m16 ? coli_i4_row_i16(d->q4 + (int64_t)o * drb_, d->s + (int64_t)o * dng_,
-                                               hq16, hs, Id, d->gs)
-                             : coli_i4_row_i8 (d->q4 + (int64_t)o * drb_, d->s + (int64_t)o * dng_,
-                                               hq, hs, hsum, Id, d->gs);
+                out[o] = coli_i4_row_f4(d->q4 + (int64_t)o * drb_,
+                                        d->s + (int64_t)o * dng_, sg, Id, d->gs);
         }
         return;
     }

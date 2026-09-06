@@ -75,8 +75,11 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - Shared: `c/quant.h` (CPU kernels; `matmul_fp8` is Qwen-only in practice),
   `c/backend_vulkan.c`, `c/shaders/*.comp`. A shared-file change must
   rebuild and re-measure both engines.
-- Build: `make -C c qwen38 qwen38-vk glm53 VK=1`. `tests/test_qwen38_prefix`
-  crashes on every tree (pre-existing); the other three qwen38 C tests pass.
+- Build: `make -C c qwen38 qwen38-vk glm53 VK=1`. **All four qwen38 C tests
+  pass** as of 2026-09-06. `tests/test_qwen38_prefix` used to SIGFPE on every
+  tree; that was C1's merge blocker and it is fixed (unguarded
+  `m->max_t / c->idx_ratio` in `ensure_kv`, which the test's fabricated Model
+  leaves at 0). If it crashes again, that guard is the first place to look.
 
 ## Git
 

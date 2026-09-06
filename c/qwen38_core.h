@@ -2414,7 +2414,15 @@ static void ensure_kv(Model *m) {
     if(m->K){for(int i=0;i<c->layers;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);if(m->IK_pooled)free(m->IK_pooled[i]);}free(m->K);free(m->V);free(m->IK);free(m->IK_pooled);free(m->IK_pooled_count);}
     m->K=(float**)calloc((size_t)c->layers,sizeof(float*));m->V=(float**)calloc((size_t)c->layers,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers,sizeof(float*));
     m->IK_pooled=(float**)calloc((size_t)c->layers,sizeof(float*));m->IK_pooled_count=(int*)calloc((size_t)c->layers,sizeof(int));
-    int64_t max_blocks=(int64_t)m->max_t/c->idx_ratio+1;
+    /* C1: idx_ratio is validated >0 for real configs (Q38_NEED, above), but
+     * ensure_kv also runs on models built directly -- SERVE paths and the
+     * fabricated Model in tests/test_qwen38_prefix.c, which never sets it.
+     * Dividing by a zero ratio SIGFPEs there, deterministically. The pooled
+     * indexer cache is only read from the indexer itself (see the pcache
+     * block in the QSA path), which cannot run without a ratio, so one block
+     * is enough to keep the pointer non-NULL for the free paths. For every
+     * config with idx_ratio>0 this computes exactly what it always did. */
+    int64_t max_blocks=c->idx_ratio>0?(int64_t)m->max_t/c->idx_ratio+1:1;
     for(int i=0;i<c->layers;i++)if(c->is_attn[i]){
         m->K[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->V[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->IK[i]=falloc((int64_t)m->max_t*c->idx_dim);
         m->IK_pooled[i]=falloc(max_blocks*(int64_t)c->idx_dim);

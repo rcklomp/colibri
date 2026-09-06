@@ -133,7 +133,10 @@ def engine_env(exe):
          "COLI_VULKAN": "1", "COLI_VK_DEV2": "auto", "COLI_VK_DEV3": "auto",
          "COLI_VK_EXPERTS2": "1695", "COLI_VK_EXPERTS3": "1695",
          "COLI_VK_SHADERS": os.path.join(os.path.dirname(exe), "shaders"),
-         "COLI_KDA_GPU": "2"}
+         "COLI_KDA_GPU": "2",
+         # the engine prints "REUSE <id> <reused> <prompt_tokens>" on stderr per
+         # turn -- the authoritative answer to "did the prefix get reused?"
+         "GLM53_VERBOSE": "1"}
     for k, v in d.items():
         os.environ.setdefault(k, v)
     if "COLI_USAGE_PATH" not in os.environ:
@@ -172,10 +175,13 @@ class EngineDriver:
               "ntok": 0, "prompt_tokens": None, "cancelled": False, "error": None}
         stop_flag = {"v": False}
 
+        ev["text"] = []
+
         def on_text(t):
             if ev["first"] is None:
                 ev["first"] = time.time()
             ev["ntok"] += 1
+            ev["text"].append(t)
 
         def on_accept(info):
             ev["accept"] = time.time()
@@ -226,7 +232,7 @@ class HttpDriver:
         if self.tools:
             body["tools"] = self.tools
         ev = {"submit": time.time(), "accept": None, "first": None, "done": None,
-              "ntok": 0, "prompt_tokens": None, "cancelled": False, "error": None}
+              "ntok": 0, "prompt_tokens": None, "cancelled": False, "error": None, "text": []}
         req = urllib.request.Request(self.url, data=json.dumps(body).encode(),
                                      headers=self.headers, method="POST")
         try:
@@ -247,6 +253,8 @@ class HttpDriver:
                             if ev["first"] is None:
                                 ev["first"] = time.time()
                             ev["ntok"] += 1
+                            if d.get("content"):
+                                ev["text"].append(d["content"])
                     if cancel_after is not None and time.time() - ev["submit"] >= cancel_after:
                         ev["cancelled"] = True
                         break   # closing the socket is how a browser cancels
@@ -327,18 +335,31 @@ def main():
                 ev = drv.run(build_messages(args, size), args.gen)
                 record("ttft", size, ev, f"size {size} run {rep+1}")
         if args.multiturn:
+            # The real chat flow, the way Open WebUI drives it: turn 1 is
+            # [user A]; turn 2 resends the history, [user A, assistant reply,
+            # user B]. The engine can resume a slot only from the exact position
+            # it stepped to (prompt + generated tokens; KDA state cannot rewind,
+            # glm53.c serve_turn), so turn 2 reuses iff the template re-renders
+            # the reply into exactly the generated tokens. Turn 3 resends turn 1's
+            # prompt unchanged ("regenerate"): by design that cannot reuse.
             base = sizes[1] if len(sizes) > 1 else sizes[0]
             assert_resident(args, "multiturn")
-            a = drv.run(build_messages(args, base), args.gen, slot=0)
-            record("turn1", base, a, "multiturn A")
-            b = drv.run(build_messages(args, base, suffix="Now also tell me, in one sentence, "
-                                       "what day of the week comes after Tuesday."), args.gen, slot=0)
-            record("turn2", base, b, "multiturn A+B")
+            msgs = build_messages(args, base)
+            a = drv.run(msgs, 48, slot=0)
+            record("turn1", base, a, "turn 1 [A]")
+            reply = "".join(a.get("text", [])).strip() or "I cannot tell."
+            follow = msgs + [{"role": "assistant", "content": reply},
+                             {"role": "user", "content": "Thanks. In one sentence: which day comes after Tuesday?"}]
+            b = drv.run(follow, args.gen, slot=0)
+            record("turn2", base, b, "turn 2 [A, reply, B]")
+            c = drv.run(msgs, args.gen, slot=0)
+            record("regen", base, c, "regenerate [A] again")
             if a["first"] and b["first"]:
-                r = (b["first"] - b["submit"]) / (a["first"] - a["submit"])
-                print(f"multiturn: ttft(A+B)/ttft(A) = {r:.2f}  ->  "
-                      f"{'PREFIX REUSED' if r < 0.35 else 'NO REUSE (turn 2 re-prefilled the prefix)'}",
-                      flush=True)
+                ta, tb = a["first"] - a["submit"], b["first"] - b["submit"]
+                new = (b["prompt_tokens"] or 0) - (a["prompt_tokens"] or 0) - a["ntok"]
+                print(f"multiturn: ttft(turn2)/ttft(turn1) = {tb/ta:.2f}; turn 2 added ~{new} new tokens "
+                      f"after the reply -> {'PREFIX REUSED' if tb < 0.35 * ta else 'NO REUSE (turn 2 re-prefilled the history)'}; "
+                      f"the engine's own verdict is the REUSE line above (reused-token count)", flush=True)
         if args.cancel is not None:
             big = max(sizes)
             assert_resident(args, "cancel")

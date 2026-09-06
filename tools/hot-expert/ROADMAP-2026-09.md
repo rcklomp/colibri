@@ -27,7 +27,7 @@ nobody has to remember them.
 | id | status | item | tier | gate |
 |---|---|---|---|---|
 | C0 | **DONE** 09-04 | `tools/rome_bench.sh`: drops caches, warms **one** model, verifies residency, pins 8 threads, sets the GLM caps, runs `datapoint.py`, appends a row. Asserts the GPU tier is really up and **refuses to record** otherwise — six config defects found writing it, incl. a mislabelled row it retro-corrected (record §C0) | Sonnet | 0.24% between runs, vs 3%: **met** |
-| C1 | **BLOCKED** 09-04 | Merge `perf/rome-cpu-path` into `hot-expert-tier`. **Gate failed** (record §C1): `test_qwen38_prefix` passes on `hot-expert-tier` and SIGFPEs on the branch — bisected to `2d3cf7e`, unguarded `m->max_t / c->idx_ratio` at `qwen38_core.h:2417`, deterministic 3/3. Also `qwen38-tiny-check` cannot run here at all (needs torch, absent). Branch is now ~19 commits, not five. **Unblock:** guard the divisor, then re-run | Opus (review) | not met; do not merge until it is |
+| C1 | **DONE 09-06 — MERGED.** The gate is met and the merge is done. `tests/test_qwen38_prefix` SIGFPEd on every tree since `2d3cf7e`: `ensure_kv` computes `m->max_t / c->idx_ratio` and the ratio is 0 for any Model built directly rather than parsed from a config — SERVE paths and the test's own fabricated Model. Real checkpoints cannot reach it (`Q38_NEED` validates `idx_ratio>0` at load). Guarded to one block when the ratio is absent; for every config with `idx_ratio>0` it computes exactly what it always did. **exit 136 → exit 0**, all four qwen38 C tests pass, all three engines build clean, and `perf/rome-cpu-path` (67 commits) is merged into `hot-expert-tier` as `2c311a0` — verified building and passing from a clean checkout on the rig *before* the push | record §C1 bisected it 3/3 | unblocks the merge | done | Opus | test exit 0: **met**; merge: **done** |
 | C2 | not started | Add `qwen38` to the record's steady-state table for GLM as well (G0 below) so both engines have the same four numbers | Haiku | table filled |
 
 ## Track G: GLM-5.3 — 2.60–2.75 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
@@ -46,8 +46,15 @@ faster than +10% changes the model's output). **The memory half is untouched,
 and `fmt=5` int3 experts attack it without new hardware — that is item 4h.**
 KDA remains solved-but-opt-in via G12.
 
-Status 2026-09-06: G0–G4, G7–G14 and three re-profiles (RP1, RP2, RP3) done;
-SPEC-PROBE answered no; G5/G6 open; **G15 (int3 experts) is next — item 4h**.
+**Status 2026-09-06 — TRACK G IS FINALISED AND MERGED.** `perf/rome-cpu-path`
+(67 commits) is merged into `hot-expert-tier` as `2c311a0`, verified building
+and passing from a clean checkout on the rig before the push. C0–C2 and
+G0–G14 done, three re-profiles (RP1, RP2, RP3) done, SPEC-PROBE answered no.
+**C1's SIGFPE is fixed and G6 has landed**, so the two long-standing blockers
+are closed. **Only G5 remains open on track G, and it is parked on a product
+question this rig cannot answer** — what context length does the deployment
+see. G15 (int3 experts, item 4h) is specified and sized but is *new* work, not
+part of the plan being finalised. **The track is now clear for phase Q.**
 RP3 found nothing to reorder and concluded the track was out of measurable
 items; **that conclusion was wrong and is corrected in 4f**. Two profiles exist
 because `COLI_KDA_GPU=2` ships off: **156.77 ms/token knob-off, 134.90
@@ -68,7 +75,7 @@ from the original plan.
 | **gate** | **Done** — Fable read G3: the roadmap's KDA description was wrong on three counts (inner loops already AVX2-vectorized; the "L=512 scalar loop" is MLA's; not bandwidth-bound at 15× its floor). Chosen: **CPU** — parallelise `coli_kda_step`, `expf(alog)` hoisted; **no shader**. The CPU-vs-shader call held on execution; the *sizing* did not (see G4: the decomposition missed 1.05 ms/call of GPU submits, and the win came from the conv loop, not the heads). | G3 §KDA decomposition: 0.9 ms DRAM + ~1 ms transcendentals + ~0.4 ms memmove = the measured 2.3 | — | done | Fable | `G4-KDA-SPEC-2026-09-04.md`: **written** |
 | G4 | **Done 2026-09-04** (record §G4): three bit-identical commits took `[OPTIME] kda` 2.301 → 1.598 ms/call (78 → 54 ms/token) and the rotating median 1.69–1.71 → **1.84/1.83**. The ≤0.6 ms/call gate was **not** met and is unreachable this way: projections + `ko` are 1.05 ms/call of GPU submits, which G3 never attributed. Head parallelism was worth 2%; the conv-channel loop was worth 2.7×. Follow-up split out as G12. | G3 §KDA; procedure and stop condition in §"Executing G4" below, which is what caught the spec's error | — | done | Opus | rotating median: **met**; per-call gate: **not met, reason recorded** |
 | G5 | Cache the pooled DSA-indexer block keys in `sparse_index.h`. **Port the idea from Qwen `2d3cf7e`, not the code** — that is the commit C1 bisected a SIGFPE to (unguarded `m->max_t / c->idx_ratio`); a naive mirror carries the bug into GLM, whose `index_kpool`/`index_topk` can likewise be 0 in a synthetic config. Guard the divisor. Confirmed applicable 09-05: `sparse_index.h:90` re-pools **the entire prefix on every call**, and `mla_layer` is called once per decode token — O(context) per token, O(context²) per generation, exactly Qwen's shape | the only O(context²) component; Qwen's fix cut its index phase 66% at 1.6k tokens | RP1 re-measured it at **1.958 µs per context token per call** (11 calls/token = 0.0215 ms/ctx-token): **2.3 ms/token at ctx 106 (1.1%)**, 44 at 2k, 176 at 8k, 706 at 32k. Overtakes the *entire* CPU-expert bucket at **ctx ≈ 3.5k** | 1 day | Sonnet | teacher_forcing identical at 690 and 1642 tokens; the dsa-index timer now exists (`[OPTIME] mla split`, added for the long-context section) |
-| G6 | Make the dev2/dev3 preload loops stop on the VRAM budget, not only on a count cap | an unlimited cap put 91 GB "in VRAM" and evicted the page cache | safety, not speed | half day | Sonnet | `COLI_VK_EXPERTS2` unset fills to budget − reserve and no further |
+| G6 | **DONE 09-06.** The dev2/dev3 preload now stops on the VRAM budget as well as the count cap. dev0's loop always did this; dev2/dev3 stopped only on the cap or an allocation failure, and their allocations are HOST_VISIBLE and spill to host RAM over ReBAR — so they never fail at the VRAM limit, which is how a large cap put 91 GB "in VRAM". `coli_vk_mem_budget2/3` already existed and were simply never called. **Reserve is 1.0 GB on the expert-only devices, not dev0's 3.0**: trying 3.0 first fires at the standard 1695 cap and stops the tier at 1600, which would silently change routing and invalidate every recorded number — a safety guard must stop a runaway, not re-tune the tier (`COLI_VK_TIER_RESERVE_GB` overrides). Note an *unset* cap skips dev2/dev3 entirely rather than filling them, so this row's original gate text described a path that cannot happen | an unlimited cap put 91 GB in host RAM | safety, not speed | done | Sonnet | cap 1695: guard does not fire, 1695/1695, GLM output identical to pre-G6 — **met**; cap 2200: stops at 1752 on "25.0 of 25.7 GB used, 1.0 reserve", MemAvailable 242 GB, no spill — **met** |
 | G7 | **DONE** 09-05 (record §G7) — parallelised the 288-row router score, inner (expert) loop not outer (token) loop: `score` has no per-token dimension, so parallelising over tokens would race. `[OPTIME] moe split: router` 0.998 → **0.137 ms/call** (7.3×). Rotating 1.84/1.83 → **2.01/2.05**. Bit-identical both prompts | G3: 41 ms/token, 0.98 ms/call, single thread, scalar reduction GCC will not vectorize; 1.2 GMAC/s | −36 ms/token; got exactly that | done | Sonnet | bit-identical: **met**; tok/s vs G4: **met** (+9–12%) |
 | G8 | **DONE** 09-05 (record §G8) — parallelised both per-head loops. Checked nested-OMP oversubscription empirically before writing anything (a compiled probe: `max_active_levels=1` on this box, so nesting collapses safely). Per-thread `score`/`pooled` scratch, same class of fix as G4's KDA. `[OPTIME] mla` 5.013 → **2.066 ms/call** (2.43×). Rotating 2.01/2.05 → **2.19/2.17**. Bit-identical both prompts | G3: 55 ms/token at 151 tokens of context, 5.0 ms/call, single thread, **O(context)** (4.1 ms at 87 tokens) | −32.4 ms/token at ctx=88; correction in the record re: context-shape | done | Sonnet | bit-identical: **met**; tok/s vs G7: **met** (+6–9%) |
 | G9 | **DONE** 09-05 (record §G9) — CPU-only experts now saved into a deferred list and run once in the issue/take gap (`can_defer = g_vk_ready && n_union <= block`; always true for decode). `[PROF]` eg/cpu went from serial (2.637s+13.612s=16.249s) to nested (eg=11.749s ⊇ cpu=11.193s) — the ~2.6s of pure GPU wait is almost entirely hidden inside CPU compute that was already larger than it. Rotating 2.19/2.17 → **2.33/2.35**. Bit-identical both prompts | G3: GPU groups 22 ms/token of pure wait; CPU experts 115 ms run *before* issue today | −22 ms/token; beat it (fresh-process +13.3%, gate +7–8%) | done | Sonnet | bit-identical: **met**; tok/s vs G8: **met** (+7–8%) |
@@ -157,6 +164,50 @@ has no legitimate numerics delta. If step 2 lands and `[OPTIME] kda` is not
 below 0.8 ms/call, stop and report before step 3; that would mean the
 decomposition in §G3 is wrong somewhere and the profile needs another look
 (Opus), not more parallelism.
+
+## Phase Q: start here (written 2026-09-06, as track G was finalised)
+
+**Baseline is established.** `qwen38-vk`, cap 512, max-new 80, 8 threads,
+GPU tier asserted at 14,673 experts: **4.06 / 4.10 rotating, 5.45 / 5.46
+warm-identical, 2.32 / 2.40 cold** (record §C2). The cold column is
+**provisional** — it is 31% below the 09-04 figure and the record says why and
+how to settle it. Do not build a projection on it.
+
+**Do this first: a G3-equivalent per-op profile.** Track Q has never had one.
+Every useful thing on track G came from G3's profile and the three re-profiles
+that corrected it; every *wrong* thing came from reasoning about buckets nobody
+had measured. `tools/hot-expert/profile_run.sh` and `profile_parse.py` are the
+procedure — the run list at the bottom is GLM's and needs a qwen38 equivalent,
+but the residency discipline and the parser's accounting checks carry over.
+**Until that profile exists, the Q items below are ordered by guesswork.**
+
+**What transfers from track G, at no cost:**
+
+| lesson | where it came from |
+|---|---|
+| Assert 100% page residency **before every run**, not once per campaign. Every engine run drops the model to ~91.6% and it does not come back | §RP2, §RP3 |
+| A probe can size **throughput** on synthetic data but **never accuracy** — the distribution is what carries the answer | §G14 |
+| The serving gate cannot resolve under ~3–4%; `[OPTIME]` timers hold to ~1%. Say "inconclusive" rather than rounding | §G11 part 1, §G13 |
+| An oracle that runs **one request per process** cannot see session-lifetime state. `tworeq.py` is the check | §G12 stage 2c |
+| A bucket is only "blocked" if what was *declined* is the same kind of thing as what is being *proposed* | item 4f, §G14 |
+| Isolated kernel speedups attenuate ~0.55–0.65× in-engine when the path streams cold weights | §G14 |
+| Freeze the routing histogram per campaign (`COLI_USAGE_PATH` to a copy) or runs mutate what the next one preloads | §C0, §RP1 |
+
+**What does NOT transfer — check, do not assume:**
+
+- **Scale.** Qwen's tier holds **14,673 experts**; GLM's holds 4,686. "VRAM-bound"
+  is a GLM finding, not a Qwen one.
+- **§SPEC-PROBE's answer.** It was decisive *for GLM* because the experts missing
+  the tier are the cold ones that never dedup across a block. Qwen3.8 is 173 GiB
+  with a much larger tier, so **Q4 must re-run the chunk probe on qwen38 before
+  anyone spends the 5–8 days** — that warning is already on the Q4 row.
+- **The clamp gap.** `qmatmul_gate_up.comp` computes `silu(gate)*up` with no
+  clamp (§G14/§G13). Whether Qwen's activations exceed its own limit is unknown.
+
+**Known-good state as of this line:** all four qwen38 C tests pass (C1's SIGFPE
+is fixed), `qwen38`, `qwen38-vk` and `glm53` all build clean, and
+`hot-expert-tier` is at `2c311a0` with track G merged and verified from a clean
+checkout.
 
 ## Track Q: Qwen3.8 (today 5.35 repeated / 3.69 rotating / 3.59 cold, 3 GPUs, 8 threads)
 

@@ -2022,6 +2022,25 @@ static int expert_split_on(void) {
         g_expert_split = getenv("GLM53_EXPERT_SPLIT") ? atoi(getenv("GLM53_EXPERT_SPLIT")) : 0;
     return g_expert_split;
 }
+/* G14: integer-domain int4 expert kernel (record §G14-PROBE).
+ *
+ * OFF BY DEFAULT AND NOT RECOMMENDED AT ANY SETTING. Measured end to end it
+ * gives 1.32x on the CPU expert path (~-9 ms/token) but CHANGES THE GREEDY
+ * TEXT: last_logits cosine 0.9896 and relL2 0.144 over 1232 prefill positions,
+ * against G12 which shipped opt-in at 0.99992 with identical text. int8
+ * activation quantisation at gs=64 is too coarse for this model -- one outlier
+ * in a group (the thing swiglu_limit=10.0 exists to clamp) crushes the other 63.
+ *
+ * It is kept as the measured baseline for the int16 follow-up (madd_epi16
+ * instead of maddubs_epi16: half the lanes, near-lossless), not as a usable
+ * configuration. Knob OFF is verified bit-identical to pristine on both oracle
+ * prompts, so the default path is untouched. */
+static int g_i4_int8 = -1;
+static int i4_int8_on(void) {
+    if (g_i4_int8 < 0) g_i4_int8 = getenv("GLM53_I4_INT8") ? atoi(getenv("GLM53_I4_INT8")) : 0;
+    return g_i4_int8;
+}
+
 static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, const Mat *d, float limit, float *sg, float *su) {
     if (expert_split_on()) {
         matmul_i4_grouped(sg, x, g->q4, g->s, 1, g->columns, g->rows, g->gs);
@@ -2040,6 +2059,60 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
         return;
     }
     const int Ig = g->columns, Og = g->rows, Id = d->columns, Od = d->rows;
+    /* G14: same three-construct shape as the fused float path below, but the
+     * rows run integer-domain. The activation is quantised ONCE for gate AND up
+     * (they share x -- a saving the microbenchmark did not have), and once more
+     * for the down projection after the swiglu. Stack scratch: ~9 KB per
+     * activation at COLI_I4Q_MAX, no malloc in the hot path. */
+    if (i4_int8_on() && Ig <= COLI_I4Q_MAX && Id <= COLI_I4Q_MAX &&
+        g->gs >= 8 && u->gs == g->gs && d->gs >= 8 &&
+        u->columns == Ig && u->rows == Og) {
+        const int grb_ = (Ig + 1) / 2, gng_ = (Ig + g->gs - 1) / g->gs;
+        const int urb_ = (Ig + 1) / 2, ung_ = gng_;
+        const int drb_ = (Id + 1) / 2, dng_ = (Id + d->gs - 1) / d->gs;
+        int8_t xq[COLI_I4Q_MAX]; float xs[COLI_I4Q_MAXG]; int32_t xsum[COLI_I4Q_MAXG];
+        int8_t hq[COLI_I4Q_MAX]; float hs[COLI_I4Q_MAXG]; int32_t hsum[COLI_I4Q_MAXG];
+        coli_i4_quant_act(x, Ig, g->gs, xq, xs, xsum);
+#ifdef _OPENMP
+        #pragma omp parallel
+#endif
+        {
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int z = 0; z < 2 * Og; z++) {
+                if (z < Og)
+                    sg[z] = coli_i4_row_i8(g->q4 + (int64_t)z * grb_, g->s + (int64_t)z * gng_,
+                                           xq, xs, xsum, Ig, g->gs);
+                else {
+                    const int o = z - Og;
+                    su[o] = coli_i4_row_i8(u->q4 + (int64_t)o * urb_, u->s + (int64_t)o * ung_,
+                                           xq, xs, xsum, Ig, u->gs);
+                }
+            }
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int i = 0; i < Og; i++) {
+                float gv = sg[i] > limit ? limit : sg[i];
+                float uv = su[i] < -limit ? -limit : (su[i] > limit ? limit : su[i]);
+                sg[i] = siluf_(gv) * uv;
+            }
+            /* the swiglu loop's implicit barrier orders this; `single` adds its
+             * own before the down rows read hq/hs/hsum */
+#ifdef _OPENMP
+            #pragma omp single
+#endif
+            coli_i4_quant_act(sg, Id, d->gs, hq, hs, hsum);
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int o = 0; o < Od; o++)
+                out[o] = coli_i4_row_i8(d->q4 + (int64_t)o * drb_, d->s + (int64_t)o * dng_,
+                                        hq, hs, hsum, Id, d->gs);
+        }
+        return;
+    }
     const int grb = (Ig + 1) / 2, gng = (Ig + g->gs - 1) / g->gs;
     const int urb = (u->columns + 1) / 2, ung = (u->columns + u->gs - 1) / u->gs;
     const int drb = (Id + 1) / 2, dng = (Id + d->gs - 1) / d->gs;

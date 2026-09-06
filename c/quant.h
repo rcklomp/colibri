@@ -202,6 +202,86 @@ static inline float coli_i4_row(const uint8_t *w, const float *scl,
     return a;
 }
 
+/* ---- G14: integer-domain int4 row kernel (record §G14-PROBE) --------------
+ * coli_i4_row spends, per 16 weights, two cvtepu8_epi32 + two sub_epi32 + two
+ * cvtepi32_ps to feed two FMAs -- §G3 measured that path at 27% of this box's
+ * DRAM bandwidth and called it ALU/decode-bound. This removes the conversion
+ * from the inner loop entirely: quantise the ACTIVATION to int8 once per group
+ * (O(I) against the matmul's O(I*O)), then accumulate in int32 with
+ * maddubs+madd and apply the group scale once at the end.
+ *
+ * Nibbles stay UNSIGNED 0..15 because maddubs takes u8 x s8. The stored value
+ * is n-8, and sum((n-8)*q) = sum(n*q) - 8*sum(q), so the bias comes off with a
+ * per-group sum of the quantised activation, computed in the same pass.
+ * No saturation is possible: |n*q| <= 15*128 = 1920 and maddubs sums two, so
+ * |.| <= 3840, inside int16.
+ *
+ * NOT bit-identical -- microbenchmarked at relL2 3.9e-3 / cosine 0.999993 per
+ * matmul against coli_i4_row, for 1.7-2.3x. Ships behind a knob, off by
+ * default. matmul_i4_grouped and coli_i4_row are deliberately left alone: they
+ * are on the qwen38 path, and §G10 showed a semantically null edit to a hot
+ * function can move GCC's codegen and with it the low bits. */
+#define COLI_I4Q_MAX   8192            /* max I this path handles; caller falls back */
+#define COLI_I4Q_MAXG  (COLI_I4Q_MAX/8) /* max groups, i.e. gs >= 8 */
+
+static inline void coli_i4_quant_act(const float *x, int I, int gs,
+                                     int8_t *xq, float *xs, int32_t *xsum){
+    const int ng=(I+gs-1)/gs;
+    for(int g=0; g<ng; g++){
+        int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+        float amax=0;
+        for(int i=base;i<base+glen;i++){ float a=fabsf(x[i]); if(a>amax) amax=a; }
+        float sc=amax/127.0f; if(sc<1e-12f) sc=1e-12f;
+        xs[g]=sc;
+        const float inv=1.0f/sc; int32_t acc=0;
+        for(int i=base;i<base+glen;i++){
+            int v=(int)lrintf(x[i]*inv);
+            if(v>127) v=127;
+            if(v<-128) v=-128;
+            xq[i]=(int8_t)v; acc+=v;
+        }
+        xsum[g]=acc;
+    }
+}
+
+static inline float coli_i4_row_i8(const uint8_t *w, const float *scl,
+                                   const int8_t *xq, const float *xs,
+                                   const int32_t *xsum, int I, int gs){
+    float a=0;
+    const int ng=(I+gs-1)/gs;
+    for(int g=0; g<ng; g++){
+        int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+        int32_t dot=0; int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F);
+        const __m256i ones=_mm256_set1_epi16(1);
+        __m256i acc=_mm256_setzero_si256();
+        for(; i+32<=base+glen; i+=32){
+            __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));   /* 32 nibbles */
+            __m128i lo=_mm_and_si128(by,m4);
+            __m128i hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i n0=_mm_unpacklo_epi8(lo,hi);       /* weights i    .. i+15 */
+            __m128i n1=_mm_unpackhi_epi8(lo,hi);       /* weights i+16 .. i+31 */
+            __m256i wu=_mm256_set_m128i(n1,n0);
+            __m256i xv=_mm256_loadu_si256((const __m256i*)(xq+i));
+            acc=_mm256_add_epi32(acc,
+                _mm256_madd_epi16(_mm256_maddubs_epi16(wu,xv), ones));
+        }
+        __m128i s128=_mm_add_epi32(_mm256_castsi256_si128(acc),
+                                   _mm256_extracti128_si256(acc,1));
+        s128=_mm_hadd_epi32(s128,s128); s128=_mm_hadd_epi32(s128,s128);
+        dot=_mm_cvtsi128_si32(s128);
+#endif
+        for(; i<base+glen; i++){
+            uint8_t byte=w[i>>1];
+            int nib=(i&1)?(byte>>4):(byte&0xF);
+            dot += nib * (int)xq[i];
+        }
+        a += (float)(dot - 8*xsum[g]) * (scl[g]*xs[g]);
+    }
+    return a;
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){

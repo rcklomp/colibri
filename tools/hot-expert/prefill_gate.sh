@@ -36,9 +36,14 @@ PY
 fi
 
 echo "=== prefill_gate $TAG: pristine=$PRISTINE candidate=$CAND $(date -Is)"
+# PRISTINE_SHADERS=<dir>: the pristine side loads its .spv files from there
+# (a shader-only change would otherwise compare a binary against itself,
+# both loading c/shaders). Copy c/shaders before rebuilding to make it.
+shaders_for() { if [ "$1" = pristine ] && [ -n "${PRISTINE_SHADERS:-}" ]; then echo "$PRISTINE_SHADERS"; else echo "$HERE/../../c/shaders"; fi; }
 for side in pristine candidate; do
   bin=$PRISTINE; [ $side = candidate ] && bin=$CAND
-  echo "--- (a)(b) oracle run: $side"
+  export COLI_VK_SHADERS="$(shaders_for $side)"
+  echo "--- (a)(b) oracle run: $side (shaders: $COLI_VK_SHADERS)"
   # the oracle half runs the CPU recurrence (COLI_KDA_GPU=0, the pristine
   # numerics) unless ORACLE_KDA_GPU says otherwise; the TTFT half below runs
   # the serving default (ttft_serve.py's engine_env: COLI_KDA_GPU=2).
@@ -76,6 +81,7 @@ PY
 echo "--- (c) serve-path TTFT (ttft_serve.py --engine), twice per size"
 for side in pristine candidate; do
   bin=$PRISTINE; [ $side = candidate ] && bin=$CAND
+  export COLI_VK_SHADERS="$(shaders_for $side)"
   python3 "$HERE/ttft_serve.py" --engine "$bin" --sizes 30,300,1000 --repeat 2 --warm \
       --tag "$TAG-$side" --json "$OUT/ttft.jsonl" | tee "$OUT/ttft_$side.txt" | grep -v "^\[resid"
 done

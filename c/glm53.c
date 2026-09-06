@@ -3884,6 +3884,15 @@ static void slots_init(const GModel *m) {
     g_n_slots = setting ? atoi(setting) : 1;
     if (g_n_slots < 1) g_n_slots = 1;
     if (g_n_slots > GLM53_MAX_SLOTS) g_n_slots = GLM53_MAX_SLOTS;
+    /* P6 (2026-09-06): the device-side KDA recurrence keeps ONE state per
+     * layer (coli_vk_kda_init re-seeds it on every session_open), so two live
+     * slots on the GPU path would share and corrupt it. Until P6b gives each
+     * slot its own device state, more than one slot forces the CPU recurrence
+     * -- loudly, so a serving config cannot drift into silent corruption. */
+    if (g_n_slots > 1 && kda_gpu_on()) {
+        fprintf(stderr, "KV_SLOTS=%d: forcing COLI_KDA_GPU=0 (one device KDA state per layer; P6b)\n", g_n_slots);
+        g_kda_gpu = 0;
+    }
     const char *context = getenv("GLM53_MAXT");
     g_slot_context = context ? atoi(context) : 8192;
     if (g_slot_context < 64) g_slot_context = 64;

@@ -23,11 +23,14 @@ prompt = rt.render_chat_for_arch([{"role":"user","content":
     "Explain in three sentences why a gated delta rule needs a decay term."}],
     enable_thinking=False)
 
-eng = rt.Engine(EXE, SNAP, cap=512, max_tokens=64)
+# TWOREQ_SLOTS=N (P6b): N KV slots, request i on slot i % N -- every slot must
+# produce the same text as slot 0, or per-slot state (CPU or device) leaks.
+NSLOTS = int(os.environ.get("TWOREQ_SLOTS", "1"))
+eng = rt.Engine(EXE, SNAP, cap=512, max_tokens=64, kv_slots=NSLOTS)
 outs = []
-for i in range(3):
+for i in range(max(3, NSLOTS)):
     buf = []
-    eng.generate(prompt, 64, 0.0, 1.0, lambda t: buf.append(t), cache_slot=0)
+    eng.generate(prompt, 64, 0.0, 1.0, lambda t: buf.append(t), cache_slot=i % NSLOTS)
     outs.append("".join(buf))
     print(f"--- request {i+1} ---\n{outs[-1]}\n", flush=True)
 ok = all(o == outs[0] for o in outs)

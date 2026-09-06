@@ -913,7 +913,12 @@ FAMILIES = (
         # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
         # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
         # le famiglie con lo stesso contesto massimo di 1048576.
-        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 0, "GLM53_MAXT"),
+        # max_kv_slots 16 = GLM53_MAX_SLOTS in glm53.c (P6, 2026-09-06): on one
+        # slot an Open WebUI title request evicts the conversation and turn 2
+        # re-prefills (191.6 s); with slots the gateway's routing keeps it
+        # (3.2 s). The engine forces the CPU recurrence for KV_SLOTS > 1 while
+        # the device holds a single KDA state per layer (P6b lifts that).
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 0, "GLM53_MAXT"),
         # tools=True: this family DOES render and parse tool calls. It used to
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client

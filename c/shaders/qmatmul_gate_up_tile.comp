@@ -1,0 +1,82 @@
+#version 450
+// P4: qmatmul_gate_up.comp for a TILE of R input rows per workgroup. See
+// qmatmul_tile.comp for the design and the bit-identity argument; this is the
+// fused gate+up+silu variant with the same two weight streams as the per-row
+// shader. Formats 1 (int8, per-row scales) and 4 (grouped int4) only; the host
+// dispatches it only for those and only when an expert has more than one row.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer WG { uint  wg[]; };
+layout(std430, binding = 2) readonly buffer SG { float gscale[]; };
+layout(std430, binding = 3) readonly buffer WU { uint  wu[]; };
+layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
+layout(std430, binding = 5) writeonly buffer H { float hid[]; };
+
+layout(push_constant) uniform P {
+    int fmt;
+    int S, I, O;    // I = input dim (hidden), O = moe_inter
+    int rowWords;
+    int gs;
+} p;
+
+const int R = 8;
+
+float i8(uint w, int l) { int b = int((w >> (uint(l) * 8u)) & 0xffu); if (b >= 128) b -= 256; return float(b); }
+float i4(uint w, int l) { return float(int((w >> (uint(l) * 4u)) & 0xfu) - 8); }
+
+void main() {
+    int s0     = int(gl_WorkGroupID.y) * R;
+    int rows   = min(R, p.S - s0);
+    int tid    = int(gl_LocalInvocationID.x);
+    int nth    = int(gl_WorkGroupSize.x);
+    int lane   = int(gl_SubgroupInvocationID);
+    int sgsize = int(gl_SubgroupSize);
+    int sg     = int(gl_SubgroupID);
+    int nsg    = nth / sgsize;
+    int stride = int(gl_NumWorkGroups.x) * nsg;
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rb = uint(o) * uint(p.rowWords);
+        float g[R], u[R];
+        for (int r = 0; r < R; r++) { g[r] = 0.0; u[r] = 0.0; }
+        if (p.fmt == 1) {
+            int words = (p.I + 3) / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        float gv = i8(gp, k), uv = i8(upk, k);
+                        for (int r = 0; r < R; r++)
+                            if (r < rows) { float xv = x[(s0 + r) * p.I + i]; g[r] += xv * gv; u[r] += xv * uv; }
+                    }
+                }
+            }
+        } else { // fmt 4
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 8;
+                float ga[R], ua[R];
+                for (int r = 0; r < R; r++) { ga[r] = 0.0; ua[r] = 0.0; }
+                for (int k = 0; k < 8; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        float gv = i4(gp, k), uv = i4(upk, k);
+                        for (int r = 0; r < R; r++)
+                            if (r < rows) { float xv = x[(s0 + r) * p.I + i]; ga[r] += xv * gv; ua[r] += xv * uv; }
+                    }
+                }
+                float sc_g = gscale[sb + uint(i0 / p.gs)], sc_u = uscale[sb + uint(i0 / p.gs)];
+                for (int r = 0; r < R; r++) { g[r] += ga[r] * sc_g; u[r] += ua[r] * sc_u; }
+            }
+        }
+        for (int r = 0; r < R; r++) {
+            float gt = subgroupAdd(g[r]), ut = subgroupAdd(u[r]);
+            if (p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }
+            if (lane == 0 && r < rows) hid[(s0 + r) * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;
+        }
+    }
+}

@@ -930,6 +930,29 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 }
 
+/* P2 (PREFILL-ROADMAP P2): mv() for S rows at once. Same kernels, same
+ * per-row reduction order -- the GPU shader is per-row independent
+ * (s = WorkGroupID.y) and the CPU kernels loop rows outside the dot -- so
+ * every row is bit-identical to S separate mv() calls. The point is one submit
+ * (or one OpenMP team) per matrix per chunk instead of one per token. */
+static void mv_rows_s(float *out, const Mat *w, const float *x, int S) {
+    if (S == 1) { mv(out, w, x); return; }
+#ifdef COLI_VULKAN
+    if (g_vk_ready && (w->fmt == 1 || w->fmt == 4)) {
+        Mat *mutable_w = (Mat *)w;
+        if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
+                           w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
+                           w->s, w->fmt, S, w->columns, w->rows, w->gs))
+            return;
+    }
+#endif
+    switch (w->fmt) {
+    case 4: matmul_i4_grouped(out, x, w->q4, w->s, S, w->columns, w->rows, w->gs); break;
+    case 1: matmul_q(out, x, w->q8, w->s, S, w->columns, w->rows); break;
+    default: matmul(out, x, w->f, S, w->columns, w->rows); break;
+    }
+}
+
 static void rms(float *out, const float *x, const float *w, int n, float eps) {
     float square = 0.0f;
     for (int i = 0; i < n; i++) square += x[i] * x[i];
@@ -1034,7 +1057,11 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
  * plus gate/up must share fmt+gs, which coli_vk_matmul_pair requires and
  * quantize_loaded already guarantees under one GLM53_BITS setting) and the
  * caller's existing mlp3() runs exactly as before. */
-static int shared_gate_up_gpu(const GLayer *l, const float *x, float *sg, float *su) {
+static int shared_gate_up_gpu(const GLayer *l, const float *x, float *sg, float *su, int S) {
+#ifndef COLI_VULKAN
+    (void)l; (void)x; (void)sg; (void)su; (void)S;
+    return 0;                       /* G13 shipped without this guard: the CPU-only build did not compile */
+#else
     if (!g_vk_ready) return 0;
     Mat *g = (Mat *)&l->rg, *u = (Mat *)&l->ru;   /* vk cache write, as mv() does */
     if (!(g->fmt == 1 || g->fmt == 4) || !(u->fmt == 1 || u->fmt == 4)) return 0;
@@ -1043,14 +1070,26 @@ static int shared_gate_up_gpu(const GLayer *l, const float *x, float *sg, float 
                                g->fmt == 4 ? (const void *)g->q4 : (const void *)g->q8, g->s, g->rows,
                                (ColiVkTensor **)&u->vk, su,
                                u->fmt == 4 ? (const void *)u->q4 : (const void *)u->q8, u->s, u->rows,
-                               g->fmt, x, 1, g->columns, g->gs);
+                               g->fmt, x, S, g->columns, g->gs);
+#endif
 }
 
 static void mlp3_shared(float *out, const float *x, const GLayer *l,
                         float limit, float *sg, float *su) {
-    if (!shared_gate_up_gpu(l, x, sg, su)) { mv(sg, &l->rg, x); mv(su, &l->ru, x); }
+    if (!shared_gate_up_gpu(l, x, sg, su, 1)) { mv(sg, &l->rg, x); mv(su, &l->ru, x); }
     swiglu_clamped(sg, su, l->rg.rows, limit);
     mv(out, &l->rd, sg);
+}
+
+/* P2.2: the shared expert for S rows in three calls instead of 3*S. sg/su
+ * must hold S * rg.rows floats. Row t of out is bit-identical to
+ * mlp3_shared() on row t of x. */
+static void mlp3_shared_rows(float *out, const float *x, int S, const GLayer *l,
+                             float limit, float *sg, float *su) {
+    const int W = l->rg.rows;
+    if (!shared_gate_up_gpu(l, x, sg, su, S)) { mv_rows_s(sg, &l->rg, x, S); mv_rows_s(su, &l->ru, x, S); }
+    swiglu_clamped(sg, su, S * W, limit);
+    mv_rows_s(out, &l->rd, sg, S);
 }
 
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
@@ -1066,6 +1105,16 @@ static void mv_cpu(float *out, const Mat *w, const float *x) {
 /* G12: run the recurrence on dev0 (G12-KDA-GPU-SPEC-2026-09-05.md). Off by
  * default -- it is NOT bit-identical (GLSL exp, tree-reduced norms), so it
  * ships behind a knob per CLAUDE.md. COLI_KDA_CPU takes precedence. */
+/* P2: GLM53_PREFILL_UNBATCHED=1 keeps every prefill stage on its per-token
+ * loop -- the pre-P2 behaviour, for bisecting a numerics or timing question.
+ * Every batched path is bit-identical per row, so this is a diagnostic, not a
+ * numerics knob. */
+static int g_prefill_unbatched_v = -1;
+static int g_prefill_unbatched(void) {
+    if (g_prefill_unbatched_v < 0)
+        g_prefill_unbatched_v = getenv("GLM53_PREFILL_UNBATCHED") ? atoi(getenv("GLM53_PREFILL_UNBATCHED")) : 0;
+    return g_prefill_unbatched_v;
+}
 static int g_kda_gpu = -1;
 static int kda_gpu_on(void) {
     if (g_kda_gpu < 0) g_kda_gpu = getenv("COLI_KDA_GPU") ? atoi(getenv("COLI_KDA_GPU")) : 0;
@@ -2233,8 +2282,33 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 
     const double t_router0 = optime_on() ? optime_now() : 0.0;
     /* --- primo tempo: il router, per ogni token --- */
+    /* P2.3: with a chunk of rows, one team over t (each thread its own score
+     * slice) instead of one team per token; the dot over d keeps its scalar
+     * order per (t, e), so every score is bit-identical. Decode (tokens == 1)
+     * keeps the e-parallel loop that G3 measured. */
+    const int rt_par = tokens >= 8 && !g_prefill_unbatched();
+    float *score_all = rt_par ? malloc((size_t)tokens * c->n_experts * sizeof(float)) : NULL;
+    if (rt_par && !score_all) { fprintf(stderr, "OOM nel router\n"); exit(1); }
+    if (rt_par) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int t = 0; t < tokens; t++) {
+            const float *row = x + (size_t)t * c->hidden;
+            float *sc = score_all + (size_t)t * c->n_experts;
+            for (int e = 0; e < c->n_experts; e++) {
+                const float *w = l->router + (size_t)e * c->hidden;
+                float sum = 0.0f;
+                for (int d = 0; d < c->hidden; d++) sum += w[d] * row[d];
+                sc[e] = sigmoidf_(sum);
+            }
+        }
+    }
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
+        if (rt_par) {
+            memcpy(score, score_all + (size_t)t * c->n_experts, (size_t)c->n_experts * sizeof(float));
+        } else {
         /* Le 288 righe sono indipendenti: ognuna legge la propria riga di
          * l->router e scrive il proprio score[e], nessun accumulatore
          * condiviso. Parallelizzare su e non tocca l'ordine della somma su d
@@ -2254,6 +2328,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             float sum = 0.0f;
             for (int d = 0; d < c->hidden; d++) sum += w[d] * row[d];
             score[e] = sigmoidf_(sum);
+        }
         }
         /* la selezione usa score+bias, il PESO usa lo score puro: la
          * distinzione e' sottile e sbagliarla cambia quali esperti contano
@@ -2276,7 +2351,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         for (int k = 0; k < topk; k++)
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
     }
-    free(score);
+    free(score); free(score_all);
     if (optime_on()) { g_ot_router += optime_now() - t_router0; g_on_router++; }
 
     /* --- secondo e terzo tempo, a blocchi che stanno in cache ---
@@ -2288,16 +2363,23 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
      * che non da' errore, da' numeri sbagliati. Quindi si lavora a blocchi
      * grandi al piu' quanto la cache: si legge il blocco in parallelo, si
      * applica a tutti i token, si passa al prossimo. */
-    float *sg = malloc((size_t)wide * sizeof(float));
-    float *su = malloc((size_t)wide * sizeof(float));
+    /* P2.2: sg/su sized for the whole chunk so the shared expert runs once per
+     * chunk; `wide` >= rg.rows, and the routed experts below still use only
+     * the first `wide` floats. */
+    const size_t shared_w = (size_t)l->rg.rows * (size_t)(tokens > 1 ? tokens : 1);
+    float *sg = malloc((shared_w > (size_t)wide ? shared_w : (size_t)wide) * sizeof(float));
+    float *su = malloc((shared_w > (size_t)wide ? shared_w : (size_t)wide) * sizeof(float));
     float *tmp = malloc((size_t)c->hidden * sizeof(float));
     if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
     const double t_shared0 = optime_on() ? optime_now() : 0.0;
-    for (int t = 0; t < tokens; t++)
-        mlp3_shared(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden, l,
-                   c->swiglu_limit, sg, su);
+    if (tokens > 1 && !g_prefill_unbatched())
+        mlp3_shared_rows(out, x, tokens, l, c->swiglu_limit, sg, su);
+    else
+        for (int t = 0; t < tokens; t++)
+            mlp3_shared(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden, l,
+                       c->swiglu_limit, sg, su);
     if (optime_on()) g_ot_shared += optime_now() - t_shared0;
 
     if (!m->streaming) {
@@ -3027,13 +3109,20 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             const float *base = site ? l->hc_ffn_base : l->hc_attn_base;
             const float *scale = site ? l->hc_ffn_scale : l->hc_attn_scale;
             double t0 = timed ? optime_now() : 0.0;
-            for (int t = 0; t < n; t++)
+            /* P2.3: every t writes only its own slices of collapsed/post/comb/
+             * normed, so the rows run in parallel; per-row math unchanged. */
+            const int hc_par = n > 1 && !g_prefill_unbatched();
+            (void)hc_par;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (hc_par)
+#endif
+            for (int t = 0; t < n; t++) {
                 coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
                             comb + (size_t)t * H * H, streams + (size_t)t * H * D,
                             fn, scale, base, H, D, c->hc_iters, c->eps, c->hc_eps);
-            for (int t = 0; t < n; t++)
                 rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
                     site ? l->post_ln : l->in_ln, D, c->eps);
+            }
             if (timed) { g_ot_hc += optime_now() - t0; g_on_hc++; t0 = optime_now(); }
             if (!site) {
                 GLayerState *st = &s->layer[i];
@@ -3056,6 +3145,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                 }
             }
             if (timed) t0 = optime_now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (hc_par)
+#endif
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
@@ -3159,6 +3251,7 @@ static void model_load(GModel *m, const char *dir) {
  * `image_token_id`, quindi qui non c'e' nulla da inserire: si sostituisce la
  * riga dell'embedding testuale con quella della torre e le posizioni restano
  * quelle che sono. Prompt di solo testo passano vision=NULL, n_vision=0. */
+static int g_span_last_only = 0;   /* set by forward_prefill around its chunks */
 static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                            const float *vision, int n_vision) {
     const Cfg *c = &m->c;
@@ -3212,18 +3305,27 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     if (!collapsed || !normed) { fprintf(stderr, "OOM in chiusura\n"); exit(1); }
 
     /* i flussi si richiudono con una media NON pesata */
-    for (int t = 0; t < n; t++)
+    const int tail_par = n > 1 && !g_prefill_unbatched();
+    (void)tail_par;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (tail_par)
+#endif
+    for (int t = 0; t < n; t++) {
         for (int d = 0; d < D; d++) {
             float sum = 0.0f;
             for (int h = 0; h < H; h++) sum += streams[((size_t)t * H + h) * D + d];
             collapsed[(size_t)t * D + d] = sum / H;
         }
-    for (int t = 0; t < n; t++)
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
+    }
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     const double t_head0 = optime_on() ? optime_now() : 0.0;
-    for (int t = 0; t < n; t++)
+    /* P2.3: a prefill chunk whose caller keeps only the last row (the serve
+     * path, forward_prefill keep_all == 0) gets the head for that row only;
+     * the teacher-forcing oracle keeps every row and pays every head. */
+    const int t_first = (g_span_last_only && n > 1) ? n - 1 : 0;
+    for (int t = t_first; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
     if (optime_on()) { g_ot_head += optime_now() - t_head0; g_on_head++; }
 
@@ -3270,9 +3372,11 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         if (vision && c->image_token >= 0)
             for (int i = 0; i < here; i++)
                 if (tokens[at + i] == c->image_token) mine++;
+        g_span_last_only = !keep_all;
         float *part = forward_span(m, s, tokens + at, here,
                                    vision ? vision + (size_t)used_vision * c->hidden : NULL,
                                    mine);
+        g_span_last_only = 0;
         used_vision += mine;
         if (keep_all) {
             memcpy(all + (size_t)at * c->vocab, part,

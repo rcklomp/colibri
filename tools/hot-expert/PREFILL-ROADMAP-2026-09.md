@@ -1,10 +1,16 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 2 same day)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 3 same day)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 3 (2026-09-06, evening): P0 and P1 are done** — the serve-path
+baseline is measured (§P0/P1 in the record), prefix reuse turns out to *work*
+on a real turn 2 (408 of 424 tokens reused, 2.7 s instead of 65 s), and the
+CANCEL gate is executable and fails as predicted. P6/P7 are re-scoped from
+"build prefix caching" to "make the reuse that exists survive Open WebUI".
 
 **Rev 2 (2026-09-06, a few hours after rev 1):** rev 1's diagnosis — "prefill
 is streaming-bound, batching cannot help, prefix caching is the only lever" —
@@ -134,14 +140,14 @@ cheapest possibly-decisive diagnosis second.
 
 | id | item | mechanism | expected effect on TTFT | effort | tier | gate (executable) |
 |---|---|---|---|---|---|---|
-| **P0** | Oracle + serve-path TTFT harness + gate script | see above | none directly — every item below is measured with it | ½–1 day | Opus spec, Sonnet build | `ttft_serve.py` reproduces its own numbers within ±10 % on two consecutive runs at all four sizes; `prefill_gate.sh` passes pristine-vs-pristine |
-| **P1** | Diagnose why prefix reuse does not fire | read the serve path: `conversation_cache_slot`, `slot_remember`, how a request is matched to a slot and what invalidates it; the 806-token prompt sent twice took 184 s then 179 s | unknown: a bug costs a day and could make turn 2+ of a conversation seconds; an absent feature becomes P6 | ≤ 1 day | Opus | a written account in the record naming the exact condition that fails; if it is a bug, the fix passes `prefill_gate.sh` and the multi-turn check shows turn-2 TTFT ≪ turn-1 |
+| **P0** ✅ | Oracle + serve-path TTFT harness + gate script | `ttft_serve.py`, `prefill_profile.sh`, `prefill_gate.sh` (commits `65f0c8a`…`e5e50c7`) | **baseline: 21 tok 3.1 s · 384 tok 66.7/65.6 s (171 ms/tok) · 1 230 tok 241.5/241.2 s (196 ms/tok)**, reproducible within 1 % | done | — | met: ±1 % at three sizes; pristine-vs-pristine gate run in the record |
+| **P1** ✅ | Why prefix reuse "does not fire" | measured with the engine's own `REUSE` line: a real turn 2 `[A, reply, B]` reused 408/424 tokens, **TTFT 2.74 s vs 65.45 s**; the rev-1 "same prompt twice" test was the *regenerate* case, which cannot reuse by design (the KDA state cannot rewind past prompt + reply) | reuse already works for a well-formed conversation; what Open WebUI loses it to is the single slot (side requests evict the session) and per-turn prefix changes | done | — | met; the Open WebUI-specific cause is P6's first step, with `GLM53_VERBOSE=1` now in `~/start_glm53.sh` so the server log carries REUSE lines |
 | **P2** | Batch the dense stages | in `kda_layer` / `mla_layer` / `ffn_layer`: gather the chunk's rows and call the existing S-row kernels once per weight per chunk (`coli_vk_matmul` S>1 for kq/kk/kv/kfa/kb/kga/kfb/kgb/ko, qa/kva/iwk/ikpg/iwp, qb/iwq, shared gate/up/down; router as one matmul); the KDA recurrence stays a per-token loop between the batched projections and the batched ko. The GPU shader is per-row independent (`s = WorkGroupID.y`), so rows are bit-identical to today | ~70 ms/token → ~10; **~1.5×** on prefill of any prefix | 2–4 days | Opus | `prefill_gate.sh` (a) bit-identical argmax; TTFT delta at 600 and 3 000 tokens ≥ 1.3×, both runs |
 | **P3** | Row-batched CPU expert compute | per expert, run `mlp3_cpu` once with S = the rows that chose it (already gathered for the GPU path); port `quant.h`'s 1×4 row-tile (K2) from the Qwen engine | cpu-expert 56 → ~25–35 ms/token | 1–2 days | Sonnet (port) | `prefill_gate.sh`; TTFT delta on top of P2 |
 | **P4** | S-tiled GPU expert shader | `qmatmul_gate_up.comp` / down: one weight read per output row applied to all S rows of that expert (register tile over rows), instead of `(O/8, rows, 1)` re-reading the expert per row | eg per token drops with the chunk's dedup (×~1.6 at K=16, ×~3–4 at K=128) — the MoE bucket's floor moves | 2–4 days | Opus (shader) | `prefill_gate.sh` (b) logits within tolerance — the reduction order changes, so this ships behind a knob; TTFT delta |
 | **P5** | The sequential remainder | kda.step 13 ms/token: GPU step shader per token in one command buffer per chunk vs CPU; mla.attn 17 ms/token: vectorise the per-(token, head) dot/softmax or run it on `attention_absorb.comp` | ~30 → ~10–15 ms/token | 2–3 days | Opus | `prefill_gate.sh`; TTFT delta |
-| **P6** | Prefix caching that works, KV **and** KDA state | at a turn boundary, reuse the cached forward state for the longest matching prefix; snapshot/restore MLA KV **and** KDA recurrent state (reuse G12's `kda_sync`/`kda_upload`) | turn 2+ of a conversation: prefill only the new tokens — **minutes → seconds** for a tool prompt | **1–3 weeks**, high risk (G12's cross-session leak and the CANCEL wedge were both this class of bug) | Opus, Fable for the state-boundary design | multi-turn check: turn-2 TTFT within a few × its *new-token* count; greedy text bit-identical to no-cache over 512 tokens on the serve path |
-| **P7** | Warm the stable prefix at startup | prefill the system+tool block once when the server learns it, so turn 1 of a new conversation reuses it | first turn of every conversation → seconds after a one-time warm | +2–4 days on P6 | Opus | a fresh conversation's first turn reuses the pre-warmed prefix; TTFT independent of tool-block size |
+| **P6** | Make reuse survive Open WebUI | (1) read the server log's REUSE lines from a real Open WebUI two-turn chat and name what broke the match (side requests on the single slot; per-turn system-prompt changes); (2) `--kv-slots N` on the gateway — `conversation_cache_slot` already routes turns by system+first-user hash — **but** with `COLI_KDA_GPU=2` the device holds one KDA state per layer, re-seeded on every `session_open`, so either serve with the CPU recurrence (−11.7 % decode) or give each slot its own device state / `kda_sync`+`kda_upload` on slot switch; (3) keep the rendered prefix stable per turn on the gateway side | turn 2+ from Open WebUI: **minutes → seconds** (what P1 measured, delivered on the user's path) | 2–5 days | Opus; Fable for the per-slot device-state decision | a two-turn chat from Open WebUI itself shows `REUSE` ≫ 0 on turn 2 in the server log, with a title-generation request in between; `tworeq.py` identical across 3 requests in every slot |
+| **P7** | Checkpoint the stable prefix (system + tools) | snapshot the session (MLA KV + KDA state + window) at the boundary where the first user turn starts, keep it per distinct prefix, and start every *new* conversation with that prefix from the snapshot — the DeepSeek-V4 engine already does this ("prefix hint", 8th SUBMIT field, `openai_server.py`); port the pattern | first turn of every conversation with the 34-tool block: **~17 min → seconds** after one warm | 3–6 days on P6 | Opus | a fresh conversation's first turn reuses the snapshot (REUSE ≈ prefix length); TTFT independent of tool-block size; greedy text bit-identical to a cold prefill over 256 tokens |
 | P8 | Capacity (cross-ref) | int3 experts (`ROADMAP-2026-09.md` 4h / G15) | partial; tracked on the main roadmap | weeks | Opus | its own gate |
 
 Rev 1's "P4 — 4-accumulator BF16 prefill kernel (Q5)" is dropped from this
@@ -175,7 +181,10 @@ way.
    WebUI container shares its source IP with the app — read the app's own
    record (its DB, its logs).
 3. **Assert residency before every measurement.** A cold cache alone turned a
-   2.8-second "hi" into 12 minutes. `ttft_serve.py` refuses to run below 99 %.
+   2.8-second "hi" into 12 minutes. `ttft_serve.py` prints residency before
+   every request and refuses below 96 % — 100 % is unreachable with an engine
+   up (a fresh process evicts ~3 %; the gateway's sits at 91.6 %), so a gate
+   compares both binaries at the *same* printed number, not at a fiction.
 4. **One in-flight request while diagnosing.** An orphaned generation (a
    timed-out probe with the CANCEL bug unfixed) blocks the queue and poisons
    every later number. Kill hard, confirm `pgrep -x glm53` empty, then measure.
@@ -186,9 +195,11 @@ way.
 
 ## Open dependency: CANCEL (still unfixed)
 
-`glm53` does not honour CANCEL between generated tokens — an aborted request
-runs to `max_tokens` holding the single engine slot (revert `73e770c`). Prefill
-work makes this worse: a 30-minute prefill a user gives up on holds the engine
-for the full 30 minutes. **P0's harness is what a correct CANCEL fix needs** —
-the G16 attempt failed for lack of a serve-path oracle. Fix CANCEL as part of,
-or immediately after, P0, with a `ttft_serve.py --cancel` case as its gate.
+`glm53` does not honour CANCEL — **measured 2026-09-06 with the new gate**: a
+1 230-token prompt cancelled at 5 s held the engine for 251 s (the whole
+prefill and the generation). Prefill work makes this worse: a 17-minute tool
+prompt a user gives up on holds the engine for 17 minutes. The G16 attempt
+failed for lack of a serve-path oracle; `ttft_serve.py --cancel 5` is that
+oracle now (PASS = engine confirms within seconds and the next request is
+served). Fix it as the next engine change after P2, or before P2 if a user is
+actively hitting it: it is also what makes every measurement session safe.

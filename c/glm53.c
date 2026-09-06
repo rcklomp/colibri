@@ -1130,9 +1130,134 @@ static int g_kda_cpu_on(void) {
     if (g_kda_cpu) mv_cpu((o), (w), (xx)); else mv((o), (w), (xx)); \
 } while (0)
 
+/* KMV for S rows: the same CPU/GPU choice as KMV, on mv_rows_s / the S-row CPU
+ * kernels. Row-wise bit-identical to S KMV calls. */
+static void kmv_rows(float *out, const Mat *w, const float *x, int S) {
+    if (g_kda_cpu < 0) g_kda_cpu = getenv("COLI_KDA_CPU") ? atoi(getenv("COLI_KDA_CPU")) : 0;
+    if (!g_kda_cpu) { mv_rows_s(out, w, x, S); return; }
+    switch (w->fmt) {
+    case 4: matmul_i4_grouped(out, x, w->q4, w->s, S, w->columns, w->rows, w->gs); break;
+    case 1: matmul_q(out, x, w->q8, w->s, S, w->columns, w->rows); break;
+    default: matmul(out, x, w->f, S, w->columns, w->rows); break;
+    }
+}
+
+/* P2.1 (PREFILL-ROADMAP P2, P2-BATCH-DENSE-SPEC): a prefill chunk of S rows
+ * through one KDA layer in five stages instead of S per-token passes.
+ *
+ *   A  the 8 projections, S rows each (one call per matrix per chunk)
+ *   B  decay / beta gating, per row
+ *   C  the recurrence, per token, SEQUENTIAL -- on the CPU state
+ *   D  head norm x o_norm x sigmoid(gate), per row
+ *   E  ko, S rows in one call
+ *
+ * When the recurrence lives on the device (gpu != 0) the state is synced to
+ * the CPU copy before C and uploaded back after it, so decode resumes on the
+ * device from the chunk's final state (G12's kda_sync / kda_upload). With
+ * COLI_KDA_GPU=0 every stage is the per-token code in the per-token order:
+ * bit-identical. With the device recurrence, prefill moves from the GLSL
+ * chain to the CPU recurrence -- closer to the pristine CPU numerics; decode
+ * is untouched. Timers: A -> proj, B -> decay, C -> step, D -> norm, E -> ko,
+ * so the per-op table stays comparable. */
+static void kda_layer_rows(const Cfg *c, const GLayer *l, const float *x, int S,
+                           float *out, float *state, float *window, float *scratch,
+                           int layer, int gpu) {
+    const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
+    float *q = malloc((size_t)S * P * sizeof(float));
+    float *k = malloc((size_t)S * P * sizeof(float));
+    float *v = malloc((size_t)S * P * sizeof(float));
+    float *low = malloc((size_t)S * D * sizeof(float));
+    float *lowg = malloc((size_t)S * D * sizeof(float));
+    float *beta = malloc((size_t)S * H * sizeof(float));
+    float *decay = malloc((size_t)S * P * sizeof(float));
+    float *gate = malloc((size_t)S * P * sizeof(float));
+    float *qkv = malloc((size_t)3 * P * sizeof(float));
+    float *core = malloc((size_t)S * P * sizeof(float));
+    float *normed = malloc((size_t)S * P * sizeof(float));
+    if (!q || !k || !v || !low || !lowg || !beta || !decay || !gate || !qkv || !core || !normed) {
+        fprintf(stderr, "OOM nel KDA a righe\n"); exit(1);
+    }
+    /* A */
+    const double _t0 = optime_on() ? optime_now() : 0.0;
+    kmv_rows(q, &l->kq, x, S);
+    kmv_rows(k, &l->kk, x, S);
+    kmv_rows(v, &l->kv, x, S);
+    kmv_rows(low, &l->kfa, x, S);
+    kmv_rows(beta, &l->kb, x, S);
+    kmv_rows(lowg, &l->kga, x, S);
+    kmv_rows(decay, &l->kfb, low, S);
+    kmv_rows(gate, &l->kgb, lowg, S);
+    if (optime_on()) { g_kt_proj += optime_now() - _t0; g_kn_batched += S; }
+    /* B */
+    const double _t1 = optime_on() ? optime_now() : 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < S; t++) {
+        float *dc = decay + (size_t)t * P;
+        for (int h = 0; h < H; h++) {
+            const float alpha = expf(l->alog[h]);
+            for (int d = 0; d < D; d++) {
+                int i = h * D + d;
+                dc[i] = c->gate_lb * sigmoidf_(alpha * (dc[i] + l->dt[i]));
+            }
+        }
+        float *bt = beta + (size_t)t * H;
+        for (int h = 0; h < H; h++) bt[h] = sigmoidf_(bt[h]);
+    }
+    if (optime_on()) { g_kt_decay += optime_now() - _t1; }
+    /* C */
+    const double _t2 = optime_on() ? optime_now() : 0.0;
+#ifdef COLI_VULKAN
+    if (gpu) coli_vk_kda_sync(layer, state, window);
+#else
+    (void)layer; (void)gpu;
+#endif
+    for (int t = 0; t < S; t++) {
+        memcpy(qkv,         q + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(qkv + P,     k + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(qkv + 2 * P, v + (size_t)t * P, (size_t)P * sizeof(float));
+        coli_kda_step(core + (size_t)t * P, state, window, qkv, l->conv,
+                      decay + (size_t)t * P, beta + (size_t)t * H,
+                      H, D, D, c->conv_k, 1e-6f, scratch);
+    }
+#ifdef COLI_VULKAN
+    if (gpu) coli_vk_kda_upload(layer, state, window);
+#endif
+    if (optime_on()) { g_kt_step += optime_now() - _t2; }
+    /* D */
+    const double _t3 = optime_on() ? optime_now() : 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < S; t++) {
+        const float *gt = gate + (size_t)t * P;
+        for (int h = 0; h < H; h++) {
+            const float *src = core + (size_t)t * P + (size_t)h * D;
+            float *dst = normed + (size_t)t * P + (size_t)h * D;
+            float square = 0.0f;
+            for (int d = 0; d < D; d++) square += src[d] * src[d];
+            float inverse = 1.0f / sqrtf(square / D + c->eps);
+            for (int d = 0; d < D; d++)
+                dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gt[(size_t)h * D + d]);
+        }
+    }
+    if (optime_on()) { g_kt_norm += optime_now() - _t3; }
+    /* E */
+    const double _t4 = optime_on() ? optime_now() : 0.0;
+    kmv_rows(out, &l->ko, normed, S);
+    if (optime_on()) { g_kt_ko += optime_now() - _t4; g_kn_calls += S; }
+    free(normed); free(core); free(qkv); free(gate); free(decay); free(beta);
+    free(lowg); free(low); free(v); free(k); free(q);
+}
+
 static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, float *state, float *window, float *scratch,
                       int layer, int gpu) {
+    if (tokens > 1 && !g_prefill_unbatched()) {
+        kda_layer_rows(c, l, x, tokens, out, state, window, scratch, layer, gpu);
+        return;
+    }
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
     float *qkv = malloc((size_t)3 * P * sizeof(float));
     float *gate = malloc((size_t)P * sizeof(float));
@@ -1314,6 +1439,30 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     memset(valid, 1, (size_t)seen);
     const double _tm0 = optime_on() ? optime_now() : 0.0;
 
+    /* P2.4: with a chunk of rows, each projection runs once on the S-row slab
+     * (its outputs for consecutive t are contiguous: qa by t, latent/ik/gates
+     * by absolute position base+t, head_w by t), the per-row norms run in
+     * parallel, then qb/iwq on the normalised slab. Per row bit-identical to
+     * the per-token path below; the absorb stays per token (P5). */
+    const int mla_rows = tokens > 1 && !g_prefill_unbatched();
+    if (mla_rows) {
+        mv_rows_s(qa, &l->qa, x, tokens);
+        mv_rows_s(latent + (size_t)base * L, &l->kva, x, tokens);
+        mv_rows_s(ik + (size_t)base * ID, &l->iwk, x, tokens);
+        mv_rows_s(gates + (size_t)base * ID, &l->ikpg, x, tokens);
+        mv_rows_s(head_w, &l->iwp, x, tokens);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int t = 0; t < tokens; t++) {
+            const int at = base + t;
+            rms(qa + (size_t)t * c->q_lora, qa + (size_t)t * c->q_lora, l->qa_ln, c->q_lora, c->eps);
+            rms(latent + (size_t)at * L, latent + (size_t)at * L, l->kva_ln, L, c->eps);
+            layer_norm(ik + (size_t)at * ID, ik + (size_t)at * ID, l->ik_nw, l->ik_nb, ID, 1e-5f);
+        }
+        mv_rows_s(queries, &l->qb, qa, tokens);
+        mv_rows_s(iq, &l->iwq, qa, tokens);
+    }
     for (int t = 0; t < tokens; t++) {
         const int at = base + t;          /* posizione assoluta nella cache */
         const float *row = x + (size_t)t * c->hidden;
@@ -1322,7 +1471,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         float *kraw = ik + (size_t)at * ID;
         /* qa/kva/iwk/ikpg/iwp leggono tutte la stessa riga: un submit invece di
          * cinque. Sul percorso denso si paga il round trip, non la matrice. */
-        {
+        if (!mla_rows) {
             const Mat *bw[5] = { &l->qa, &l->kva, &l->iwk, &l->ikpg, &l->iwp };
             float *bo[5] = { qn, here, kraw,
                              gates + (size_t)at * ID, head_w + (size_t)t * IH };
@@ -1334,11 +1483,13 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 mv(head_w + (size_t)t * IH, &l->iwp, row);
             }
         }
+        if (!mla_rows) {
         rms(qn, qn, l->qa_ln, c->q_lora, c->eps);
         rms(here, here, l->kva_ln, L, c->eps);
         layer_norm(kraw, kraw, l->ik_nw, l->ik_nb, ID, 1e-5f);
+        }
         /* qb e iwq leggono entrambe il q_a normalizzato: altro submit unico. */
-        {
+        if (!mla_rows) {
             const Mat *bw[2] = { &l->qb, &l->iwq };
             float *bo[2] = { queries + (size_t)t * H * QK, iq + (size_t)t * IH * ID };
             if (!vk_batch_mv(bw, bo, 2, qn, c->q_lora)) {

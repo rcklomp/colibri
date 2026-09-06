@@ -39,7 +39,10 @@ echo "=== prefill_gate $TAG: pristine=$PRISTINE candidate=$CAND $(date -Is)"
 for side in pristine candidate; do
   bin=$PRISTINE; [ $side = candidate ] && bin=$CAND
   echo "--- (a)(b) oracle run: $side"
-  "$HERE/prefill_profile.sh" "$bin" "$PROMPT" "$TAG-$side" | tee "$OUT/profile_$side.txt" | grep -v "^teacher_forcing\|^last_logits"
+  # the oracle half runs the CPU recurrence (COLI_KDA_GPU=0, the pristine
+  # numerics) unless ORACLE_KDA_GPU says otherwise; the TTFT half below runs
+  # the serving default (ttft_serve.py's engine_env: COLI_KDA_GPU=2).
+  COLI_KDA_GPU=${ORACLE_KDA_GPU:-0} "$HERE/prefill_profile.sh" "$bin" "$PROMPT" "$TAG-$side" | tee "$OUT/profile_$side.txt" | grep -v "^teacher_forcing\|^last_logits"
   grep "^teacher_forcing" "$HOME/bench/prefill_profile_$TAG-$side.log" > "$OUT/tf_$side.txt"
   grep "^last_logits" "$HOME/bench/prefill_profile_$TAG-$side.log" > "$OUT/logits_$side.txt"
 done

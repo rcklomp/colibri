@@ -55,7 +55,11 @@ resid "$TAG-pre" || { echo "ABORT: not 100% resident after warm"; exit 1; }
 P=$(cat "$PF")
 echo "### prefill_profile tag=$TAG bin=$BIN prompt=$PF chunk=$CHUNK $(date -Is)" | tee "$LOG"
 t0=$(date +%s.%N)
-"$BIN" --model "$M" --prompt "$P" --greedy 0 --logits 2>&1 | tee -a "$LOG" \
+# Positional cap = expert-cache slots per layer, the same 512 the serve
+# harness and tworeq.py use. Without it the CLI sizes the cache from
+# MemAvailable and evicts the model under itself (p0self pristine run: 100% ->
+# 91.7% during the prefill, 414 ms/token instead of the serve path's 171-196).
+"$BIN" --model "$M" --prompt "$P" --greedy 0 --logits "${CAP:-512}" 2>&1 | tee -a "$LOG" \
   | grep -E "^\[OPTIME\]|^\[PROF\]|^prefill|caricamento|teacher_forcing" | cut -c1-200
 echo "### wall(load+prefill)=$(echo "$(date +%s.%N) - $t0" | bc)s" | tee -a "$LOG"
 resid "$TAG-post" || true

@@ -3262,17 +3262,29 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             double t0 = timed ? optime_now() : 0.0;
             /* P2.3: every t writes only its own slices of collapsed/post/comb/
              * normed, so the rows run in parallel; per-row math unchanged. */
+            /* No OpenMP `if` clause: a 1-row decode step must not enter libgomp
+             * at all (181 one-thread regions per token cost ~300 ms/token on
+             * rome with OMP_PROC_BIND=close, p2 gate 2026-09-06). */
             const int hc_par = n > 1 && !g_prefill_unbatched();
-            (void)hc_par;
+            if (hc_par) {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (hc_par)
+#pragma omp parallel for schedule(static)
 #endif
-            for (int t = 0; t < n; t++) {
-                coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
-                            comb + (size_t)t * H * H, streams + (size_t)t * H * D,
-                            fn, scale, base, H, D, c->hc_iters, c->eps, c->hc_eps);
-                rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
-                    site ? l->post_ln : l->in_ln, D, c->eps);
+                for (int t = 0; t < n; t++) {
+                    coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
+                                comb + (size_t)t * H * H, streams + (size_t)t * H * D,
+                                fn, scale, base, H, D, c->hc_iters, c->eps, c->hc_eps);
+                    rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
+                        site ? l->post_ln : l->in_ln, D, c->eps);
+                }
+            } else {
+                for (int t = 0; t < n; t++)
+                    coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
+                                comb + (size_t)t * H * H, streams + (size_t)t * H * D,
+                                fn, scale, base, H, D, c->hc_iters, c->eps, c->hc_eps);
+                for (int t = 0; t < n; t++)
+                    rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
+                        site ? l->post_ln : l->in_ln, D, c->eps);
             }
             if (timed) { g_ot_hc += optime_now() - t0; g_on_hc++; t0 = optime_now(); }
             if (!site) {
@@ -3296,13 +3308,20 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                 }
             }
             if (timed) t0 = optime_now();
+            if (hc_par) {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (hc_par)
+#pragma omp parallel for schedule(static)
 #endif
-            for (int t = 0; t < n; t++)
-                coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
-                             streams + (size_t)t * H * D, post + (size_t)t * H,
-                             comb + (size_t)t * H * H, H, D);
+                for (int t = 0; t < n; t++)
+                    coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
+                                 streams + (size_t)t * H * D, post + (size_t)t * H,
+                                 comb + (size_t)t * H * H, H, D);
+            } else {
+                for (int t = 0; t < n; t++)
+                    coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
+                                 streams + (size_t)t * H * D, post + (size_t)t * H,
+                                 comb + (size_t)t * H * H, H, D);
+            }
             if (timed) g_ot_hc += optime_now() - t0;   /* same site: counted once above */
             float *swap = streams; streams = next; next = swap;
         }
@@ -3457,17 +3476,27 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 
     /* i flussi si richiudono con una media NON pesata */
     const int tail_par = n > 1 && !g_prefill_unbatched();
-    (void)tail_par;
+    if (tail_par) {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (tail_par)
+#pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++) {
-        for (int d = 0; d < D; d++) {
-            float sum = 0.0f;
-            for (int h = 0; h < H; h++) sum += streams[((size_t)t * H + h) * D + d];
-            collapsed[(size_t)t * D + d] = sum / H;
+        for (int t = 0; t < n; t++) {
+            for (int d = 0; d < D; d++) {
+                float sum = 0.0f;
+                for (int h = 0; h < H; h++) sum += streams[((size_t)t * H + h) * D + d];
+                collapsed[(size_t)t * D + d] = sum / H;
+            }
+            rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
         }
-        rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
+    } else {
+        for (int t = 0; t < n; t++)
+            for (int d = 0; d < D; d++) {
+                float sum = 0.0f;
+                for (int h = 0; h < H; h++) sum += streams[((size_t)t * H + h) * D + d];
+                collapsed[(size_t)t * D + d] = sum / H;
+            }
+        for (int t = 0; t < n; t++)
+            rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
     }
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));

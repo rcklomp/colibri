@@ -159,7 +159,10 @@ def engine_env(exe):
 class EngineDriver:
     def __init__(self, args):
         engine_env(args.exe)
+        # openai_server lives in the repo's c/, not necessarily next to the
+        # binary (a pristine copy in ~/bench is the normal gate input)
         sys.path.insert(0, os.path.dirname(args.exe))
+        sys.path.insert(0, os.path.normpath(os.path.join(HERE, "..", "..", "c")))
         import openai_server as rt
         self.rt = rt
         res = rt.resolve_model(args.snap)

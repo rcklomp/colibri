@@ -2647,6 +2647,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
     /* P3: rows scratch for the CPU experts of a chunk (tokens x hidden twice,
      * tokens x moe_inter twice); off for a single row or GLM53_PREFILL_UNBATCHED. */
+#ifdef COLI_VULKAN
     CpuRows cpu_rows = { NULL, NULL, NULL, NULL, 0 };
     if (tokens > 1 && !g_prefill_unbatched()) {
         cpu_rows.xr = malloc((size_t)tokens * c->hidden * sizeof(float));
@@ -2658,6 +2659,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             fprintf(stderr, "OOM nel MoE (righe)\n"); exit(1);
         }
     }
+#endif
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
     const double t_shared0 = optime_on() ? optime_now() : 0.0;
@@ -2679,7 +2681,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float *dst = out + (size_t)t * c->hidden;
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
-        free(cpu_rows.xr); free(cpu_rows.tr); free(cpu_rows.sgr); free(cpu_rows.sur);
+        #ifdef COLI_VULKAN
+    free(cpu_rows.xr); free(cpu_rows.tr); free(cpu_rows.sgr); free(cpu_rows.sur);
+#endif
     free(tmp); free(su); free(sg); free(weight); free(chosen);
         return;
     }
@@ -2958,7 +2962,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     free(cpu_gate); free(cpu_up); free(cpu_down); free(cpu_eid);
 #endif
     free(to_read); free(slot_of); free(union_ids);
+    #ifdef COLI_VULKAN
     free(cpu_rows.xr); free(cpu_rows.tr); free(cpu_rows.sgr); free(cpu_rows.sur);
+#endif
     free(tmp); free(su); free(sg); free(weight); free(chosen);
 #ifdef COLI_VULKAN
     free(vg0); free(vu0); free(vd0); free(vrows0); free(vtok0); free(vw0); free(xk0);

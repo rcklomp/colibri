@@ -1,10 +1,18 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 2 same day)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 2 (2026-09-06, a few hours after rev 1):** rev 1's diagnosis — "prefill
+is streaming-bound, batching cannot help, prefix caching is the only lever" —
+was **wrong**, and it was wrong because it was asserted from one sentence in
+the record instead of from the profile that already existed. The corrected
+diagnosis is below; it changes the item list and the ordering. Rev 1's items
+survive as P1 (reuse diagnosis) and P6/P7 (prefix caching); the real ceiling
+is materially higher than rev 1 said.
 
 ## Why this exists (read before planning anything)
 
@@ -22,14 +30,7 @@ first so no orphan contaminated it):
 | ~4 tokens | 76.8 s | — |
 | ~602 tokens | 259.6 s | **598 tokens in 183 s → ~3.3 tok/s** |
 
-Prefill runs at **decode speed** (~3.3 tok/s), which is the whole problem. On a
-normal transformer prefill is far faster per token than decode because N prompt
-tokens batch through one matmul. Here they do not, and the record already said
-why in one line everyone (including this session, for hours) glossed over:
-**"prefill is dominated by expert reads."** The RAM-bandwidth wall that bounds
-decode bounds prefill too, multiplied by prompt length.
-
-Consequences, all measured or derived:
+Prefill runs at **decode speed**. Consequences, all measured or derived:
 - a plain short chat prompt (~30–100 tokens): **10–30 s** to first token
 - a prompt carrying Open WebUI's 34 builtin tools (~6 000 tokens):
   **~30 minutes** to first token, every turn
@@ -37,138 +38,157 @@ Consequences, all measured or derived:
 The 34 tools are ~5 600 tokens of JSON schema attached to *every* message. That
 is what turned "hi" into a 30-minute request.
 
-### Why prefill was never optimised (the honest three)
+## The diagnosis (rev 2) — prefill is decode in a loop
 
-1. **The benchmark defined the target and the benchmark measured decode.**
-   Every gate in `ROADMAP-2026-09.md` is rotating-median tok/s on
-   `datapoint.py`, which uses ~30–40-token prompts. An item was only justified
-   if it moved that gate; nothing measured large-prompt TTFT, so no prefill
-   item was ever justifiable. `G0` even recorded "cold TTFT 17.9 s" as one of
-   four numbers — and nothing was ever built against it.
-2. **A prefill item was specced and never started.** `ROADMAP-2026-09.md`'s
-   Q5 — "4-accumulator BF16 matmul for prefill rows, 9.0 → 5.1 ms at S=32,
-   *TTFT not decode*, half a day" — has sat unstarted on the Qwen track. It also
-   only speeds the *compute*, which §below argues is not the bottleneck.
-3. **The easy prefill wins were measured and don't beat this box's wall.**
-   Commit `21999ff` measured GPU prefill as "not helping prefill-bound long
-   context"; the record calls prefill "dominated by expert reads". SPEC-PROBE
-   (`ROME-3x7900XTX-2026-09-04.md`) proved the killer detail: **cold experts do
-   not dedup across tokens** — the CPU expert count was identical at every
-   prefill chunk size 1→16. So batching N prefill tokens streams ~N× the expert
-   volume; the GEMM batching that makes prefill fast elsewhere buys almost
-   nothing here.
+SPEC-PROBE (`ROME-3x7900XTX-2026-09-04.md`) prefilled the same 330 tokens at
+chunk sizes 1→16 with the full `[OPTIME]` split. Nobody read it as a prefill
+profile. Read that way, in ms per prompt token:
 
-## The one lever that matters, and why it is hard
+| bucket | K=1 | K=16 | K1/K16 | batches on any normal engine? | why it does not here |
+|---|---:|---:|---:|---|---|
+| **total (layers)** | 183.6 | 169.8 | 1.08× | | |
+| cpu experts | 56.1 | 54.9 | 1.02× | yes, per expert across the rows that chose it | `mlp3_cpu` is called **once per token at S=1** (`glm53.c` ffn_layer, "per ogni token che lo ha scelto") even though the expert's weights were already read once per chunk |
+| eg — GPU expert group | 65.6 | 62.5 | 1.05× | yes | the group *does* gather rows per expert (`vrows[]`), but `qmatmul_gate_up.comp` dispatches `(O/8, rows, 1)`: **every row re-reads the whole expert from VRAM** — S rows cost S× one row |
+| shared expert | 14.3 | 15.2 | 0.94× | yes, dense | `mlp3_shared` per token, S=1 |
+| router | 5.7 | 5.5 | 1.05× | yes | per token, one OpenMP team per token |
+| kda.proj | 22.1 | 19.1 | 1.16× | yes, 8 plain matmuls | `kda_layer` loops `for t < tokens`, one fused GPU submit **per token** (`coli_vk_kda_layer(row)` is 1-row by signature) |
+| kda.ko | 13.4 | 13.7 | 0.97× | yes, plain matmul | same loop, `KMV` per token |
+| kda.step | 13.2 | 11.6 | 1.14× | **no** — sequential recurrence | (legitimate) |
+| mla.proj | 6.9 | 5.8 | 1.18× | yes | `mla_layer` loops per token, `vk_batch_mv` at M=1 |
+| mla.attn | 17.1 | 17.1 | 1.00× | mostly (sparse indexer selects per token) | scalar C per (token, head) |
+| hc+norm | 9.0 | 8.9 | 1.01× | yes | per-token loops |
 
-Given that prefill is streaming-bound and batching does not reduce the stream,
-a faster kernel cannot fix TTFT. **The only lever that makes interactive use
-viable is not computing the same prefix twice.**
+Decomposition at K=1: **cpu-expert stream 31 %, sequential recurrence 7 %,
+everything else 62 % — and that 62 % (114 ms/token) is ordinary matmul and
+attention work that batches on every other engine.** Perfect batching at K=16
+would take it to ~7 ms/token; it stayed at 103.
 
-The stable part of every turn — the system prompt and the ~5 600-token tool
-block — is *identical* across turns and across conversations. If it is
-prefilled **once** and reused, a follow-up turn only prefills the new user
-message (tens of tokens = seconds). That is the whole game.
+The serve path runs at the default `GLM53_PREFILL_CHUNK=128` (not set in
+`~/start_glm53.sh`; SPEC-PROBE never measured above 16). The chunk only
+dedupes the *disk/RAM read* of expert weights — real (GPU expert-calls fell
+75 628 → 47 921 from K=1 to K=16 in the `[PROF]` line) but irrelevant, because
+**every stage costs per row what it costs per token in decode**, and the rows
+are the same at every chunk size.
 
-**It does not currently work.** Measured 2026-09-06: the same 806-token prompt
-sent twice took 184 s then 179 s — no reuse. Whatever prefix-reuse machinery
-exists (`slot_remember`, session state) is not firing on the serve path, and
-the cause is unknown as of this writing.
+Three things rev 1 got wrong, stated so they are not repeated:
+1. "GEMM batching buys almost nothing here" — it buys nothing *because the code
+   does not batch*. The GPU dense matmul already takes `S` rows
+   (`coli_vk_matmul(..., S, I, O, gs)`); `mv()` hard-codes 1. The CPU int4
+   kernels already take `S`. `quant.h:1317` already carries a 1×4 row-tiled
+   int4 kernel written for "the prefill union delivers nr=2..16 rows per
+   expert" — on the Qwen engine. None of it is wired into glm53's prefill.
+2. "Cold experts do not dedup across tokens" rested on `[PROF] cpu n=35252`,
+   which counts (token, expert) *pairs* — constant by construction. It proved
+   nothing. The `eg experts=` counter does show dedup.
+3. "Faster kernels cannot fix TTFT" — the kernels are not the problem; the
+   call shape is.
 
-**It is genuinely hard here, harder than normal KV caching**, because GLM-5.3
-is not a plain transformer:
-- 11 MLA layers hold a KV cache — standard, snapshot/restore is well-understood.
-- **34 KDA layers hold recurrent (gated-delta) state.** A prefix cache must
-  snapshot and restore *that* at the cache boundary, not just attention keys.
-  G12 built `coli_vk_kda_sync` / `coli_vk_kda_upload` for exactly this class of
-  state migration, so the machinery is not greenfield — but it is precisely the
-  kind of subtle, serve-path, correctness-sensitive work that produced two
-  separate bugs this session (the G12 cross-session state leak, the CANCEL
-  wedge). Neither was caught by a decode oracle.
+**What the corrected ceiling looks like** (derived, to be measured by P0):
+batching the dense stages (P2) removes most of ~70 ms/token; row-batching
+the CPU expert compute (P3) and S-tiling the GPU expert shader (P4) attack
+the 56 + 65 (overlapped) MoE ms/token; the recurrence (13) and the sparse
+attention (17) remain. A floor around 60–80 ms/token is plausible → **2.5–3×
+on every prefill, including the first one of a new prefix**, on top of which
+prefix reuse (P6/P7) makes repeated prefixes ~free. Rev 1 offered only the
+latter.
 
 ## The prerequisite nobody built (this comes first, always)
 
-**P0 — a serve-path TTFT oracle and harness.** The root cause of 2026-09-06 is
-that the engine was validated only as a decode-throughput benchmark, never as
-an interactive server. Every gate below is stated in TTFT terms, and none of
-them can be trusted without a harness that:
+**P0 — a prefill oracle, a serve-path TTFT harness, and an executable gate.**
+The root cause of 2026-09-06 is that the engine was validated only as a
+decode-throughput benchmark, never as an interactive server. The gates in
+`ROADMAP-2026-09.md` were prose; "incomplete gates" cost this project days.
+Here a gate is a **script that exits non-zero**, and an item is done when the
+script passes, with its output pasted in the commit body. P0 delivers three
+instruments in `tools/hot-expert/`:
 
-- drives the **actual serve protocol** (SUBMIT/DATA/STOP/CANCEL over the pipe,
-  or the HTTP gateway), not the `--greedy` CLI path. The CANCEL fix this session
-  passed a `--greedy 64` oracle that never executed the serve loop it changed,
-  and shipped broken. **A prefill item validated on the CLI path is not
-  validated.**
-- measures **first-token latency**, separated from decode, at several prompt
-  sizes including a realistic tool-laden one (~6 000 tokens).
-- runs multi-turn: submit A, submit A+B, and prove the shared prefix was reused
-  (turn 2 TTFT ≪ turn 1).
-- asserts **residency before every run** (the discipline `profile_run.sh`
-  already encodes and this session repeatedly ignored — a 12-minute "hi" was a
-  cold-cache artifact, not the engine).
+1. `prefill_profile.sh` — the **diagnostic**: teacher-forcing CLI run
+   (`--ids`, no `--greedy`, so the whole run *is* prefill) with
+   `COLI_TIMERS=1` at the serve chunk size, on a fixed 600-token and a fixed
+   3 000-token id list, printing the table above in ms/token. Every P item is
+   measured against its row.
+2. `ttft_serve.py` — the **gate instrument**: drives the real serve protocol
+   through `openai_server.Engine` (the class the gateway uses — the pattern
+   `tworeq.py` already proves works), measures first-token latency separated
+   from decode at 30 / 300 / 3 000 / 6 000 prompt tokens, and runs the
+   multi-turn check (submit A, then A+B: was the prefix reused?). Residency is
+   asserted before every run and the engine is verified idle (`pgrep`) before
+   and after. Refuses to run otherwise.
+3. `prefill_gate.sh <pristine-binary> <candidate-binary>` — the **gate**:
+   (a) teacher-forcing argmax **identical at every position** over the
+   600-token list and (b) last-position logits cosine ≥ 1−1e-4 / argmax equal
+   over the 3 000-token list, both vs pristine; (c) `ttft_serve.py` on both
+   binaries, twice each, printing the deltas. Exit 0 only if (a)(b) pass; the
+   deltas are the item's number.
 
-Until P0 exists, every item below is unmeasurable. Half a day to a day. Haiku
-to build the harness once the shape is specced; the spec is Opus.
+A prefill item validated on the `--greedy` CLI path is not validated (the G16
+CANCEL fix passed a `--greedy 64` oracle that never executed the serve loop it
+changed, and shipped broken). Half a day to a day. Opus spec, Haiku/Sonnet
+build.
 
 ## The items
 
-Effort and effect are honest, not optimistic. The ceiling is stated with each.
+Effort and effect are honest, not optimistic. Ordering is by
+(expected effect × confidence) / effort, with the instrument first and the
+cheapest possibly-decisive diagnosis second.
 
-| id | item | mechanism | expected effect on TTFT | effort | tier | gate |
+| id | item | mechanism | expected effect on TTFT | effort | tier | gate (executable) |
 |---|---|---|---|---|---|---|
-| **P0** | Serve-path TTFT harness | drive the real protocol, measure first-token latency, multi-turn reuse check, residency asserted | none directly — it is the instrument every other item is gated on | ½–1 day | Opus spec, Haiku build | first-token latency measured at 30 / 300 / 3 000 / 6 000-token prompts, reproducible ±10% |
-| **P1** | Diagnose why prefix reuse does not fire | read the serve path: how the gateway maps a request to a slot, whether `slot_remember` matches the prefix across turns, what invalidates it | none — it is the design study P2 needs | 1–2 days | Opus | a written account of the current reuse logic and exactly why identical prompts re-prefill |
-| **P2** | Prefix caching that works, KV **and** KDA state | at a turn boundary, reuse the cached forward state for the longest matching prefix; snapshot/restore MLA KV **and** KDA recurrent state (reuse G12's `kda_sync`/`kda_upload`) | turn 2+ of a conversation: **~30 min → seconds** for a tool prompt | **1–3 weeks**, high risk | Opus, Fable for the state-boundary design | P0 multi-turn: turn-2 TTFT within a few × turn-1's *new-token* count, **and** greedy text bit-identical to no-cache over 512 tokens (this is where a subtle state bug hides — the oracle must be the serve-path one, not decode) |
-| **P3** | Warm the stable prefix at startup | prefill the system+tool block once when the server learns it (cache-on-first-sight), so even turn 1 of a new conversation reuses it | first turn of every conversation: **~30 min → seconds** (after a one-time warm) | +2–4 days on top of P2 | Opus | a fresh conversation's first turn reuses the pre-warmed prefix; TTFT independent of tool-block size |
-| **P4** | Faster prefill compute kernel (the Q5 item) | 4-accumulator BF16 matmul for S>1 prefill rows | small — compute is not the bottleneck; ~1.1–1.2× overall at best | ½ day, low risk | Sonnet | TTFT on the 690-token document vs baseline; land only if P0 shows it is worth the numerics knob |
-| **P5** | Capacity (cross-ref, not owned here) | int3 experts (`ROADMAP-2026-09.md` item 4h / G15) shrink the streamed volume for prefill and decode alike | partial — the prefill expert union is huge, so relief is bounded | weeks | Opus | its own numerics gate; tracked on the main roadmap |
+| **P0** | Oracle + serve-path TTFT harness + gate script | see above | none directly — every item below is measured with it | ½–1 day | Opus spec, Sonnet build | `ttft_serve.py` reproduces its own numbers within ±10 % on two consecutive runs at all four sizes; `prefill_gate.sh` passes pristine-vs-pristine |
+| **P1** | Diagnose why prefix reuse does not fire | read the serve path: `conversation_cache_slot`, `slot_remember`, how a request is matched to a slot and what invalidates it; the 806-token prompt sent twice took 184 s then 179 s | unknown: a bug costs a day and could make turn 2+ of a conversation seconds; an absent feature becomes P6 | ≤ 1 day | Opus | a written account in the record naming the exact condition that fails; if it is a bug, the fix passes `prefill_gate.sh` and the multi-turn check shows turn-2 TTFT ≪ turn-1 |
+| **P2** | Batch the dense stages | in `kda_layer` / `mla_layer` / `ffn_layer`: gather the chunk's rows and call the existing S-row kernels once per weight per chunk (`coli_vk_matmul` S>1 for kq/kk/kv/kfa/kb/kga/kfb/kgb/ko, qa/kva/iwk/ikpg/iwp, qb/iwq, shared gate/up/down; router as one matmul); the KDA recurrence stays a per-token loop between the batched projections and the batched ko. The GPU shader is per-row independent (`s = WorkGroupID.y`), so rows are bit-identical to today | ~70 ms/token → ~10; **~1.5×** on prefill of any prefix | 2–4 days | Opus | `prefill_gate.sh` (a) bit-identical argmax; TTFT delta at 600 and 3 000 tokens ≥ 1.3×, both runs |
+| **P3** | Row-batched CPU expert compute | per expert, run `mlp3_cpu` once with S = the rows that chose it (already gathered for the GPU path); port `quant.h`'s 1×4 row-tile (K2) from the Qwen engine | cpu-expert 56 → ~25–35 ms/token | 1–2 days | Sonnet (port) | `prefill_gate.sh`; TTFT delta on top of P2 |
+| **P4** | S-tiled GPU expert shader | `qmatmul_gate_up.comp` / down: one weight read per output row applied to all S rows of that expert (register tile over rows), instead of `(O/8, rows, 1)` re-reading the expert per row | eg per token drops with the chunk's dedup (×~1.6 at K=16, ×~3–4 at K=128) — the MoE bucket's floor moves | 2–4 days | Opus (shader) | `prefill_gate.sh` (b) logits within tolerance — the reduction order changes, so this ships behind a knob; TTFT delta |
+| **P5** | The sequential remainder | kda.step 13 ms/token: GPU step shader per token in one command buffer per chunk vs CPU; mla.attn 17 ms/token: vectorise the per-(token, head) dot/softmax or run it on `attention_absorb.comp` | ~30 → ~10–15 ms/token | 2–3 days | Opus | `prefill_gate.sh`; TTFT delta |
+| **P6** | Prefix caching that works, KV **and** KDA state | at a turn boundary, reuse the cached forward state for the longest matching prefix; snapshot/restore MLA KV **and** KDA recurrent state (reuse G12's `kda_sync`/`kda_upload`) | turn 2+ of a conversation: prefill only the new tokens — **minutes → seconds** for a tool prompt | **1–3 weeks**, high risk (G12's cross-session leak and the CANCEL wedge were both this class of bug) | Opus, Fable for the state-boundary design | multi-turn check: turn-2 TTFT within a few × its *new-token* count; greedy text bit-identical to no-cache over 512 tokens on the serve path |
+| **P7** | Warm the stable prefix at startup | prefill the system+tool block once when the server learns it, so turn 1 of a new conversation reuses it | first turn of every conversation → seconds after a one-time warm | +2–4 days on P6 | Opus | a fresh conversation's first turn reuses the pre-warmed prefix; TTFT independent of tool-block size |
+| P8 | Capacity (cross-ref) | int3 experts (`ROADMAP-2026-09.md` 4h / G15) | partial; tracked on the main roadmap | weeks | Opus | its own gate |
+
+Rev 1's "P4 — 4-accumulator BF16 prefill kernel (Q5)" is dropped from this
+track: it is a Qwen-engine BF16 kernel, and the finding above is that the call
+shape, not the kernel, is the problem.
 
 ## The honest ceiling, stated up front
 
-Even if P2 and P3 both land perfectly:
-- The **very first prefill of a given prefix is still paid once.** P3 hides it
-  behind a startup warm for the *stable* block, but any prompt that changes the
-  prefix — editing an earlier message, toggling a tool, a new system prompt —
-  re-pays it at ~3.3 tok/s.
-- This is a **latency** fix, not a throughput fix. It makes repeated prefixes
-  free; it does not make the engine fast at genuinely novel long context. A
-  32k-token document summarised cold is still ~2.7 hours of prefill. Nothing on
-  this track changes that; only capacity (P5 / more VRAM) does, and only partly.
+- P2–P5 speed **every** prefill, including the first of a new prefix, by an
+  estimated 2.5–3× (to be measured). A 6 000-token tool prompt goes from ~30 min
+  to ~10 min: better, still not interactive. **P6/P7 remain necessary for
+  Open WebUI with tools**; P2–P5 make everything P6 cannot cache tolerable.
+- A 32k-token document summarised cold is ~2.7 h today and ~1 h after P2–P5.
+  Only capacity (P8 / more VRAM) changes that, and only partly.
 
 ## The alternative this track must not bury
 
-Recorded so a future session weighs it honestly rather than defaulting to the
-hard path: **this box may not be the right home for low-latency interactive use
-with large prompts.** Colibri's real strength is running a model too big to fit
-in VRAM at all, for batch and throughput work. A model that *fits* — a smaller
-model, or Qwen3.8 on the GPU tier — gives interactive tools that respond in
-seconds today, with none of P0–P3. If the requirement is "tools that work,"
-that is the faster answer; if the requirement is specifically "GLM-5.3 with
-tools on this hardware," this track is the way, and it is weeks with real risk.
+Recorded so a future session weighs it honestly: **this box may not be the
+right home for low-latency interactive use with large prompts.** Colibri's
+strength is running a model too big to fit in VRAM at all. A model that
+*fits* gives interactive tools that respond in seconds today, with none of
+P0–P7. If the requirement is "tools that work," that is the faster answer; if
+it is specifically "GLM-5.3 with tools on this hardware," this track is the
+way.
 
 ## Discipline this track inherits from 2026-09-06 (non-negotiable)
 
-The interactive failure was compounded by measurement mistakes this session
-made repeatedly. They are rules here, not suggestions:
-
 1. **Validate on the path the user uses.** A prefill/serve item proven on the
-   `--greedy` CLI path is not proven. Build and use P0 first.
-2. **Measure the user's request, not a proxy.** Traffic generated from inside
-   the Open WebUI container shares its source IP with the app — do not mistake
-   your own test for the user's. Read the app's own record (its DB, its logs).
+   `--greedy` CLI path is not proven. `ttft_serve.py` or nothing.
+2. **Measure the user's request, not a proxy.** Traffic from inside the Open
+   WebUI container shares its source IP with the app — read the app's own
+   record (its DB, its logs).
 3. **Assert residency before every measurement.** A cold cache alone turned a
-   2.8-second "hi" into 12 minutes. `profile_run.sh` already encodes this.
-4. **One in-flight request while diagnosing.** This engine serves one at a time;
-   an orphaned generation (e.g. a timed-out probe with the CANCEL bug unfixed)
-   blocks the queue and poisons every later measurement. Kill hard and confirm
-   `pgrep` is empty before trusting a number.
+   2.8-second "hi" into 12 minutes. `ttft_serve.py` refuses to run below 99 %.
+4. **One in-flight request while diagnosing.** An orphaned generation (a
+   timed-out probe with the CANCEL bug unfixed) blocks the queue and poisons
+   every later number. Kill hard, confirm `pgrep -x glm53` empty, then measure.
 5. **No claim of "it works" without an end-to-end pass on the real path**,
    shown to the user, reproducible.
+6. **Read the profile before asserting the bottleneck.** Rev 1 of this file is
+   the counter-example.
 
-## Open dependency: CANCEL (from the decode session, still unfixed)
+## Open dependency: CANCEL (still unfixed)
 
 `glm53` does not honour CANCEL between generated tokens — an aborted request
-runs to `max_tokens` holding the single engine slot (`ROADMAP-2026-09.md` /
-this session's revert of the G16 attempt). Prefill work makes this worse, not
-better: a 30-minute prefill that a user gives up on holds the engine for the
-full 30 minutes. **P0's harness is also what a correct CANCEL fix needs** — the
-G16 attempt failed because it had no serve-path oracle. Fix CANCEL as part of,
-or immediately after, P0.
+runs to `max_tokens` holding the single engine slot (revert `73e770c`). Prefill
+work makes this worse: a 30-minute prefill a user gives up on holds the engine
+for the full 30 minutes. **P0's harness is what a correct CANCEL fix needs** —
+the G16 attempt failed for lack of a serve-path oracle. Fix CANCEL as part of,
+or immediately after, P0, with a `ttft_serve.py --cancel` case as its gate.

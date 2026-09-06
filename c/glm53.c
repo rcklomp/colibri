@@ -1962,9 +1962,33 @@ static void vk_preload_tier(GModel *m) {
             reg[0] = t[0]; reg[1] = t[1]; reg[2] = t[2]; loaded++; g_vk_n++;
         } else { for (int q = 0; q < 3; q++) if (t[q]) coli_vk_tensor_free(t[q]); break; }
     }
+    /* G6: how much VRAM to leave unused on the EXPERT-ONLY devices. dev0 keeps
+     * 3.0 GB because it also holds the dense set (~3.78 GB), the KV mirror and
+     * every scratch buffer; dev2/dev3 hold experts and nothing else, so their
+     * only other consumers are command buffers, descriptor pools and a ~1 MB
+     * expert-group scratch. 3.0 GB there is not caution, it is a re-tuning:
+     * measured on this rig it stops the tier at 1600 of the 1695 every recorded
+     * number was taken with, which would silently change routing and invalidate
+     * the baseline. This guard exists to stop a RUNAWAY -- an unset cap
+     * spilling into host RAM over ReBAR -- not to resize the tier. */
+    double tier_reserve = 1.0;
+    { const char *r = getenv("COLI_VK_TIER_RESERVE_GB");
+      if (r) { double v = atof(r); if (v >= 0.0) tier_reserve = v; } }
     if (g_vk_budget2 > 0 && coli_vk_dev2_available()) {
         int loaded2 = 0;
         for (int i = 0; i < (int)n && (g_vk_budget2 <= 0 || loaded2 < g_vk_budget2); i++) {
+            /* G6: stop on the VRAM budget, not only on the count cap. dev0's
+             * loop has always done this; dev2/dev3 did not, and that is how an
+             * unset cap put 91 GB "in VRAM" and evicted the page cache. These
+             * are HOST_VISIBLE allocations that spill to host RAM over ReBAR,
+             * so they do NOT fail at the VRAM limit -- without this check the
+             * loop happily keeps succeeding into system memory. Same 3 GB
+             * reserve and same every-8 cadence as dev0. */
+            if ((loaded2 & 7) == 0) { double u, b;
+                if (coli_vk_mem_budget2(&u, &b) && (b - u) < tier_reserve) {
+                    fprintf(stderr, "[VK] preload dev2: stopping on VRAM budget "
+                            "(%.1f of %.1f GB used, %.1f reserve)\n", u, b, tier_reserve);
+                    break; } }
             int layer = cand[i].layer, eid = cand[i].eid;
             void **reg = vk_reg_at(layer, eid);
             if (reg[0]) continue;
@@ -1982,6 +2006,11 @@ static void vk_preload_tier(GModel *m) {
     if (g_vk_budget3 > 0 && coli_vk_dev3_available()) {
         int loaded3 = 0;
         for (int i = 0; i < (int)n && (g_vk_budget3 <= 0 || loaded3 < g_vk_budget3); i++) {
+            if ((loaded3 & 7) == 0) { double u, b;            /* G6, as dev2 above */
+                if (coli_vk_mem_budget3(&u, &b) && (b - u) < tier_reserve) {
+                    fprintf(stderr, "[VK] preload dev3: stopping on VRAM budget "
+                            "(%.1f of %.1f GB used, %.1f reserve)\n", u, b, tier_reserve);
+                    break; } }
             int layer = cand[i].layer, eid = cand[i].eid;
             void **reg = vk_reg_at(layer, eid);
             if (reg[0]) continue;

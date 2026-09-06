@@ -37,10 +37,16 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   together. Warm one model at a time (drop caches, `cat` its shards) and
   verify with `fincore` before any number is recorded. A cold run pays 100k+
   major faults and is not a baseline.
-- **GLM tier caps:** `glm53`'s dev2/dev3 preload stops on a count cap only.
-  Always pass `COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695` (until roadmap
-  item G6 lands) and preload from the histogram with the most history
-  (`~/.glm53_explain.bin`). An unlimited cap spilled 91 GB into host RAM.
+- **GLM tier caps:** **G6 landed 2026-09-06** — the dev2/dev3 preload now
+  stops on the VRAM budget as well as the count cap (1.0 GB reserve on those
+  expert-only devices, `COLI_VK_TIER_RESERVE_GB` to change it), so a large cap
+  can no longer spill into host RAM. Verified: cap 2200 stops at 1752 with
+  MemAvailable unmoved; the old behaviour is what put 91 GB in host RAM.
+  **Still always pass `COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695`** — now for
+  COMPARABILITY, not safety: every recorded number was taken at 1695, the guard
+  deliberately does not fire there, and changing the tier changes routing.
+  Preload from the histogram with the most history (`~/.glm53_explain.bin`).
+  Note an *unset* cap does not fill the tier, it skips dev2/dev3 entirely.
 - **Never run a `glm53` built from `fix/expert-cache-vs-page-cache*` or
   commit `eabeb9a` here:** its cache sizing takes MemAvailable and thrashes
   the box until the OOM killer acts. If SSH stops answering, that is why;

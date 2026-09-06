@@ -225,8 +225,24 @@ class EngineDriver:
         ev["done"] = time.time()
         return ev
 
+    def faults(self):
+        """(major, minor) page faults of the engine process so far -- the
+        upstream datapoint on PR #1324 (2026-09-06) is that below ~1:1
+        model:RAM the kernel's page LRU and the engine's slot LRU fight and a
+        'hit' re-faults inside the matmul; the delta per request says whether
+        that is happening here."""
+        try:
+            f = open(f"/proc/{self.eng.process.pid}/stat").read().split()
+            return int(f[11]), int(f[9])
+        except Exception:
+            return 0, 0
+
     def run(self, messages, gen, slot=0, cancel_after=None):
-        return self._one(self.render(messages), gen, slot, cancel_after)
+        f0 = self.faults()
+        ev = self._one(self.render(messages), gen, slot, cancel_after)
+        f1 = self.faults()
+        ev["majflt"], ev["minflt"] = f1[0] - f0[0], f1[1] - f0[1]
+        return ev
 
     def close(self):
         try:
@@ -304,8 +320,9 @@ def fmt(ev, label):
     pt = ev["prompt_tokens"]
     rate = f"{pt/ttft:.2f} tok/s" if pt and ev["first"] else "?"
     err = f" ERROR={ev['error']}" if ev["error"] and not ev["cancelled"] else ""
+    flt = f" majflt={ev['majflt']}" if ev.get("majflt") is not None else ""
     return (f"{label:<22} prompt_tokens={pt!s:>6} accept={acc:6.2f}s "
-            f"ttft={ttft:8.2f}s ({rate:>11}) gen={ev['ntok']:<4} decode={dec}{err}")
+            f"ttft={ttft:8.2f}s ({rate:>11}) gen={ev['ntok']:<4} decode={dec}{flt}{err}")
 
 
 def main():
@@ -351,6 +368,7 @@ def main():
                "ttft_s": (ev["first"] - ev["submit"]) if ev["first"] else None,
                "gen": ev["ntok"], "cancelled": ev["cancelled"], "error": ev["error"],
                "decode_tps": ((ev["ntok"] - 1) / (ev["done"] - ev["first"])) if ev["first"] and ev["ntok"] > 1 else None,
+               "majflt": ev.get("majflt"), "minflt": ev.get("minflt"),
                "tools": bool(args.tools), "t": time.time()}
         records.append(rec)
         if args.json:

@@ -3560,43 +3560,6 @@ static void serve_data(unsigned long long id, const char *text, int n) {
     fflush(stdout);
 }
 
-/* Un CANCEL/STOP arrivato MENTRE il turno gira (G16).
- *
- * Prima di questa funzione glm53 leggeva i comandi solo FRA un turno e l'altro,
- * e il suo gestore di CANCEL rispondeva NOT_FOUND spiegando che "le richieste
- * si servono una per volta, quindi un CANCEL arriva sempre per una che non e'
- * piu' in volo". Era vero per il motore e falso per chi lo usa: il gateway
- * manda CANCEL appena il client HTTP sparisce, poi TIENE la sua ammissione
- * finche' il motore non risponde. Il turno orfano macinava fino a max_tokens
- * e ogni richiesta successiva restava in coda dietro di lui -- con il default
- * di 1024 token, sei minuti e mezzo di stallo per una scheda chiusa.
- *
- * qwen38 lo fa da sempre (qwen38.c, ciclo di decode) e kimi_k3 lo documenta:
- * "STOP and CANCEL are honoured between generated tokens". Questo allinea
- * glm53 agli altri motori. Ritorna 1=STOP, 2=CANCEL, 0=niente, -1=EOF.
- *
- * coli_stdin_readable() e' il poll non bloccante condiviso in compat.h; usarlo
- * invece di select() diretto tiene dentro le due correzioni Windows che quel
- * commento elenca. */
-static int serve_read_req(ServeReq *q, char *verb, size_t verb_size);
-
-static int serve_poll_control(unsigned long long active) {
-    int result = 0;
-    while (coli_stdin_readable()) {
-        ServeReq probe; char verb[16];
-        if (!serve_read_req(&probe, verb, sizeof(verb))) { free(probe.payload); return -1; }
-        if (!strcmp(verb, "CANCEL") && probe.id == active)      result = 2;
-        else if (!strcmp(verb, "STOP") && probe.id == active)   result = 1;
-        else if (!strcmp(verb, "SUBMIT"))
-            /* Un SUBMIT durante un turno non si puo' servire qui: lo si consuma
-             * e lo si rifiuta, altrimenti il suo payload sfasa il frame dopo. */
-            serve_line("ERROR %llu BUSY\n", probe.id);
-        free(probe.payload);
-        if (result) return result;
-    }
-    return 0;
-}
-
 /* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
  * righe: puo' contenerne. */
 static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
@@ -3731,15 +3694,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                                     total - shared, vision, n_vision, 0);
     GSession *session = slot->session;
     int rows = 1;
-    int cancelled = 0, input_eof = 0;
     for (int step = 0; step < budget; step++) {
-        /* G16: fra un token e l'altro, non solo fra un turno e l'altro. */
-        if (!input_eof) {
-            int control = serve_poll_control(q->id);
-            if (control < 0) input_eof = 1;
-            else if (control == 2) { cancelled = 1; break; }
-            else if (control == 1) break;      /* STOP: fine garbata, DONE normale */
-        }
         if (total >= room) { limited = 1; break; }
         int next = sample_token(logits + (size_t)(rows - 1) * m->c.vocab, m->c.vocab);
         free(logits);
@@ -3759,13 +3714,6 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
-    if (cancelled) {
-        /* L'ack che il gateway aspetta per liberare la sua ammissione. Senza
-         * questo tiene lo slot fino al queue-timeout e tutto si accoda. */
-        serve_line("ERROR %llu CANCELLED\n", q->id);
-        free(sequence);
-        return;
-    }
     const double elapsed = now_s() - started;
     /* Quanto prefisso lo slot ha risparmiato.
      *

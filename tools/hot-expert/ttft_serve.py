@@ -180,7 +180,9 @@ class EngineDriver:
         rt.ARCH = res.descriptor.id
         self.tools = load_tools(args.tools)
         t0 = time.time()
-        self.eng = rt.Engine(args.exe, args.snap, cap=args.cap, max_tokens=args.gen)
+        self.kv_slots = max(1, args.kv_slots)
+        self.eng = rt.Engine(args.exe, args.snap, cap=args.cap, max_tokens=args.gen,
+                             kv_slots=self.kv_slots)
         # The engine loads the model lazily on the first SUBMIT in some builds
         # and eagerly in others; either way the first request pays it. A
         # throwaway 4-token request makes every measured number a warm-process
@@ -237,7 +239,16 @@ class EngineDriver:
         except Exception:
             return 0, 0
 
-    def run(self, messages, gen, slot=0, cancel_after=None):
+    def slot_for(self, messages):
+        """The gateway's own routing: with --kv-slots > 1 a conversation is
+        keyed by its system messages + first user message (openai_server.
+        conversation_cache_slot), so its turns land on one slot and a side
+        request (title generation) lands elsewhere."""
+        return self.rt.conversation_cache_slot(messages, self.kv_slots) if self.kv_slots > 1 else 0
+
+    def run(self, messages, gen, slot=None, cancel_after=None):
+        if slot is None:
+            slot = self.slot_for(messages)
         f0 = self.faults()
         ev = self._one(self.render(messages), gen, slot, cancel_after)
         f1 = self.faults()
@@ -268,7 +279,7 @@ class HttpDriver:
         self.tools = load_tools(args.tools)
         self.model = args.model_id
 
-    def run(self, messages, gen, slot=0, cancel_after=None):
+    def run(self, messages, gen, slot=None, cancel_after=None):
         body = {"model": self.model, "messages": messages, "stream": True,
                 "max_tokens": gen, "temperature": 0, "stream_options": {"include_usage": True}}
         if self.tools:
@@ -338,6 +349,10 @@ def main():
     ap.add_argument("--text", default=DEFAULT_TEXT, help="deterministic filler text")
     ap.add_argument("--tools", help="JSON list of OpenAI-style tools to attach (realistic prompt)")
     ap.add_argument("--multiturn", action="store_true", help="prefix-reuse check: A then A+B, same slot")
+    ap.add_argument("--side-request", action="store_true",
+                    help="multiturn: interleave an Open WebUI-style title-generation request between turn 1 and 2")
+    ap.add_argument("--system", help="text file used as a system message on every multiturn prompt (a stable prefix)")
+    ap.add_argument("--kv-slots", type=int, default=1, help="engine KV slots; >1 routes conversations like the gateway does")
     ap.add_argument("--cancel", type=float, metavar="SECONDS", help="CANCEL check after this many seconds")
     ap.add_argument("--min-resident", type=float, default=96.0,
                     help="refuse below this; 100%% is unreachable with an engine up (see assert_resident)")
@@ -392,14 +407,23 @@ def main():
             base = sizes[1] if len(sizes) > 1 else sizes[0]
             assert_resident(args, "multiturn")
             msgs = build_messages(args, base)
-            a = drv.run(msgs, 48, slot=0)
+            if args.system:
+                msgs = [{"role": "system", "content": open(args.system, encoding="utf-8").read()}] + msgs
+            a = drv.run(msgs, 48)
             record("turn1", base, a, "turn 1 [A]")
             reply = "".join(a.get("text", [])).strip() or "I cannot tell."
+            if args.side_request:
+                # what Open WebUI does after every reply: a separate short
+                # request (title / tags / follow-ups) on a different prompt
+                side = [{"role": "user", "content": "Create a concise, 3-5 word title for this chat, "
+                         "no quotes: 'User asked what machine some notes are about.'"}]
+                sd = drv.run(side, 12)
+                record("side", 0, sd, "side request (title)")
             follow = msgs + [{"role": "assistant", "content": reply},
                              {"role": "user", "content": "Thanks. In one sentence: which day comes after Tuesday?"}]
-            b = drv.run(follow, args.gen, slot=0)
+            b = drv.run(follow, args.gen)
             record("turn2", base, b, "turn 2 [A, reply, B]")
-            c = drv.run(msgs, args.gen, slot=0)
+            c = drv.run(msgs, args.gen)
             record("regen", base, c, "regenerate [A] again")
             if a["first"] and b["first"]:
                 ta, tb = a["first"] - a["submit"], b["first"] - b["submit"]

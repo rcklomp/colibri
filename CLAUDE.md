@@ -67,22 +67,34 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   engine. Check `pgrep -x glm53`, `pgrep -x qwen38`, `pgrep -x qwen38-vk`
   first (one pattern per call).
 - **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
-  `openai_server.py` on 8081 with `--kv-slots 8`, `COLI_KDA_GPU=0` (the
-  device holds one KDA state per layer; the engine forces 0 for >1 slot
-  until P6b), `COLI_REQ_LOG=1` and `GLM53_VERBOSE=1` into a timestamped
+  `openai_server.py` on 8081 with `--kv-slots 4` and `COLI_KDA_GPU=2`
+  (P6b, 2026-09-07: each slot has its own KDA device state, pool allocated
+  before the expert preload — dev0 holds 1 248 experts instead of 1 296),
+  `GLM53_PREFIX_CKPT=1` and `COLI_PREFIX_PIN=1` (P7: prefix checkpoints under
+  `<SNAP>/.coli_ckpt`, the Open WebUI memory block pinned per conversation),
+  `COLI_REQ_LOG=1` and `GLM53_VERBOSE=1` into a timestamped
   `~/glm53_server.log`; `~/bench/owui_report.sh N` shows the last N
-  requests with prompt tokens, reused tokens and ttft. Stop it only for a
-  measurement (`pkill -f "openai_[s]erver.py"`, then `pkill -9 -x glm53`)
-  and restart it with `SKIP_WARM=1 setsid nohup ~/start_glm53.sh > ~/glm53_server.log 2>&1 < /dev/null &`.
+  requests with prompt tokens, reused tokens and ttft; `CKPT hit/store`
+  lines say when a checkpoint fired. Stop it only inside a chain script
+  that restarts it on every exit path (`pkill -f "openai_[s]erver.py"`, then
+  `pkill -9 -x glm53`; restart with
+  `SKIP_WARM=1 setsid nohup ~/start_glm53.sh > ~/glm53_server.log 2>&1 < /dev/null &`).
+  A gate step must wait for its engine to die before the next one starts
+  (`wait_no_engine()` in `p7_gate.sh`), or the chain's `cp` of the pristine
+  fails with ETXTBSY and a failed candidate stays in service.
 - **`pkill -f` over ssh matches the ssh command itself** if the pattern
   appears in it, and kills the session: always use the bracket form
   (`"openai_[s]erver.py"`, `"p7_[c]hain.sh"`). Never `scp` over a bash
   script that is running on the rig; git merges are safe (new inode).
-- **Open WebUI** (docker `open-webui`, port 3000) is parked until P7: its
-  builtin tools put 4 000+ tokens in front of every first turn (876 s
-  measured). With the tools capability and the title/tags/follow-up tasks
-  off (set in its sqlite `webui.db`, 2026-09-07) a follow-up turn reuses the
-  prefix and answers in ~5 s. `tools/hot-expert/chat.py` is the plain client;
+- **Open WebUI** (docker `open-webui`, port 3000): its builtin tools put
+  6 300 tokens in front of every first turn; since P7 that prefix is
+  checkpointed (one cold prefill of ~24 min per distinct tool block, then
+  ~5 s) and its per-turn memory block is pinned. The preset's `builtin_tools`
+  and `memory` capabilities are still OFF in `webui.db` (2026-09-07) — the
+  owner decides when to turn them back on. The server caches presets: after
+  a `webui.db` edit call `GET /api/models` or nothing changes. Drive its
+  backend from inside the container (PyJWT token from `WEBUI_SECRET_KEY`;
+  never `import open_webui` in a side process, it runs the migrations). `tools/hot-expert/chat.py` is the plain client;
   `ttft_serve.py --url` the measuring one.
 - Dropping caches needs sudo; ask the owner or run it yourself in an
   interactive shell. Never write the password into a file or a script.
@@ -117,8 +129,10 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   still point `COLI_VK_SHADERS` at the repo's `c/shaders`; the harness
   refuses to run without them).
 - Binary copies for gates live in `~/bench/` (`glm53.pristine` = pre-prefill
-  track, `glm53.p2`, `glm53.p4base`, `glm53.p4c_base`, `glm53.p6base`); each
-  gate's pristine is the binary in service before the item. **All four qwen38 C tests
+  track, `glm53.p2`, `glm53.p4base`, `glm53.p4c_base`, `glm53.p6base`,
+  `glm53.p7base` = pre-P7, `glm53.p6bbase` = P7, `glm53.p6b` = the P6b binary
+  in service since 2026-09-07 16:50); each gate's pristine is the binary in
+  service before the item. **All four qwen38 C tests
   pass** as of 2026-09-06. `tests/test_qwen38_prefix` used to SIGFPE on every
   tree; that was C1's merge blocker and it is fixed (unguarded
   `m->max_t / c->idx_ratio` in `ensure_kv`, which the test's fabricated Model

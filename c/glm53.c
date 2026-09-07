@@ -650,6 +650,11 @@ typedef struct {
     float *kda_scratch;
     int filled;                           /* posizioni gia' in cache */
     int cap;
+    /* P6b: quale insieme di stato sul dispositivo appartiene a questa sessione.
+     * Lo stato ricorrente e' della CONVERSAZIONE, quindi dello slot: con piu'
+     * slot vivi contemporaneamente due sessioni non possono condividerlo. Il
+     * percorso CLI e il segment adapter tengono una sessione sola: slot 0. */
+    int slot;
 } GSession;
 
 typedef struct {
@@ -1115,6 +1120,19 @@ static int g_prefill_unbatched(void) {
         g_prefill_unbatched_v = getenv("GLM53_PREFILL_UNBATCHED") ? atoi(getenv("GLM53_PREFILL_UNBATCHED")) : 0;
     return g_prefill_unbatched_v;
 }
+#define GLM53_MAX_SLOTS 16
+
+/* P6b: KV_SLOTS letto in due posti che devono concordare -- model_load, che
+ * alloca il pool di stato KDA sul dispositivo PRIMA del preload degli esperti,
+ * e slots_init, che apre gli slot. Se divergessero, il pool sarebbe corto e il
+ * motore ricadrebbe sulla CPU senza motivo. */
+static int kv_slots_wanted(void) {
+    const char *setting = getenv("KV_SLOTS");
+    int n = setting ? atoi(setting) : 1;
+    if (n < 1) n = 1;
+    if (n > GLM53_MAX_SLOTS) n = GLM53_MAX_SLOTS;
+    return n;
+}
 static int g_kda_gpu = -1;
 static int kda_gpu_on(void) {
     if (g_kda_gpu < 0) g_kda_gpu = getenv("COLI_KDA_GPU") ? atoi(getenv("COLI_KDA_GPU")) : 0;
@@ -1161,7 +1179,7 @@ static void kmv_rows(float *out, const Mat *w, const float *x, int S) {
  * so the per-op table stays comparable. */
 static void kda_layer_rows(const Cfg *c, const GLayer *l, const float *x, int S,
                            float *out, float *state, float *window, float *scratch,
-                           int layer, int gpu) {
+                           int layer, int gpu, int slot) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
     float *q = malloc((size_t)S * P * sizeof(float));
     float *k = malloc((size_t)S * P * sizeof(float));
@@ -1215,14 +1233,14 @@ static void kda_layer_rows(const Cfg *c, const GLayer *l, const float *x, int S,
      * the per-token code in the per-token order: bit-identical. */
     const double _t2 = optime_on() ? optime_now() : 0.0;
 #ifndef COLI_VULKAN
-    (void)layer; (void)gpu;
+    (void)layer; (void)gpu; (void)slot;
 #endif
     for (int t = 0; t < S; t++) {
         memcpy(qkv,         q + (size_t)t * P, (size_t)P * sizeof(float));
         memcpy(qkv + P,     k + (size_t)t * P, (size_t)P * sizeof(float));
         memcpy(qkv + 2 * P, v + (size_t)t * P, (size_t)P * sizeof(float));
 #ifdef COLI_VULKAN
-        if (gpu && coli_vk_kda_step(layer, qkv, decay + (size_t)t * P, beta + (size_t)t * H,
+        if (gpu && coli_vk_kda_step(layer, slot, qkv, decay + (size_t)t * P, beta + (size_t)t * H,
                                     1e-6f, core + (size_t)t * P))
             continue;   /* state and window advanced on the device */
 #endif
@@ -1259,9 +1277,9 @@ static void kda_layer_rows(const Cfg *c, const GLayer *l, const float *x, int S,
 
 static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, float *state, float *window, float *scratch,
-                      int layer, int gpu) {
+                      int layer, int gpu, int slot) {
     if (tokens > 1 && !g_prefill_unbatched()) {
-        kda_layer_rows(c, l, x, tokens, out, state, window, scratch, layer, gpu);
+        kda_layer_rows(c, l, x, tokens, out, state, window, scratch, layer, gpu, slot);
         return;
     }
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
@@ -1305,7 +1323,7 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             /* gpu==3 bisects: chain through the head norm, ko on the CPU. */
             const int stop_at_norm = (gpu == 3);
             float *chain_dst = stop_at_norm ? normed_gpu : out + (size_t)t * c->hidden;
-            if (ok && coli_vk_kda_layer(layer, it, 8, row, c->hidden,
+            if (ok && coli_vk_kda_layer(layer, slot, it, 8, row, c->hidden,
                                         (ColiVkTensor **)&ko->vk,
                                         (ko->fmt == 4) ? (const void *)ko->q4 : (const void *)ko->q8,
                                         ko->s, ko->fmt, ko->gs, ko->rows,
@@ -1364,7 +1382,7 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
          * below still run where they did. This is the increment that measures
          * the shader's real in-engine dispatch cost before the full chain is
          * built -- it ADDS a round trip, so it is not expected to be a win. */
-        if (gpu && coli_vk_kda_step(layer, qkv, decay, beta, 1e-6f, core)) {
+        if (gpu && coli_vk_kda_step(layer, slot, qkv, decay, beta, 1e-6f, core)) {
             /* state and window advanced on the device */
         } else
 #endif
@@ -3151,6 +3169,25 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             g_vk_n = 0;
             const char *up = getenv("COLI_USAGE_PATH");
             if (up) { FILE *f = fopen(up, "rb"); if (f) { size_t got = fread(g_eusage, sizeof(uint64_t), (size_t)g_vk_NL * g_vk_E, f); fclose(f); fprintf(stderr, "[VK] usage histogram loaded (%zu entries)\n", got); } }
+            /* P6b: the per-slot KDA state pool goes up BEFORE the expert
+             * preload. dev0 sits at 23.2 of 24 GB in service and the preload
+             * stops when free VRAM drops under its 3.0 GB reserve; a pool
+             * allocated afterwards would eat that reserve, which the KV mirror
+             * and every scratch buffer need. Allocated here it costs experts
+             * instead -- 625 MB = 44 of dev0's 1 296 at 4 slots -- and the
+             * "preload: N heat-ranked experts" line below reports the price. */
+            if (m->c.kda_proj && kda_gpu_on() && !g_kda_cpu_on()) {
+                unsigned char *is_kda = calloc((size_t)m->c.n_layers, 1);
+                int nk = 0;
+                if (is_kda) {
+                    for (int i = 0; i < m->c.n_layers; i++)
+                        if (!m->c.is_full[i]) { is_kda[i] = 1; nk++; }
+                    if (nk) coli_vk_kda_pool_init(kv_slots_wanted(), m->c.n_layers, is_kda,
+                                                  m->c.kda_heads, m->c.kda_hd, m->c.kda_hd,
+                                                  m->c.conv_k);
+                    free(is_kda);
+                }
+            }
             vk_preload_tier(m);
         }
         fprintf(stderr, g_vk_ready
@@ -3257,11 +3294,12 @@ static float *vision_encode(GModel *m, const float *patches,
 }
 
 /* ---------- sessione ---------- */
-static GSession *session_open(const GModel *m, int cap) {
+static GSession *session_open(const GModel *m, int cap, int slot) {
     const Cfg *c = &m->c;
     GSession *s = calloc(1, sizeof(*s));
     if (!s) { fprintf(stderr, "OOM sulla sessione\n"); exit(1); }
     s->cap = cap;
+    s->slot = slot;
     s->layer = calloc((size_t)c->n_layers, sizeof(*s->layer));
     if (!s->layer) { fprintf(stderr, "OOM sugli stati di layer\n"); exit(1); }
     if (c->kda_proj)
@@ -3291,7 +3329,7 @@ static GSession *session_open(const GModel *m, int cap) {
              * =2 runs the whole layer as one submit. kda_gpu carries the mode so a
              * layer that could not take its weights stays on the CPU entirely. */
             if (kda_gpu_on() && !g_kda_cpu_on())
-                st->kda_gpu = coli_vk_kda_init(i, c->kda_heads, c->kda_hd, c->kda_hd,
+                st->kda_gpu = coli_vk_kda_init(i, slot, c->kda_heads, c->kda_hd, c->kda_hd,
                                                c->conv_k, st->kda_state, st->kda_window,
                                                m->layer[i].conv, m->layer[i].alog,
                                                m->layer[i].dt, m->layer[i].onorm)
@@ -3448,7 +3486,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                     if (timed) { g_ot_mla += optime_now() - t0; g_on_mla++; }
                 } else {
                     kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
-                              s->kda_scratch, i, st->kda_gpu);
+                              s->kda_scratch, i, st->kda_gpu, s->slot);
                     if (timed) { g_ot_kda += optime_now() - t0; g_on_kda++; }
                 }
             } else {
@@ -3739,7 +3777,7 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
  * gli oracoli, dove il punto e' il risultato e non il tempo. */
 static float *forward(GModel *m, const int *tokens, int n,
                       const float *vision, int n_vision) {
-    GSession *s = session_open(m, n);
+    GSession *s = session_open(m, n, 0);
     float *logits = forward_span(m, s, tokens, n, vision, n_vision);
     session_close(m, s);
     return logits;
@@ -3873,7 +3911,8 @@ static int sample_token(const float *logits, int vocab) {
  * riavvolge: la cache DSA si potrebbe troncare, essendo posizionale, ma la
  * ricorrenza no, e fingere il contrario darebbe risposte sbagliate in silenzio.
  * Se il prompt nuovo non estende quello vecchio, la sessione si rifa'. */
-#define GLM53_MAX_SLOTS 16
+/* GLM53_MAX_SLOTS is defined near kv_slots_wanted(): model_load sizes the KDA
+ * device pool from KV_SLOTS before the expert preload and needs the same cap. */
 
 typedef struct {
     GSession *session;
@@ -3886,18 +3925,33 @@ static int g_n_slots = 0;
 static int g_slot_context = 0;
 
 static void slots_init(const GModel *m) {
-    const char *setting = getenv("KV_SLOTS");
-    g_n_slots = setting ? atoi(setting) : 1;
-    if (g_n_slots < 1) g_n_slots = 1;
-    if (g_n_slots > GLM53_MAX_SLOTS) g_n_slots = GLM53_MAX_SLOTS;
-    /* P6 (2026-09-06): the device-side KDA recurrence keeps ONE state per
-     * layer (coli_vk_kda_init re-seeds it on every session_open), so two live
-     * slots on the GPU path would share and corrupt it. Until P6b gives each
-     * slot its own device state, more than one slot forces the CPU recurrence
-     * -- loudly, so a serving config cannot drift into silent corruption. */
-    if (g_n_slots > 1 && kda_gpu_on()) {
-        fprintf(stderr, "KV_SLOTS=%d: forcing COLI_KDA_GPU=0 (one device KDA state per layer; P6b)\n", g_n_slots);
-        g_kda_gpu = 0;
+    g_n_slots = kv_slots_wanted();
+    /* P6 (2026-09-06): the device-side KDA recurrence kept ONE state per layer,
+     * so two live slots on the GPU path shared and corrupted it, and any
+     * KV_SLOTS > 1 forced the CPU recurrence (~10 % decode, ~5 % prefill).
+     *
+     * P6b (2026-09-07): model_load allocates one state set per slot before the
+     * expert preload, so slots coexist on the device. What is left of the guard
+     * is the honest version of the same rule: force the CPU recurrence when the
+     * pool does NOT cover every slot -- all or nothing, never some slots on the
+     * device and some on the CPU, which would make numerics depend on which
+     * slot a conversation hashed to. Still loud: a serving config must not
+     * drift into silent corruption, and it must not silently lose 10 % of
+     * decode either. */
+    if (kda_gpu_on()) {
+#ifdef COLI_VULKAN
+        const int pool = coli_vk_kda_pool_slots();
+#else
+        const int pool = 0;
+#endif
+        if (pool < g_n_slots) {
+            fprintf(stderr, "KV_SLOTS=%d: forcing COLI_KDA_GPU=0 "
+                            "(KDA device slot pool holds %d; P6b)\n", g_n_slots, pool);
+            g_kda_gpu = 0;
+        } else if (getenv("GLM53_VERBOSE")) {
+            fprintf(stderr, "KV_SLOTS=%d: KDA device slot pool holds %d -- "
+                            "COLI_KDA_GPU=%d stays on\n", g_n_slots, pool, g_kda_gpu);
+        }
     }
     const char *context = getenv("GLM53_MAXT");
     g_slot_context = context ? atoi(context) : 8192;
@@ -4065,7 +4119,7 @@ static void ckpt_sync_out(const GModel *m, GSession *s) {
     for (int i = 0; i < c->n_layers; i++) {
         GLayerState *st = &s->layer[i];
         if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
-            coli_vk_kda_sync(i, st->kda_state, st->kda_window);
+            coli_vk_kda_sync(i, s->slot, st->kda_state, st->kda_window);
     }
 #else
     (void)m; (void)s;
@@ -4078,7 +4132,7 @@ static void ckpt_sync_in(const GModel *m, GSession *s) {
     for (int i = 0; i < c->n_layers; i++) {
         GLayerState *st = &s->layer[i];
         if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
-            coli_vk_kda_upload(i, st->kda_state, st->kda_window);
+            coli_vk_kda_upload(i, s->slot, st->kda_state, st->kda_window);
     }
 #else
     (void)m; (void)s;
@@ -4545,7 +4599,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         shared = cached;
     if (shared <= 0) {
         slot_reset(m, slot);
-        slot->session = session_open(m, room);
+        slot->session = session_open(m, room, (int)(slot - g_slots));
         shared = 0;
     }
     /* L'immagine annunciata per QUESTA richiesta, se c'e'. Il prefisso in
@@ -4565,7 +4619,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         }
         if (shared) {                             /* niente riuso con un'immagine */
             slot_reset(m, slot);
-            slot->session = session_open(m, room);
+            slot->session = session_open(m, room, (int)(slot - g_slots));
             shared = 0;
         }
         vision = vision_encode(m, g_pending.patches, g_pending.grid_h,
@@ -4819,7 +4873,7 @@ int main(int argc, char **argv) {
 
     /* Una sola sessione per tutta la generazione: il prompt si prefilla una
      * volta e ogni token dopo costa un token, non tutto il prefisso. */
-    GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
+    GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1, 0);
     const double prefill_start = now_s();
     float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
     if (getenv("GLM53_VERBOSE"))
@@ -4932,7 +4986,7 @@ static void glm53_kda_sync_out(Glm53SegmentSession *session) {
     for (uint32_t i = session->engine->layer_begin; i < session->engine->layer_end; i++) {
         GLayerState *st = &session->session->layer[i];
         if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
-            coli_vk_kda_sync((int)i, st->kda_state, st->kda_window);
+            coli_vk_kda_sync((int)i, session->session->slot, st->kda_state, st->kda_window);
     }
 #else
     (void)session;
@@ -4944,7 +4998,7 @@ static void glm53_kda_sync_in(Glm53SegmentSession *session) {
     for (uint32_t i = session->engine->layer_begin; i < session->engine->layer_end; i++) {
         GLayerState *st = &session->session->layer[i];
         if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
-            coli_vk_kda_upload((int)i, st->kda_state, st->kda_window);
+            coli_vk_kda_upload((int)i, session->session->slot, st->kda_state, st->kda_window);
     }
 #else
     (void)session;
@@ -5052,7 +5106,7 @@ static int glm53_segment_session_create(void *engine_impl, void **session_impl,
                               ? options->context_tokens : engine->context_tokens;
     if (session->context_tokens > engine->context_tokens)
         session->context_tokens = engine->context_tokens;
-    session->session = session_open(&engine->model, (int)session->context_tokens);
+    session->session = session_open(&engine->model, (int)session->context_tokens, 0);
     session->position = 0;
     *session_impl = session;
     return 0;

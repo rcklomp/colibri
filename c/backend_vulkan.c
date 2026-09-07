@@ -36,6 +36,7 @@ typedef struct {
  * kv_dev shadow. */
 #define VK_KV_LAYERS 160
 #define VK_KDA_LAYERS 64      /* GLM-5.3 has 34 KDA layers; headroom for the test slots */
+#define VK_KDA_SLOTS 16       /* P6b: one device state set per KV slot (= GLM53_MAX_SLOTS) */
 typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
     int rows, K, R;
@@ -101,10 +102,19 @@ static struct {
     VkPipelineLayout plyt_kdec, plyt_khn;
     VkPipeline pipe_kdec, pipe_khn;
     VkDescriptorPool kchain_pool; VkDescriptorSet dset_kdec, dset_khn, dset_kko;
-    struct { VkBuffer state, window, conv, alog, dt, onorm;
-             void *state_p, *window_p, *conv_p, *alog_p, *dt_p, *onorm_p;
+    /* P6b: the recurrence state and the conv window are per CONVERSATION, so
+     * they are per KV slot; conv taps / alog / dt / onorm are model weights and
+     * stay one per layer. The slot sets are allocated once by
+     * coli_vk_kda_pool_init BEFORE the expert preload (glm53.c model_load) and
+     * never swapped -- allocating them afterwards would come out of dev0's 3 GB
+     * reserve, which the KV mirror and the scratches need. */
+    struct { VkBuffer state, window; void *state_p, *window_p; } kda_slot[VK_KDA_LAYERS][VK_KDA_SLOTS];
+    struct { VkBuffer conv, alog, dt, onorm;
+             void *conv_p, *alog_p, *dt_p, *onorm_p;
              size_t sbytes, wbytes, cbytes; int heads, k, v, kernel; } kda[VK_KDA_LAYERS];
+    int kda_slots;               /* slots the pool holds for every KDA layer; 0 = none */
     Scratch kda_qkv, kda_gate, kda_beta, kda_out;
+    Scratch kda_stage;           /* HOST_CACHED staging for the device->host state sync */
     Scratch att_sc;              /* attention score scratch (GPU-only) */
     Scratch att_ctx;             /* fused absorb+o: ctx stays on device (GPU-only) */
     Scratch y2;                  /* second output of the fused matmul pair (readback) */
@@ -165,9 +175,10 @@ static int pick_memtype_cached(VkPhysicalDevice phys) {
     return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
 }
 
-static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+static int alloc_hostvis_mtu(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr,
+                             uint32_t memtype, VkBufferUsageFlags usage) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -183,6 +194,9 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
+}
+static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+    return alloc_hostvis_mtu(bytes, buf, mem, ptr, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 }
 /* Priority class of subsequent allocations (VK_EXT_memory_priority; no-op without it).
  * Scratches/KV force 1.0 internally; weight uploads take whatever is current — the
@@ -215,16 +229,19 @@ static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void 
     return alloc_hostvis_mt(bytes, buf, mem, ptr, G.memtype);
 }
 
-static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
+static int scratch_reserve_mtu(Scratch *s, size_t bytes, uint32_t memtype, VkBufferUsageFlags usage) {
     if (s->cap >= bytes) return 1;
     if (s->buf) { vkDestroyBuffer(G.dev, s->buf, NULL); vkFreeMemory(G.dev, s->mem, NULL); }
     s->buf = VK_NULL_HANDLE; s->cap = 0; s->ptr = NULL;
     float p0 = G.prio; G.prio = 1.0f;            /* scratches ride every submit: never evict */
-    int ok = alloc_hostvis_mt(bytes, &s->buf, &s->mem, &s->ptr, memtype);
+    int ok = alloc_hostvis_mtu(bytes, &s->buf, &s->mem, &s->ptr, memtype, usage);
     G.prio = p0;
     if (!ok) return 0;
     s->cap = bytes;
     return 1;
+}
+static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
+    return scratch_reserve_mtu(s, bytes, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 }
 static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt(s, bytes, G.memtype); }
 
@@ -569,9 +586,9 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
 typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; struct VkWArena *next; } VkWArena;
 static VkWArena *g_warena;
 #define VK_WARENA_BLOCK ((size_t)256 << 20)
-static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
+static int arena_suballoc_u(size_t bytes, VkBufferUsageFlags usage, VkBuffer *buf, void **ptr) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -606,6 +623,9 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
     if (ptr) *ptr = a->base + off;
     a->off = off + req.size;
     return 1;
+}
+static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
+    return arena_suballoc_u(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, buf, ptr);
 }
 
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
@@ -1929,61 +1949,173 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
  * tile resident on the GPU for the life of the session. NOT bit-identical to
  * the CPU (GLSL exp, tree-reduced norms); see G12-KDA-GPU-SPEC-2026-09-05.md.
  * Returns 0 on any unsupported shape so the caller keeps the CPU path. */
-int coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
+/* P6b: is (layer, slot) backed by a device state set? */
+static int kda_slot_ready(int layer, int slot) {
+    return layer >= 0 && layer < VK_KDA_LAYERS && slot >= 0 && slot < VK_KDA_SLOTS &&
+           G.kda_slot[layer][slot].state != VK_NULL_HANDLE;
+}
+
+int coli_vk_kda_pool_slots(void) { return G.kda_slots; }
+
+/* P6b: one state+window set per KV slot for every KDA layer, allocated in ONE
+ * pass BEFORE the expert preload and never swapped or evicted.
+ *
+ * All or nothing: a partial pool would mean some slots on the device and some
+ * on the CPU, i.e. numerics that depend on which slot a conversation hashed to
+ * (the spec's rejected "mixed slots"), so anything short of `nslots` frees what
+ * it took and returns 0 -- the engine then keeps forcing the CPU recurrence.
+ *
+ * `kda_layer[i] != 0` marks a KDA layer. The layer list is a parameter and not
+ * VK_KDA_LAYERS because the array is sized for headroom (64) and GLM-5.3 has
+ * 34: allocating the headroom would cost 1 173 MB at 4 slots instead of 625. */
+int coli_vk_kda_pool_init(int nslots, int nlayers, const unsigned char *kda_layer,
+                          int heads, int k_dim, int v_dim, int kernel) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (nslots < 1 || !kda_layer || nlayers < 1) return 0;
+    /* The per-layer arrays are sized VK_KDA_LAYERS. A model with a KDA layer
+     * past that index cannot be covered, and a partial pool is not allowed. */
+    for (int i = VK_KDA_LAYERS; i < nlayers; i++) if (kda_layer[i]) return 0;
+    if (nlayers > VK_KDA_LAYERS) nlayers = VK_KDA_LAYERS;
+    if (nslots > VK_KDA_SLOTS) nslots = VK_KDA_SLOTS;
+    if (heads < 1 || k_dim < 1 || v_dim < 1 || kernel < 1) return 0;
+    if (v_dim > 128 || k_dim > 1024 || kernel > 8) return 0;
+    if (G.kda_slots) return G.kda_slots;          /* built once */
+
+    const size_t width = (size_t)heads * (size_t)k_dim;
+    const size_t sb = (size_t)heads * k_dim * v_dim * sizeof(float);
+    const size_t wb = 3u * width * (size_t)kernel * sizeof(float);
+    /* TRANSFER_SRC so the device->host sync can vkCmdCopyBuffer into cached
+     * staging instead of reading write-combined memory at ~14 MB/s (p2c). */
+    const VkBufferUsageFlags usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    int nk = 0;
+    for (int i = 0; i < nlayers; i++) if (kda_layer[i]) nk++;
+    if (!nk) return 0;
+
+    float p0 = G.prio; G.prio = 1.0f;             /* recurrence state: never evict */
+    int ok = 1;
+    for (int i = 0; i < nlayers && ok; i++) {
+        if (!kda_layer[i]) continue;
+        for (int sl = 0; sl < nslots && ok; sl++) {
+            void *sp = NULL, *wp = NULL;
+            ok = arena_suballoc_u(sb, usage, &G.kda_slot[i][sl].state, &sp)
+              && arena_suballoc_u(wb, usage, &G.kda_slot[i][sl].window, &wp);
+            if (!ok) { G.kda_slot[i][sl].state = VK_NULL_HANDLE;
+                       G.kda_slot[i][sl].window = VK_NULL_HANDLE; break; }
+            memset(sp, 0, sb); memset(wp, 0, wb);
+            G.kda_slot[i][sl].state_p = sp; G.kda_slot[i][sl].window_p = wp;
+        }
+    }
+    G.prio = p0;
+    if (!ok) {
+        for (int i = 0; i < nlayers; i++)
+            for (int sl = 0; sl < VK_KDA_SLOTS; sl++) {
+                if (G.kda_slot[i][sl].state)  vkDestroyBuffer(G.dev, G.kda_slot[i][sl].state, NULL);
+                if (G.kda_slot[i][sl].window) vkDestroyBuffer(G.dev, G.kda_slot[i][sl].window, NULL);
+                memset(&G.kda_slot[i][sl], 0, sizeof(G.kda_slot[i][sl]));
+            }
+        fprintf(stderr, "[VK] KDA slot pool: FAILED at %d slots x %d layers "
+                        "(%.0f MB) -- the CPU recurrence stays\n",
+                nslots, nk, (double)nk * nslots * (sb + wb) / 1e6);
+        return 0;
+    }
+    G.kda_slots = nslots;
+    fprintf(stderr, "[VK] KDA slot pool: %d x %.0f MB (%d KDA layers, %.0f MB total)\n",
+            nslots, (double)nk * (sb + wb) / 1e6, nk,
+            (double)nk * nslots * (sb + wb) / 1e6);
+    return nslots;
+}
+
+int coli_vk_kda_init(int layer, int slot, int heads, int k_dim, int v_dim, int kernel,
                      const float *state, const float *window, const float *conv_w,
                      const float *alog, const float *dt, const float *onorm) {
     if (!G.ready || !G.shader_kda) return 0;
     if (layer < 0 || layer >= VK_KDA_LAYERS) return 0;
+    if (slot < 0 || slot >= VK_KDA_SLOTS) return 0;
     /* one v per thread; q/k/decay staged in a 1024-entry LDS array; hist[8] */
     if (heads < 1 || k_dim < 1 || v_dim < 1 || kernel < 1) return 0;
     if (v_dim > 128 || k_dim > 1024 || kernel > 8) return 0;
     const size_t width = (size_t)heads * (size_t)k_dim;
     const size_t sb = (size_t)heads * k_dim * v_dim * sizeof(float);
     const size_t wb = 3u * width * (size_t)kernel * sizeof(float);
-    if (G.kda[layer].state) {
-        /* Buffers exist, so this is a NEW SESSION on a warm engine. The state and
-         * the conv window belong to the CONVERSATION and must be re-seeded from
-         * the caller's freshly zeroed copies; the conv taps, alog, dt and onorm
-         * are model weights and stay. Returning early here without re-seeding let
-         * request N+1 continue request N's recurrence -- invisible to every
-         * fresh-process oracle (one request per process) and caught only by the
-         * serving harness, where warm-identical came back BELOW rotating. */
-        if (G.kda[layer].sbytes != sb || G.kda[layer].wbytes != wb) return 0;
-        memcpy(G.kda[layer].state_p, state, sb);
-        memcpy(G.kda[layer].window_p, window, wb);
-        return 1;
+    if (!kda_slot_ready(layer, slot)) return 0;   /* no pool -> the CPU recurrence */
+
+    if (!G.kda[layer].conv) {
+        /* First session that touches this layer: the model weights go up once.
+         * They are per LAYER, not per slot -- alog/dt/onorm/conv never change. */
+        const size_t ab = (size_t)heads * sizeof(float);      /* alog  */
+        const size_t db = width * sizeof(float);              /* dt    */
+        const size_t ob = (size_t)v_dim * sizeof(float);      /* onorm */
+        void *cp, *ap = NULL, *dp = NULL, *op = NULL;
+        float p0 = G.prio; G.prio = 1.0f;
+        int ok = arena_suballoc(wb, &G.kda[layer].conv, &cp);
+        if (ok && alog && dt && onorm)
+            ok = arena_suballoc(ab, &G.kda[layer].alog, &ap)
+              && arena_suballoc(db, &G.kda[layer].dt, &dp)
+              && arena_suballoc(ob, &G.kda[layer].onorm, &op);
+        G.prio = p0;
+        if (!ok) { G.kda[layer].conv = VK_NULL_HANDLE; return 0; }
+        memcpy(cp, conv_w, wb);
+        if (ap) { memcpy(ap, alog, ab); memcpy(dp, dt, db); memcpy(op, onorm, ob); }
+        G.kda[layer].alog_p = ap; G.kda[layer].dt_p = dp; G.kda[layer].onorm_p = op;
+        G.kda[layer].conv_p = cp;
+        G.kda[layer].sbytes = sb; G.kda[layer].wbytes = wb; G.kda[layer].cbytes = wb;
+        G.kda[layer].heads = heads; G.kda[layer].k = k_dim; G.kda[layer].v = v_dim;
+        G.kda[layer].kernel = kernel;
+    } else if (G.kda[layer].sbytes != sb || G.kda[layer].wbytes != wb) {
+        return 0;                                 /* a differently shaped model */
     }
-    const size_t ab = (size_t)heads * sizeof(float);          /* alog  */
-    const size_t db = width * sizeof(float);                  /* dt    */
-    const size_t ob = (size_t)v_dim * sizeof(float);          /* onorm */
-    void *sp, *wp, *cp, *ap = NULL, *dp = NULL, *op = NULL;
-    float p0 = G.prio; G.prio = 1.0f;                       /* recurrence state: never evict */
-    int ok = arena_suballoc(sb, &G.kda[layer].state, &sp)
-          && arena_suballoc(wb, &G.kda[layer].window, &wp)
-          && arena_suballoc(wb, &G.kda[layer].conv, &cp);
-    /* the chain stages' per-layer weights; absent -> step-only path still works */
-    if (ok && alog && dt && onorm)
-        ok = arena_suballoc(ab, &G.kda[layer].alog, &ap)
-          && arena_suballoc(db, &G.kda[layer].dt, &dp)
-          && arena_suballoc(ob, &G.kda[layer].onorm, &op);
-    G.prio = p0;
-    if (!ok) { G.kda[layer].state = VK_NULL_HANDLE; return 0; }
-    memcpy(sp, state, sb); memcpy(wp, window, wb); memcpy(cp, conv_w, wb);
-    if (ap) { memcpy(ap, alog, ab); memcpy(dp, dt, db); memcpy(op, onorm, ob); }
-    G.kda[layer].alog_p = ap; G.kda[layer].dt_p = dp; G.kda[layer].onorm_p = op;
-    G.kda[layer].state_p = sp; G.kda[layer].window_p = wp; G.kda[layer].conv_p = cp;
-    G.kda[layer].sbytes = sb; G.kda[layer].wbytes = wb; G.kda[layer].cbytes = wb;
-    G.kda[layer].heads = heads; G.kda[layer].k = k_dim; G.kda[layer].v = v_dim;
-    G.kda[layer].kernel = kernel;
+    /* A NEW SESSION on THIS slot. The state and the conv window belong to the
+     * CONVERSATION and must be re-seeded from the caller's freshly zeroed
+     * copies. Returning early here without re-seeding let request N+1 continue
+     * request N's recurrence -- invisible to every fresh-process oracle (one
+     * request per process) and caught only by the serving harness, where
+     * warm-identical came back BELOW rotating (G12 stage 2c). Per slot now:
+     * seeding slot 2 must not touch slot 1's live recurrence. */
+    memcpy(G.kda_slot[layer][slot].state_p, state, sb);
+    memcpy(G.kda_slot[layer][slot].window_p, window, wb);
     return 1;
 }
 
-/* Device -> host for the two segment-migration spans. The only place the host
- * copies are refreshed while the knob is on. */
-int coli_vk_kda_sync(int layer, float *state, float *window) {
-    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
-    if (state)  memcpy(state,  G.kda[layer].state_p,  G.kda[layer].sbytes);
-    if (window) memcpy(window, G.kda[layer].window_p, G.kda[layer].wbytes);
+/* Device -> host for the two segment-migration spans and P7's checkpoint
+ * capture. The only place the host copies are refreshed while the knob is on.
+ *
+ * P6b: through a vkCmdCopyBuffer into HOST_CACHED staging, not a memcpy from
+ * the mapped write-combined buffer. That read path measured ~14 MB/s (p2c,
+ * 2026-09-06: 150 MB in 11 s), which made a 370 MB checkpoint capture cost
+ * ~27 s; the copy engine plus a cached memcpy is three orders of magnitude
+ * off that. Falls back to the direct read if the staging cannot be reserved,
+ * because a slow sync is still better than a failed one. */
+int coli_vk_kda_sync(int layer, int slot, float *state, float *window) {
+    if (!G.ready || !kda_slot_ready(layer, slot)) return 0;
+    const size_t sb = G.kda[layer].sbytes, wb = G.kda[layer].wbytes;
+    if (!sb || !wb) return 0;
+    const size_t need = sb + wb;
+    if (!scratch_reserve_mtu(&G.kda_stage, need, G.memtype_cached,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        if (state)  memcpy(state,  G.kda_slot[layer][slot].state_p,  sb);
+        if (window) memcpy(window, G.kda_slot[layer][slot].window_p, wb);
+        return 1;
+    }
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "kda sync resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "kda sync beginCmd");
+    VkBufferCopy cs = {.srcOffset = 0, .dstOffset = 0, .size = sb};
+    vkCmdCopyBuffer(G.cmd, G.kda_slot[layer][slot].state, G.kda_stage.buf, 1, &cs);
+    VkBufferCopy cw = {.srcOffset = 0, .dstOffset = sb, .size = wb};
+    vkCmdCopyBuffer(G.cmd, G.kda_slot[layer][slot].window, G.kda_stage.buf, 1, &cw);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "kda sync endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                       .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "kda sync resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kda sync queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] kda sync fence wait failed -- disabling GPU offload\n");
+        G.ready = 0; G.cmd_ready = 0; G.bound_tensor = NULL; return 0;
+    }
+    if (state)  memcpy(state,  (const uint8_t *)G.kda_stage.ptr,      sb);
+    if (window) memcpy(window, (const uint8_t *)G.kda_stage.ptr + sb, wb);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* shared command buffer clobbered */
     return 1;
 }
 
@@ -1998,14 +2130,14 @@ int coli_vk_kda_sync(int layer, float *state, float *window) {
  * and ko lives in G.y.
  *
  * Returns 0 -> caller runs its existing path, unchanged. */
-int coli_vk_kda_layer(int layer, ColiVkMM *proj, int nproj,
+int coli_vk_kda_layer(int layer, int slot, ColiVkMM *proj, int nproj,
                       const float *x, int I,
                       ColiVkTensor **ko, const void *kow, const float *kos,
                       int ko_fmt, int ko_gs, int ko_O,
                       float gate_lb, float norm_eps, float head_eps,
                       int stop_after_norm, float *out) {
     if (!G.ready || !G.shader_kda || !G.pipe_kdec || !G.pipe_khn) return 0;
-    if (layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (!kda_slot_ready(layer, slot)) return 0;
     if (!G.kda[layer].alog_p) return 0;              /* chain weights not resident */
     if (nproj != 8 || I < 1 || ko_O < 1) return 0;
     const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
@@ -2075,8 +2207,8 @@ int coli_vk_kda_layer(int layer, ColiVkMM *proj, int nproj,
     wr_desc(G.dset_kdec, 4, bd);
 
     VkDescriptorBufferInfo bs[7] = {                                  /* step */
-        {.buffer = G.kda[layer].state,  .range = VK_WHOLE_SIZE},
-        {.buffer = G.kda[layer].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_slot[layer][slot].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_slot[layer][slot].window, .range = VK_WHOLE_SIZE},
         {.buffer = G.y.buf, .offset = yoff[0], .range = 3 * wsz},         /* q|k|v run */
         {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
         {.buffer = G.y.buf, .offset = yoff[6], .range = wsz},             /* gated decay */
@@ -2174,19 +2306,22 @@ int coli_vk_kda_layer(int layer, ColiVkMM *proj, int nproj,
 
 /* Host -> device, the inverse of _sync: used after a segment restore has
  * written the CPU spans, so the resident recurrence resumes from them. */
-int coli_vk_kda_upload(int layer, const float *state, const float *window) {
-    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
-    if (state)  memcpy(G.kda[layer].state_p,  state,  G.kda[layer].sbytes);
-    if (window) memcpy(G.kda[layer].window_p, window, G.kda[layer].wbytes);
+int coli_vk_kda_upload(int layer, int slot, const float *state, const float *window) {
+    if (!G.ready || !kda_slot_ready(layer, slot)) return 0;
+    /* Host -> device stays a plain memcpy: WRITING write-combined memory is
+     * fast (it is the read direction that measured 14 MB/s), and a copy
+     * through staging would only add a submit. */
+    if (state)  memcpy(G.kda_slot[layer][slot].state_p,  state,  G.kda[layer].sbytes);
+    if (window) memcpy(G.kda_slot[layer][slot].window_p, window, G.kda[layer].wbytes);
     return 1;
 }
 
 /* One token through one layer. qkv/gate/beta come from the host in this
  * standalone form (Stage 1 of the spec and the self-test); only `out` returns. */
-int coli_vk_kda_step(int layer, const float *qkv, const float *gate,
+int coli_vk_kda_step(int layer, int slot, const float *qkv, const float *gate,
                      const float *beta, float norm_eps, float *out) {
     if (!G.ready || !G.shader_kda) return 0;
-    if (layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (!kda_slot_ready(layer, slot)) return 0;
     const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
     const size_t width = (size_t)heads * (size_t)K;
     const size_t qb = 3u * width * sizeof(float), gb = width * sizeof(float);
@@ -2199,8 +2334,8 @@ int coli_vk_kda_step(int layer, const float *qkv, const float *gate,
     memcpy(G.kda_beta.ptr, beta, bb);
 
     VkDescriptorBufferInfo bi[7] = {
-        {.buffer = G.kda[layer].state,  .range = VK_WHOLE_SIZE},
-        {.buffer = G.kda[layer].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_slot[layer][slot].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_slot[layer][slot].window, .range = VK_WHOLE_SIZE},
         {.buffer = G.kda_qkv.buf,       .range = VK_WHOLE_SIZE},
         {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
         {.buffer = G.kda_gate.buf,      .range = VK_WHOLE_SIZE},

@@ -4113,7 +4113,14 @@ static size_t ckpt_span_bytes(const CkptSpan *spans, size_t count) {
 /* G12: con la ricorrenza sul dispositivo le due copie host sono STALE. Sono i
  * due soli punti in cui il checkpoint le fa combaciare col dispositivo, e sono
  * esattamente le due direzioni di glm53_kda_sync_out / _in (:4433, :4445). */
+/* P6b: quanto e' costata l'ULTIMA lettura dello stato dal dispositivo. Il
+ * percorso vecchio leggeva memoria write-combined a ~14 MB/s (150 MB in 11 s,
+ * p2c 2026-09-06); il gate legge questo numero dalla riga CKPT store, perche'
+ * "il sync e' veloce" non e' un'affermazione che si possa fare a occhio. */
+static double g_ckpt_sync_ms = 0.0;
+
 static void ckpt_sync_out(const GModel *m, GSession *s) {
+    const double t0 = now_s();
 #ifdef COLI_VULKAN
     const Cfg *c = &m->c;
     for (int i = 0; i < c->n_layers; i++) {
@@ -4124,6 +4131,7 @@ static void ckpt_sync_out(const GModel *m, GSession *s) {
 #else
     (void)m; (void)s;
 #endif
+    g_ckpt_sync_ms = (now_s() - t0) * 1000.0;
 }
 
 static void ckpt_sync_in(const GModel *m, GSession *s) {
@@ -4286,18 +4294,21 @@ static void ckpt_store(const GModel *m, GSession *s, const int *ids, int len, in
     slot->blob = malloc(bytes);
     if (!slot->ids || !slot->blob) { ckpt_free(slot); return; }
     size_t at = 0;
+    const double t_copy = now_s();
     for (size_t i = 0; i < count; i++) {
         memcpy(slot->blob + at, spans[i].ptr, spans[i].bytes);
         at += spans[i].bytes;
     }
+    const double copy_ms = (now_s() - t_copy) * 1000.0;
     memcpy(slot->ids, ids, (size_t)len * sizeof(int));
     slot->len = len;
     slot->bytes = bytes;
     slot->kind = kind;
     slot->used = ++g_ckpt_clock;
     if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "CKPT store prefix=%d %.0f MB kind=%d slot=%d\n",
-                len, bytes / 1e6, kind, victim);
+        fprintf(stderr, "CKPT store prefix=%d %.0f MB kind=%d slot=%d "
+                        "sync=%.0f ms copy=%.0f ms\n",
+                len, bytes / 1e6, kind, victim, g_ckpt_sync_ms, copy_ms);
     if (kind == 0) ckpt_disk_write(m, victim);
     else if (ckpt_disk_wanted()) {
         /* Il file di questo slot descrive ormai un'altra cattura. */

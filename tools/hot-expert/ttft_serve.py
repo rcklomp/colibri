@@ -297,6 +297,12 @@ class EngineDriver:
             # prompt length only in the DONE STAT fields generate() returns
             if ev["prompt_tokens"] is None and isinstance(stats, dict):
                 ev["prompt_tokens"] = stats.get("prompt_tokens")
+            # P6b step 6: the engine's own expert-cache hit rate, from the same
+            # DONE STAT line. The pool costs dev0 experts, so the gate has to
+            # show that routing did not move; without this the claim rests on
+            # the preload count alone, which is an allocation, not a hit.
+            if isinstance(stats, dict):
+                ev["hit_pct"] = stats.get("cache_hit_percent")
         except Exception as e:  # ClientCancelled is the expected outcome of --cancel
             ev["error"] = type(e).__name__
             ev["cancelled"] = "Cancel" in type(e).__name__
@@ -745,6 +751,7 @@ def main():
                "decode_tps": ((ev["ntok"] - 1) / (ev["done"] - ev["first"])) if ev["first"] and ev["ntok"] > 1 else None,
                "majflt": ev.get("majflt"), "minflt": ev.get("minflt"),
                "reused": ev.get("reused"), "slot": ev.get("slot"),
+               "hit_pct": ev.get("hit_pct"),
                "ckpt": ev.get("ckpt"),
                "tools": bool(args.tools), "t": time.time()}
         records.append(rec)

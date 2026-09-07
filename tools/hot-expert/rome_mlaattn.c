@@ -236,6 +236,76 @@ int main(int argc, char **argv) {
         for (int lay = 0; lay < layers; lay++) transpose_q(qT, q);
     double tt = (now() - t0) / reps;
 
+    /* ---- the WHOLE core, both ways, so the residual is attributed ----
+     * The score pass is only part of `mla.attn`: the softmax, the weighted
+     * pool over the same rows, and the kvb_v projection are the rest, and the
+     * candidate additionally reads its 64 scores back out of sc[u][h]. Running
+     * both whole cores says how much of the bucket the score pass ever was. */
+    float *pool_pool = malloc((size_t)nthr * L * sizeof(float));
+    double tfb = 0, tfc = 0, tft = 0;
+    float *scT = malloc((size_t)WIDTH * H * sizeof(float));
+    for (int pass = 0; pass < 3; pass++) {
+        t0 = now();
+        for (int r = 0; r < reps; r++) for (int lay = 0; lay < layers; lay++) {
+            const float *lat = latent + (size_t)(lay % pool_layers) * cap * L;
+            if (pass >= 1) {
+                transpose_q(qT, q);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int u = 0; u < used; u++)
+                    cand_score_row(out_cand + (size_t)u * H, qT, lat + (size_t)idx[u] * L, scale);
+            }
+            /* pass 2: hand the h loop a CONTIGUOUS score row per head, by
+             * transposing sc[u][h] -> scT[h][u] once. If the candidate's extra
+             * cost is the strided read-back, this pass gets it back. */
+            if (pass == 2) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int h = 0; h < H; h++)
+                    for (int u = 0; u < used; u++)
+                        scT[(size_t)h * WIDTH + u] = out_cand[(size_t)u * H + h];
+            }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int h = 0; h < H; h++) {
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                float *score = out_base + (size_t)tid * WIDTH;
+                float *pooled = pool_pool + (size_t)tid * L;
+                float top = -INFINITY;
+                if (pass == 0) {
+                    int ub; base_scores(score, q + (size_t)h * L, lat, chosen, WIDTH, cap,
+                                        scale, &ub, &top);
+                } else if (pass == 2) {
+                    for (int u = 0; u < used; u++) {
+                        score[u] = scT[(size_t)h * WIDTH + u];
+                        if (score[u] > top) top = score[u];
+                    }
+                } else {
+                    for (int u = 0; u < used; u++) {
+                        score[u] = out_cand[(size_t)u * H + h];
+                        if (score[u] > top) top = score[u];
+                    }
+                }
+                double total = 0.0;
+                for (int u = 0; u < used; u++) { score[u] = expf(score[u] - top); total += score[u]; }
+                memset(pooled, 0, (size_t)L * sizeof(float));
+                for (int u = 0; u < used; u++) {
+                    const float w = (float)(score[u] / total);
+                    const float *c_j = lat + (size_t)idx[u] * L;
+                    for (int d = 0; d < L; d++) pooled[d] += w * c_j[d];
+                }
+            }
+        }
+        double el = (now() - t0) / reps;
+        if (pass == 0) tfb = el; else if (pass == 1) tfc = el; else tft = el;
+    }
+
     printf("threads=%d used=%d layers=%d pool=%d layer(s) = %.1f MB\n",
            nthr, used, layers, pool_layers,
            (double)lat_n * 4 / 1048576.0);
@@ -245,5 +315,12 @@ int main(int argc, char **argv) {
     printf("  transpose %8.3f ms/token (%.1f%% of the candidate)\n",
            tt * 1e3, 100.0 * tt / tc);
     printf("  net       %8.3f ms/token   speedup %.2fx\n", (tc + tt) * 1e3, tb / (tc + tt));
+    printf("  --- whole core (scores + softmax + weighted pool; no kvb_v, no o) ---\n");
+    printf("  core base %8.3f ms/token   (scores %5.1f%% of it)\n", tfb * 1e3, 100.0 * tb / tfb);
+    printf("  core cand %8.3f ms/token   speedup %.2fx   (softmax+pool floor %.3f ms)\n",
+           tfc * 1e3, tfb / tfc, (tfb - tb) * 1e3);
+    printf("  core cand+T %6.3f ms/token   speedup %.2fx  (sc transposed to [h][u] first)\n",
+           tft * 1e3, tfb / tft);
+    free(scT); free(pool_pool);
     return bad ? 1 : 0;
 }

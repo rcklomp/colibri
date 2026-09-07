@@ -48,5 +48,6 @@ except Exception:
         eng.process.kill()
     except Exception:
         pass
-print("RESULT:", "IDENTICAL across 3 requests" if ok else "DIVERGED")
+print("RESULT:", f"IDENTICAL across {len(outs)} requests"
+      if ok else f"DIVERGED across {len(outs)} requests")
 sys.exit(0 if ok else 1)

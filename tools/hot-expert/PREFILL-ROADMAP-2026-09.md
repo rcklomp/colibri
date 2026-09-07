@@ -1,10 +1,30 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 11, 2026-09-07 12:30)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 12, 2026-09-07 17:00)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 12 (2026-09-07, 17:00): P6b in service — the CPU recurrence P6 forced is
+gone.** One KDA state+window set per KV slot on dev0, allocated in `model_load`
+**before** the expert preload (after it, the 624 MB would come out of dev0's
+3.0 GB reserve); `coli_vk_kda_*` and `GSession` carry the slot; `slots_init`
+forces `COLI_KDA_GPU=0` only when the pool is short, loudly. `p6b_gate.sh`
+exits 0 on all six steps: `tworeq` at 4 slots IDENTICAL at `COLI_KDA_GPU=2`
+**with zero `forcing` lines** (the check that makes the oracle mean anything)
+and at `=0`; bit-identical against the P7 binary at one slot (782 teacher-forced
+positions, last-logit `max_abs=0`, TTFT 1.00/0.98/0.98×); decode at four slots
+**5.702 tok/s vs 5.728 at one slot on the GPU (0.996×) and 4.990–5.089 with the
+CPU recurrence (+13.2 %)**; the live side-request case through the gateway
+reuses **1 339/1 355 in 3.08 s** with no `forcing` line; and the device→host
+state sync moved off write-combined memory — **370 MB checkpoint captured with
+a 69 ms sync (156 MB of KDA spans, ~2 262 MB/s) where the old path was
+~14 MB/s** — which is what makes a P7 checkpoint possible at the GPU knob at
+all (conv 2 with the 34-tool block: 5.15 s, t1/t2 = 279×). Price: the preload
+drops **1 296 → 1 248 heat-ranked experts** (48, 3.7 % of dev0's tier), hit
+rate unchanged. Serving since 16:50 at `--kv-slots 4` with `COLI_KDA_GPU=2`.
+Next: RP4, P5, then the upstream-`dev` merge.
 
 **Rev 11 (2026-09-07, 12:30): P7 in service.** Prefix checkpoints in the
 engine (the `deepseek_v4.c` `v4_ckpt_*` pattern over the segment adapter's own
@@ -22,7 +42,7 @@ the engine is killed and respawned; the restored answer is byte-identical over
 checkpoints on disk and nothing in memory, turn 1 of a conversation the process
 has never seen answers in **8.93 s**. Serving since 12:25 with
 `GLM53_PREFIX_CKPT=1 COLI_PREFIX_PIN=1`. Next: P6b, RP4, P5, then the
-upstream-`dev` merge.
+upstream-`dev` merge. (P6b landed the same day — see rev 12.)
 
 **Rev 10 (2026-09-07, 06:40): P7 scoped by measurement; spec written.** The
 first thing P7 did was the two-turn chat with memory context on, through
@@ -238,7 +258,7 @@ serving knob (rev 5's rule).
 | **P4** ✅ | S-tiled GPU matmul shaders — experts **and** dense (`f0197d0`; **landed 2026-09-06 21:20**: teacher-forcing identical and logits max-abs 0 — bit-identical, no knob; serve-path TTFT 1.11× / 1.13× / 1.11× at 21 / 384 / 1 230 vs P3; kda 31.7 → 22.7 ms/token in the profile — §P4 in the record) | `qmatmul_gate_up.comp` / down / `qmatmul.comp`: one weight read per output row applied to all S rows (register tile over rows), instead of `(O/8, rows, 1)` re-reading the matrix per row. P2 showed the dense path needs it too: batched kda.proj+ko still cost 18 ms/token for ~2 of arithmetic | eg per token drops with the chunk's dedup (×~1.6 at K=16, ×~3–4 at K=128) — the MoE bucket's floor moves | 2–4 days | Opus (shader) | `prefill_gate.sh` (b) logits within tolerance — the reduction order changes, so this ships behind a knob; TTFT delta |
 | **P5** | The sequential remainder | kda.step 13 ms/token: the S per-token `kda_step` submits of one chunk recorded into one command buffer (one round trip per layer per chunk instead of S); mla.attn 27 ms/token at 500 ctx and growing: vectorise the per-(token, head) dot/softmax or run it on `attention_absorb.comp`; router 5 ms/token: vectorised dot behind a knob (order changes) | ~30 → ~10–15 ms/token | 2–3 days | Opus | `prefill_gate.sh`; TTFT delta |
 | **P6** ✅ | Make reuse survive Open WebUI (`cb9c11e`; **in service 2026-09-06 23:30**: `--kv-slots 4`, `COLI_KDA_GPU=0`; `tworeq` identical across slots at both knobs; live-gateway side-request case turn 2 **171 s → 3.1 s**, REUSE 1 339/1 355 — §P6 in the record). Confirmed on the owner's own Open WebUI on 2026-09-07 with tools and side tasks off: follow-up turn REUSE 32/41, ttft 5.3 s, 180 tokens at 4.4 tok/s. Stability *with* memory context and the tool block on is P7's question | | | | | met |
-| **P6b** | Per-slot KDA device state | `G.kda[slot][layer]` state/window on dev0 (34 × 4 MB per slot), `coli_vk_kda_*` take the slot; `session_open` passes it; then `COLI_KDA_GPU=2` and slots coexist and the ~10 % decode / ~5 % prefill of the CPU recurrence come back | decode 3.4 → 3.8 tok/s at 4 slots | 1–2 days | Opus | `tworeq TWOREQ_SLOTS=4` identical at `COLI_KDA_GPU=2` **without** the guard firing; the live-gateway side-request case; decode within 1 % of the 1-slot GPU number | (1) read the server log's REUSE lines from a real Open WebUI two-turn chat and name what broke the match (side requests on the single slot; per-turn system-prompt changes); (2) `--kv-slots N` on the gateway — `conversation_cache_slot` already routes turns by system+first-user hash — **but** with `COLI_KDA_GPU=2` the device holds one KDA state per layer, re-seeded on every `session_open`, so either serve with the CPU recurrence (−11.7 % decode) or give each slot its own device state / `kda_sync`+`kda_upload` on slot switch; (3) keep the rendered prefix stable per turn on the gateway side | turn 2+ from Open WebUI: **minutes → seconds** (what P1 measured, delivered on the user's path) | 2–5 days | Opus; Fable for the per-slot device-state decision | a two-turn chat from Open WebUI itself shows `REUSE` ≫ 0 on turn 2 in the server log, with a title-generation request in between; `tworeq.py` identical across 3 requests in every slot |
+| **P6b** ✅ | Per-slot KDA device state — spec `P6B-KDA-SLOT-STATE-SPEC-2026-09.md`, built on `perf/p6b-kda-slots`, **in service 2026-09-07 16:50** (binary 53ccbb42…, `--kv-slots 4`, `COLI_KDA_GPU=2`) | `G.kda_slot[layer][slot]` state/window on dev0 (34 × 4.58 MB = 156 MB per slot), `coli_vk_kda_pool_init` allocates every slot's set BEFORE `vk_preload_tier` (after it, the 624 MB would eat dev0's 3.0 GB reserve); `coli_vk_kda_init/step/layer/sync/upload` and `GSession` take the slot; `slots_init` forces the CPU recurrence only when the pool is short. `coli_vk_kda_sync` goes through a `vkCmdCopyBuffer` into HOST_CACHED staging instead of a memcpy from write-combined memory | measured: decode at 4 slots **5.039 → 5.702 tok/s (+13.2 %)**, within 0.996× of the 1-slot GPU number; bit-identical at one slot (`max_abs=0`); live gateway turn 2 REUSE **1 339/1 355 in 3.08 s** with no `forcing` line; the state sync **~14 MB/s → ~2 262 MB/s** (370 MB checkpoint, 69 ms), which is what lets P7 capture at the GPU knob; price 1 296 → **1 248** preloaded experts (48, 3.7 %) | done | Opus (spec: Fable) | `p6b_gate.sh` exits 0 on all six steps (§P6b in the record) |
 | **P7** ✅ | Checkpoint the stable prefix (tools + base system) **and pin the per-turn context block** — spec `P7-PREFIX-CKPT-SPEC-2026-09.md`, built on `perf/p7-prefix-ckpt`, **in service 2026-09-07 12:25** (binary 19e28e72…, `GLM53_PREFIX_CKPT=1 COLI_PREFIX_PIN=1`, `--kv-slots 8`, `COLI_KDA_GPU=0`) | engine: the session's span list (11 DSA layers' latent/ikeys/igates rows + 34 KDA states/windows; **370 MB at 6 328 tokens**) copied at the prefix boundary the gateway sends in the 8th SUBMIT field (`src=hint`, verified against the prompt's own ids) or at the LCP of successive fresh prompts, persisted under `<SNAP>/.coli_ckpt`. Gateway: `COLI_PREFIX_PIN=1` keeps the `<memory_context>` block byte-identical across a conversation's turns | measured: new conversation with the 34-tool block **1 452 s → 5.30 s** (engine) / **8.93 s** (live gateway, restored from disk after a restart); re-ranked memory block **126.82 s → 3.00 s**, 17 tokens prefilled instead of 1 005; off (`GLM53_PREFIX_CKPT=0`) the engine is bit-identical to the pristine one | done | Opus (spec: Fable) | `p7_gate.sh` exits 0 on all five steps (§P7 in the record); live gateway `--prefix-ckpt` and `--pin-block` PASS with `CKPT hit` and `[pin] … hit` in the server log |
 | P9 (parked) | Pin mapped expert slots (`compat_mlock` at fill, unlock at evict) | upstream's datapoint on PR #1324 (2026-09-06): below ~1:1 model:RAM the kernel page LRU and the engine slot LRU disagree and a hit re-faults inside the matmul; rome sits near 1:1 once the engine's anon memory is counted, but shows ~0 major faults per request at 99 % residency — a robustness item (deterministic residency), not speed | none measured here; `ttft_serve.py` now prints majflt per request — build this only if that number stops being ~0 | 1 day | Sonnet | majflt per request stays 0 across a full gate with no `--warm` |
 | — | Housekeeping (not this track): merge upstream `dev` | #1325 (portable `st.h` mapping) and #1350 (RSS counts owned memory — the fix for the `eabeb9a` thrash CLAUDE.md warns about) are in upstream `dev` since 2026-09-05; this fork is 103 ahead / 64 behind since 2026-08-31. **Known conflict:** the fork's `glm53.c` still carries the #1324-style engine-local expert mapping (`expert_map_init`, `[MAP] … file mappati`); #1324 was closed as superseded on 2026-09-07 and the merge must replace that path with `dev`'s `st_map_shard_range` one, then re-run `prefill_gate.sh` and `rome_bench.sh`. #1321 (cache budget) is rebased on `dev` and open | — | 1–2 days | Opus | all four qwen38 tests pass, `prefill_gate.sh` and `rome_bench.sh` reproduce their last rows |

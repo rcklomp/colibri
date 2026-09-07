@@ -260,15 +260,21 @@ r5=${PIPESTATUS[0]}
 wait_no_engine || exit 2
 grep "CKPT store" "$OUT/engine_sync.log" || true
 python3 - "$OUT/engine_sync.log" "$SYNC_MS" <<'PY' && rc5=0 || rc5=3
-import re, sys
+import os, re, sys
 pat = re.compile(r"CKPT store prefix=(\d+) (\d+) MB kind=(\d+) slot=(\d+) sync=(\d+) ms copy=(\d+) ms")
 rows = [m.groups() for m in (pat.search(l) for l in open(sys.argv[1])) if m]
 bound = float(sys.argv[2])
-print("%10s %8s %10s %10s %14s" % ("prefix", "MB", "sync ms", "copy ms", "MB/s (sync)"))
+# The MB column is the WHOLE checkpoint; the sync only moves the KDA spans
+# (34 x 4.58 MB = 156 MB at GLM's shape), so MB/sync is an upper bound on the
+# device->host rate and the KDA column is the honest one. Both are printed.
+KDA_MB = float(os.environ.get("P6B_KDA_MB", "156"))
+print("%10s %8s %10s %10s %14s %16s"
+      % ("prefix", "ckpt MB", "sync ms", "copy ms", "MB/s (ckpt)", "MB/s (KDA spans)"))
 ok = bool(rows)
 for p, mb, kind, slot, sync, copy in rows:
     r = (float(mb) / (float(sync) / 1000.0)) if float(sync) > 0 else float("inf")
-    print("%10s %8s %10s %10s %14.0f" % (p, mb, sync, copy, r))
+    rk = (KDA_MB / (float(sync) / 1000.0)) if float(sync) > 0 else float("inf")
+    print("%10s %8s %10s %10s %14.0f %16.0f" % (p, mb, sync, copy, r, rk))
     if float(sync) > bound: ok = False
 if not rows: print("no CKPT store line -- nothing was captured, so nothing was measured")
 print("step 5:", "PASS" if ok else "FAIL (sync must be under %.0f ms)" % bound)

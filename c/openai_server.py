@@ -2842,10 +2842,19 @@ class Engine:
             raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         tool_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        # COLI_REQ_LOG=1 (prefill track P0, 2026-09-07): one "[req]" line per
+        # request on stderr with time-to-first-token, total time and the
+        # engine's token counts -- the instrument for judging interactive use
+        # from the server log alone (Open WebUI shows none of this).
+        req_log = bool(os.environ.get("COLI_REQ_LOG"))
+        req_t0 = time.monotonic()
+        req_first = [None]
 
         def decode(data):
             text = decoder.decode(data)
             if text:
+                if req_first[0] is None:
+                    req_first[0] = time.monotonic()
                 on_text(text)
 
         def decode_tool(data):
@@ -2994,6 +3003,14 @@ class Engine:
                 tool_tail = tool_decoder.decode(b"", final=True)
                 if tool_tail and on_tool is not None:
                     on_tool(tool_tail)
+                if req_log:
+                    now = time.monotonic()
+                    ttft = (req_first[0] - req_t0) if req_first[0] is not None else now - req_t0
+                    sys.stderr.write("[req] id=%s slot=%d prompt_tokens=%d ttft=%.2fs gen=%d total=%.2fs %s\n" % (
+                        request_id, cache_slot, value.get("prompt_tokens", 0), ttft,
+                        value.get("completion_tokens", 0), now - req_t0,
+                        "length" if value.get("length_limited") else "stop"))
+                    sys.stderr.flush()
                 return value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
                 raise ClientCancelled()

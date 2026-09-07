@@ -2202,6 +2202,128 @@ def conversation_cache_slot(messages, kv_slots):
     return int.from_bytes(digest[:8], "big") % kv_slots
 
 
+# ---- P7 (2026-09-07): the gateway-side prefix pin ------------------------------
+#
+# Open WebUI appends its memory block to the END of the leading system message
+# (open_webui/utils/memory.py:290-406, add_or_update_system_message(append=True))
+# and rebuilds it from a vector search over the last seven user messages, so its
+# ITEM ORDER changes every turn as soon as the account holds more than one
+# memory. Measured on rome 2026-09-07: with one memory turn 2 reused 162/177
+# tokens and answered in 2.1 s; with four memories the block re-ranked, the
+# leading system message changed, the engine found no common prefix and the
+# gateway's slot hash moved the conversation to another slot -- 0/195 reused,
+# 21.6 s. Sorting the block's items was considered and rejected: it fixes the
+# order but not the membership (the retrieval is top-k of N, and the 2 000-char
+# limits truncate by rank).
+#
+# So: keep turn 1's block for the life of the conversation. The prompt is then
+# byte-stable, the slot hash is stable, and the engine's slot reuse covers the
+# whole history. The trade is that memory retrieval becomes per-conversation
+# rather than per-turn -- which is why it is a knob, default off. A NEW
+# conversation whose first user message equals an old one's inherits that
+# conversation's pin until the process restarts; that is documented, not
+# special-cased, because the key that makes the pin stable is exactly the key
+# that makes it collide.
+PREFIX_PIN_MAX = 64
+_prefix_pin_cache = collections.OrderedDict()
+_prefix_pin_lock = threading.Lock()
+
+
+def prefix_pin_tags():
+    raw = os.environ.get("COLI_PREFIX_PIN_TAGS", "memory_context")
+    return tuple(tag.strip() for tag in raw.split(",") if tag.strip())
+
+
+def message_text(message):
+    """The text of a message whether it came as a string or as content parts."""
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content
+                          if isinstance(part, dict) and part.get("type") == "text")
+    return content if isinstance(content, str) else ""
+
+
+def split_context_block(content, tags):
+    """(base, block, tag) for the first <TAG>...</TAG> found, else None."""
+    for tag in tags:
+        opener, closer = f"<{tag}>", f"</{tag}>"
+        start = content.find(opener)
+        if start < 0:
+            continue
+        end = content.find(closer, start)
+        if end < 0:
+            continue
+        end += len(closer)
+        return (content[:start] + content[end:]).strip(), content[start:end], tag
+    return None
+
+
+def pin_context_blocks(messages):
+    """Replace the per-turn context block of `messages[0]` with this conversation's first one.
+
+    Returns the same list (mutated at index 0) so the caller's body, the render and
+    conversation_cache_slot all see the pinned version. A no-op unless
+    COLI_PREFIX_PIN=1 and the leading system message carries one of
+    COLI_PREFIX_PIN_TAGS (default `memory_context`).
+    """
+    if os.environ.get("COLI_PREFIX_PIN", "0") != "1":
+        return messages
+    if not isinstance(messages, list) or not messages:
+        return messages
+    head = messages[0]
+    if not isinstance(head, dict) or head.get("role") != "system":
+        return messages
+    content = head.get("content")
+    if not isinstance(content, str) or not content:
+        return messages
+    split = split_context_block(content, prefix_pin_tags())
+    if not split:
+        return messages
+    base, block, _tag = split
+    first_user = ""
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "user":
+            first_user = message_text(message)
+            break
+    key = hashlib.sha1((base + "\0" + first_user).encode("utf-8", "replace")).hexdigest()
+    with _prefix_pin_lock:
+        hit = key in _prefix_pin_cache
+        if hit:
+            pinned = _prefix_pin_cache[key]
+            _prefix_pin_cache.move_to_end(key)
+        else:
+            pinned = block
+            _prefix_pin_cache[key] = block
+            while len(_prefix_pin_cache) > PREFIX_PIN_MAX:
+                _prefix_pin_cache.popitem(last=False)
+    pinned_head = dict(head)
+    # The shape Open WebUI itself produced on turn 1: base, blank line, block.
+    pinned_head["content"] = base + "\n\n" + pinned
+    messages[0] = pinned_head
+    if os.environ.get("COLI_REQ_LOG"):
+        print(f"[pin] key={key[:8]} {'hit' if hit else 'new'} "
+              f"block={len(pinned.encode('utf-8'))}", file=sys.stderr, flush=True)
+    return messages
+
+
+def glm53_prefix_cut(prompt):
+    """Character index in a rendered glm53 prompt where the per-conversation part starts.
+
+    Everything before it -- `[gMASK]<sop>`, the tool block, the base system text --
+    is shared by every conversation on this gateway, so it is the boundary worth a
+    checkpoint. The pinned context block sits at the END of the leading system
+    message, so when there is one it IS the boundary; otherwise the first
+    `<|user|>` is. The engine re-tokenises the substring and ignores a hint that
+    does not land on a token boundary.
+    """
+    for tag in prefix_pin_tags():
+        at = prompt.find(f"<{tag}>")
+        if at > 0:
+            return at
+    at = prompt.find("<|user|>")
+    return at if at > 0 else 0
+
+
 def stop_policy(body, chat):
     sequences = parse_stop_sequences(body)
     ignore_leading = body.get("x_colibri_ignore_leading_stop", False)
@@ -2884,13 +3006,19 @@ class Engine:
         # conversation (opencode session) restores in seconds; without the hint
         # the engine only discovers the boundary on the second fresh prompt.
         # Older engines parse six or seven fields and ignore the eighth.
+        # P7 (2026-09-07): glm53 does the same thing with its own boundary --
+        # glm53_prefix_cut, which prefers the pinned context block's start over
+        # the first <|user|> so the hint stays cross-conversation.
         prefix_field = ""
+        cut = 0
         if ARCH == "deepseek_v4":
             cut = min((i for i in (prompt.find("<\uff5cUser\uff5c>"),
                                    prompt.find("<\uff5cAssistant\uff5c>")) if i > 0),
                       default=0)
-            if cut > 0:
-                prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
+        elif ARCH == "glm53":
+            cut = glm53_prefix_cut(prompt)
+        if cut > 0:
+            prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
                   + (prefix_field if prefix_field else (f" {len(xpayload)}" if xpayload else ""))
@@ -3870,6 +3998,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt + completion}
 
     def chat_completion(self, body, request_id):
+        # P7: pin the per-turn context block BEFORE anything reads the messages,
+        # so the render and conversation_cache_slot (which keys the KV slot on
+        # the leading system messages + the first user message) both see the
+        # same, byte-stable prompt on every turn of a conversation.
+        if isinstance(body.get("messages"), list):
+            body["messages"] = pin_context_blocks(body["messages"])
         reasoning_effort = body.get("reasoning_effort")
         efforts = (None, "none", "minimal", "low", "medium", "high", "xhigh")
         if reasoning_effort not in efforts:

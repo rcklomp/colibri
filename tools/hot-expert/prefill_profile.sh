@@ -131,6 +131,10 @@ if rows:
     print(f"\n[VKTSROW] per-expert GPU time by row count (level 2; dispatches serialized)")
     print(f"{'dev':>4} {'rows':>9} {'n':>8} {'gate_up us':>11} {'down us':>9} {'total us':>9} {'us/row':>8}")
     for d, lo, hi, n, gu, dn, to in rows:
-        mid = (int(lo) + int(hi)) / 2
-        print(f"{d:>4} {lo+'..'+hi:>9} {int(n):>8} {float(gu):>11.1f} {float(dn):>9.1f} {float(to):>9.1f} {float(to)/mid:>8.1f}")
+        # the engine's last bin has no upper bound (lo=65, hi prints as 64):
+        # render it as "65+" and size it at the chunk's own row ceiling
+        top = int(hi) >= int(lo)
+        label = f"{lo}..{hi}" if top else f"{lo}+"
+        mid = (int(lo) + int(hi)) / 2 if top else int(lo)
+        print(f"{d:>4} {label:>9} {int(n):>8} {float(gu):>11.1f} {float(dn):>9.1f} {float(to):>9.1f} {float(to)/mid:>8.1f}")
 PY

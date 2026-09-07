@@ -1,10 +1,34 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 12, 2026-09-07 17:00)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 13, 2026-09-07 20:10)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 13 (2026-09-07, 20:10): RP4 answered, and it closes the expert shader.**
+`COLI_VK_TIMESTAMPS` (off by default, bit-identical on and off, TTFT 1.00× with
+it on) puts `VK_QUERY_TYPE_TIMESTAMP` queries inside the expert group's command
+buffer on all three devices and, via `VK_EXT_calibrated_timestamps`, splits the
+CPU-side `eg` wait into queue latency, GPU busy per phase and fence tail. The
+answer, at 781 and 3 462 tokens with three repeats each: **of `eg`'s 58.1
+ms/token, 53.6 is the CPU experts running concurrently inside the same timer
+(92 %), GPU busy on the busiest device is 1.97, and the time the GPU actually
+makes the engine wait is 0.068 ms/token — 0.12 %.** P4b and P4c did not fail to
+move the expert group; the bucket was never GPU work, and both of §P4c's
+remaining suspects (per-dispatch fixed cost, occupancy at 8 output rows) are
+refuted by their own numbers. The per-expert table does find two real kernel
+facts — a one-row expert costs 2.7–3.4× a two-row one (the per-row shader's LDS
+bank conflict, `vk_tile_ok4` requires `S > 1`), and the R = 8 tile is not flat
+in rows because it re-reads 67.1 MB of activations per row against a 14.16 MB
+weight stream — but both are capped by `gpu_late`: **≤ 0.07 ms of a 120.6 ms
+prefill token, and ≤ 1.96 ms of a 167.5 ms decode token (1.2 %)**. Neither was
+built. The larger residual is host-side: `eg − cpu` is 4.5 ms/token in prefill
+and ~6.0 in decode for 126 issue/take pairs per token, which is `VK_PROF`'s
+question and §G13's shape of fix. **The prefill levers are unchanged and are
+not the GPU:** CPU experts 53.6 ms/token at 781 tokens, MLA attention 69.6
+ms/token at 3 462 (40 % of the token) — that is P5. Next: P5, then the
+upstream-`dev` merge.
 
 **Rev 12 (2026-09-07, 17:00): P6b in service — the CPU recurrence P6 forced is
 gone.** One KDA state+window set per KV slot on dev0, allocated in `model_load`
@@ -24,7 +48,8 @@ a 69 ms sync (156 MB of KDA spans, ~2 262 MB/s) where the old path was
 all (conv 2 with the 34-tool block: 5.15 s, t1/t2 = 279×). Price: the preload
 drops **1 296 → 1 248 heat-ranked experts** (48, 3.7 % of dev0's tier), hit
 rate unchanged. Serving since 16:50 at `--kv-slots 4` with `COLI_KDA_GPU=2`.
-Next: RP4, P5, then the upstream-`dev` merge.
+Next: RP4, P5, then the upstream-`dev` merge. (RP4 landed the same day — see
+rev 13.)
 
 **Rev 11 (2026-09-07, 12:30): P7 in service.** Prefix checkpoints in the
 engine (the `deepseek_v4.c` `v4_ckpt_*` pattern over the segment adapter's own
@@ -262,7 +287,8 @@ serving knob (rev 5's rule).
 | **P7** ✅ | Checkpoint the stable prefix (tools + base system) **and pin the per-turn context block** — spec `P7-PREFIX-CKPT-SPEC-2026-09.md`, built on `perf/p7-prefix-ckpt`, **in service 2026-09-07 12:25** (binary 19e28e72…, `GLM53_PREFIX_CKPT=1 COLI_PREFIX_PIN=1`, `--kv-slots 8`, `COLI_KDA_GPU=0`) | engine: the session's span list (11 DSA layers' latent/ikeys/igates rows + 34 KDA states/windows; **370 MB at 6 328 tokens**) copied at the prefix boundary the gateway sends in the 8th SUBMIT field (`src=hint`, verified against the prompt's own ids) or at the LCP of successive fresh prompts, persisted under `<SNAP>/.coli_ckpt`. Gateway: `COLI_PREFIX_PIN=1` keeps the `<memory_context>` block byte-identical across a conversation's turns | measured: new conversation with the 34-tool block **1 452 s → 5.30 s** (engine) / **8.93 s** (live gateway, restored from disk after a restart); re-ranked memory block **126.82 s → 3.00 s**, 17 tokens prefilled instead of 1 005; off (`GLM53_PREFIX_CKPT=0`) the engine is bit-identical to the pristine one | done | Opus (spec: Fable) | `p7_gate.sh` exits 0 on all five steps (§P7 in the record); live gateway `--prefix-ckpt` and `--pin-block` PASS with `CKPT hit` and `[pin] … hit` in the server log |
 | P9 (parked) | Pin mapped expert slots (`compat_mlock` at fill, unlock at evict) | upstream's datapoint on PR #1324 (2026-09-06): below ~1:1 model:RAM the kernel page LRU and the engine slot LRU disagree and a hit re-faults inside the matmul; rome sits near 1:1 once the engine's anon memory is counted, but shows ~0 major faults per request at 99 % residency — a robustness item (deterministic residency), not speed | none measured here; `ttft_serve.py` now prints majflt per request — build this only if that number stops being ~0 | 1 day | Sonnet | majflt per request stays 0 across a full gate with no `--warm` |
 | — | Housekeeping (not this track): merge upstream `dev` | #1325 (portable `st.h` mapping) and #1350 (RSS counts owned memory — the fix for the `eabeb9a` thrash CLAUDE.md warns about) are in upstream `dev` since 2026-09-05; this fork is 103 ahead / 64 behind since 2026-08-31. **Known conflict:** the fork's `glm53.c` still carries the #1324-style engine-local expert mapping (`expert_map_init`, `[MAP] … file mappati`); #1324 was closed as superseded on 2026-09-07 and the merge must replace that path with `dev`'s `st_map_shard_range` one, then re-run `prefill_gate.sh` and `rome_bench.sh`. #1321 (cache budget) is rebased on `dev` and open | — | 1–2 days | Opus | all four qwen38 tests pass, `prefill_gate.sh` and `rome_bench.sh` reproduce their last rows |
-| **P4b** ✗ / **P4c** ✅ | Tile shader variants: LDS staging measured 0.91× and was refused by the gate; vec4 x loads passed at 1.03× (neutral profile) and are in service. Neither moved the GPU expert group (58 ms/token, ~1.9 ms per expert call): the x-load hypothesis is out; next is **RP4 — GPU timestamps around each expert's dispatches** before any further shader work | | | | Opus | `prefill_gate.sh` |
+| **P4b** ✗ / **P4c** ✅ | Tile shader variants: LDS staging measured 0.91× and was refused by the gate; vec4 x loads passed at 1.03× (neutral profile) and are in service. **RP4 settled why neither moved the expert group: the 58 ms/token bucket is 92 % CPU experts overlapping inside the same timer, GPU busy on the busiest device is 1.97 ms/token, and the GPU makes the engine wait 0.068 ms/token.** There was nothing there to move; a shader that ran in zero time would have saved 0.06 % of the token. P4b's premise (get the activations out of global memory) was right — the tile re-reads 67.1 MB of activations per row, 4.7× its whole weight stream — and its implementation wrong; P4c's premise (too many loads, not too many bytes) was wrong. **No further expert-shader work on this track** | | | | Opus | `prefill_gate.sh` |
+| **RP4** ✅ | GPU-side timestamps on the expert group (`COLI_VK_TIMESTAMPS`, off by default; `perf/rp4-vk-timestamps`, **in service 2026-09-07 20:00**, binary `325c9c7a…`, serving script unchanged) | per-device `VK_QUERY_TYPE_TIMESTAMP` pool written at the top of the expert group's command buffer, between the gate+up and down phases and after the down phase (`=1`), plus per expert (`=2`, serializing and honest about it); `VK_EXT_calibrated_timestamps` (asked for only when the knob is set) maps the device clock onto `CLOCK_MONOTONIC`, which splits the CPU-side `eg` wait into queue latency / GPU busy per phase / fence tail, and yields `gpu_late` — the only part of the wait the GPU owns. `prefill_profile.sh` prints it as a row group under `eg` | measured at 781 and 3 462 tokens, three repeats each: GPU busy **1.97 / 0.93 / 0.89** ms/token on dev0/dev2/dev3, `gpu_late` **0.068** ms/token (0.12 % of `eg`), `queue_lat` 0.07–0.25; per-expert 232–235 µs (dev0, 9.3 rows) vs 84–86 µs (dev2/dev3, ~5 rows); a **one-row** expert costs 2.7–3.4× a two-row one because `vk_tile_ok4` requires `S > 1` and the per-row shader hits an LDS bank conflict. Prefill wall identical off / `=1` / `=2` | done | Opus | `rp4_chain.sh`: `prefill_gate.sh` OFF **rc 0** (bit-identical, TTFT 0.99×/1.00×/1.00×), `tworeq` 4 slots at `COLI_KDA_GPU=2` IDENTICAL with 0 forcing lines, `prefill_gate.sh` ON **rc 0** (bit-identical, TTFT 1.00× at every size) — §RP4 in the record |
 | P8 | Capacity (cross-ref) | int3 experts (`ROADMAP-2026-09.md` 4h / G15) | partial; tracked on the main roadmap | weeks | Opus | its own gate |
 
 Rev 1's "P4 — 4-accumulator BF16 prefill kernel (Q5)" is dropped from this

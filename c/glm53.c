@@ -1138,6 +1138,14 @@ static int kda_gpu_on(void) {
     if (g_kda_gpu < 0) g_kda_gpu = getenv("COLI_KDA_GPU") ? atoi(getenv("COLI_KDA_GPU")) : 0;
     return g_kda_gpu;
 }
+/* P5.2: one submit per layer per chunk for the prefill recurrence. On by
+ * default; =0 restores the S per-token submits, for the before/after profile
+ * in one binary. */
+static int g_kda_rows = -1;
+static int g_kda_rows_on(void) {
+    if (g_kda_rows < 0) g_kda_rows = getenv("COLI_KDA_ROWS") ? atoi(getenv("COLI_KDA_ROWS")) : 1;
+    return g_kda_rows;
+}
 static int g_kda_cpu = -1;
 static int g_kda_cpu_on(void) {
     if (g_kda_cpu < 0) g_kda_cpu = getenv("COLI_KDA_CPU") ? atoi(getenv("COLI_KDA_CPU")) : 0;
@@ -1234,6 +1242,18 @@ static void kda_layer_rows(const Cfg *c, const GLayer *l, const float *x, int S,
     const double _t2 = optime_on() ? optime_now() : 0.0;
 #ifndef COLI_VULKAN
     (void)layer; (void)gpu; (void)slot;
+#endif
+#ifdef COLI_VULKAN
+    /* P5.2: the S dispatches of one chunk in ONE command buffer, one submit,
+     * one fence, with a compute barrier between consecutive tokens -- the
+     * recurrence stays sequential, only the S-1 extra round trips go. Same
+     * shader, same push constants but `tok`, same device state at the end, so
+     * P6b's per-slot state and P7's capture are unaffected and the result is
+     * bit-identical to the per-token loop below. COLI_KDA_ROWS=0 restores it. */
+    if (gpu && S > 1 && g_kda_rows_on() &&
+        coli_vk_kda_step_rows(layer, slot, S, q, k, v, decay, beta, 1e-6f, core)) {
+        /* all S tokens advanced on the device */
+    } else
 #endif
     for (int t = 0; t < S; t++) {
         memcpy(qkv,         q + (size_t)t * P, (size_t)P * sizeof(float));

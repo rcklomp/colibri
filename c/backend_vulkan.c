@@ -140,7 +140,9 @@ static struct {
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 struct PCN { int S, D; float eps; };
-struct PCK { int heads, k_dim, v_dim, kernel; float norm_eps; };
+/* P5.2: `tok` selects this dispatch's slice of the chunk's qkv/gate/beta/out.
+ * Every single-token caller leaves it 0 and gets the indices it always had. */
+struct PCK { int heads, k_dim, v_dim, kernel; float norm_eps; int tok; };
 struct PCKD { int heads, k_dim; float gate_lb; };      /* kda_decay */
 struct PCKN { int heads, v_dim; float eps; };          /* kda_headnorm */
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
@@ -2608,6 +2610,99 @@ int coli_vk_kda_step(int layer, int slot, const float *qkv, const float *gate,
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kda queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] kda fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    memcpy(out, G.kda_out.ptr, ob);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* shared command buffer clobbered */
+    return 1;
+}
+
+/* P5.2: a whole prefill chunk's S tokens through one KDA layer in ONE submit.
+ *
+ * The recurrence is sequential in t and stays sequential: this records S
+ * dispatches into ONE command buffer with a compute barrier between each, so
+ * dispatch t+1 sees dispatch t's state and window writes. What it removes is
+ * the S-1 extra submit+fence round trips per layer per chunk -- the
+ * coli_vk_attn_qprep pattern, applied to a chain instead of a tree.
+ *
+ * Bit-identical to S coli_vk_kda_step() calls: same shader, same push
+ * constants apart from `tok`, same order, and the same state buffer mutated in
+ * the same sequence. The device state after the submit is exactly the state
+ * after S separate submits, so P6b's per-slot state and P7's capture
+ * (coli_vk_kda_sync) see what they saw before.
+ *
+ * q/k/v are [S][width], gate [S][width], beta [S][heads], out [S][heads*V].
+ * The three projections are copied into the qkv buffer in the per-token
+ * [q|k|v] layout the shader expects. Returns 0 (having done nothing) if the
+ * scratch cannot be reserved, so the caller keeps the per-token loop. */
+int coli_vk_kda_step_rows(int layer, int slot, int S,
+                          const float *q, const float *k, const float *v,
+                          const float *gate, const float *beta,
+                          float norm_eps, float *out) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (!kda_slot_ready(layer, slot)) return 0;
+    if (S < 1) return 0;
+    const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
+    const size_t width = (size_t)heads * (size_t)K;
+    const size_t wbytes = width * sizeof(float);
+    const size_t qb = 3u * width * (size_t)S * sizeof(float);
+    const size_t gb = width * (size_t)S * sizeof(float);
+    const size_t bb = (size_t)heads * (size_t)S * sizeof(float);
+    const size_t ob = (size_t)heads * V * (size_t)S * sizeof(float);
+    if (!scratch_reserve(&G.kda_qkv, qb) || !scratch_reserve(&G.kda_gate, gb) ||
+        !scratch_reserve(&G.kda_beta, bb) ||
+        !scratch_reserve_mt(&G.kda_out, ob, G.memtype_cached)) return 0;
+    for (int t = 0; t < S; t++) {
+        uint8_t *dst = (uint8_t *)G.kda_qkv.ptr + (size_t)t * 3u * wbytes;
+        memcpy(dst,               q + (size_t)t * width, wbytes);
+        memcpy(dst + wbytes,      k + (size_t)t * width, wbytes);
+        memcpy(dst + 2 * wbytes,  v + (size_t)t * width, wbytes);
+    }
+    memcpy(G.kda_gate.ptr, gate, gb);
+    memcpy(G.kda_beta.ptr, beta, bb);
+
+    VkDescriptorBufferInfo bi[7] = {
+        {.buffer = G.kda_slot[layer][slot].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_slot[layer][slot].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_qkv.buf,       .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_gate.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_beta.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_out.buf,       .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[7];
+    for (int i = 0; i < 7; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_kda,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 7, w, 0, NULL);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "kda rows resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "kda rows beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kda);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kda, 0, 1,
+                            &G.dset_kda, 0, NULL);
+    /* state and window are read AND written by every dispatch: the barrier has
+     * to order write->read and write->write, not just write->read. */
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    for (int t = 0; t < S; t++) {
+        struct PCK pc = {heads, K, V, G.kda[layer].kernel, norm_eps, t};
+        vkCmdPushConstants(G.cmd, G.plyt_kda, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+        if (t + 1 < S)
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    VKCHECK(vkEndCommandBuffer(G.cmd), "kda rows endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                       .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "kda rows resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kda rows queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] kda rows fence wait failed \u2014 disabling GPU offload\n");
         G.ready = 0; return 0;
     }
     memcpy(out, G.kda_out.ptr, ob);

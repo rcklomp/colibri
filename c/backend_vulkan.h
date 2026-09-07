@@ -117,6 +117,12 @@ int  coli_vk_kda_layer(int layer, int slot, ColiVkMM *proj, int nproj,
                        int stop_after_norm, float *out);
 int  coli_vk_kda_step(int layer, int slot, const float *qkv, const float *gate,
                       const float *beta, float norm_eps, float *out);
+/* P5.2: S tokens of a prefill chunk, S dispatches with barriers in ONE submit.
+ * q/k/v/gate are [S][heads*k_dim], beta [S][heads], out [S][heads*v_dim]. */
+int  coli_vk_kda_step_rows(int layer, int slot, int S,
+                           const float *q, const float *k, const float *v,
+                           const float *gate, const float *beta,
+                           float norm_eps, float *out);
 int  coli_vk_kda_sync(int layer, int slot, float *state, float *window);
 int  coli_vk_kda_upload(int layer, int slot, const float *state, const float *window);
 

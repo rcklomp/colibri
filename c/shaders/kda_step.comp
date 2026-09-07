@@ -34,6 +34,9 @@ layout(std430, binding = 6) writeonly buffer Out   { float outv[]; };    // [hea
 layout(push_constant) uniform P {
     int heads, k_dim, v_dim, kernel;
     float norm_eps;
+    int tok;        // P5.2: which token of the chunk this dispatch is, so a
+                    // whole prefill chunk records into ONE command buffer.
+                    // 0 for every single-token caller -> the same indices.
 } p;
 
 const int MAXK = 1024;      // per-head q/k/decay staged in LDS
@@ -47,12 +50,12 @@ float silu(float x) { return x / (1.0 + exp(-x)); }
 // One conv channel: shift the kernel-tap history left, append this token's
 // projection, dot with the taps, SiLU. The window shift is a register rename
 // here; on the CPU it is a 12-byte memmove per channel (24,576 of them a call).
-float conv_channel(int ch, int KER) {
+float conv_channel(int ch, int KER, uint qbase) {
     uint wbase = uint(ch) * uint(KER);
     uint cbase = wbase;
     float hist[8];
     for (int t = 0; t < KER - 1; t++) hist[t] = window[wbase + uint(t + 1)];
-    hist[KER - 1] = qkv[ch];
+    hist[KER - 1] = qkv[qbase + uint(ch)];
     float sum = 0.0;
     for (int t = 0; t < KER; t++) {
         window[wbase + uint(t)] = hist[t];
@@ -84,17 +87,25 @@ void main() {
     int tid = int(gl_LocalInvocationID.x);
     int K = p.k_dim, V = p.v_dim, KER = p.kernel;
     int width = p.heads * K;
+    // P5.2: this dispatch's slice of the chunk's host-side buffers. The state
+    // and the conv window are per (layer, slot) and are NOT offset: the
+    // recurrence is sequential in tok and the barriers between dispatches are
+    // what order it.
+    uint qbase = uint(p.tok) * uint(3 * width);
+    uint gbase = uint(p.tok) * uint(width);
+    uint bbase = uint(p.tok) * uint(p.heads);
+    uint obase = uint(p.tok) * uint(p.heads * V);
 
     // ---- short causal conv + SiLU, this head's 2*K + V channels ----
     // Channel groups match coli_kda_step's `mixed` layout exactly:
     //   q: [h*K, h*K+K)   k: [width + h*K, ...)   v: [2*width + h*V, ...)
     for (int i = tid; i < K; i += 128) {
-        sq[i] = conv_channel(h * K + i, KER);
-        sk[i] = conv_channel(width + h * K + i, KER);
-        sd[i] = gate[h * K + i];
+        sq[i] = conv_channel(h * K + i, KER, qbase);
+        sk[i] = conv_channel(width + h * K + i, KER, qbase);
+        sd[i] = gate[gbase + uint(h * K + i)];
     }
     float val = 0.0;
-    if (tid < V) val = conv_channel(2 * width + h * V + tid, KER);
+    if (tid < V) val = conv_channel(2 * width + h * V + tid, KER, qbase);
     barrier();
 
     // ---- q/k RMS norms (tree-reduced; see block_sum for why that is fine) ----
@@ -109,7 +120,7 @@ void main() {
 
     if (tid >= V) return;
     uint base = uint(h) * uint(K) * uint(V);
-    float bh = beta[h];
+    float bh = beta[bbase + uint(h)];
 
     // ---- pass one: decay the state, read what it predicts for this key ----
     float mem = 0.0;
@@ -127,5 +138,5 @@ void main() {
         state[idx] = r;
         res += (sq[k] * query_norm) * r;
     }
-    outv[uint(h) * uint(V) + uint(tid)] = res;
+    outv[obase + uint(h) * uint(V) + uint(tid)] = res;
 }

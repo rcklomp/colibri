@@ -48,6 +48,5 @@ cublasLt64*.dll
 cudart64*.dll
 glm53
 qwen36
-shaders/attention_absorb.spv
-shaders/qmatmul_gate_up.spv
-shaders/rmsnorm.spv
+shaders/*.spv
+qwen38-vk

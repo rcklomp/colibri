@@ -1,0 +1,106 @@
+#version 450
+// P4 (tools/hot-expert/P4-STILE-SHADER-SPEC-2026-09.md): qmatmul.comp for a
+// TILE of R input rows per workgroup instead of one.
+//
+// The per-row kernel (qmatmul.comp) is dispatched (ceil(O/8), S, 1): every
+// input row s re-reads the whole weight matrix, so S rows cost S x |W| of VRAM
+// traffic. Here gl_WorkGroupID.y indexes a tile of R rows; each lane loads a
+// packed weight word ONCE and applies it to R accumulators. Per row the
+// arithmetic is the per-row shader's: the same lane owns the same words in the
+// same order, a += x * decode(word) per element, then the group scale, then
+// the same subgroupAdd -- so y[s, o] is meant to be bit-identical to
+// qmatmul.comp (the gate checks; if a compiler contraction differs, the host
+// knob COLI_VK_TILE=0 restores the per-row pipeline).
+//
+// x is read from global memory as vec4 (v3, P4c): v1 read it as 64 scalar
+// loads per lane per weight word and was bound by those loads (VK_PROF
+// 2026-09-06: 0.8 ms of fence wait per dense call); v2 staged the tile in
+// shared memory and was slower still (125.9 -> 143.4 ms/token: the staging
+// traffic per workgroup exceeds the weight bytes it saves, and the lane
+// pattern into the LDS is bank-conflicted). Here each row costs two 16-byte
+// loads per word; the per-element FMAs stay in the per-row shader's order
+// (components .x .y .z .w in sequence, one accumulator per row), so y[s, o]
+// stays bit-identical. Formats: 1 (int8, per-row scale) and 4 (grouped
+// int4). The host dispatches this pipeline only for those, only when S > 1,
+// and only when I % 8 == 0.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X  { vec4 x4[]; };   // v3: 16-byte loads; host gates I % 8 == 0
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;
+    int S, I, O;
+    int rowWords;
+    int gs;
+} p;
+
+const int R = 8;
+
+float i8(uint word, int lane) {
+    int b = int((word >> (uint(lane) * 8u)) & 0xffu);
+    if (b >= 128) b -= 256;
+    return float(b);
+}
+float i4(uint word, int lane) {
+    return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
+}
+
+void main() {
+    int s0     = int(gl_WorkGroupID.y) * R;
+    int rows   = min(R, p.S - s0);
+    int tid    = int(gl_LocalInvocationID.x);
+    int nth    = int(gl_WorkGroupSize.x);
+    int sg     = int(gl_SubgroupID);
+    int lane   = int(gl_SubgroupInvocationID);
+    int sgsize = int(gl_SubgroupSize);
+    int nsg    = nth / sgsize;
+    int stride = int(gl_NumWorkGroups.x) * nsg;
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rowBase = uint(o) * uint(p.rowWords);
+        float sum[R];
+        for (int r = 0; r < R; r++) sum[r] = 0.0;
+        if (p.fmt == 1) {
+            int words = (p.I + 3) / 4;
+            int I4 = p.I / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)];
+                float w0 = i8(pk, 0), w1 = i8(pk, 1), w2 = i8(pk, 2), w3 = i8(pk, 3);
+                for (int r = 0; r < R; r++) {
+                    if (r < rows) {
+                        vec4 xv = x4[(s0 + r) * I4 + wi];
+                        sum[r] += xv.x * w0; sum[r] += xv.y * w1; sum[r] += xv.z * w2; sum[r] += xv.w * w3;
+                    }
+                }
+            }
+        } else { // fmt 4: grouped int4, per-word group scale (gs % 8 == 0, host-gated)
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            int I4 = p.I / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                float w0 = i4(pk, 0), w1 = i4(pk, 1), w2 = i4(pk, 2), w3 = i4(pk, 3);
+                float w4 = i4(pk, 4), w5 = i4(pk, 5), w6 = i4(pk, 6), w7 = i4(pk, 7);
+                float sc = scale[sb + uint(i0 / p.gs)];
+                for (int r = 0; r < R; r++) {
+                    if (r < rows) {
+                        vec4 xa = x4[(s0 + r) * I4 + wi * 2], xb = x4[(s0 + r) * I4 + wi * 2 + 1];
+                        float a = 0.0;
+                        a += xa.x * w0; a += xa.y * w1; a += xa.z * w2; a += xa.w * w3;
+                        a += xb.x * w4; a += xb.y * w5; a += xb.z * w6; a += xb.w * w7;
+                        sum[r] += a * sc;
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < R; r++) {
+            float tot = subgroupAdd(sum[r]);          // uniform control flow: every lane, every r
+            if (lane == 0 && r < rows)
+                y[(s0 + r) * p.O + o] = (p.fmt == 4) ? tot : tot * scale[o];
+        }
+    }
+}

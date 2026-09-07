@@ -977,6 +977,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
+    q38_ik_pool_reset(m);
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
     int len = np;
@@ -1012,6 +1013,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
+    q38_ik_pool_reset(m);
     double nll = 0; int scored = 0;
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
@@ -1456,6 +1458,24 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
     double attention=timers->seconds[Q38_TM_DELTANET]+
                      timers->seconds[Q38_TM_QSA_INDEX]+
                      timers->seconds[Q38_TM_QSA_ATTENTION];
+    if(getenv("Q38_PROF")){
+        double total=wall_s>0?wall_s:1.0;
+        fprintf(stderr,
+          "[Q38PROF] wall=%.1fs gen=%d | expert_read=%.2fs(%.0f%%) fp8_expand=%.2fs(%.0f%%) "
+          "expert_compute=%.2fs(%.0f%%) attention=%.2fs(%.0f%%) lm_head=%.2fs(%.0f%%)\n",
+          wall_s,completion_tokens,
+          expert_read,100*expert_read/total,
+          fp8_expand,100*fp8_expand/total,
+          expert_compute,100*expert_compute/total,
+          attention,100*attention/total,
+          timers->seconds[Q38_TM_LM_HEAD],100*timers->seconds[Q38_TM_LM_HEAD]/total);
+        fprintf(stderr,
+          "[Q38PROF] deltanet=%.2fs qsa_index=%.2fs qsa_attn=%.2fs dense_matmul=%.2fs ple=%.2fs "
+          "| map_serve=%ld map_copy=%ld\n",
+          timers->seconds[Q38_TM_DELTANET],timers->seconds[Q38_TM_QSA_INDEX],
+          timers->seconds[Q38_TM_QSA_ATTENTION],timers->seconds[Q38_TM_DENSE_MATMUL],
+          timers->seconds[Q38_TM_PLE],q38_map_serve,q38_map_copy);
+    }
     int count=snprintf(out,capacity,
         "PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",
         wall_s,prompt_tokens,completion_tokens,expert_read,
@@ -1501,7 +1521,7 @@ static int serve_one(Model *m, ServeReq *q){
     if(reuse==np){
         const float *cached=q38_prefix_cached_logits(m);
         if(!cached){
-            q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
+            q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;q38_ik_pool_reset(m);
             lo=step(m,ids,np,0);reuse=0;
         }else{
             lo=falloc(m->c.vocab);
@@ -1512,7 +1532,7 @@ static int serve_one(Model *m, ServeReq *q){
     }else{
         /* A miss invalidates the snapshot before reset so no later request can
          * pair its recurrent state with the old token record. */
-        q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
+        q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;q38_ik_pool_reset(m);
         lo=step(m,ids,np,0);
     }
     if(reuse!=np&&!q38_prefix_cache_save(m,ids,np,lo)&&getenv("Q38_PREFIX_LOG"))
@@ -1735,6 +1755,9 @@ int main(int argc, char **argv) {
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);
+#ifdef Q38_VK_TIER
+    q38vk_preload(&m);   /* needs the histogram rt_load just read */
+#endif
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
@@ -2246,8 +2269,10 @@ static int qwen38_segment_session_run(void *impl,const ColiSegmentRunRequest *r,
     if(r->output!=r->input)memcpy(r->output,r->input,bytes);
     pthread_mutex_lock(&e->run_lock); Model *m=&e->model;
     m->K=s->K;m->V=s->V;m->IK=s->IK;m->DN_rec=s->DN_rec;m->DN_conv=s->DN_conv;m->ple_history=s->ple_history;m->ple_history_len=s->ple_history_len;m->PLE_conv_state=s->PLE_conv_state;m->kv_cap=(int)s->context_tokens;m->kv_len=(int)s->position;
+    m->IK_pooled=NULL;m->IK_pooled_count=NULL;
     q38_layers_forward_range(m,(float*)r->output,r->token_ids,(int)r->rows,(int)r->position,(int)e->layer_begin,(int)e->layer_end);
     s->ple_history_len=m->ple_history_len;m->K=NULL;m->V=NULL;m->IK=NULL;m->DN_rec=NULL;m->DN_conv=NULL;m->ple_history=NULL;m->PLE_conv_state=NULL;m->kv_len=0;
+    m->IK_pooled=NULL;m->IK_pooled_count=NULL;
     pthread_mutex_unlock(&e->run_lock);s->position+=r->rows;return 0;
 }
 

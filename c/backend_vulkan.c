@@ -35,6 +35,7 @@ typedef struct {
  * kernel reads them in place. Allocated once at max_t rows, like the CUDA
  * kv_dev shadow. */
 #define VK_KV_LAYERS 160
+#define VK_KDA_LAYERS 64      /* GLM-5.3 has 34 KDA layers; headroom for the test slots */
 typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
     int rows, K, R;
@@ -58,6 +59,10 @@ static struct {
     /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
     VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
     VkPipeline pipe_gu; VkDescriptorPool dpool_gu; VkDescriptorSet dset_gu;
+    /* P4: S-tiled variants of pipe / pipe_gu (same layouts, same bindings);
+     * VK_NULL_HANDLE when the shader is absent or COLI_VK_TILE=0. Used only
+     * for S > 1 and fmt 1/4 -- decode never sees them. */
+    VkShaderModule shader_t, shader_gu_t; VkPipeline pipe_t, pipe_gu_t; int tile_on;
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
@@ -82,6 +87,24 @@ static struct {
     VkPipeline pipe_nrm; VkDescriptorPool qprep_pool; VkDescriptorSet dset_qp3, dset_nrm;
     Scratch qp1, qp2;
     VkBuffer lnbuf[VK_KV_LAYERS]; VkDeviceMemory lnmem[VK_KV_LAYERS]; int lnlen[VK_KV_LAYERS];
+    /* KDA recurrence (G12): state and conv window live on the device for the whole
+     * session — 4 MB + 393 KB per layer at GLM's shape, 136 MB over 34 layers.
+     * Reading them back per call would be ~5 ms/token over PCIe, a third of the
+     * win, so the host copies go stale and re-sync only at segment export/import
+     * (coli_vk_kda_sync). conv taps are immutable, uploaded once with the rest. */
+    VkShaderModule shader_kda; VkDescriptorSetLayout dsl_kda; VkPipelineLayout plyt_kda;
+    VkPipeline pipe_kda; VkDescriptorPool kda_pool; VkDescriptorSet dset_kda;
+    /* chain stages (G12): decay/beta gating and the per-head output norm, so a
+     * layer's projections + recurrence + ko record into ONE command buffer. */
+    VkShaderModule shader_kdec, shader_khn;
+    VkDescriptorSetLayout dsl_kdec, dsl_khn;
+    VkPipelineLayout plyt_kdec, plyt_khn;
+    VkPipeline pipe_kdec, pipe_khn;
+    VkDescriptorPool kchain_pool; VkDescriptorSet dset_kdec, dset_khn, dset_kko;
+    struct { VkBuffer state, window, conv, alog, dt, onorm;
+             void *state_p, *window_p, *conv_p, *alog_p, *dt_p, *onorm_p;
+             size_t sbytes, wbytes, cbytes; int heads, k, v, kernel; } kda[VK_KDA_LAYERS];
+    Scratch kda_qkv, kda_gate, kda_beta, kda_out;
     Scratch att_sc;              /* attention score scratch (GPU-only) */
     Scratch att_ctx;             /* fused absorb+o: ctx stays on device (GPU-only) */
     Scratch y2;                  /* second output of the fused matmul pair (readback) */
@@ -92,6 +115,7 @@ static struct {
      * expert-called-repeatedly pattern). The synchronous fence wait each call means no
      * submission is ever in flight, so rebinding/re-recording only when something
      * actually changed is safe. */
+    VkDescriptorPool mm_pool; VkDescriptorSet mm_set[VK_MM_MAX];  /* batched dense matvec */
     ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, cmd_ready;
     VkBuffer bound_xbuf, bound_ybuf;
     size_t used_bytes, tensor_count;
@@ -106,6 +130,9 @@ static struct {
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 struct PCN { int S, D; float eps; };
+struct PCK { int heads, k_dim, v_dim, kernel; float norm_eps; };
+struct PCKD { int heads, k_dim; float gate_lb; };      /* kda_decay */
+struct PCKN { int heads, v_dim; float eps; };          /* kda_headnorm */
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
@@ -202,7 +229,7 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
 static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt(s, bytes, G.memtype); }
 
 static int rowwords(int fmt, int I) {
-    size_t rb = fmt == 1 ? (size_t)I                         // bytes/row on CPU side
+    size_t rb = (fmt == 1 || fmt == 8) ? (size_t)I            // bytes/row on CPU side
               : fmt == 5 ? ((size_t)I + 63) / 64 * 24        // int3-g64: 24B per 64-group
               : (size_t)(I + 1) / 2;
     return (int)((rb + 3) / 4);                              // padded to uint32 (24|4: exact)
@@ -213,6 +240,8 @@ static size_t scale_floats(int fmt, int I, int O, int gs) {
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
+    if (fmt == 8)                                          // 128x128-blocked [ceil(O/128),ceil(I/128)]
+        return (((size_t)O + 127) / 128) * (((size_t)I + 127) / 128);
     return (size_t)O;
 }
 
@@ -264,6 +293,31 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
         .descriptorPool = *dpool, .descriptorSetCount = 1, .pSetLayouts = dsl};
     VKCHECK(vkAllocateDescriptorSets(dev, &dsa, dset), "allocDescSet");
     return 1;
+}
+
+/* P4: a second pipeline on an EXISTING layout, so the descriptor sets
+ * allocated for the per-row pipeline bind unchanged. */
+static VkPipeline build_pipeline_on(VkDevice dev, VkShaderModule shader, VkPipelineLayout plyt) {
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+        .layout = plyt};
+    if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return pipe;
+}
+/* COLI_VK_TILE=0 turns the tiled pipelines off (bisection); default on. */
+static int vk_tile_env(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("COLI_VK_TILE") ? atoi(getenv("COLI_VK_TILE")) : 1;
+    return v;
+}
+#define VK_TILE_R 8
+/* rows -> workgroup rows for the tiled pipeline */
+#define VK_TILES(S) ((uint32_t)(((S) + VK_TILE_R - 1) / VK_TILE_R))
+static inline int vk_tile_ok4(VkPipeline tile, int fmt, int S, int I) {
+    /* P4c: the tiled shaders read x as vec4 and whole packed words */
+    return tile != VK_NULL_HANDLE && S > 1 && (fmt == 1 || fmt == 4) && (I % 8) == 0;
 }
 
 /* "…/qmatmul.spv" -> "…/qmatmul<suffix>" (sibling of the main shader). */
@@ -400,12 +454,62 @@ int coli_vk_init(const char *spv_path) {
      * (single-matmul path keeps working). */
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
     G.shader_gu = load_spv(G.dev, gu_path);
+    /* P4 tiles: optional; absent shader or COLI_VK_TILE=0 -> per-row pipelines only. */
+    G.tile_on = vk_tile_env();
+    G.pipe_t = G.pipe_gu_t = VK_NULL_HANDLE;
+    if (G.tile_on) {
+        char t_path[512]; derive_sibling(spv_path, "_tile.spv", t_path, sizeof(t_path));
+        G.shader_t = load_spv(G.dev, t_path);
+        if (G.shader_t) G.pipe_t = build_pipeline_on(G.dev, G.shader_t, G.plyt);
+    }
     if (G.shader_gu && !build_pipeline(G.dev, 6, sizeof(struct PC), G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
         return 0;
+    if (G.tile_on && G.pipe_gu) {
+        char gt_path[512]; derive_sibling(spv_path, "_gate_up_tile.spv", gt_path, sizeof(gt_path));
+        G.shader_gu_t = load_spv(G.dev, gt_path);
+        if (G.shader_gu_t) G.pipe_gu_t = build_pipeline_on(G.dev, G.shader_gu_t, G.plyt_gu);
+    }
+    if (G.tile_on) fprintf(stderr, "[VK] P4 tiles: dense %s, gate_up %s\n",
+                           G.pipe_t ? "on" : "off", G.pipe_gu_t ? "on" : "off");
 
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
     /* Optional rmsnorm pipeline: enables the pair->norm->q_b single-submit chain
      * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
+    /* Optional KDA recurrence pipeline (G12). Absent -> COLI_KDA_GPU is a no-op
+     * and the engine keeps the CPU coli_kda_step, which stays the reference. */
+    char kda_path[512]; derive_dir_file(spv_path, "kda_step.spv", kda_path, sizeof(kda_path));
+    G.shader_kda = load_spv(G.dev, kda_path);
+    if (G.shader_kda) {
+        VkDescriptorPool kp; VkDescriptorSet ks;
+        if (!build_pipeline(G.dev, 7, sizeof(struct PCK), G.shader_kda,
+                            &G.dsl_kda, &G.plyt_kda, &G.pipe_kda, &kp, &ks))
+            return 0;
+        G.kda_pool = kp; G.dset_kda = ks;
+        /* the other two chain stages; either missing -> no chain, step-only path */
+        char d_path[512], n_path[512];
+        derive_dir_file(spv_path, "kda_decay.spv", d_path, sizeof(d_path));
+        derive_dir_file(spv_path, "kda_headnorm.spv", n_path, sizeof(n_path));
+        G.shader_kdec = load_spv(G.dev, d_path);
+        G.shader_khn  = load_spv(G.dev, n_path);
+        if (G.shader_kdec && G.shader_khn) {
+            VkDescriptorPool p1, p2; VkDescriptorSet s1, s2;
+            if (!build_pipeline(G.dev, 4, sizeof(struct PCKD), G.shader_kdec,
+                                &G.dsl_kdec, &G.plyt_kdec, &G.pipe_kdec, &p1, &s1) ||
+                !build_pipeline(G.dev, 4, sizeof(struct PCKN), G.shader_khn,
+                                &G.dsl_khn, &G.plyt_khn, &G.pipe_khn, &p2, &s2))
+                return 0;
+            G.dset_kdec = s1; G.dset_khn = s2;
+            /* one more 4-binding matmul set for the chain's ko */
+            VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
+            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+            VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.kchain_pool), "kchain descPool");
+            VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = G.kchain_pool, .descriptorSetCount = 1, .pSetLayouts = &G.dsl};
+            VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_kko), "kchain descSet");
+        }
+    }
+
     char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
     G.shader_nrm = load_spv(G.dev, nrm_path);
     if (G.shader_nrm) {
@@ -507,13 +611,13 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&              /* fmt=4/7: word-aligned groups only */
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&  /* fmt=4/7: word-aligned groups only */
         !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
-    size_t cpu_rb = fmt == 1 ? (size_t)I
+    size_t cpu_rb = (fmt == 1 || fmt == 8) ? (size_t)I
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
     t->wbytes = stride * (size_t)O;
@@ -618,13 +722,14 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        const int tiled = vk_tile_ok4(G.pipe_t, fmt, S, I);   /* P4: S rows per weight read */
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tiled ? G.pipe_t : G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
          * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
-        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)S, 1);
+        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), tiled ? VK_TILES(S) : (uint32_t)S, 1);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
     }
@@ -655,6 +760,111 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     return 1;
 }
 
+/* Batched dense matvec: N independent (tensor -> output) pairs that all consume
+ * the SAME input vector, recorded into one command buffer and submitted once.
+ * The dense path pays ~0.4 ms of submit+fence per call regardless of matrix
+ * size, so N separate calls pay N round trips for work the GPU finishes inside
+ * one of them. Returns 0 (and touches nothing) if it cannot serve the batch, so
+ * the caller can fall back to N plain coli_vk_matmul calls. */
+int coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I) {
+    if (!G.ready || count < 1 || count > VK_MM_MAX || I < 1) return 0;
+    /* Chained items must follow the independent ones: one barrier, two stages. */
+    int nchained = 0;
+    for (int c = 0; c < count; c++) {
+        const int src = items[c].src;
+        if (src < 0) { if (nchained) return 0; continue; }
+        if (src >= c) return 0;            /* must already have been produced */
+        if (items[src].src >= 0) return 0; /* only one level of chaining */
+        nchained++;
+    }
+    for (int c = 0; c < count; c++) {
+        const int iw = items[c].src < 0 ? I : items[items[c].src].O;
+        if (iw < 1) return 0;
+        items[c].I = iw;
+        if (!upload_tensor(items[c].tensor, items[c].weights, items[c].scales,
+                           items[c].fmt, iw, items[c].O, items[c].gs)) return 0;
+    }
+
+    /* y offsets must satisfy the storage-buffer offset alignment; 256 covers it. */
+    size_t yoff[VK_MM_MAX], ytot = 0;
+    for (int c = 0; c < count; c++) {
+        yoff[c] = ytot;
+        ytot += ((size_t)items[c].O * sizeof(float) + 255) & ~(size_t)255;
+    }
+    const size_t xb = (size_t)I * sizeof(float);
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, ytot, G.memtype_cached)) return 0;
+    memcpy(G.x.ptr, x, xb);
+
+    if (!G.mm_pool) {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * VK_MM_MAX};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = VK_MM_MAX, .poolSizeCount = 1, .pPoolSizes = &ps};
+        VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.mm_pool), "mm descPool");
+        VkDescriptorSetLayout ls[VK_MM_MAX];
+        for (int c = 0; c < VK_MM_MAX; c++) ls[c] = G.dsl;
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = G.mm_pool, .descriptorSetCount = VK_MM_MAX, .pSetLayouts = ls};
+        VKCHECK(vkAllocateDescriptorSets(G.dev, &ai, G.mm_set), "mm descSets");
+    }
+
+    for (int c = 0; c < count; c++) {
+        ColiVkTensor *t = *items[c].tensor;
+        const int src = items[c].src;
+        VkDescriptorBufferInfo bi[4] = {
+            src < 0 ? (VkDescriptorBufferInfo){.buffer = G.x.buf, .range = VK_WHOLE_SIZE}
+                    : (VkDescriptorBufferInfo){.buffer = G.y.buf, .offset = yoff[src],
+                                               .range = (VkDeviceSize)items[src].O * sizeof(float)},
+            {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = G.y.buf, .offset = yoff[c], .range = (VkDeviceSize)items[c].O * sizeof(float)}};
+        VkWriteDescriptorSet w[4];
+        for (int i = 0; i < 4; i++) w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.mm_set[c],
+            .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+        vkUpdateDescriptorSets(G.dev, 4, w, 0, NULL);
+    }
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "mm resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "mm beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    int barrier_done = 0;
+    for (int c = 0; c < count; c++) {
+        ColiVkTensor *t = *items[c].tensor;
+        if (items[c].src >= 0 && !barrier_done) {
+            VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            barrier_done = 1;
+        }
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.mm_set[c], 0, NULL);
+        struct PC pc = {items[c].fmt, 1, items[c].I, items[c].O, t->rowWords, t->gs};
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd, (uint32_t)((items[c].O + 7) / 8), 1, 1);
+    }
+    VKCHECK(vkEndCommandBuffer(G.cmd), "mm endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "mm resetFence");
+    double _s0 = G.eg_prof ? vk_now() : 0;
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "mm queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] batched matmul fence wait failed - disabling GPU offload\n");
+        G.ready = 0; G.cmd_ready = 0; G.bound_tensor = NULL;
+        return 0;
+    }
+    if (G.eg_prof) { double _d = vk_now() - _s0; g_vsub_ms += _d; g_vwait_ms += 0; g_vsub_n++; }
+    for (int c = 0; c < count; c++)
+        if (items[c].out)
+            memcpy(items[c].out, (const uint8_t *)G.y.ptr + yoff[c], (size_t)items[c].O * sizeof(float));
+
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
+    return 1;
+}
+
 /* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE
  * dispatch that reads x once for both projections. gate/up are resident (uploaded on
  * first call). D = input (hidden) dim, I = moe_inter. Returns 0 -> caller falls back. */
@@ -682,11 +892,12 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    const int tiled_gu = vk_tile_ok4(G.pipe_gu_t, fmt, S, D);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tiled_gu ? G.pipe_gu_t : G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs};   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)S, 1);
+    vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), tiled_gu ? VK_TILES(S) : (uint32_t)S, 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
@@ -774,21 +985,32 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
-    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
-    for (int c = 0; c < count; c++) {
-        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
-        vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
+    /* P4: an expert with more than one row runs the tiled pipeline (one weight
+     * read per output row for up to VK_TILE_R rows); single-row experts and
+     * formats the tile does not implement keep the per-row pipeline. */
+    {
+        VkPipeline cur = VK_NULL_HANDLE;
+        for (int c = 0; c < count; c++) {
+            VkPipeline want = vk_tile_ok4(G.pipe_gu_t, fmt, rows[c], D) ? G.pipe_gu_t : G.pipe_gu;
+            if (want != cur) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
+            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
+            vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), want == G.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+        }
     }
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* phase 2: down projection hidden -> y */
-    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-    for (int c = 0; c < count; c++) {
-        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
-        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
-        vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
+    {
+        VkPipeline cur = VK_NULL_HANDLE;
+        for (int c = 0; c < count; c++) {
+            VkPipeline want = vk_tile_ok4(G.pipe_t, dfmt, rows[c], I) ? G.pipe_t : G.pipe;
+            if (want != cur) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
+            struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
+            vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), want == G.pipe_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+        }
     }
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
@@ -853,6 +1075,7 @@ static struct {
     VkShaderModule sh_qmm, sh_gu;
     VkDescriptorSetLayout dsl, dsl_gu; VkPipelineLayout plyt, plyt_gu;
     VkPipeline pipe, pipe_gu;
+    VkShaderModule sh_qmm_t, sh_gu_t; VkPipeline pipe_t, pipe_gu_t;   /* P4 tiles */
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
@@ -920,14 +1143,14 @@ static int arena_suballoc_d2(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&
         !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
     t->dev = 1;
     size_t stride = (size_t)t->rowWords * 4;
-    size_t cpu_rb = fmt == 1 ? (size_t)I
+    size_t cpu_rb = (fmt == 1 || fmt == 8) ? (size_t)I
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);
     t->wbytes = stride * (size_t)O;
@@ -1018,6 +1241,16 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     VkDescriptorPool dp; VkDescriptorSet ds;   /* build_pipeline's singleton set: unused here */
     if (!build_pipeline(G2.dev, 4, sizeof(struct PC), G2.sh_qmm, &G2.dsl, &G2.plyt, &G2.pipe, &dp, &ds)) return 0;
     if (!build_pipeline(G2.dev, 6, sizeof(struct PC), G2.sh_gu, &G2.dsl_gu, &G2.plyt_gu, &G2.pipe_gu, &dp, &ds)) return 0;
+    G2.pipe_t = G2.pipe_gu_t = VK_NULL_HANDLE;   /* P4 tiles, optional */
+    if (vk_tile_env()) {
+        char t_path[512], gt_path[512];
+        derive_sibling(spv_path, "_tile.spv", t_path, sizeof(t_path));
+        derive_sibling(spv_path, "_gate_up_tile.spv", gt_path, sizeof(gt_path));
+        G2.sh_qmm_t = load_spv(G2.dev, t_path);
+        G2.sh_gu_t = load_spv(G2.dev, gt_path);
+        if (G2.sh_qmm_t) G2.pipe_t = build_pipeline_on(G2.dev, G2.sh_qmm_t, G2.plyt);
+        if (G2.sh_gu_t) G2.pipe_gu_t = build_pipeline_on(G2.dev, G2.sh_gu_t, G2.plyt_gu);
+    }
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G2.qfam};
     VKCHECK(vkCreateCommandPool(G2.dev, &cpci, NULL, &G2.cpool), "d2 cmdPool");
@@ -1116,20 +1349,28 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G2.cmd, &begin), "d2 eg beginCmd");
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
-    vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.pipe_gu);
-    for (int c = 0; c < count; c++) {
-        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-        vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
-        vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
+    {   /* P4: tiled pipeline for experts with more than one row */
+        VkPipeline cur = VK_NULL_HANDLE;
+        for (int c = 0; c < count; c++) {
+            VkPipeline want = vk_tile_ok4(G2.pipe_gu_t, fmt, rows[c], D) ? G2.pipe_gu_t : G2.pipe_gu;
+            if (want != cur) { vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
+            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+            vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
+            vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), want == G2.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+        }
     }
     vkCmdPipelineBarrier(G2.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.pipe);
-    for (int c = 0; c < count; c++) {
-        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
-        vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt, 0, 1, &G2.dn[c], 0, NULL);
-        vkCmdPushConstants(G2.cmd, G2.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G2.cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
+    {
+        VkPipeline cur = VK_NULL_HANDLE;
+        for (int c = 0; c < count; c++) {
+            VkPipeline want = vk_tile_ok4(G2.pipe_t, dfmt, rows[c], I) ? G2.pipe_t : G2.pipe;
+            if (want != cur) { vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
+            struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+            vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt, 0, 1, &G2.dn[c], 0, NULL);
+            vkCmdPushConstants(G2.cmd, G2.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G2.cmd, (uint32_t)((D + 7) / 8), want == G2.pipe_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+        }
     }
     VKCHECK(vkEndCommandBuffer(G2.cmd), "d2 eg endCmd");
     if (G.eg_prof) { tA = vk_now(); q_rec += tA - t0; t0 = tA; }
@@ -1167,6 +1408,356 @@ int coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
     if (G2.inflight) return 0;
     if (!eg2_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
     return coli_vk_expert_group_take2(y);
+}
+
+/* ==================== THIRD DEVICE: expert tier only (COLI_VK_DEV3) ============
+ * A self-contained context for a second Vulkan GPU (e.g. an RX 580 beside the
+ * RX 9070) that hosts ONLY resident tier experts and runs ONLY the async
+ * expert-group path (fused gate_up -> down). Attention, dense, q-prep and the
+ * KV mirror stay on device 0. Deliberately separate from G so the device-0 hot
+ * path is untouched and both groups can be in flight simultaneously. The same
+ * physical device as dev0 is allowed when forced by index (a second logical
+ * device — the pre-hardware test mode); `auto` requires a distinct real GPU. */
+static struct {
+    int ready;
+    VkPhysicalDevice phys; VkDevice dev; VkQueue queue; uint32_t qfam;
+    uint32_t memtype, memtype_cached;
+    VkShaderModule sh_qmm, sh_gu;
+    VkDescriptorSetLayout dsl, dsl_gu; VkPipelineLayout plyt, plyt_gu;
+    VkPipeline pipe, pipe_gu;
+    VkShaderModule sh_qmm_t, sh_gu_t; VkPipeline pipe_t, pipe_gu_t;   /* P4 tiles */
+    VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
+    VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
+    Scratch x, h, y;
+    int inflight; size_t pending_yb;
+    VkWArena *arena;
+    size_t used_bytes, tensor_count;
+    int has_budget;
+} G3;
+
+static int alloc_hostvis_d3(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VKCHECK(vkCreateBuffer(G3.dev, &bi, NULL, buf), "d3 vkCreateBuffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G3.dev, *buf, &req);
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = memtype};
+    VKCHECK(vkAllocateMemory(G3.dev, &ai, NULL, mem), "d3 vkAllocateMemory");
+    VKCHECK(vkBindBufferMemory(G3.dev, *buf, *mem, 0), "d3 vkBindBufferMemory");
+    if (ptr) VKCHECK(vkMapMemory(G3.dev, *mem, 0, bytes, 0, ptr), "d3 vkMapMemory");
+    return 1;
+}
+static int scratch_reserve_d3(Scratch *s, size_t bytes, uint32_t memtype) {
+    if (s->cap >= bytes) return 1;
+    if (s->buf) { vkDestroyBuffer(G3.dev, s->buf, NULL); vkFreeMemory(G3.dev, s->mem, NULL); }
+    s->buf = VK_NULL_HANDLE; s->cap = 0; s->ptr = NULL;
+    if (!alloc_hostvis_d3(bytes, &s->buf, &s->mem, &s->ptr, memtype)) return 0;
+    s->cap = bytes;
+    return 1;
+}
+static int arena_suballoc_d3(size_t bytes, VkBuffer *buf, void **ptr) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VKCHECK(vkCreateBuffer(G3.dev, &bi, NULL, buf), "d3 vkCreateBuffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G3.dev, *buf, &req);
+    if (!(req.memoryTypeBits & (1u << G3.memtype))) { vkDestroyBuffer(G3.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    size_t align = req.alignment ? req.alignment : 256, off = 0;
+    VkWArena *a = G3.arena;
+    for (; a; a = a->next) {
+        off = (a->off + align - 1) & ~(align - 1);
+        if (off + req.size <= a->cap) break;
+    }
+    if (!a) {
+        size_t cap = req.size > VK_WARENA_BLOCK ? (req.size + 4095) & ~(size_t)4095 : VK_WARENA_BLOCK;
+        a = calloc(1, sizeof(*a));
+        if (!a) { vkDestroyBuffer(G3.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = cap, .memoryTypeIndex = G3.memtype};
+        if (vkAllocateMemory(G3.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
+            vkMapMemory(G3.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
+            if (a->mem) vkFreeMemory(G3.dev, a->mem, NULL);
+            free(a); vkDestroyBuffer(G3.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
+        }
+        a->cap = cap; a->next = G3.arena; G3.arena = a;
+        off = 0;
+    }
+    VKCHECK(vkBindBufferMemory(G3.dev, *buf, a->mem, off), "d3 vkBindBufferMemory");
+    if (ptr) *ptr = a->base + off;
+    a->off = off + req.size;
+    return 1;
+}
+static int upload_tensor_d3(ColiVkTensor **out, const void *weights, const float *scales,
+                            int fmt, int I, int O, int gs) {
+    if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&
+        !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
+    t->dev = 2;
+    size_t stride = (size_t)t->rowWords * 4;
+    size_t cpu_rb = (fmt == 1 || fmt == 8) ? (size_t)I
+                  : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
+    size_t sfl = scale_floats(fmt, I, O, gs);
+    t->wbytes = stride * (size_t)O;
+    void *wptr;
+    if (!arena_suballoc_d3(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
+    memset(wptr, 0, t->wbytes);
+    for (int o = 0; o < O; o++)
+        memcpy((uint8_t *)wptr + (size_t)o * stride,
+               (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
+    void *sptr;
+    if (!arena_suballoc_d3(sfl * sizeof(float), &t->sbuf, &sptr)) {
+        vkDestroyBuffer(G3.dev, t->wbuf, NULL); free(t); return 0;
+    }
+    memcpy(sptr, scales, sfl * sizeof(float));
+    __atomic_add_fetch(&G3.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&G3.tensor_count, 1, __ATOMIC_RELAXED);
+    *out = t;
+    return 1;
+}
+
+/* Bring up the second device. devidx: -1 = auto (best-ranked real GPU that is NOT
+ * device 0; fails if none), >=0 = that enumeration index (same-physical-device
+ * allowed with a warning — the pre-hardware test mode). Requires coli_vk_init. */
+int coli_vk_init_dev3(const char *spv_path, int devidx) {
+    if (G3.ready) return 1;
+    if (!G.ready) return 0;
+    uint32_t nd = 0;
+    vkEnumeratePhysicalDevices(G.inst, &nd, NULL);
+    VkPhysicalDevice devs[8]; if (nd > 8) nd = 8;
+    if (!nd) return 0;
+    vkEnumeratePhysicalDevices(G.inst, &nd, devs);
+    if (devidx >= 0) {
+        if ((uint32_t)devidx >= nd) { fprintf(stderr, "[VK] dev3: index %d out of range (%u devices)\n", devidx, nd); return 0; }
+        G3.phys = devs[devidx];
+        if (G3.phys == G.phys || (G2.ready && G3.phys == G2.phys))
+            fprintf(stderr, "[VK] dev3: SAME physical device as another tier (test mode)\n");
+    } else {
+        int bestrank = -1;
+        for (uint32_t i = 0; i < nd; i++) {
+            if (devs[i] == G.phys) continue;
+            if (G2.ready && devs[i] == G2.phys) continue;
+            VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(devs[i], &p);
+            int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 4 :
+                       p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3 : -1;
+            if (rank > bestrank) { bestrank = rank; G3.phys = devs[i]; }
+        }
+        if (bestrank < 0) { fprintf(stderr, "[VK] dev3=auto: no second real GPU found\n"); return 0; }
+    }
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(G3.phys, &nq, NULL);
+    VkQueueFamilyProperties qf[16]; if (nq > 16) nq = 16;
+    vkGetPhysicalDeviceQueueFamilyProperties(G3.phys, &nq, qf);
+    G3.qfam = UINT32_MAX;
+    for (uint32_t i = 0; i < nq; i++)
+        if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { G3.qfam = i; break; }
+    if (G3.qfam == UINT32_MAX) { fprintf(stderr, "[VK] dev3: no compute queue\n"); return 0; }
+    float qprio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = G3.qfam, .queueCount = 1, .pQueuePriorities = &qprio};
+    const char *dext[1]; uint32_t ndext = 0;
+#ifdef VK_EXT_memory_budget
+    {
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(G3.phys, NULL, &ne, NULL);
+        VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
+        if (ep) {
+            vkEnumerateDeviceExtensionProperties(G3.phys, NULL, &ne, ep);
+            for (uint32_t i = 0; i < ne; i++)
+                if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G3.has_budget = 1;
+            free(ep);
+        }
+        if (G3.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    }
+#endif
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+        .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
+    VKCHECK(vkCreateDevice(G3.phys, &di, NULL, &G3.dev), "d3 vkCreateDevice");
+    vkGetDeviceQueue(G3.dev, G3.qfam, 0, &G3.queue);
+    int mt = pick_memtype(G3.phys);
+    if (mt < 0) { fprintf(stderr, "[VK] dev3: no host-visible memory\n"); return 0; }
+    G3.memtype = (uint32_t)mt;
+    G3.memtype_cached = (uint32_t)pick_memtype_cached(G3.phys);
+    G3.sh_qmm = load_spv(G3.dev, spv_path);
+    if (!G3.sh_qmm) return 0;
+    char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
+    G3.sh_gu = load_spv(G3.dev, gu_path);
+    if (!G3.sh_gu) { fprintf(stderr, "[VK] dev3: gate_up shader required for the tier\n"); return 0; }
+    VkDescriptorPool dp; VkDescriptorSet ds;   /* build_pipeline's singleton set: unused here */
+    if (!build_pipeline(G3.dev, 4, sizeof(struct PC), G3.sh_qmm, &G3.dsl, &G3.plyt, &G3.pipe, &dp, &ds)) return 0;
+    if (!build_pipeline(G3.dev, 6, sizeof(struct PC), G3.sh_gu, &G3.dsl_gu, &G3.plyt_gu, &G3.pipe_gu, &dp, &ds)) return 0;
+    G3.pipe_t = G3.pipe_gu_t = VK_NULL_HANDLE;   /* P4 tiles, optional */
+    if (vk_tile_env()) {
+        char t_path[512], gt_path[512];
+        derive_sibling(spv_path, "_tile.spv", t_path, sizeof(t_path));
+        derive_sibling(spv_path, "_gate_up_tile.spv", gt_path, sizeof(gt_path));
+        G3.sh_qmm_t = load_spv(G3.dev, t_path);
+        G3.sh_gu_t = load_spv(G3.dev, gt_path);
+        if (G3.sh_qmm_t) G3.pipe_t = build_pipeline_on(G3.dev, G3.sh_qmm_t, G3.plyt);
+        if (G3.sh_gu_t) G3.pipe_gu_t = build_pipeline_on(G3.dev, G3.sh_gu_t, G3.plyt_gu);
+    }
+    VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G3.qfam};
+    VKCHECK(vkCreateCommandPool(G3.dev, &cpci, NULL, &G3.cpool), "d3 cmdPool");
+    VkCommandBufferAllocateInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = G3.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VKCHECK(vkAllocateCommandBuffers(G3.dev, &cbi, &G3.cmd), "d3 cmdBuf");
+    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VKCHECK(vkCreateFence(G3.dev, &fi, NULL, &G3.fence), "d3 fence");
+    G3.ready = 1;
+    VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G3.phys, &p);
+    fprintf(stderr, "[VK] dev3 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
+            p.deviceName, G3.qfam, G3.memtype);
+    return 1;
+}
+
+int coli_vk_dev3_available(void) { return G3.ready; }
+
+int coli_vk_mem_budget3(double *used_gb, double *budget_gb) {
+#ifdef VK_EXT_memory_budget
+    if (!G3.has_budget || !G3.phys) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+    vkGetPhysicalDeviceMemoryProperties2(G3.phys, &mp2);
+    double u = 0, b = 0;
+    for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
+        if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            u += (double)bud.heapUsage[i]; b += (double)bud.heapBudget[i];
+        }
+    if (used_gb) *used_gb = u / 1e9;
+    if (budget_gb) *budget_gb = b / 1e9;
+    return b > 0;
+#else
+    (void)used_gb; (void)budget_gb; return 0;
+#endif
+}
+
+int coli_vk_tensor_ensure3(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp) {
+    if (!G3.ready) return 0;
+    return upload_tensor_d3(tensor, weights, scales, fmt, I, O, grp);
+}
+
+/* dev3 mirror of eg_prepare_submit: identical structure on G3's pipelines/scratches. */
+static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                              ColiVkTensor *const *downs, const int *rows, int count,
+                              const float *x) {
+    if (!G3.ready || count < 1 || count > 64) return 0;
+    ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
+    int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
+    if (D > 6144) return 0;
+    int dfmt = downs[0]->fmt;
+    for (int c = 0; c < count; c++) {
+        off[c] = total; total += rows[c];
+        if (rows[c] < 1 || gates[c]->I != D || gates[c]->O != I || gates[c]->fmt != fmt ||
+            ups[c]->I != D || ups[c]->O != I || ups[c]->fmt != fmt ||
+            downs[c]->I != I || downs[c]->O != D || downs[c]->fmt != dfmt) return 0;
+    }
+    size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
+    /* VK_PROF=1: phase split of the dev3 issue cost (same scheme as the dense path) —
+     * localizes the per-block tax between our copy, descriptors, recording and the
+     * driver's submit on the chipset-x4 Polaris path. */
+    static double q_x, q_desc, q_rec, q_sub; static long q_n;
+    double t0 = G.eg_prof ? vk_now() : 0, tA;
+    if (!scratch_reserve_d3(&G3.x, xb, G3.memtype) || !scratch_reserve_d3(&G3.h, hb, G3.memtype) ||
+        !scratch_reserve_d3(&G3.y, yb, G3.memtype_cached)) return 0;
+    memcpy(G3.x.ptr, x, xb);
+    if (G.eg_prof) { tA = vk_now(); q_x += tA - t0; t0 = tA; }
+    if (!G3.pool) {
+        VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64*6 + 64*4};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 128, .poolSizeCount = 1, .pPoolSizes = &ps};
+        VKCHECK(vkCreateDescriptorPool(G3.dev, &dpi, NULL, &G3.pool), "d3 eg descPool");
+        VkDescriptorSetLayout lg[64], ld[64];
+        for (int c = 0; c < 64; c++) { lg[c] = G3.dsl_gu; ld[c] = G3.dsl; }
+        VkDescriptorSetAllocateInfo ag = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G3.pool, .descriptorSetCount = 64, .pSetLayouts = lg};
+        VkDescriptorSetAllocateInfo ad = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G3.pool, .descriptorSetCount = 64, .pSetLayouts = ld};
+        VKCHECK(vkAllocateDescriptorSets(G3.dev, &ag, G3.gu), "d3 eg gu sets");
+        VKCHECK(vkAllocateDescriptorSets(G3.dev, &ad, G3.dn), "d3 eg dn sets");
+        G3.nsets = 64;
+    }
+    for (int c = 0; c < count; c++) {
+        VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
+        VkDescriptorBufferInfo gi[6] = {
+            {G3.x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G3.h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+        wr_desc_dev(G3.dev, G3.gu[c], 6, gi);
+        VkDescriptorBufferInfo di[4] = {
+            {G3.h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G3.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+        wr_desc_dev(G3.dev, G3.dn[c], 4, di);
+    }
+    if (G.eg_prof) { tA = vk_now(); q_desc += tA - t0; t0 = tA; }
+    VKCHECK(vkResetCommandBuffer(G3.cmd, 0), "d3 eg resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G3.cmd, &begin), "d3 eg beginCmd");
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    {   /* P4: tiled pipeline for experts with more than one row */
+        VkPipeline cur = VK_NULL_HANDLE;
+        for (int c = 0; c < count; c++) {
+            VkPipeline want = vk_tile_ok4(G3.pipe_gu_t, fmt, rows[c], D) ? G3.pipe_gu_t : G3.pipe_gu;
+            if (want != cur) { vkCmdBindPipeline(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
+            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+            vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt_gu, 0, 1, &G3.gu[c], 0, NULL);
+            vkCmdPushConstants(G3.cmd, G3.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G3.cmd, (uint32_t)((I + 7) / 8), want == G3.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+        }
+    }
+    vkCmdPipelineBarrier(G3.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    {
+        VkPipeline cur = VK_NULL_HANDLE;
+        for (int c = 0; c < count; c++) {
+            VkPipeline want = vk_tile_ok4(G3.pipe_t, dfmt, rows[c], I) ? G3.pipe_t : G3.pipe;
+            if (want != cur) { vkCmdBindPipeline(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
+            struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+            vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt, 0, 1, &G3.dn[c], 0, NULL);
+            vkCmdPushConstants(G3.cmd, G3.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G3.cmd, (uint32_t)((D + 7) / 8), want == G3.pipe_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+        }
+    }
+    VKCHECK(vkEndCommandBuffer(G3.cmd), "d3 eg endCmd");
+    if (G.eg_prof) { tA = vk_now(); q_rec += tA - t0; t0 = tA; }
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G3.cmd};
+    VKCHECK(vkResetFences(G3.dev, 1, &G3.fence), "d3 eg resetFence");
+    VKCHECK(vkQueueSubmit(G3.queue, 1, &si, G3.fence), "d3 eg queueSubmit");
+    if (G.eg_prof) { tA = vk_now(); q_sub += tA - t0;
+        if ((++q_n & 2047) == 0)
+            fprintf(stderr, "[VK_PROF d3iss] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f ms\n",
+                    q_n, q_x, q_desc, q_rec, q_sub);
+    }
+    G3.pending_yb = yb; G3.inflight = 1;
+    return 1;
+}
+
+int coli_vk_expert_group_issue3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                ColiVkTensor *const *downs, const int *rows, int count,
+                                const float *x) {
+    if (G3.inflight) return 0;
+    return eg3_prepare_submit(gates, ups, downs, rows, count, x);
+}
+int coli_vk_expert_group_take3(float *y) {
+    if (!G3.inflight) return 0;
+    G3.inflight = 0;
+    if (vk_fence_wait(G3.dev, G3.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] dev3 expert-group fence wait failed — disabling dev3 offload\n");
+        G3.ready = 0; return 0;
+    }
+    memcpy(y, G3.y.ptr, G3.pending_yb);
+    return 1;
+}
+int coli_vk_expert_group3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                          ColiVkTensor *const *downs, const int *rows, int count,
+                          float *y, const float *x) {
+    if (G3.inflight) return 0;
+    if (!eg3_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
+    return coli_vk_expert_group_take3(y);
 }
 
 /* ---- MLA absorb attention core -------------------------------------------------
@@ -1306,15 +1897,17 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    const int tiled_p = vk_tile_ok4(G.pipe_t, fmt, S, I);
+    const uint32_t ys = tiled_p ? VK_TILES(S) : (uint32_t)S;
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tiled_p ? G.pipe_t : G.pipe);
     struct PC pc1 = {fmt, S, I, O1, t1->rowWords, t1->gs};
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
     vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
-    vkCmdDispatch(G.cmd, (uint32_t)((O1 + 7) / 8), (uint32_t)S, 1);
+    vkCmdDispatch(G.cmd, (uint32_t)((O1 + 7) / 8), ys, 1);
     struct PC pc2 = {fmt, S, I, O2, t2->rowWords, t2->gs};
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset_pair, 0, NULL);
     vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
-    vkCmdDispatch(G.cmd, (uint32_t)((O2 + 7) / 8), (uint32_t)S, 1);
+    vkCmdDispatch(G.cmd, (uint32_t)((O2 + 7) / 8), ys, 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
@@ -1330,6 +1923,317 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     return 1;
 }
 
+
+/* ---- KDA recurrence on the device (G12) ---------------------------------
+ * coli_kda_step's arithmetic, one workgroup per head, with the 128x128 state
+ * tile resident on the GPU for the life of the session. NOT bit-identical to
+ * the CPU (GLSL exp, tree-reduced norms); see G12-KDA-GPU-SPEC-2026-09-05.md.
+ * Returns 0 on any unsupported shape so the caller keeps the CPU path. */
+int coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
+                     const float *state, const float *window, const float *conv_w,
+                     const float *alog, const float *dt, const float *onorm) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS) return 0;
+    /* one v per thread; q/k/decay staged in a 1024-entry LDS array; hist[8] */
+    if (heads < 1 || k_dim < 1 || v_dim < 1 || kernel < 1) return 0;
+    if (v_dim > 128 || k_dim > 1024 || kernel > 8) return 0;
+    const size_t width = (size_t)heads * (size_t)k_dim;
+    const size_t sb = (size_t)heads * k_dim * v_dim * sizeof(float);
+    const size_t wb = 3u * width * (size_t)kernel * sizeof(float);
+    if (G.kda[layer].state) {
+        /* Buffers exist, so this is a NEW SESSION on a warm engine. The state and
+         * the conv window belong to the CONVERSATION and must be re-seeded from
+         * the caller's freshly zeroed copies; the conv taps, alog, dt and onorm
+         * are model weights and stay. Returning early here without re-seeding let
+         * request N+1 continue request N's recurrence -- invisible to every
+         * fresh-process oracle (one request per process) and caught only by the
+         * serving harness, where warm-identical came back BELOW rotating. */
+        if (G.kda[layer].sbytes != sb || G.kda[layer].wbytes != wb) return 0;
+        memcpy(G.kda[layer].state_p, state, sb);
+        memcpy(G.kda[layer].window_p, window, wb);
+        return 1;
+    }
+    const size_t ab = (size_t)heads * sizeof(float);          /* alog  */
+    const size_t db = width * sizeof(float);                  /* dt    */
+    const size_t ob = (size_t)v_dim * sizeof(float);          /* onorm */
+    void *sp, *wp, *cp, *ap = NULL, *dp = NULL, *op = NULL;
+    float p0 = G.prio; G.prio = 1.0f;                       /* recurrence state: never evict */
+    int ok = arena_suballoc(sb, &G.kda[layer].state, &sp)
+          && arena_suballoc(wb, &G.kda[layer].window, &wp)
+          && arena_suballoc(wb, &G.kda[layer].conv, &cp);
+    /* the chain stages' per-layer weights; absent -> step-only path still works */
+    if (ok && alog && dt && onorm)
+        ok = arena_suballoc(ab, &G.kda[layer].alog, &ap)
+          && arena_suballoc(db, &G.kda[layer].dt, &dp)
+          && arena_suballoc(ob, &G.kda[layer].onorm, &op);
+    G.prio = p0;
+    if (!ok) { G.kda[layer].state = VK_NULL_HANDLE; return 0; }
+    memcpy(sp, state, sb); memcpy(wp, window, wb); memcpy(cp, conv_w, wb);
+    if (ap) { memcpy(ap, alog, ab); memcpy(dp, dt, db); memcpy(op, onorm, ob); }
+    G.kda[layer].alog_p = ap; G.kda[layer].dt_p = dp; G.kda[layer].onorm_p = op;
+    G.kda[layer].state_p = sp; G.kda[layer].window_p = wp; G.kda[layer].conv_p = cp;
+    G.kda[layer].sbytes = sb; G.kda[layer].wbytes = wb; G.kda[layer].cbytes = wb;
+    G.kda[layer].heads = heads; G.kda[layer].k = k_dim; G.kda[layer].v = v_dim;
+    G.kda[layer].kernel = kernel;
+    return 1;
+}
+
+/* Device -> host for the two segment-migration spans. The only place the host
+ * copies are refreshed while the knob is on. */
+int coli_vk_kda_sync(int layer, float *state, float *window) {
+    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (state)  memcpy(state,  G.kda[layer].state_p,  G.kda[layer].sbytes);
+    if (window) memcpy(window, G.kda[layer].window_p, G.kda[layer].wbytes);
+    return 1;
+}
+
+/* ---- the whole KDA layer in ONE submit (G12) ----------------------------
+ * projections -> decay/beta gating -> recurrence -> head norm -> ko, recorded
+ * into one command buffer with compute barriers between stages. The engine
+ * pays two submit+fence round trips per layer per token today (one for the
+ * batched projections, one for ko, with the CPU recurrence between them); this
+ * pays one, and the recurrence, the gating and the norm stop touching the CPU.
+ *
+ * Only `out` [ko_O] returns to the host. Everything between the projections
+ * and ko lives in G.y.
+ *
+ * Returns 0 -> caller runs its existing path, unchanged. */
+int coli_vk_kda_layer(int layer, ColiVkMM *proj, int nproj,
+                      const float *x, int I,
+                      ColiVkTensor **ko, const void *kow, const float *kos,
+                      int ko_fmt, int ko_gs, int ko_O,
+                      float gate_lb, float norm_eps, float head_eps,
+                      int stop_after_norm, float *out) {
+    if (!G.ready || !G.shader_kda || !G.pipe_kdec || !G.pipe_khn) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (!G.kda[layer].alog_p) return 0;              /* chain weights not resident */
+    if (nproj != 8 || I < 1 || ko_O < 1) return 0;
+    const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
+    const int width = heads * K;
+
+    /* same two-stage rule as coli_vk_matmul_multi: independents first, then the
+     * chained ones, one level deep. */
+    int nchained = 0;
+    for (int c = 0; c < nproj; c++) {
+        const int src = proj[c].src;
+        if (src < 0) { if (nchained) return 0; continue; }
+        if (src >= c || proj[src].src >= 0) return 0;
+        nchained++;
+    }
+    for (int c = 0; c < nproj; c++) {
+        const int iw = proj[c].src < 0 ? I : proj[proj[c].src].O;
+        if (iw < 1) return 0;
+        proj[c].I = iw;
+        if (!upload_tensor(proj[c].tensor, proj[c].weights, proj[c].scales,
+                           proj[c].fmt, iw, proj[c].O, proj[c].gs)) return 0;
+    }
+    if (!upload_tensor(ko, kow, kos, ko_fmt, heads * V, ko_O, ko_gs)) return 0;
+
+    /* G.y layout: the 8 projection outputs, then core, normed, out. */
+    size_t yoff[VK_MM_MAX], ytot = 0;
+    for (int c = 0; c < nproj; c++) {
+        yoff[c] = ytot;
+        ytot += ((size_t)proj[c].O * sizeof(float) + 255) & ~(size_t)255;
+    }
+    /* the recurrence wants q|k|v as one [3*width] run; that holds only if each
+     * projection's output is already 256-aligned, which it is at GLM's shape
+     * (width*4 = 32768). Check rather than assume. */
+    if (yoff[1] - yoff[0] != (size_t)width * sizeof(float) ||
+        yoff[2] - yoff[1] != (size_t)width * sizeof(float)) return 0;
+    if (proj[0].O != width || proj[1].O != width || proj[2].O != width) return 0;
+    if (proj[4].O != heads || proj[6].O != width || proj[7].O != width) return 0;
+    const size_t yoff_core   = ytot; ytot += ((size_t)heads * V * 4 + 255) & ~(size_t)255;
+    const size_t yoff_normed = ytot; ytot += ((size_t)heads * V * 4 + 255) & ~(size_t)255;
+    const size_t yoff_out    = ytot; ytot += ((size_t)ko_O * 4 + 255) & ~(size_t)255;
+
+    const size_t xb = (size_t)I * sizeof(float);
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, ytot, G.memtype_cached)) return 0;
+    memcpy(G.x.ptr, x, xb);
+
+    if (!G.mm_pool) return 0;                        /* projection sets live there */
+
+    /* ---- descriptors: 8 projections, decay, step, headnorm, ko ---- */
+    for (int c = 0; c < nproj; c++) {
+        ColiVkTensor *t = *proj[c].tensor;
+        const int src = proj[c].src;
+        VkDescriptorBufferInfo bi[4] = {
+            src < 0 ? (VkDescriptorBufferInfo){.buffer = G.x.buf, .range = VK_WHOLE_SIZE}
+                    : (VkDescriptorBufferInfo){.buffer = G.y.buf, .offset = yoff[src],
+                                               .range = (VkDeviceSize)proj[src].O * sizeof(float)},
+            {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = G.y.buf, .offset = yoff[c], .range = (VkDeviceSize)proj[c].O * sizeof(float)}};
+        wr_desc(G.mm_set[c], 4, bi);
+    }
+    const VkDeviceSize wsz = (VkDeviceSize)width * sizeof(float);
+    const VkDeviceSize hv  = (VkDeviceSize)heads * V * sizeof(float);
+    VkDescriptorBufferInfo bd[4] = {                                  /* decay */
+        {.buffer = G.y.buf, .offset = yoff[6], .range = wsz},             /* decay in place */
+        {.buffer = G.y.buf, .offset = yoff[4], .range = (VkDeviceSize)heads * 4}, /* beta  */
+        {.buffer = G.kda[layer].alog, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].dt,   .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_kdec, 4, bd);
+
+    VkDescriptorBufferInfo bs[7] = {                                  /* step */
+        {.buffer = G.kda[layer].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff[0], .range = 3 * wsz},         /* q|k|v run */
+        {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff[6], .range = wsz},             /* gated decay */
+        {.buffer = G.y.buf, .offset = yoff[4], .range = (VkDeviceSize)heads * 4},
+        {.buffer = G.y.buf, .offset = yoff_core, .range = hv}};
+    VkWriteDescriptorSet w7[7];
+    for (int i = 0; i < 7; i++) w7[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_kda,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bs[i]};
+    vkUpdateDescriptorSets(G.dev, 7, w7, 0, NULL);
+
+    VkDescriptorBufferInfo bn[4] = {                                  /* head norm */
+        {.buffer = G.y.buf, .offset = yoff_core,   .range = hv},
+        {.buffer = G.y.buf, .offset = yoff[7],     .range = wsz},         /* gate */
+        {.buffer = G.kda[layer].onorm, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff_normed, .range = hv}};
+    wr_desc(G.dset_khn, 4, bn);
+
+    ColiVkTensor *kt = *ko;
+    VkDescriptorBufferInfo bk[4] = {                                  /* ko */
+        {.buffer = G.y.buf, .offset = yoff_normed, .range = hv},
+        {.buffer = kt->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = kt->sbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .offset = yoff_out, .range = (VkDeviceSize)ko_O * sizeof(float)}};
+    wr_desc(G.dset_kko, 4, bk);
+
+    /* ---- one command buffer ---- */
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    #define KDA_BARRIER() vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, \
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL)
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "kchain resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "kchain beginCmd");
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    int barrier_done = 0;
+    for (int c = 0; c < nproj; c++) {
+        ColiVkTensor *t = *proj[c].tensor;
+        if (proj[c].src >= 0 && !barrier_done) { KDA_BARRIER(); barrier_done = 1; }
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.mm_set[c], 0, NULL);
+        struct PC pc = {proj[c].fmt, 1, proj[c].I, proj[c].O, t->rowWords, t->gs};
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd, (uint32_t)((proj[c].O + 7) / 8), 1, 1);
+    }
+    KDA_BARRIER();
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kdec);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kdec, 0, 1, &G.dset_kdec, 0, NULL);
+    struct PCKD pcd = {heads, K, gate_lb};
+    vkCmdPushConstants(G.cmd, G.plyt_kdec, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcd), &pcd);
+    vkCmdDispatch(G.cmd, (uint32_t)((width + 255) / 256), 1, 1);
+    KDA_BARRIER();
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kda);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kda, 0, 1, &G.dset_kda, 0, NULL);
+    struct PCK pck = {heads, K, V, G.kda[layer].kernel, norm_eps};
+    vkCmdPushConstants(G.cmd, G.plyt_kda, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pck), &pck);
+    vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+    KDA_BARRIER();
+
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_khn);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_khn, 0, 1, &G.dset_khn, 0, NULL);
+    struct PCKN pcn = {heads, V, head_eps};
+    vkCmdPushConstants(G.cmd, G.plyt_khn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcn), &pcn);
+    vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+    KDA_BARRIER();
+
+    if (!stop_after_norm) {
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset_kko, 0, NULL);
+        struct PC pck2 = {ko_fmt, 1, heads * V, ko_O, kt->rowWords, kt->gs};
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pck2), &pck2);
+        vkCmdDispatch(G.cmd, (uint32_t)((ko_O + 7) / 8), 1, 1);
+    }
+    VKCHECK(vkEndCommandBuffer(G.cmd), "kchain endCmd");
+    #undef KDA_BARRIER
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "kchain resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kchain queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] kda chain fence wait failed — disabling GPU offload\n");
+        G.ready = 0; G.cmd_ready = 0; G.bound_tensor = NULL; return 0;
+    }
+    if (stop_after_norm)   /* bisection: hand `normed` back, caller runs ko */
+        memcpy(out, (const uint8_t *)G.y.ptr + yoff_normed, (size_t)heads * V * sizeof(float));
+    else
+        memcpy(out, (const uint8_t *)G.y.ptr + yoff_out, (size_t)ko_O * sizeof(float));
+    G.cmd_ready = 0; G.bound_tensor = NULL;
+    return 1;
+}
+
+/* Host -> device, the inverse of _sync: used after a segment restore has
+ * written the CPU spans, so the resident recurrence resumes from them. */
+int coli_vk_kda_upload(int layer, const float *state, const float *window) {
+    if (!G.ready || layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    if (state)  memcpy(G.kda[layer].state_p,  state,  G.kda[layer].sbytes);
+    if (window) memcpy(G.kda[layer].window_p, window, G.kda[layer].wbytes);
+    return 1;
+}
+
+/* One token through one layer. qkv/gate/beta come from the host in this
+ * standalone form (Stage 1 of the spec and the self-test); only `out` returns. */
+int coli_vk_kda_step(int layer, const float *qkv, const float *gate,
+                     const float *beta, float norm_eps, float *out) {
+    if (!G.ready || !G.shader_kda) return 0;
+    if (layer < 0 || layer >= VK_KDA_LAYERS || !G.kda[layer].state) return 0;
+    const int heads = G.kda[layer].heads, K = G.kda[layer].k, V = G.kda[layer].v;
+    const size_t width = (size_t)heads * (size_t)K;
+    const size_t qb = 3u * width * sizeof(float), gb = width * sizeof(float);
+    const size_t bb = (size_t)heads * sizeof(float), ob = (size_t)heads * V * sizeof(float);
+    if (!scratch_reserve(&G.kda_qkv, qb) || !scratch_reserve(&G.kda_gate, gb) ||
+        !scratch_reserve(&G.kda_beta, bb) ||
+        !scratch_reserve_mt(&G.kda_out, ob, G.memtype_cached)) return 0;
+    memcpy(G.kda_qkv.ptr, qkv, qb);
+    memcpy(G.kda_gate.ptr, gate, gb);
+    memcpy(G.kda_beta.ptr, beta, bb);
+
+    VkDescriptorBufferInfo bi[7] = {
+        {.buffer = G.kda[layer].state,  .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].window, .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_qkv.buf,       .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda[layer].conv,   .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_gate.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_beta.buf,      .range = VK_WHOLE_SIZE},
+        {.buffer = G.kda_out.buf,       .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[7];                     /* wr_desc caps at 6; local here */
+    for (int i = 0; i < 7; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_kda,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 7, w, 0, NULL);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "kda resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "kda beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kda);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_kda, 0, 1, &G.dset_kda, 0, NULL);
+    struct PCK pc = {heads, K, V, G.kda[layer].kernel, norm_eps};
+    vkCmdPushConstants(G.cmd, G.plyt_kda, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)heads, 1, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "kda endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "kda resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "kda queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] kda fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    memcpy(out, G.kda_out.ptr, ob);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* shared command buffer clobbered */
+    return 1;
+}
 
 /* q-prep chain: [q_a + kv_a pair] -> rmsnorm(q_latent) -> [q_b], recorded in ONE
  * command buffer with compute barriers — one submit+fence where the engine paid
@@ -1505,6 +2409,16 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
 
 void coli_vk_tensor_free(ColiVkTensor *t) {
     if (!t) return;
+    if (t->dev == 2) {   /* dev3 tensor: destroy on ITS device, count in ITS counters */
+        if (G3.ready) {
+            if (t->wbuf) { vkDestroyBuffer(G3.dev, t->wbuf, NULL); vkFreeMemory(G3.dev, t->wmem, NULL); }
+            if (t->sbuf) { vkDestroyBuffer(G3.dev, t->sbuf, NULL); vkFreeMemory(G3.dev, t->smem, NULL); }
+        }
+        __atomic_sub_fetch(&G3.tensor_count, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&G3.used_bytes, t->wbytes + scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float), __ATOMIC_RELAXED);
+        free(t);
+        return;
+    }
     if (t->dev == 1) {   /* dev2 tensor: destroy on ITS device, count in ITS counters */
         if (G2.ready) {
             if (t->wbuf) { vkDestroyBuffer(G2.dev, t->wbuf, NULL); vkFreeMemory(G2.dev, t->wmem, NULL); }
@@ -1585,6 +2499,7 @@ void coli_vk_shutdown(void) {
 // ---- standalone GPU-vs-CPU validation + microbench --------------------------
 #include <math.h>
 #include <time.h>
+#include "delta_attention.h"   /* coli_kda_step: the CPU reference for run_kda (G12) */
 
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9; }
@@ -2018,6 +2933,76 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
     return mq > 1e-2f || mk > 1e-3f;
 }
 
+/* KDA recurrence vs coli_kda_step, N consecutive steps from the same state.
+ * Stage 1 of G12-KDA-GPU-SPEC-2026-09-05.md: the point is not one step's error
+ * but whether it COMPOUNDS -- the state is recurrent, so a shader that is
+ * merely close diverges over a conversation. Gate: max rel err <= 1e-5 on the
+ * output every step, and on the whole state at the end. */
+static int run_kda(int slot, int heads, int k_dim, int v_dim, int kernel, int steps) {
+    const size_t width = (size_t)heads * k_dim;
+    const size_t ns = (size_t)heads * k_dim * v_dim, nw = 3 * width * kernel;
+    float *st_g = calloc(ns, 4), *st_c = calloc(ns, 4);
+    float *wi_g = calloc(nw, 4), *wi_c = calloc(nw, 4);
+    float *cw = malloc(nw * 4), *qkv = malloc(3 * width * 4);
+    float *gate = malloc(width * 4), *beta = malloc((size_t)heads * 4);
+    float *og = malloc((size_t)heads * v_dim * 4), *oc = malloc((size_t)heads * v_dim * 4);
+    float *scratch = malloc((size_t)coli_kda_scratch_floats(heads, k_dim, v_dim) * 4);
+    for (size_t i = 0; i < nw; i++) cw[i] = (rand() % 2000 - 1000) / 4000.0f;
+    for (size_t i = 0; i < ns; i++) { float v = (rand() % 2000 - 1000) / 8000.0f; st_g[i] = st_c[i] = v; }
+    const float eps = 1e-6f;
+
+    if (!coli_vk_kda_init(slot, heads, k_dim, v_dim, kernel, st_g, wi_g, cw, NULL, NULL, NULL)) {
+        printf("kda unavailable (kda_step.spv missing? shape unsupported?)\n");
+        free(st_g); free(st_c); free(wi_g); free(wi_c); free(cw); free(qkv);
+        free(gate); free(beta); free(og); free(oc); free(scratch); return 1;
+    }
+    float worst_out = 0;
+    int bad_step = -1;
+    for (int s = 0; s < steps; s++) {
+        for (size_t i = 0; i < 3 * width; i++) qkv[i] = (rand() % 2000 - 1000) / 1000.0f;
+        for (size_t i = 0; i < width; i++)  gate[i] = -(rand() % 100) / 400.0f;   /* log-decay < 0 */
+        for (int h = 0; h < heads; h++)     beta[h] = (rand() % 1000) / 1000.0f;
+        if (!coli_vk_kda_step(slot, qkv, gate, beta, eps, og)) { printf("kda step failed\n"); break; }
+        coli_kda_step(oc, st_c, wi_c, qkv, cw, gate, beta, heads, k_dim, v_dim, kernel, eps, scratch);
+        float m = 0;
+        for (size_t i = 0; i < (size_t)heads * v_dim; i++) {
+            float d = fabsf(og[i] - oc[i]) / (fabsf(oc[i]) + 1e-3f);
+            if (d > m) m = d;
+        }
+        if (m > worst_out) { worst_out = m; }
+        if (m > 1e-5f && bad_step < 0) bad_step = s;
+        /* the decisive question is whether error COMPOUNDS or saturates: the
+         * decay alpha<1 should make an error introduced at step s fade, but
+         * that is an assertion until the curve is printed. */
+        if (s == 99 || s == 199 || s == 399 || s == 799 || s == 1599 || s == steps - 1) {
+            float sd = 0;
+            for (size_t i = 0; i < ns; i++) {
+                float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+                if (d > sd) sd = d;
+            }
+            /* st_g is stale until synced; pull it for the checkpoint only */
+            coli_vk_kda_sync(slot, st_g, NULL);
+            sd = 0;
+            for (size_t i = 0; i < ns; i++) {
+                float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+                if (d > sd) sd = d;
+            }
+            printf("    step %5d: out %.3g  state %.3g\n", s + 1, m, sd);
+        }
+    }
+    coli_vk_kda_sync(slot, st_g, wi_g);
+    float ms = 0;
+    for (size_t i = 0; i < ns; i++) {
+        float d = fabsf(st_g[i] - st_c[i]) / (fabsf(st_c[i]) + 1e-3f);
+        if (d > ms) ms = d;
+    }
+    printf("kda h=%d k=%d v=%d ker=%d steps=%d | max rel: out %.3g (first>1e-5 at step %d), state %.3g\n",
+           heads, k_dim, v_dim, kernel, steps, worst_out, bad_step, ms);
+    free(st_g); free(st_c); free(wi_g); free(wi_c); free(cw); free(qkv);
+    free(gate); free(beta); free(og); free(oc); free(scratch);
+    return worst_out > 1e-5f || ms > 1e-5f;
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -2099,6 +3084,11 @@ int main(int argc, char **argv) {
     bad |= run_expert_group(2, 6144, 2048, 32);
     /* int3-g64 expert group: correctness + the 0.86x-bytes throughput question.
      * count=1 included — it is the SHARED-expert path shape in the engine. */
+    /* G12 Stage 1: the KDA recurrence at GLM's shape, and the drift over a
+     * conversation's worth of steps. 34 layers x 128 tokens is ~4400 steps a
+     * run; 1000 is enough to see compounding if there is any. */
+    bad |= run_kda(40, 64, 128, 128, 4, 4000);       /* GLM-5.3 KDA shape, past a full generation */
+    bad |= run_kda(41, 8, 64, 64, 4, 200);           /* small shape, odd occupancy */
     bad |= run_qprep(1, 1, 6144, 1536, 576, 16384);   /* GLM q_a/kv_a/q_b decode shapes */
     bad |= run_qprep(1, 11, 6144, 1536, 576, 16384);  /* prefill batch */
     bad |= run_qprep(1, 2, 6144, 1536, 576, 16384);   /* S=2 (MTP verify) */

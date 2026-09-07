@@ -75,6 +75,44 @@ int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const flo
  * physical device is allowed with a warning — pre-hardware test mode). Its group
  * may be in flight simultaneously with device 0's. Tensors remember their device
  * (coli_vk_tensor_dev); free/bytes work on either. */
+/* Batched dense matvec: N independent tensors against one shared input vector,
+ * one submit instead of N. The dense path costs ~0.4 ms of submit+fence per call
+ * regardless of size, so batching is worth it even for tiny matrices. */
+#define VK_MM_MAX 8
+typedef struct {
+    ColiVkTensor **tensor;
+    const void *weights; const float *scales;
+    int fmt, O, gs;
+    float *out;    /* NULL = intermediate, stays on the device */
+    int I;         /* input width */
+    int src;       /* -1 = the shared input vector; >=0 = output of that item */
+} ColiVkMM;
+int  coli_vk_matmul_multi(ColiVkMM *items, int count, const float *x, int I);
+
+/* KDA gated-delta recurrence on the device (G12,
+ * tools/hot-expert/G12-KDA-GPU-SPEC-2026-09-05.md). State and the conv window
+ * stay resident for the session: _init uploads them once, _step runs one token
+ * through one layer, _sync copies them back for segment migration — the only
+ * place the host copies are refreshed. NOT bit-identical to coli_kda_step
+ * (GLSL exp, tree-reduced norms); gated by a drift oracle and COLI_KDA_GPU.
+ * All three return 0 on any unsupported shape, leaving the CPU path intact. */
+int  coli_vk_kda_init(int layer, int heads, int k_dim, int v_dim, int kernel,
+                      const float *state, const float *window, const float *conv_w,
+                      const float *alog, const float *dt, const float *onorm);
+/* The whole layer in ONE submit: projections -> decay -> recurrence -> head
+ * norm -> ko, with only `out` returning to the host. Returns 0 -> caller keeps
+ * its existing two-submit path. */
+int  coli_vk_kda_layer(int layer, ColiVkMM *proj, int nproj,
+                       const float *x, int I,
+                       ColiVkTensor **ko, const void *kow, const float *kos,
+                       int ko_fmt, int ko_gs, int ko_O,
+                       float gate_lb, float norm_eps, float head_eps,
+                       int stop_after_norm, float *out);
+int  coli_vk_kda_step(int layer, const float *qkv, const float *gate,
+                      const float *beta, float norm_eps, float *out);
+int  coli_vk_kda_sync(int layer, float *state, float *window);
+int  coli_vk_kda_upload(int layer, const float *state, const float *window);
+
 int  coli_vk_init_dev2(const char *spv_path, int devidx);
 int  coli_vk_dev2_available(void);
 int  coli_vk_tensor_dev(const ColiVkTensor *t);
@@ -85,6 +123,20 @@ int  coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const
                                  const float *x);
 int  coli_vk_expert_group_take2(float *y);
 int  coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                           ColiVkTensor *const *downs, const int *rows, int count,
+                           float *y, const float *x);
+
+/* Third device: same contract as dev2, on a third GPU. auto skips both dev0's
+ * and dev2's physical device. */
+int  coli_vk_init_dev3(const char *spv_path, int devidx);
+int  coli_vk_dev3_available(void);
+int  coli_vk_mem_budget3(double *used_gb, double *budget_gb);
+int  coli_vk_tensor_ensure3(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);
+int  coli_vk_expert_group_issue3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                 ColiVkTensor *const *downs, const int *rows, int count,
+                                 const float *x);
+int  coli_vk_expert_group_take3(float *y);
+int  coli_vk_expert_group3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                            ColiVkTensor *const *downs, const int *rows, int count,
                            float *y, const float *x);
 

@@ -1,0 +1,38 @@
+#version 450
+// KDA decay/beta gating (G12), mirroring kda_layer in c/glm53.c:
+//   decay[h*D+d] = gate_lb * sigmoid(exp(alog[h]) * (decay[h*D+d] + dt[h*D+d]))
+//   beta[h]      = sigmoid(beta[h])
+// Both in place, on the projections' own output buffers, so nothing returns to
+// the host between the projections and the recurrence. exp(alog[h]) is hoisted
+// per head on the CPU (G4); here every invocation recomputes it, which is one
+// extra exp against the 512 the recurrence already does per head per step.
+//
+// sigmoid() is the two-branch form of sigmoidf_() in glm53.c, not 1/(1+exp(-x)):
+// the negative branch keeps exp() away from overflow for large |x|.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0)          buffer Decay { float decay[]; };  // [heads*k_dim] rw
+layout(std430, binding = 1)          buffer Beta  { float beta[]; };   // [heads] rw
+layout(std430, binding = 2) readonly buffer Alog  { float alog[]; };   // [heads]
+layout(std430, binding = 3) readonly buffer Dt    { float dt[]; };     // [heads*k_dim]
+
+layout(push_constant) uniform P {
+    int heads, k_dim;
+    float gate_lb;
+} p;
+
+float sigm(float x) {
+    return x >= 0.0 ? 1.0 / (1.0 + exp(-x)) : exp(x) / (1.0 + exp(x));
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    int width = p.heads * p.k_dim;
+    if (i < width) {
+        int h = i / p.k_dim;
+        decay[i] = p.gate_lb * sigm(exp(alog[h]) * (decay[i] + dt[i]));
+    }
+    /* distinct buffer, so no ordering constraint against the decay write */
+    if (i < p.heads) beta[i] = sigm(beta[i]);
+}

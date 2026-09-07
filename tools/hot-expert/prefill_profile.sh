@@ -34,6 +34,9 @@ export COLI_VK_SHADERS="${COLI_VK_SHADERS:-$HERE/../../c/shaders}"
 export COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695
 export COLI_KDA_GPU=${COLI_KDA_GPU:-2}
 export COLI_TIMERS=1 GLM53_VERBOSE=1 GLM53_PREFILL_CHUNK=$CHUNK
+# RP4: 0 = off (no query pool, no device extension, nothing in the command
+# buffer); 1 = phase timestamps on the expert group; 2 = + per expert.
+export COLI_VK_TIMESTAMPS=${COLI_VK_TIMESTAMPS:-0}
 cp "$HOME/.glm53_explain.bin" /tmp/prefill_hist.$$.bin
 export COLI_USAGE_PATH=/tmp/prefill_hist.$$.bin
 
@@ -64,7 +67,7 @@ t0=$(date +%s.%N)
 # MemAvailable and evicts the model under itself (p0self pristine run: 100% ->
 # 91.7% during the prefill, 414 ms/token instead of the serve path's 171-196).
 "$BIN" --model "$M" --prompt "$P" --greedy 0 --logits "${CAP:-512}" 2>&1 | tee -a "$LOG" \
-  | grep -E "^\[OPTIME\]|^\[PROF\]|^prefill|caricamento|teacher_forcing" | cut -c1-200
+  | grep -E "^\[OPTIME\]|^\[PROF\]|^\[VKTS|^prefill|caricamento|teacher_forcing" | cut -c1-200
 echo "### wall(load+prefill)=$(echo "$(date +%s.%N) - $t0" | bc)s" | tee -a "$LOG"
 resid "$TAG-post" || true
 rm -f /tmp/prefill_hist.$$.bin /tmp/prefill_fincore.$$.txt
@@ -92,4 +95,42 @@ for name, v in rows:
     print(f"{name:16s} {v/N*1000:9.1f} {100*v/T:5.0f}%")
 eg = re.search(r'eg=[\d.]+s\(disp=(\d+) experts=(\d+)\) cpu=[\d.]+s\(n=(\d+)\)', s)
 if eg: print(f"gpu expert-calls {int(eg.group(2))/N:.1f}/token, cpu (token,expert) pairs {int(eg.group(3))/N:.1f}/token")
+
+# RP4: the GPU-side row group, printed only when COLI_VK_TIMESTAMPS was set.
+# It sits next to the CPU-side "eg (gpu)" bucket above: that one is the wall
+# time the engine blocks, this one is what the GPU actually did in it.
+ts  = re.findall(r'^\[VKTS\] dev(\d+) chunks=(\d+) experts=(\d+) gate_up=([\d.-]+) ms down=([\d.-]+) ms '
+                 r'per_expert=([\d.-]+) us queue_lat=([\d.-]+) ms fence_tail=([\d.-]+) ms', s, re.M)
+tsp = {m[0]: m for m in re.findall(r'^\[VKTS\+\] dev(\d+) level=(\d+) busy=([\d.-]+) ms \(([\d.-]+)% of submit->fence '
+                                   r'([\d.-]+) ms\) rows=([\d.-]+) \(([\d.-]+)/expert\) cpu_overlap=([\d.-]+) ms '
+                                   r'join_wait=([\d.-]+) ms experts/chunk=([\d.-]+) gpu_late=([\d.-]+) ms in (\d+)/(\d+)', s, re.M)}
+if ts:
+    print(f"\n[VKTS] GPU-side expert group, ms per prompt token (N={N})")
+    print(f"{'dev':>4} {'chunks':>7} {'experts':>8} {'gate_up':>8} {'down':>7} {'busy':>7} "
+          f"{'queue':>7} {'span':>7} {'cpu_ovl':>8} {'join':>7} {'gpu_late':>9} {'us/exp':>7} {'r/exp':>6} {'busy%':>6}")
+    for d, ch, ex, gu, dn, pe, ql, ft in ts:
+        p2 = tsp.get(d)
+        busy = float(gu) + float(dn)
+        span = float(p2[4]) if p2 else float('nan')
+        ovlp = float(p2[7]) if p2 else float('nan')
+        join = float(p2[8]) if p2 else float('nan')
+        rpe  = float(p2[6]) if p2 else float('nan')
+        late = float(p2[10]) if p2 else float('nan')
+        lat_n = f"{p2[11]}/{p2[12]}" if p2 else "?"
+        print(f"{d:>4} {int(ch):>7} {int(ex):>8} {float(gu)/N:>8.2f} {float(dn)/N:>7.2f} "
+              f"{busy/N:>7.2f} {float(ql)/N:>7.2f} {span/N:>7.2f} {ovlp/N:>8.2f} {join/N:>7.2f} "
+              f"{late/N:>9.3f} {float(pe):>7.1f} {rpe:>6.2f} {(100*busy/span if span else 0):>5.1f}%")
+        print(f"{'':>4} {'':>7} {'':>8} (ms/prompt-token; gpu_late in {lat_n} chunks -- "
+              f"the only part of the eg wait the GPU owns)")
+    tot = sum(float(m[3]) + float(m[4]) for m in ts)
+    latot = sum(float(v[10]) for v in tsp.values()) if tsp else 0.0
+    print(f"  three devices: GPU busy {tot/N:.2f} ms/token summed (they run concurrently), "
+          f"gpu_late {latot/N:.3f} ms/token summed")
+rows = re.findall(r'^\[VKTSROW\] dev(\d+) rows=(\d+)\.\.(\d+) n=(\d+) gate_up=([\d.-]+) us down=([\d.-]+) us total=([\d.-]+) us', s, re.M)
+if rows:
+    print(f"\n[VKTSROW] per-expert GPU time by row count (level 2; dispatches serialized)")
+    print(f"{'dev':>4} {'rows':>9} {'n':>8} {'gate_up us':>11} {'down us':>9} {'total us':>9} {'us/row':>8}")
+    for d, lo, hi, n, gu, dn, to in rows:
+        mid = (int(lo) + int(hi)) / 2
+        print(f"{d:>4} {lo+'..'+hi:>9} {int(n):>8} {float(gu):>11.1f} {float(dn):>9.1f} {float(to):>9.1f} {float(to)/mid:>8.1f}")
 PY

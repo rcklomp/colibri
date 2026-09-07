@@ -337,6 +337,210 @@ static inline int vk_tile_ok4(VkPipeline tile, int fmt, int S, int I) {
     return tile != VK_NULL_HANDLE && S > 1 && (fmt == 1 || fmt == 4) && (I % 8) == 0;
 }
 
+/* ==================== RP4: GPU-side timestamps on the expert group =========
+ * COLI_VK_TIMESTAMPS=1 writes three VK_QUERY_TYPE_TIMESTAMP queries into every
+ * expert-group command buffer -- one at the top, one after the fused gate+up
+ * phase (where the pipeline barrier already drains the queue, so the query
+ * costs nothing structurally) and one after the down phase -- and reads them
+ * back after the fence. With VK_EXT_calibrated_timestamps the device clock is
+ * mapped onto CLOCK_MONOTONIC at every join, which splits the CPU-side `eg`
+ * wait that glm53's [PROF] line measures into
+ *     submit -> first GPU timestamp    queue latency
+ *     first  -> last  GPU timestamp    GPU busy, per phase
+ *     last   -> fence observed         fence tail -- which CONTAINS the CPU's
+ *                                      own overlapped expert work whenever the
+ *                                      engine joins late; that part is
+ *                                      reported separately as cpu_overlap and
+ *                                      join_wait so the tail is readable.
+ * COLI_VK_TIMESTAMPS=2 adds one query after EACH expert's dispatch in each
+ * phase. That one is NOT free: a BOTTOM_OF_PIPE timestamp drains the queue on
+ * RADV, so a phase's experts stop overlapping. It is the only way to get
+ * per-expert GPU time and its scaling with rows, and its phase totals read
+ * next to level 1's say how much overlap level 1 had.
+ * Both levels are numerically inert: no dispatch changes, no buffer changes.
+ * Unset/0 (the default): no device extension, no query pool, and not one
+ * vkCmd* added to the recorded command buffer. */
+#define VKTS_NDEV 3
+#define VKTS_MAXQ (3 + 2 * 64)
+#define VKTS_BINS 8
+static const int vkts_bin_lo[VKTS_BINS] = {1, 2, 3, 5, 9, 17, 33, 65};
+static struct VkTsDev {
+    VkQueryPool pool; VkDevice dev; int ok, cal_ok, pending;
+    double period_ms; uint64_t tsmask;
+    PFN_vkGetCalibratedTimestampsEXT cal;
+    int count, nq, rows[64]; double t_submit, t_enter;    /* current submit */
+    long chunks, experts; double rows_tot;                /* accumulators */
+    double gu_ms, dn_ms, queue_ms, tail_ms, join_ms, overlap_ms, span_ms;
+    double bin_gu[VKTS_BINS], bin_dn[VKTS_BINS]; long bin_n[VKTS_BINS];
+    double late_ms; long late_n;   /* the GPU finished AFTER the CPU came to join */
+    long qmiss, calmiss;
+} g_ts[VKTS_NDEV];
+/* context 0/1/2 are dev0 / COLI_VK_DEV2 / COLI_VK_DEV3 */
+static const int vkts_devno[VKTS_NDEV] = {0, 2, 3};
+
+static int vkts_level(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("COLI_VK_TIMESTAMPS");
+        v = e ? atoi(e) : 0;
+        if (v < 0) v = 0; if (v > 2) v = 2;
+    }
+    return v;
+}
+
+/* Called from each device's init once the queue exists. Silent when off. */
+static void vkts_setup(int i, VkPhysicalDevice phys, VkDevice dev, uint32_t qfam) {
+    if (!vkts_level() || i < 0 || i >= VKTS_NDEV) return;
+    struct VkTsDev *T = &g_ts[i];
+    VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(phys, &p);
+    if (!(p.limits.timestampPeriod > 0)) { fprintf(stderr, "[VKTS] dev%d: no timestampPeriod\n", vkts_devno[i]); return; }
+    uint32_t nqf = 0, bits = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, NULL);
+    VkQueueFamilyProperties *qf = nqf ? malloc(nqf * sizeof(*qf)) : NULL;
+    if (qf) {
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qf);
+        if (qfam < nqf) bits = qf[qfam].timestampValidBits;
+        free(qf);
+    }
+    if (!bits) { fprintf(stderr, "[VKTS] dev%d: queue family %u has timestampValidBits=0\n", vkts_devno[i], qfam); return; }
+    VkQueryPoolCreateInfo qpi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = VKTS_MAXQ};
+    if (vkCreateQueryPool(dev, &qpi, NULL, &T->pool) != VK_SUCCESS) {
+        fprintf(stderr, "[VKTS] dev%d: query pool creation failed\n", vkts_devno[i]); return;
+    }
+    T->dev = dev; T->ok = 1;
+    T->period_ms = (double)p.limits.timestampPeriod / 1e6;
+    T->tsmask = (bits >= 64) ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+    /* the device<->host clock map; absent extension => queue_lat/fence_tail
+     * stay 0 and only the combined submit->fence span is reported. */
+    T->cal = (PFN_vkGetCalibratedTimestampsEXT)vkGetDeviceProcAddr(dev, "vkGetCalibratedTimestampsEXT");
+    if (T->cal) {
+        PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT en =
+            (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)
+            vkGetInstanceProcAddr(G.inst, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+        uint32_t nd = 0; int dev_dom = 0, mono_dom = 0;
+        if (en && en(phys, &nd, NULL) == VK_SUCCESS && nd) {
+            VkTimeDomainEXT *dom = malloc(nd * sizeof(*dom));
+            if (dom && en(phys, &nd, dom) == VK_SUCCESS)
+                for (uint32_t k = 0; k < nd; k++) {
+                    if (dom[k] == VK_TIME_DOMAIN_DEVICE_EXT) dev_dom = 1;
+                    if (dom[k] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT) mono_dom = 1;
+                }
+            free(dom);
+        }
+        T->cal_ok = dev_dom && mono_dom;
+    }
+    fprintf(stderr, "[VKTS] dev%d: timestamps on (level %d, period %.1f ns, %u valid bits, calibration %s)\n",
+            vkts_devno[i], vkts_level(), p.limits.timestampPeriod, bits, T->cal_ok ? "on" : "ABSENT");
+}
+
+/* Record the reset + the top-of-pipe query. Returns the level in force for
+ * this command buffer (0 = write nothing else). */
+static int vkts_cmd_begin(int i, VkCommandBuffer cmd, int count) {
+    int lv = vkts_level();
+    struct VkTsDev *T = &g_ts[i];
+    if (!lv || !T->ok || count < 1 || count > 64) return 0;
+    T->count = count;
+    T->nq = (lv >= 2) ? 3 + 2 * count : 3;
+    vkCmdResetQueryPool(cmd, T->pool, 0, (uint32_t)T->nq);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, T->pool, 0);
+    T->pending = lv;
+    return lv;
+}
+static void vkts_mark(int i, VkCommandBuffer cmd, uint32_t q) {
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts[i].pool, q);
+}
+static void vkts_submitted(int i, int lv, int count, const int *rows) {
+    if (!lv) return;
+    struct VkTsDev *T = &g_ts[i];
+    T->t_submit = T->t_enter = vk_now();
+    for (int c = 0; c < count && c < 64; c++) T->rows[c] = rows[c];
+}
+static void vkts_join(int i) { if (g_ts[i].pending) g_ts[i].t_enter = vk_now(); }
+
+/* Read the queries back after the fence and fold them into the accumulators. */
+static void vkts_collect(int i) {
+    struct VkTsDev *T = &g_ts[i];
+    int lv = T->pending;
+    if (!lv) return;
+    T->pending = 0;
+    double t_fence = vk_now();
+    uint64_t q[VKTS_MAXQ];
+    if (vkGetQueryPoolResults(T->dev, T->pool, 0, (uint32_t)T->nq,
+                              sizeof(q[0]) * (size_t)T->nq, q, sizeof(q[0]),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) {
+        T->qmiss++; return;
+    }
+    for (int k = 0; k < T->nq; k++) q[k] &= T->tsmask;
+    double gu = (double)(q[1] - q[0]) * T->period_ms;
+    double dn = (double)(q[2] - q[1]) * T->period_ms;
+    T->gu_ms += gu; T->dn_ms += dn;
+    T->span_ms   += t_fence - T->t_submit;
+    T->overlap_ms += T->t_enter - T->t_submit;
+    T->join_ms   += t_fence - T->t_enter;
+    if (T->cal_ok) {
+        VkCalibratedTimestampInfoEXT ci[2] = {
+            {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT},
+            {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, .timeDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT}};
+        uint64_t v[2] = {0, 0}, dev_max = 0;
+        if (T->cal(T->dev, 2, ci, v, &dev_max) == VK_SUCCESS) {
+            /* host time of q[0]: now(host) - (now(dev) - q0) ticks */
+            double host_now = (double)v[1] / 1e6;
+            double back = (double)(int64_t)((v[0] & T->tsmask) - q[0]) * T->period_ms;
+            double h0 = host_now - back;
+            T->queue_ms += h0 - T->t_submit;
+            T->tail_ms  += t_fence - (h0 + gu + dn);
+            /* the part of the CPU's wait the GPU is actually responsible for:
+             * only the chunks where the last GPU timestamp lands AFTER the
+             * engine came to join. Everything else is the CPU's own experts. */
+            if (h0 + gu + dn > T->t_enter) { T->late_n++; T->late_ms += h0 + gu + dn - T->t_enter; }
+        } else T->calmiss++;
+    }
+    if (lv >= 2) {
+        for (int c = 0; c < T->count; c++) {
+            uint64_t a = c ? q[3 + c - 1] : q[0];
+            uint64_t b = c ? q[3 + T->count + c - 1] : q[1];
+            double e_gu = (double)(q[3 + c] - a) * T->period_ms;
+            double e_dn = (double)(q[3 + T->count + c] - b) * T->period_ms;
+            int r = T->rows[c], bin = 0;
+            while (bin + 1 < VKTS_BINS && r >= vkts_bin_lo[bin + 1]) bin++;
+            T->bin_gu[bin] += e_gu; T->bin_dn[bin] += e_dn; T->bin_n[bin]++;
+        }
+    }
+    T->chunks++; T->experts += T->count;
+    for (int c = 0; c < T->count; c++) T->rows_tot += T->rows[c];
+}
+
+__attribute__((destructor)) static void vkts_report(void) {
+    int lv = vkts_level();
+    if (!lv) return;
+    for (int i = 0; i < VKTS_NDEV; i++) {
+        struct VkTsDev *T = &g_ts[i];
+        if (!T->chunks) continue;
+        double busy = T->gu_ms + T->dn_ms;
+        double per_e = T->experts ? busy / (double)T->experts * 1000.0 : 0.0;
+        fprintf(stderr, "[VKTS] dev%d chunks=%ld experts=%ld gate_up=%.1f ms down=%.1f ms "
+                        "per_expert=%.1f us queue_lat=%.1f ms fence_tail=%.1f ms\n",
+                vkts_devno[i], T->chunks, T->experts, T->gu_ms, T->dn_ms, per_e, T->queue_ms, T->tail_ms);
+        fprintf(stderr, "[VKTS+] dev%d level=%d busy=%.1f ms (%.1f%% of submit->fence %.1f ms) "
+                        "rows=%.0f (%.2f/expert) cpu_overlap=%.1f ms join_wait=%.1f ms "
+                        "experts/chunk=%.1f gpu_late=%.1f ms in %ld/%ld chunks qmiss=%ld calmiss=%ld\n",
+                vkts_devno[i], lv, busy, T->span_ms > 0 ? 100.0 * busy / T->span_ms : 0.0, T->span_ms,
+                T->rows_tot, T->experts ? T->rows_tot / (double)T->experts : 0.0,
+                T->overlap_ms, T->join_ms, T->chunks ? (double)T->experts / (double)T->chunks : 0.0,
+                T->late_ms, T->late_n, T->chunks, T->qmiss, T->calmiss);
+        if (lv >= 2)
+            for (int b = 0; b < VKTS_BINS; b++) {
+                if (!T->bin_n[b]) continue;
+                int hi = (b + 1 < VKTS_BINS) ? vkts_bin_lo[b + 1] - 1 : 64;
+                fprintf(stderr, "[VKTSROW] dev%d rows=%d..%d n=%ld gate_up=%.1f us down=%.1f us total=%.1f us\n",
+                        vkts_devno[i], vkts_bin_lo[b], hi, T->bin_n[b],
+                        T->bin_gu[b] / T->bin_n[b] * 1000.0, T->bin_dn[b] / T->bin_n[b] * 1000.0,
+                        (T->bin_gu[b] + T->bin_dn[b]) / T->bin_n[b] * 1000.0);
+            }
+    }
+}
+
 /* "…/qmatmul.spv" -> "…/qmatmul<suffix>" (sibling of the main shader). */
 static void derive_sibling(const char *spv, const char *suffix, char *out, size_t n) {
     const char *dot = strstr(spv, ".spv");
@@ -394,7 +598,7 @@ int coli_vk_init(const char *spv_path) {
     /* Pressure-proofing extensions (both optional, detected at runtime):
      * memory_priority ranks allocations for the kernel's eviction order,
      * memory_budget exposes how much VRAM a new allocation can still take. */
-    const char *dext[2]; uint32_t ndext = 0;
+    const char *dext[3]; uint32_t ndext = 0; int has_cal = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G.phys, NULL, &ne, NULL);
@@ -408,6 +612,7 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
+                if (!strcmp(ep[i].extensionName, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) has_cal = 1;
             }
             free(ep);
         }
@@ -423,6 +628,9 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
     if (G.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
 #endif
+    /* RP4: asked for only when COLI_VK_TIMESTAMPS is set, so a run with the
+     * knob off creates exactly the device it created before. */
+    if (vkts_level() && has_cal) dext[ndext++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
     di.enabledExtensionCount = ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
     G.prio = 0.75f;                              /* default class: dense/resident weights */
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
@@ -559,6 +767,7 @@ int coli_vk_init(const char *spv_path) {
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.fence), "fence");
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
 
+    vkts_setup(0, G.phys, G.dev, G.qfam);
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
@@ -1003,6 +1212,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VKCHECK(vkResetCommandBuffer(G.eg_cmd, 0), "eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
+    const int vkts = vkts_cmd_begin(0, G.eg_cmd, count);   /* RP4; 0 when the knob is off */
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
     /* P4: an expert with more than one row runs the tiled pipeline (one weight
@@ -1017,8 +1227,10 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
             vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), want == G.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            if (vkts >= 2) vkts_mark(0, G.eg_cmd, (uint32_t)(3 + c));
         }
     }
+    if (vkts) vkts_mark(0, G.eg_cmd, 1);
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* phase 2: down projection hidden -> y */
     {
@@ -1030,8 +1242,10 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
             vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), want == G.pipe_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            if (vkts >= 2) vkts_mark(0, G.eg_cmd, (uint32_t)(3 + count + c));
         }
     }
+    if (vkts) vkts_mark(0, G.eg_cmd, 2);
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
 
@@ -1040,6 +1254,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     { double vp0 = G.eg_prof ? vk_now() : 0;
       VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.eg_fence), "eg queueSubmit");
       if (G.eg_prof) g_vsub_ms += vk_now() - vp0; }
+    vkts_submitted(0, vkts, count, rows);
     G.eg_pending_yb = yb; G.eg_inflight = 1;
     return 1;
 }
@@ -1057,10 +1272,12 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
 int coli_vk_expert_group_take(float *y) {
     if (!G.eg_inflight) return 0;
     G.eg_inflight = 0;
+    vkts_join(0);
     if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
         G.ready = 0; return 0;
     }
+    vkts_collect(0);
     double t4 = G.eg_prof ? vk_now() : 0;
     memcpy(y, G.eg_y.ptr, G.eg_pending_yb);
     if (G.eg_prof) {
@@ -1229,21 +1446,26 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G2.qfam, .queueCount = 1, .pQueuePriorities = &qprio};
-    const char *dext[1]; uint32_t ndext = 0;
-#ifdef VK_EXT_memory_budget
+    const char *dext[2]; uint32_t ndext = 0; int has_cal = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, NULL);
         VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
         if (ep) {
             vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, ep);
-            for (uint32_t i = 0; i < ne; i++)
+            for (uint32_t i = 0; i < ne; i++) {
+#ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G2.has_budget = 1;
+#endif
+                if (!strcmp(ep[i].extensionName, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) has_cal = 1;
+            }
             free(ep);
         }
+#ifdef VK_EXT_memory_budget
         if (G2.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
-    }
 #endif
+        if (vkts_level() && has_cal) dext[ndext++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;   /* RP4 */
+    }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
@@ -1279,6 +1501,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     VKCHECK(vkAllocateCommandBuffers(G2.dev, &cbi, &G2.cmd), "d2 cmdBuf");
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G2.dev, &fi, NULL, &G2.fence), "d2 fence");
+    vkts_setup(1, G2.phys, G2.dev, G2.qfam);
     G2.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G2.phys, &p);
     fprintf(stderr, "[VK] dev2 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
@@ -1368,6 +1591,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     VKCHECK(vkResetCommandBuffer(G2.cmd, 0), "d2 eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G2.cmd, &begin), "d2 eg beginCmd");
+    const int vkts = vkts_cmd_begin(1, G2.cmd, count);   /* RP4 */
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
@@ -1378,8 +1602,10 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
             vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
             vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), want == G2.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            if (vkts >= 2) vkts_mark(1, G2.cmd, (uint32_t)(3 + c));
         }
     }
+    if (vkts) vkts_mark(1, G2.cmd, 1);
     vkCmdPipelineBarrier(G2.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     {
         VkPipeline cur = VK_NULL_HANDLE;
@@ -1390,13 +1616,16 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
             vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt, 0, 1, &G2.dn[c], 0, NULL);
             vkCmdPushConstants(G2.cmd, G2.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             vkCmdDispatch(G2.cmd, (uint32_t)((D + 7) / 8), want == G2.pipe_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            if (vkts >= 2) vkts_mark(1, G2.cmd, (uint32_t)(3 + count + c));
         }
     }
+    if (vkts) vkts_mark(1, G2.cmd, 2);
     VKCHECK(vkEndCommandBuffer(G2.cmd), "d2 eg endCmd");
     if (G.eg_prof) { tA = vk_now(); q_rec += tA - t0; t0 = tA; }
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G2.cmd};
     VKCHECK(vkResetFences(G2.dev, 1, &G2.fence), "d2 eg resetFence");
     VKCHECK(vkQueueSubmit(G2.queue, 1, &si, G2.fence), "d2 eg queueSubmit");
+    vkts_submitted(1, vkts, count, rows);
     if (G.eg_prof) { tA = vk_now(); q_sub += tA - t0;
         if ((++q_n & 2047) == 0)
             fprintf(stderr, "[VK_PROF d2iss] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f ms\n",
@@ -1415,10 +1644,12 @@ int coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const 
 int coli_vk_expert_group_take2(float *y) {
     if (!G2.inflight) return 0;
     G2.inflight = 0;
+    vkts_join(1);
     if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] dev2 expert-group fence wait failed — disabling dev2 offload\n");
         G2.ready = 0; return 0;
     }
+    vkts_collect(1);
     memcpy(y, G2.y.ptr, G2.pending_yb);
     return 1;
 }
@@ -1580,21 +1811,26 @@ int coli_vk_init_dev3(const char *spv_path, int devidx) {
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G3.qfam, .queueCount = 1, .pQueuePriorities = &qprio};
-    const char *dext[1]; uint32_t ndext = 0;
-#ifdef VK_EXT_memory_budget
+    const char *dext[2]; uint32_t ndext = 0; int has_cal = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G3.phys, NULL, &ne, NULL);
         VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
         if (ep) {
             vkEnumerateDeviceExtensionProperties(G3.phys, NULL, &ne, ep);
-            for (uint32_t i = 0; i < ne; i++)
+            for (uint32_t i = 0; i < ne; i++) {
+#ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G3.has_budget = 1;
+#endif
+                if (!strcmp(ep[i].extensionName, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) has_cal = 1;
+            }
             free(ep);
         }
+#ifdef VK_EXT_memory_budget
         if (G3.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
-    }
 #endif
+        if (vkts_level() && has_cal) dext[ndext++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;   /* RP4 */
+    }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
@@ -1630,6 +1866,7 @@ int coli_vk_init_dev3(const char *spv_path, int devidx) {
     VKCHECK(vkAllocateCommandBuffers(G3.dev, &cbi, &G3.cmd), "d3 cmdBuf");
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G3.dev, &fi, NULL, &G3.fence), "d3 fence");
+    vkts_setup(2, G3.phys, G3.dev, G3.qfam);
     G3.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G3.phys, &p);
     fprintf(stderr, "[VK] dev3 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
@@ -1718,6 +1955,7 @@ static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     VKCHECK(vkResetCommandBuffer(G3.cmd, 0), "d3 eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G3.cmd, &begin), "d3 eg beginCmd");
+    const int vkts = vkts_cmd_begin(2, G3.cmd, count);   /* RP4 */
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
@@ -1728,8 +1966,10 @@ static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
             vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt_gu, 0, 1, &G3.gu[c], 0, NULL);
             vkCmdPushConstants(G3.cmd, G3.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             vkCmdDispatch(G3.cmd, (uint32_t)((I + 7) / 8), want == G3.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            if (vkts >= 2) vkts_mark(2, G3.cmd, (uint32_t)(3 + c));
         }
     }
+    if (vkts) vkts_mark(2, G3.cmd, 1);
     vkCmdPipelineBarrier(G3.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     {
         VkPipeline cur = VK_NULL_HANDLE;
@@ -1740,13 +1980,16 @@ static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
             vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt, 0, 1, &G3.dn[c], 0, NULL);
             vkCmdPushConstants(G3.cmd, G3.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             vkCmdDispatch(G3.cmd, (uint32_t)((D + 7) / 8), want == G3.pipe_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            if (vkts >= 2) vkts_mark(2, G3.cmd, (uint32_t)(3 + count + c));
         }
     }
+    if (vkts) vkts_mark(2, G3.cmd, 2);
     VKCHECK(vkEndCommandBuffer(G3.cmd), "d3 eg endCmd");
     if (G.eg_prof) { tA = vk_now(); q_rec += tA - t0; t0 = tA; }
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G3.cmd};
     VKCHECK(vkResetFences(G3.dev, 1, &G3.fence), "d3 eg resetFence");
     VKCHECK(vkQueueSubmit(G3.queue, 1, &si, G3.fence), "d3 eg queueSubmit");
+    vkts_submitted(2, vkts, count, rows);
     if (G.eg_prof) { tA = vk_now(); q_sub += tA - t0;
         if ((++q_n & 2047) == 0)
             fprintf(stderr, "[VK_PROF d3iss] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f ms\n",
@@ -1765,10 +2008,12 @@ int coli_vk_expert_group_issue3(ColiVkTensor *const *gates, ColiVkTensor *const 
 int coli_vk_expert_group_take3(float *y) {
     if (!G3.inflight) return 0;
     G3.inflight = 0;
+    vkts_join(2);
     if (vk_fence_wait(G3.dev, G3.fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] dev3 expert-group fence wait failed — disabling dev3 offload\n");
         G3.ready = 0; return 0;
     }
+    vkts_collect(2);
     memcpy(y, G3.y.ptr, G3.pending_yb);
     return 1;
 }
@@ -2597,6 +2842,8 @@ void coli_vk_shutdown(void) {
     if (G.pair_pool) vkDestroyDescriptorPool(G.dev, G.pair_pool, NULL);
     coli_vk_kv_reset();
     if (G.eg_pool) vkDestroyDescriptorPool(G.dev, G.eg_pool, NULL);
+    for (int i = 0; i < VKTS_NDEV; i++)       /* RP4 query pools (only ever created with the knob on) */
+        if (g_ts[i].pool) { vkDestroyQueryPool(g_ts[i].dev, g_ts[i].pool, NULL); g_ts[i].pool = VK_NULL_HANDLE; g_ts[i].ok = 0; }
     vkDestroyFence(G.dev, G.fence, NULL);
     vkDestroyFence(G.dev, G.eg_fence, NULL);
     vkDestroyCommandPool(G.dev, G.cpool, NULL);

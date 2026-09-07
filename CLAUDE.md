@@ -7,6 +7,17 @@ Follow it before forming any plan.
 
 ## Read first, in this order
 
+0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` (rev 9) — the prefill /
+   interactive-use track, opened 2026-09-06 when Open WebUI exposed that
+   nothing had ever measured time-to-first-token. P0–P6 landed the same
+   day; the open items are P7 (checkpoint the system+tools prefix), P6b
+   (per-slot KDA device state), RP4 (GPU timestamps on the expert group),
+   P5, then the upstream-`dev` merge. **Its gate is a script:**
+   `tools/hot-expert/prefill_gate.sh <pristine> <candidate>` exits 1 on an
+   oracle miss and 3 on a TTFT regression or a decode drop; an item is done
+   when it exits 0 with its table in the commit body. The chain scripts in
+   `~/bench/p*_chain.sh` on the rig are the pattern for running it unattended
+   (stop gateway → merge → build → gate → tworeq → serve only on rc 0 → restart).
 1. `tools/hot-expert/ROADMAP-2026-09.md` — the two tracks (GLM-5.3, Qwen3.8),
    each item with evidence, expected delta, gate, and the model tier that
    may execute it. Work only on a named item.
@@ -53,7 +64,26 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   it recovers on its own.
 - **One benchmark at a time.** The rig serialises measurements. Parallel
   sessions or subagents may edit and build concurrently; only one may run an
-  engine. Check `pgrep -x qwen38 -x qwen38-vk -x glm53` first.
+  engine. Check `pgrep -x glm53`, `pgrep -x qwen38`, `pgrep -x qwen38-vk`
+  first (one pattern per call).
+- **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
+  `openai_server.py` on 8081 with `--kv-slots 8`, `COLI_KDA_GPU=0` (the
+  device holds one KDA state per layer; the engine forces 0 for >1 slot
+  until P6b), `COLI_REQ_LOG=1` and `GLM53_VERBOSE=1` into a timestamped
+  `~/glm53_server.log`; `~/bench/owui_report.sh N` shows the last N
+  requests with prompt tokens, reused tokens and ttft. Stop it only for a
+  measurement (`pkill -f "openai_[s]erver.py"`, then `pkill -9 -x glm53`)
+  and restart it with `SKIP_WARM=1 setsid nohup ~/start_glm53.sh > ~/glm53_server.log 2>&1 < /dev/null &`.
+- **`pkill -f` over ssh matches the ssh command itself** if the pattern
+  appears in it, and kills the session: always use the bracket form
+  (`"openai_[s]erver.py"`, `"p7_[c]hain.sh"`). Never `scp` over a bash
+  script that is running on the rig; git merges are safe (new inode).
+- **Open WebUI** (docker `open-webui`, port 3000) is parked until P7: its
+  builtin tools put 4 000+ tokens in front of every first turn (876 s
+  measured). With the tools capability and the title/tags/follow-up tasks
+  off (set in its sqlite `webui.db`, 2026-09-07) a follow-up turn reuses the
+  prefix and answers in ~5 s. `tools/hot-expert/chat.py` is the plain client;
+  `ttft_serve.py --url` the measuring one.
 - Dropping caches needs sudo; ask the owner or run it yourself in an
   interactive shell. Never write the password into a file or a script.
 
@@ -81,7 +111,14 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - Shared: `c/quant.h` (CPU kernels; `matmul_fp8` is Qwen-only in practice),
   `c/backend_vulkan.c`, `c/shaders/*.comp`. A shared-file change must
   rebuild and re-measure both engines.
-- Build: `make -C c qwen38 qwen38-vk glm53 VK=1`. **All four qwen38 C tests
+- Build: `make -C c qwen38 qwen38-vk glm53 VK=1` (the tiled shaders
+  `shaders/qmatmul_tile.spv` / `qmatmul_gate_up_tile.spv` are built by the
+  same Makefile and loaded from `c/shaders` — a binary copied elsewhere must
+  still point `COLI_VK_SHADERS` at the repo's `c/shaders`; the harness
+  refuses to run without them).
+- Binary copies for gates live in `~/bench/` (`glm53.pristine` = pre-prefill
+  track, `glm53.p2`, `glm53.p4base`, `glm53.p4c_base`, `glm53.p6base`); each
+  gate's pristine is the binary in service before the item. **All four qwen38 C tests
   pass** as of 2026-09-06. `tests/test_qwen38_prefix` used to SIGFPE on every
   tree; that was C1's merge blocker and it is fixed (unguarded
   `m->max_t / c->idx_ratio` in `ensure_kv`, which the test's fabricated Model

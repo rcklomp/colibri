@@ -1505,6 +1505,19 @@ static int vk_batch_mv(const Mat *const *ws, float *const *os, int n,
                                    (acc) = _mm256_add_ps((acc), m_); } while (0)
 #endif
 
+static int g_router_lanes = -1;
+static int router_lanes_on(void) {
+    if (g_router_lanes < 0) {
+#ifdef GLM53_MLA_HEADVEC
+        const char *e = getenv("COLI_ROUTER_LANES");
+        g_router_lanes = e ? atoi(e) : 1;
+#else
+        g_router_lanes = 0;
+#endif
+    }
+    return g_router_lanes;
+}
+
 static int g_mla_headvec = -1;
 static int mla_headvec_on(void) {
     if (g_mla_headvec < 0) {
@@ -1518,23 +1531,28 @@ static int mla_headvec_on(void) {
     return g_mla_headvec;
 }
 
-/* absorbed[h][d] (H rows of L) -> qT[d][h] (L rows of H). */
-static void mla_transpose_q(float *qT, const float *q, int H, int L) {
-    const int hb = H & ~7, db = L & ~7;
-    for (int h = 0; h < hb; h += 8)
-        for (int d = 0; d < db; d += 8)
-            for (int hh = 0; hh < 8; hh++)
-                for (int dd = 0; dd < 8; dd++)
-                    qT[(size_t)(d + dd) * H + h + hh] = q[(size_t)(h + hh) * L + d + dd];
-    for (int h = 0; h < H; h++)
-        for (int d = (h < hb) ? db : 0; d < L; d++)
-            qT[(size_t)d * H + h] = q[(size_t)h * L + d];
+/* a[N][K] -> aT[K][N], 8x8 blocked. */
+static void glm_transpose(float *aT, const float *a, int N, int K) {
+    const int nb = N & ~7, kb = K & ~7;
+    for (int n = 0; n < nb; n += 8)
+        for (int k = 0; k < kb; k += 8)
+            for (int nn = 0; nn < 8; nn++)
+                for (int kk = 0; kk < 8; kk++)
+                    aT[(size_t)(k + kk) * N + n + nn] = a[(size_t)(n + nn) * K + k + kk];
+    for (int n = 0; n < N; n++)
+        for (int k = (n < nb) ? kb : 0; k < K; k++)
+            aT[(size_t)k * N + n] = a[(size_t)n * K + k];
 }
 
-/* dst[h] = scale * sum_d qT[d][h] * c_j[d], for every head, in the
- * reference's summation order. */
-static void mla_score_row(float *dst, const float *qT, const float *c_j,
-                          int H, int L, float scale) {
+/* dst[j] = scale * sum_k aT[k][j] * b[k], for all N lanes j at once, each lane
+ * accumulating over k in ascending order with the product rounded before it is
+ * added -- the summation order of the scalar `sum += a[k]*b[k]` this replaces.
+ * The 64-lane block is what breaks the add-chain latency (eight independent
+ * chains); the 32- and 8-lane blocks and the scalar tail cover any N. */
+static void glm_lane_dots(float *dst, const float *aT, const float *b,
+                          int N, int K, float scale) {
+    const int H = N, L = K;
+    const float *qT = aT, *c_j = b;
     int h = 0;
 #ifdef GLM53_MLA_HEADVEC
     for (; h + 64 <= H; h += 64) {
@@ -1563,6 +1581,23 @@ static void mla_score_row(float *dst, const float *qT, const float *c_j,
         _mm256_storeu_ps(dst + h + 40, _mm256_mul_ps(a5, s));
         _mm256_storeu_ps(dst + h + 48, _mm256_mul_ps(a6, s));
         _mm256_storeu_ps(dst + h + 56, _mm256_mul_ps(a7, s));
+    }
+    for (; h + 32 <= H; h += 32) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        const float *p = qT + h;
+        for (int d = 0; d < L; d++, p += H) {
+            const __m256 b = _mm256_broadcast_ss(c_j + d);
+            MLA_MULADD(a0, b, _mm256_loadu_ps(p));
+            MLA_MULADD(a1, b, _mm256_loadu_ps(p + 8));
+            MLA_MULADD(a2, b, _mm256_loadu_ps(p + 16));
+            MLA_MULADD(a3, b, _mm256_loadu_ps(p + 24));
+        }
+        const __m256 s = _mm256_set1_ps(scale);
+        _mm256_storeu_ps(dst + h,      _mm256_mul_ps(a0, s));
+        _mm256_storeu_ps(dst + h + 8,  _mm256_mul_ps(a1, s));
+        _mm256_storeu_ps(dst + h + 16, _mm256_mul_ps(a2, s));
+        _mm256_storeu_ps(dst + h + 24, _mm256_mul_ps(a3, s));
     }
     for (; h + 8 <= H; h += 8) {
         __m256 a0 = _mm256_setzero_ps();
@@ -1732,12 +1767,12 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 if (at < 0 || at >= seen) continue;
                 slot_at[used_all++] = at;
             }
-            mla_transpose_q(qT, absorbed + (size_t)t * H * L, H, L);
+            glm_transpose(qT, absorbed + (size_t)t * H * L, H, L);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
             for (int u = 0; u < used_all; u++)
-                mla_score_row(sc + (size_t)u * H, qT, latent + (size_t)slot_at[u] * L,
+                glm_lane_dots(sc + (size_t)u * H, qT, latent + (size_t)slot_at[u] * L,
                               H, L, scale);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -2777,7 +2812,42 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     const int rt_par = tokens >= 8 && !g_prefill_unbatched();
     float *score_all = rt_par ? malloc((size_t)tokens * c->n_experts * sizeof(float)) : NULL;
     if (rt_par && !score_all) { fprintf(stderr, "OOM nel router\n"); exit(1); }
-    if (rt_par) {
+    /* P5.3: the router dot is the same latency-bound scalar reduction P5.1
+     * found in the MLA attention core -- 288 x 4 096 per token per MoE layer at
+     * ~10 GMAC/s on eight threads. Here the free lane axis is the CHUNK's
+     * TOKENS: transposing x to xT[d][t] once per layer (2 MB at S=128) lets one
+     * router row be dotted against 64 tokens at a time, each lane summing over
+     * d in the same ascending order with the product rounded first. So, unlike
+     * what the roadmap assumed, this needs no reordering and is bit-identical;
+     * COLI_ROUTER_LANES=0 restores the per-token scalar dot. */
+    float *xT = NULL, *rdot = NULL;
+    const int rt_lanes = rt_par && router_lanes_on();
+    int rt_thr = 1;
+    if (rt_lanes) {
+#ifdef _OPENMP
+        rt_thr = coli_kda_threads();
+#endif
+        xT = malloc((size_t)c->hidden * tokens * sizeof(float));
+        rdot = malloc((size_t)rt_thr * tokens * sizeof(float));
+        if (!xT || !rdot) { fprintf(stderr, "OOM nel router\n"); exit(1); }
+        glm_transpose(xT, x, tokens, c->hidden);
+    }
+    if (rt_lanes) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int e = 0; e < c->n_experts; e++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *dots = rdot + (size_t)tid * tokens;
+            glm_lane_dots(dots, xT, l->router + (size_t)e * c->hidden,
+                          tokens, c->hidden, 1.0f);
+            for (int t = 0; t < tokens; t++)
+                score_all[(size_t)t * c->n_experts + e] = sigmoidf_(dots[t]);
+        }
+    } else if (rt_par) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -2839,7 +2909,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         for (int k = 0; k < topk; k++)
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
     }
-    free(score); free(score_all);
+    free(score); free(score_all); free(xT); free(rdot);
     if (optime_on()) { g_ot_router += optime_now() - t_router0; g_on_router++; }
 
     /* --- secondo e terzo tempo, a blocchi che stanno in cache ---

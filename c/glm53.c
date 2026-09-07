@@ -1445,6 +1445,122 @@ static int vk_batch_mv(const Mat *const *ws, float *const *os, int n,
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */
+
+/* P5.1 (PREFILL-ROADMAP P5): the MLA attention core's score pass with the
+ * HEADS in the SIMD lanes.
+ *
+ * Found by RP4: at 3 462 tokens `mla.attn` is 69.6 ms/token, 40 % of the whole
+ * prefill token, and `tools/hot-expert/rome_mlaattn.c` shows where it goes.
+ * The per-(token, head) score loop
+ *
+ *     for (d) dot += q[d] * c_j[d];
+ *
+ * runs at **10.0-10.8 GMAC/s on eight threads** (0.4 MAC/cycle/thread): gcc 15
+ * vectorises the PRODUCTS (vmulps over 8 d at a time) but must keep the
+ * summation strictly sequential, so the loop is bound by the latency of the
+ * scalar add chain, not by the machine's FP throughput. The dot is ~73 % of
+ * `attn` at 3 462 tokens.
+ *
+ * The fix does not change one flop. It transposes the token's 64 absorbed
+ * queries once, to qT[d][h], and then computes all 64 heads' scores against
+ * one latent row at a time: lane h accumulates over d in ascending order, one
+ * rounded product added per step -- exactly the reference's arithmetic, now in
+ * 64 independent chains instead of one. Measured 215-230 GMAC/s, 18-22x, with
+ * the same numbers at a 7 MB (one layer) and a 77 MB (eleven layers) latent
+ * pool, so it is compute-bound and not an L3 artefact.
+ *
+ * Bit-identical, and that is not an assumption: `rome_mlaattn.c` compares
+ * every one of the 131 072 (head, slot) scores at the widest shape and reports
+ * 0 mismatches. The one trap is FMA -- the reference rounds each product
+ * before accumulating, gcc contracts an intrinsic mul+add straight back into
+ * vfmadd231ps, and `#pragma STDC FP_CONTRACT OFF` does not stop it; the empty
+ * asm below does, at no instruction cost.
+ *
+ * COLI_MLA_HEADVEC=0 restores the per-head scalar loop (same numbers, for the
+ * before/after profile in one binary). */
+#if defined(__AVX2__) && defined(__FMA__) && (defined(__GNUC__) || defined(__clang__))
+#define GLM53_MLA_HEADVEC 1
+#define MLA_MULADD(acc, x, y) do { __m256 m_ = _mm256_mul_ps((x), (y)); \
+                                   __asm__("" : "+x"(m_)); \
+                                   (acc) = _mm256_add_ps((acc), m_); } while (0)
+#endif
+
+static int g_mla_headvec = -1;
+static int mla_headvec_on(void) {
+    if (g_mla_headvec < 0) {
+#ifdef GLM53_MLA_HEADVEC
+        const char *e = getenv("COLI_MLA_HEADVEC");
+        g_mla_headvec = e ? atoi(e) : 1;
+#else
+        g_mla_headvec = 0;
+#endif
+    }
+    return g_mla_headvec;
+}
+
+/* absorbed[h][d] (H rows of L) -> qT[d][h] (L rows of H). */
+static void mla_transpose_q(float *qT, const float *q, int H, int L) {
+    const int hb = H & ~7, db = L & ~7;
+    for (int h = 0; h < hb; h += 8)
+        for (int d = 0; d < db; d += 8)
+            for (int hh = 0; hh < 8; hh++)
+                for (int dd = 0; dd < 8; dd++)
+                    qT[(size_t)(d + dd) * H + h + hh] = q[(size_t)(h + hh) * L + d + dd];
+    for (int h = 0; h < H; h++)
+        for (int d = (h < hb) ? db : 0; d < L; d++)
+            qT[(size_t)d * H + h] = q[(size_t)h * L + d];
+}
+
+/* dst[h] = scale * sum_d qT[d][h] * c_j[d], for every head, in the
+ * reference's summation order. */
+static void mla_score_row(float *dst, const float *qT, const float *c_j,
+                          int H, int L, float scale) {
+    int h = 0;
+#ifdef GLM53_MLA_HEADVEC
+    for (; h + 64 <= H; h += 64) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+        __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+        const float *p = qT + h;
+        for (int d = 0; d < L; d++, p += H) {
+            const __m256 b = _mm256_broadcast_ss(c_j + d);
+            MLA_MULADD(a0, b, _mm256_loadu_ps(p));
+            MLA_MULADD(a1, b, _mm256_loadu_ps(p + 8));
+            MLA_MULADD(a2, b, _mm256_loadu_ps(p + 16));
+            MLA_MULADD(a3, b, _mm256_loadu_ps(p + 24));
+            MLA_MULADD(a4, b, _mm256_loadu_ps(p + 32));
+            MLA_MULADD(a5, b, _mm256_loadu_ps(p + 40));
+            MLA_MULADD(a6, b, _mm256_loadu_ps(p + 48));
+            MLA_MULADD(a7, b, _mm256_loadu_ps(p + 56));
+        }
+        const __m256 s = _mm256_set1_ps(scale);
+        _mm256_storeu_ps(dst + h,      _mm256_mul_ps(a0, s));
+        _mm256_storeu_ps(dst + h + 8,  _mm256_mul_ps(a1, s));
+        _mm256_storeu_ps(dst + h + 16, _mm256_mul_ps(a2, s));
+        _mm256_storeu_ps(dst + h + 24, _mm256_mul_ps(a3, s));
+        _mm256_storeu_ps(dst + h + 32, _mm256_mul_ps(a4, s));
+        _mm256_storeu_ps(dst + h + 40, _mm256_mul_ps(a5, s));
+        _mm256_storeu_ps(dst + h + 48, _mm256_mul_ps(a6, s));
+        _mm256_storeu_ps(dst + h + 56, _mm256_mul_ps(a7, s));
+    }
+    for (; h + 8 <= H; h += 8) {
+        __m256 a0 = _mm256_setzero_ps();
+        const float *p = qT + h;
+        for (int d = 0; d < L; d++, p += H) {
+            const __m256 b = _mm256_broadcast_ss(c_j + d);
+            MLA_MULADD(a0, b, _mm256_loadu_ps(p));
+        }
+        _mm256_storeu_ps(dst + h, _mm256_mul_ps(a0, _mm256_set1_ps(scale)));
+    }
+#endif
+    for (; h < H; h++) {
+        float dot = 0.0f;
+        for (int d = 0; d < L; d++) dot += qT[(size_t)d * H + h] * c_j[d];
+        dst[h] = dot * scale;
+    }
+}
+
 static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
@@ -1574,8 +1690,67 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *pooled_pool = malloc((size_t)nthreads_mla * L * sizeof(float));
     float *score_pool = malloc((size_t)nthreads_mla * width * sizeof(float));
     const float scale = 1.0f / sqrtf((float)QK);
+    /* P5.1: the head-lane score pass wants the token's queries as qT[d][h] and
+     * a place to leave the 64 scores of each slot. 128 KB + width*H floats
+     * (525 KB at width 2051), allocated once per layer per chunk. */
+    const int headvec = mla_headvec_on();
+    float *qT = headvec ? malloc((size_t)L * H * sizeof(float)) : NULL;
+    float *sc = headvec ? malloc((size_t)width * H * sizeof(float)) : NULL;
+    int *slot_at = headvec ? malloc((size_t)width * sizeof(int)) : NULL;
+    if (headvec && (!qT || !sc || !slot_at)) { fprintf(stderr, "OOM nell'attenzione MLA\n"); exit(1); }
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
+        if (headvec) {
+            /* Same slots, same order, same arithmetic -- only the loop nest
+             * changes: the 64 heads move into the SIMD lanes and the slots
+             * become the parallel axis. `score[u]` below is then read out of
+             * sc[u][h] instead of recomputed per head, and `top` is the max
+             * over the same set. */
+            int used_all = 0;
+            for (int i = 0; i < width; i++) {
+                const int at = chosen[i];
+                if (at < 0 || at >= seen) continue;
+                slot_at[used_all++] = at;
+            }
+            mla_transpose_q(qT, absorbed + (size_t)t * H * L, H, L);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int u = 0; u < used_all; u++)
+                mla_score_row(sc + (size_t)u * H, qT, latent + (size_t)slot_at[u] * L,
+                              H, L, scale);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int h = 0; h < H; h++) {
+#ifdef _OPENMP
+                float *pooled = pooled_pool + (size_t)omp_get_thread_num() * L;
+                float *score = score_pool + (size_t)omp_get_thread_num() * width;
+#else
+                float *pooled = pooled_pool;
+                float *score = score_pool;
+#endif
+                float top = -INFINITY;
+                for (int u = 0; u < used_all; u++) {
+                    score[u] = sc[(size_t)u * H + h];
+                    if (score[u] > top) top = score[u];
+                }
+                float *result = context + (size_t)h * V;
+                memset(result, 0, (size_t)V * sizeof(float));
+                if (!used_all) continue;
+                double total = 0.0;
+                for (int i = 0; i < used_all; i++) { score[i] = expf(score[i] - top); total += score[i]; }
+                memset(pooled, 0, (size_t)L * sizeof(float));
+                for (int u = 0; u < used_all; u++) {
+                    const float weight = (float)(score[u] / total);
+                    const float *c_j = latent + (size_t)slot_at[u] * L;
+                    for (int d = 0; d < L; d++) pooled[d] += weight * c_j[d];
+                }
+                mv_rows(result, &l->kvb_v, pooled, h * V, V);
+            }
+            mv(out + (size_t)t * c->hidden, &l->o, context);
+            continue;
+        }
         /* Heads are independent: each reads its own absorbed[] query and
          * writes its own context[] slice. mv_rows's own #pragma omp parallel
          * for (quant.h) collapses to one thread per call inside this region
@@ -1627,6 +1802,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(out + (size_t)t * c->hidden, &l->o, context);
     }
     if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+    free(slot_at); free(sc); free(qT);
     free(score_pool); free(pooled_pool);
 
     free(context); free(selected); free(valid); free(head_w);

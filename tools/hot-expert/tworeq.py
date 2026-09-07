@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.expanduser("~/src/colibri/c"))
 import openai_server as rt
 
 SNAP = os.path.expanduser("~/models/GLM-5.3-Flash-colibri-int4-g64")
-EXE  = os.path.expanduser("~/src/colibri/c/glm53")
+# TWOREQ_EXE (P7): gate a CANDIDATE binary without copying it over the served
+# one -- the served tree's glm53 cannot even be relinked while the gateway runs.
+EXE  = os.environ.get("TWOREQ_EXE") or os.path.expanduser("~/src/colibri/c/glm53")
 res  = rt.resolve_model(SNAP)
 rt.ARCH = res.descriptor.id
 prompt = rt.render_chat_for_arch([{"role":"user","content":
@@ -34,5 +36,17 @@ for i in range(max(3, NSLOTS)):
     outs.append("".join(buf))
     print(f"--- request {i+1} ---\n{outs[-1]}\n", flush=True)
 ok = all(o == outs[0] for o in outs)
+# Close the engine and WAIT for it: leaving the child alive made the next step
+# of p7_gate.sh refuse ("another glm53 is running") and, worse, made a revert's
+# `cp` over the served binary fail with ETXTBSY, which left the candidate in
+# service after a failed gate (2026-09-07).
+try:
+    eng.close()
+    eng.process.wait(timeout=60)
+except Exception:
+    try:
+        eng.process.kill()
+    except Exception:
+        pass
 print("RESULT:", "IDENTICAL across 3 requests" if ok else "DIVERGED")
 sys.exit(0 if ok else 1)

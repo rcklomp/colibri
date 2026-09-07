@@ -810,17 +810,44 @@ static double current_rss_gb(void) {
     return rss_gb();  /*Return peak memory usage if we can't measure current usage*/
   }
 
-  char line[256];
-  unsigned long long kb = 0;
+    char line[256];
+    unsigned long long kb = 0, anon_kb = 0, vmrss_kb = 0;
+    int have_anon = 0, have_vmrss = 0;
 
-  while (fgets(line, sizeof(line), f)) {
-    if (strncmp(line, "VmRSS:", 6) == 0) {
-      if (sscanf(line + 6, "%llu", &kb) == 1) {
-        fclose(f);
-        return (double)kb / (1024.0 * 1024.0);
+    /* RssAnon, non VmRSS: sono le pagine che il processo POSSIEDE davvero.
+     *
+     * VmRSS conta anche le pagine di file mappate, che il kernel recupera da
+     * solo quando serve memoria. Con COLI_MAP_EXPERTS=1 (#1325) gli esperti
+     * arrivano da una mappatura invece che da una copia, quindi VmRSS sale di
+     * gigabyte senza che un byte in piu' sia sottratto al sistema -- e
+     * rss_guard, che SFRATTA esperti quando la misura supera il budget, si
+     * metterebbe a sfrattare per liberare memoria che non stava occupando.
+     * Non un avviso cosmetico: cache distrutta e lavoro rifatto.
+     *
+     * Misurato su GLM-5.3 (391 GB di container, 25 GB di RAM): con la
+     * mappatura accesa il pianificatore riportava 18.2 GB e avvisava di uno
+     * sforamento di 0.8 GB che non esisteva.
+     *
+     * Senza mappatura RssAnon e VmRSS coincidono quasi esattamente, perche' la
+     * memoria degli esperti e' malloc'ata e quindi anonima: questo cambio NON
+     * altera il comportamento del percorso pread di oggi, ed e' la ragione per
+     * cui e' sicuro farlo PRIMA di accendere la mappatura.
+     *
+     * RssAnon esiste da Linux 4.5; se manca si torna a VmRSS, cioe' al
+     * comportamento precedente, che resta corretto quando nulla e' mappato. */
+    while (fgets(line, sizeof(line), f)) {
+      if (!have_anon && strncmp(line, "RssAnon:", 8) == 0) {
+        if (sscanf(line + 8, "%llu", &anon_kb) == 1) have_anon = 1;
+      } else if (!have_vmrss && strncmp(line, "VmRSS:", 6) == 0) {
+        if (sscanf(line + 6, "%llu", &vmrss_kb) == 1) have_vmrss = 1;
       }
+      if (have_anon && have_vmrss) break;
     }
-  }
+    if (have_anon || have_vmrss) {
+      kb = have_anon ? anon_kb : vmrss_kb;
+      fclose(f);
+      return (double)kb / (1024.0 * 1024.0);
+    }
 
   fclose(f);
   if(!announced_proc_failure) {
@@ -9624,6 +9651,25 @@ static int pin_count_for_budget(Model *m, const PinRec *r, int from, int n,
     }
     return count;
 }
+/* #1351: how many ranked experts a VRAM budget holds, priced at each row's
+ * real width. Dividing the budget by expert_bytes_probe() priced every routed
+ * int4 expert at the int8 MTP width, and the single-GPU auto tier stopped at
+ * 56% of the card (3,604 experts in 136 GB, exact to the expert). The probe's
+ * width is right for slots shared ACROSS rows (ws[], staging); the VRAM prefix
+ * is one upload per expert at that expert's own width.
+ *
+ * raw_n >= 0 is the COLI_ANS split: the first raw_n ranked experts go up raw,
+ * the rest entropy-coded at ~0.80 of their width (same factor as before).
+ * Returns the count only; the caller adds its per-device slack. */
+static int pin_prefix_for_budget(Model *m, const PinRec *r, int n, double budget_b, int raw_n){
+    if(budget_b<=0.0 || n<=0) return 0;
+    if(raw_n<0) return pin_count_for_budget(m,r,0,n,budget_b);
+    if(raw_n>n) raw_n=n;
+    int got=pin_count_for_budget(m,r,0,raw_n,budget_b);
+    if(got<raw_n) return got;                    /* the budget ends inside the raw prefix */
+    double left=budget_b-pin_range_bytes(m,r,0,got);
+    return got+pin_count_for_budget(m,r,got,n,left/0.80);
+}
 
 #ifdef __linux__
 /* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
@@ -9759,14 +9805,17 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
      * tier under CUDA_DENSE=1 regardless of the configured budget (#491). */
     if(g_cuda_expert_auto) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
-        prefix_est=(int)(budget/eb)+g_cuda_ndev;
+        /* Per row, not budget/eb: eb is the container's WIDEST expert (the int8
+         * MTP row on shipped GLM-5.2), the right price for a slot shared across
+         * rows and the wrong one for a VRAM upload, which costs the expert's own
+         * width. With the widest as divisor the single-GPU auto tier placed 56%
+         * of its budget and stopped (#1351). The staging cap below keeps eb on
+         * purpose: it bounds a HOST peak of slabs that are reused across rows. */
+        int raw_n=-1;
 #ifdef COLI_ANS
-        if(g_cuda_raw_experts>=0){
-            int raw=g_cuda_raw_experts;
-            if((double)raw*eb>budget) raw=(int)(budget/eb);
-            prefix_est=raw+(int)((budget-(double)raw*eb)/(0.80*eb))+g_cuda_ndev;
-        }
+        raw_n=g_cuda_raw_experts;
 #endif
+        prefix_est=pin_prefix_for_budget(m,r,n,budget,raw_n)+g_cuda_ndev;
         if(prefix_est>n) prefix_est=n;
         cpu_from=prefix_est;                    /* prefix RAM is returned after upload */
     }
@@ -9867,11 +9916,31 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                     }
 #endif
                     if(uploaded){
+                        /* VRAM, not logical bytes (#687). The allocator rounds
+                         * every cudaMalloc up and nothing was charging the
+                         * difference, so `remaining` drifted optimistic by a
+                         * term that GREW with the tier: an int4-g64 scale array
+                         * is 0.75 MiB and lands in 1 MiB, three per expert, so
+                         * 0.75 MiB per expert uncounted (measured on sm_86;
+                         * #687 measured 0.741 +/- 0.019 on H100/H200 from the
+                         * other direction). At 6,235 experts that is 4.6 GB
+                         * against a flat 2 GB reserve, which is why auto could
+                         * claim the card to within 4 MiB and then fail every
+                         * lazy dense upload afterwards.
+                         *
+                         * m->gpu_expert_bytes stays LOGICAL: it is reported as
+                         * the tier's size and compared against `budget`, and
+                         * quoting padding to the user as model bytes would
+                         * trade one wrong number for another. */
                         int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                        int64_t vram  =(int64_t)coli_cuda_tensor_vram(s->g.cuda)
+                                      +(int64_t)coli_cuda_tensor_vram(s->u.cuda)
+                                      +(int64_t)coli_cuda_tensor_vram(s->d.cuda);
+                        if(vram<actual) vram=actual;
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
-                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                        remaining[best]-=vram;   placed_b[best]+=actual; placed_n[best]++;
                         placed_w[best]+=(double)r[a].c;
                         if(g_cuda_release_host){ expert_host_release(m,s); pin_host_released+=(double)need; }
                         placed=1;
@@ -9945,22 +10014,10 @@ static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare
  * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
  * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
-#ifdef __APPLE__
-    mach_msg_type_number_t cnt=HOST_VM_INFO64_COUNT;
-    vm_statistics64_data_t vm;
-    if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vm,&cnt)!=KERN_SUCCESS) return 0;
-    return ((double)vm.free_count+(double)vm.inactive_count+(double)vm.purgeable_count)
-           * (double)sysconf(_SC_PAGESIZE) / 1e9;
-#elif defined(_WIN32)
-    double total, avail;
-    compat_meminfo(&total, &avail);
-    return avail;
-#else
-    FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
-    char ln[256]; double kb=0;
-    while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
-    fclose(f); return kb/1e6;
-#endif
+    /* Era la sola copia giusta di questa misura; glm53.c ne aveva una che
+     * leggeva /proc ovunque (#1375). Ora vive in compat.h e la chiamano
+     * entrambi: su Windows tiene anche conto del commit disponibile. */
+    return compat_mem_available_gb();
 }
 
 static int kv_slot_count(void){

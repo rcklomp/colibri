@@ -84,8 +84,20 @@ def _engine_error(fields, message):
     know how to compact a conversation actually get the chance to (previously the engine
     silently truncated the prompt instead, which is #401)."""
     if fields and fields[0] == "CONTEXT_EXCEEDED":
-        limit = fields[2] if len(fields) > 2 else "the context"
-        used = fields[1] if len(fields) > 1 else "?"
+        # Two spellings of the same frame. colibri and deepseek_v4 write the
+        # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write
+        # `prompt_tokens=N requested=M capacity=C`. Reading the second by
+        # position took "requested=M" (the completion budget) as the limit and
+        # printed it raw: "maximum context length is requested=4 tokens", with
+        # the real ceiling nowhere (#1376). Unifying the engines' spelling is
+        # a separate change; the server must read both meanwhile.
+        kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+        if kv:
+            limit = kv.get("capacity") or "the context"
+            used = kv.get("prompt_tokens") or "?"
+        else:
+            limit = fields[2] if len(fields) > 2 else "the context"
+            used = fields[1] if len(fields) > 1 else "?"
         return APIError(400,
                         f"This model's maximum context length is {limit} tokens, however your "
                         f"messages resulted in at least {used} tokens. Please shorten the "
@@ -1597,7 +1609,16 @@ GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
 
 
 def _image_bytes_from_url(url):
-    """data: URI, file:// o percorso sul disco -> i byte dell'immagine."""
+    """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
+
+    A local path is read with the server process's own permissions. On a
+    server that binds beyond loopback (which already requires an API key),
+    an authenticated client could otherwise read any file the process can
+    reach -- e.g. "file:///etc/passwd". Two guards without breaking the
+    documented loopback single-user case: '..' is refused outright (never
+    needed for a real image path), and if COLI_IMAGE_ROOT is set the resolved
+    path must stay inside it, mirroring serve_static's relative_to() check.
+    Errors stay generic so the reply never confirms a path or its permissions."""
     if not isinstance(url, str) or not url:
         raise APIError(400, "image_url.url must be a non-empty string.", "messages")
     if url.startswith("data:"):
@@ -1615,12 +1636,21 @@ def _image_bytes_from_url(url):
         raise APIError(400, "remote image URLs are not fetched; send the image "
                             "as a base64 data: URI or a path on this machine.",
                        "messages")
-    path = url[7:] if url.startswith("file://") else url
+    raw = url[7:] if url.startswith("file://") else url
+    if ".." in Path(raw).parts:
+        raise APIError(400, "image path is not allowed.", "messages")
     try:
-        with open(path, "rb") as handle:
+        target = Path(raw).resolve()
+        image_root = os.environ.get("COLI_IMAGE_ROOT")
+        if image_root:
+            target.relative_to(Path(image_root).resolve())
+    except (ValueError, OSError):
+        raise APIError(400, "image path is not allowed.", "messages")
+    try:
+        with open(target, "rb") as handle:
             return handle.read()
-    except OSError as problem:
-        raise APIError(400, f"cannot read image {path}: {problem}", "messages")
+    except OSError:
+        raise APIError(400, "cannot read the requested image.", "messages")
 
 
 # Qwen3.8 splices images as <|vision_start|> + N x <|image_pad|> + <|vision_end|>,
@@ -1826,22 +1856,30 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         tools = None                              # il client li ha vietati: non si offrono
 
     prompt = ["[gMASK]<sop>"]
-    if enable_thinking:
-        # SOLO col ragionamento acceso. Con --no-think il prompt chiude gia' il
-        # blocco, e lasciare "Reasoning Effort: Max" davanti a un <think></think>
-        # chiuso dice al modello due cose opposte: rifletti al massimo, e hai
-        # finito di riflettere. Il modello risponde riaprendo un <think>, lo
-        # splitter -- che era partito correttamente in modalita' testo -- lo vede
-        # e ci rientra, e da li' in poi tutta la risposta viene archiviata come
-        # pensiero: l'utente vede riflettere e poi nessuna risposta (#1278).
-        # render_chat (GLM-5.2) mette questa riga sotto la stessa condizione da
-        # sempre, ed e' l'unico dei due che non ha mai avuto questa segnalazione.
-        #
-        # low e high passano, tutto il resto e' Max: e' la scala del template,
-        # non la nostra. `none` non arriva qui, spegne il ragionamento a monte.
-        effort = {"minimal": "Low", "low": "Low", "medium": "High",
-                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
-        prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    # La riga di effort esce SEMPRE, come nel template: `effective_reasoning_effort`
+    # ha un ramo else che vale 'max', quindi non e' mai none. GLM-5.3 non ha un modo
+    # "non ragionare" -- in questo template `enable_thinking` non esiste proprio, e
+    # il prompt di generazione APRE sempre <think>.
+    #
+    # Quindi enable_thinking=False qui non puo' voler dire "spegni": vuol dire "il
+    # minimo che il modello supporta", cioe' Low. Il ragionamento avviene comunque;
+    # a nasconderlo e' il gateway, non il prompt.
+    #
+    # La forma che questo sostituisce -- nessuna riga di effort e <think></think>
+    # chiuso -- non esiste nel template e il modello non l'ha mai vista: e' la causa
+    # di #1278. Meta' di quella deviazione l'ho aggiunta io in #1282, giustificandola
+    # con un meccanismo poi misurato falso e ritirato pubblicamente sulla issue.
+    # Reso il template con jinja2 accanto a questo renderer, l'unica forma che sa
+    # produrre e':
+    #     [gMASK]<sop><|system|>Reasoning Effort: {Low|High|Max}<|user|>..<|assistant|><think>
+    #
+    # low e high passano, tutto il resto e' Max: e' la scala del template, non la
+    # nostra. `none` non arriva qui, spegne il ragionamento a monte per le famiglie
+    # che possono davvero spegnerlo.
+    effort = {"minimal": "Low", "low": "Low", "medium": "High",
+              "high": "High", "xhigh": "Max"}.get(reasoning_effort,
+                                                  "Max" if enable_thinking else "Low")
+    prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
@@ -1871,17 +1909,13 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
-    # Il prompt di generazione apre il blocco di ragionamento; con il
-    # ragionamento spento lo chiude subito.
-    #
-    # Il template ufficiale conosce solo la prima forma, perche' per lui il
-    # modello ragiona sempre. La seconda pero' non e' inventata: e' esattamente
-    # quello che il template scrive davanti a un turno passato che ragionamento
-    # non ne aveva (<think></think> seguito dal contenuto), quindi e' uno stato
-    # su cui il modello e' stato addestrato e non una posizione mai vista.
-    # Chi vuole il comportamento ufficiale non tocca niente: acceso e' il caso
-    # che combacia col template, ed e' quello che il test confronta.
-    prompt.append("<|assistant|><think>" if enable_thinking else "<|assistant|><think></think>")
+    # Il prompt di generazione apre il blocco, sempre, come il template:
+    #     {%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}
+    # Il vecchio commento qui sosteneva che <think></think> chiuso fosse "uno stato
+    # su cui il modello e' addestrato" perche' il template lo scrive davanti a un
+    # TURNO PASSATO senza ragionamento. E' vero per un turno passato e falso per il
+    # prompt di generazione: la posizione da cui il modello scrive non e' mai quella.
+    prompt.append("<|assistant|><think>")
     return "".join(prompt)
 
 
@@ -1916,8 +1950,14 @@ def starts_in_reasoning(enable_thinking):
     dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
     solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
     Se le due cose non concordano il ragionamento finisce incollato davanti
-    alla risposta, che e' il difetto che questa funzione esiste per non avere."""
-    return enable_thinking
+    alla risposta, che e' il difetto che questa funzione esiste per non avere.
+
+    GLM-5.3 e' l'eccezione che rende la regola esplicita: il suo template non
+    ha un interruttore, render_chat_glm53 apre <think> SEMPRE, e "thinking
+    spento" vuol dire solo effort Low. L'uscita comincia dentro al blocco in
+    ogni caso; partire in modalita' testo perche' il client ha detto False e'
+    esattamente il ragionamento incollato davanti alla risposta di #1278."""
+    return enable_thinking or ARCH == "glm53"
 
 
 class ThinkingStreamSplit:

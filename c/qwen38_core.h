@@ -126,6 +126,7 @@ typedef struct {
     GatedResidual final_gr;
     Layer *L;
     LCache *cache;
+    uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
     Q38ExpertScaleCache *expert_scales;
     uint64_t clock, hits, miss;
     uint64_t expert_weight_reads, expert_scale_reads, expert_pair_reads;
@@ -1205,16 +1206,16 @@ incompatible:
 }
 
 /* Una mappatura per SHARD, non per tensore: 24576 esperti x 3 matrici
- * sarebbero 73728 mappature. compat_map_readonly gestisce l'allineamento e
- * funziona anche su Windows; le pagine restano file-backed e reclaimable, cioe'
- * non sono il working set anonimo che la cache degli slot creava copiandole. */
-#define Q38_MAXFD 4096
-static compat_ro_map q38_shard_map[Q38_MAXFD];
-static const unsigned char *q38_shard_base[Q38_MAXFD];
-static int64_t q38_shard_len[Q38_MAXFD];
-static signed char q38_shard_tried[Q38_MAXFD];
+ * sarebbero 73728 mappature. Dal merge di `dev` (#1325) la tabella e'
+ * st.h::st_map_shard_range -- stessa forma (compat_map_readonly, allineamento
+ * gestito, Windows incluso, pagine file-backed e reclaimable invece del
+ * working set anonimo che la cache degli slot creava copiandole), una sola
+ * implementazione per tutti i motori. Qui restano la manopola e i contatori
+ * che [Q38PROF] stampa. */
 static long q38_map_serve, q38_map_copy;
 
+/* Q38_NO_MMAP=1 riporta il percorso a pread+slab per un A/B; COLI_MAP_EXPERTS=0
+ * (la manopola di st.h) fa lo stesso per ogni motore. */
 static int q38_mmap_enabled(void) {
     static int on = -1;
     if (on < 0) on = !(getenv("Q38_NO_MMAP") && atoi(getenv("Q38_NO_MMAP")));
@@ -1244,42 +1245,6 @@ static void q38_populate_range(const unsigned char *p, int64_t nbytes) {
 #else
     (void)p; (void)nbytes;
 #endif
-}
-
-/* Ritorna la base mappata dello shard, o NULL. Un fallimento si ricorda: non
- * si ritenta una mmap per ogni singolo esperto. */
-static const unsigned char *q38_shard_mapped(int fd) {
-    if (fd < 0 || fd >= Q38_MAXFD || !q38_mmap_enabled()) return NULL;
-    if (q38_shard_base[fd]) return q38_shard_base[fd];
-    if (q38_shard_tried[fd]) return NULL;
-    q38_shard_tried[fd] = 1;
-    int64_t len = (int64_t)lseek(fd, 0, SEEK_END);
-    if (len <= 0) return NULL;
-    const void *data = NULL;
-    if (compat_map_readonly(fd, 0, (size_t)len, &q38_shard_map[fd], &data) != 0) return NULL;
-    q38_shard_base[fd] = (const unsigned char *)data;
-    q38_shard_len[fd] = len;
-    return q38_shard_base[fd];
-}
-
-/* Un intervallo e' servibile dalla mappatura se lo shard e' mappato e
- * l'intervallo ci sta dentro. FP8 e' un byte per elemento: nessun vincolo di
- * allineamento, e le scale arrivano dal banco per-layer, non dal file. */
-static const unsigned char *q38_mapped_range(int fd, int64_t off, int64_t nbytes) {
-    if (off < 0 || nbytes <= 0) return NULL;
-    const unsigned char *base = q38_shard_mapped(fd);
-    if (!base) return NULL;
-    if (off > q38_shard_len[fd] - nbytes) return NULL;
-    return base + off;
-}
-
-static void q38_unmap_shards(void) {
-    for (int fd = 0; fd < Q38_MAXFD; fd++)
-        if (q38_shard_base[fd]) {
-            compat_unmap_readonly(&q38_shard_map[fd]);
-            q38_shard_base[fd] = NULL;
-            q38_shard_len[fd] = 0;
-        }
 }
 
 static void q38_bind_borrowed_fp8(Q38Weight *weight,void *data,float *scales,
@@ -1343,11 +1308,15 @@ static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
     Q38ExpertScaleCache *cache=&m->expert_scales[layer];
     float *scales=cache->values+(int64_t)expert*3*cache->scale_count;
     /* Se i tre intervalli sono mappati, lo slot li PUNTA invece di copiarli:
-     * niente slab, niente 14 MB per miss, e la residenza la gestisce il kernel. */
-    {
-        const unsigned char *pg=q38_mapped_range(weight[0]->fd,weight[0]->off,weight[0]->nbytes);
-        const unsigned char *pu=q38_mapped_range(weight[1]->fd,weight[1]->off,weight[1]->nbytes);
-        const unsigned char *pd=q38_mapped_range(weight[2]->fd,weight[2]->off,weight[2]->nbytes);
+     * niente slab, niente 14 MB per miss, e la residenza la gestisce il kernel.
+     * #1325 (merge 2026-09-08): la mappatura per shard vive in st.h
+     * (st_map_shard_range); qui resta il prefault, che su questo motore VALE
+     * 4-6x sul percorso esperti CPU (vedi q38_populate_range), e i due
+     * contatori che [Q38PROF] stampa. */
+    if(q38_mmap_enabled()){
+        const unsigned char *pg=(const unsigned char*)st_map_shard_range(weight[0]->fd,weight[0]->off,weight[0]->nbytes);
+        const unsigned char *pu=(const unsigned char*)st_map_shard_range(weight[1]->fd,weight[1]->off,weight[1]->nbytes);
+        const unsigned char *pd=(const unsigned char*)st_map_shard_range(weight[2]->fd,weight[2]->off,weight[2]->nbytes);
         if(pg&&pu&&pd){
             int sc=(int)cache->scale_count;
             /* gate and up are adjacent in the official shards: one advice covers both */
@@ -1547,7 +1516,19 @@ static int q38vk_expert_ensure(Model *m, int layer, int eid) {
 }
 #endif
 
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits in qwen38.c),
+ * cleared there. Marked on both lookup paths, single and batched. */
+static void q38_ehit_mark(Model *m,int layer,int eid) {
+    const Cfg *c=&m->c;
+    if(!m->ehit){
+        m->ehit=(uint8_t**)calloc((size_t)c->layers,sizeof(uint8_t*));
+        for(int i=0;i<c->layers;i++)m->ehit[i]=(uint8_t*)calloc((size_t)c->experts,1);
+    }
+    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)m->ehit[layer][eid]=1;
+}
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
+    q38_ehit_mark(m,layer,eid);
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
     if(si>=0){m->hits++;lc->slots[si].used=++m->clock;return &lc->slots[si];}
     m->miss++; Slot *s;
@@ -1580,6 +1561,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     for(int index=0;index<count;index++){
         int expert=experts[index];
         if(expert<0||expert>=m->c.experts)return 0;
+        q38_ehit_mark(m,layer,expert);
         for(int previous=0;previous<index;previous++)
             if(experts[previous]==expert)return 0;
         int slot_index=cache->by_expert[expert];

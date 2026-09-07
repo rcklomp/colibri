@@ -67,6 +67,9 @@
 
 #include "cli_args.h"
 #include "json.h"
+/* Expert weights are served from the shard mapping by default in this engine
+ * (see expert_map_init); GLM53_NO_MMAP / COLI_MAP_EXPERTS=0 turn it off. */
+#define COLI_MAP_EXPERTS_DEFAULT 1
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
@@ -676,6 +679,12 @@ typedef struct {
     int64_t e_len[6], e_at[6], e_slot;
     uint64_t clock, ebytes;
     long hits, miss;
+    /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
+     * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
+     * cumulativi dall'avvio; il turno ne prende la differenza. */
+    double t_attn, t_ffn, t_disk, t_head;
+    uint64_t forwards;
+    uint8_t **ehit;                       /* [layer][expert] toccato in questo turno */
     /* torre vision: presente solo se il checkpoint la porta */
     int has_vision;
     ColiVisionTower vision;
@@ -1893,13 +1902,17 @@ typedef struct ERef {
 
 /* I sei pezzi non sono adiacenti nel file, ma non devono esserlo nemmeno in
  * memoria: expert_mats ci costruisce sopra solo tre viste in sola lettura. */
-typedef struct { int eid; uint8_t *piece[GLM53_EXPERT_PIECES]; uint8_t *own; uint64_t used; int mapped; } Slot;
+typedef struct { int eid; uint8_t *piece[GLM53_EXPERT_PIECES]; uint8_t *own; uint64_t used; } Slot;
 
 /* Una mappatura per file, non per esperto: gli offset dei pezzi non sono
- * allineati alla pagina, ma mappando il file intero ci pensa il kernel. */
-#define GLM53_MAXFD 4096
-static uint8_t *g_fmap[GLM53_MAXFD];
-static size_t   g_fmaplen[GLM53_MAXFD];
+ * allineati alla pagina, ma mappando il file intero ci pensa il kernel.
+ *
+ * #1325 (upstream `dev`, 2026-09-08 merge): the mapping table itself now
+ * lives in st.h as st_map_shard_range -- one implementation for every engine
+ * instead of a private g_fmap[] here. What stays engine-local is what st.h
+ * cannot know: whether EVERY expert of this checkpoint is servable from the
+ * mapping (g_map_all sizes the LRU below) and the two counters [PROF] and the
+ * streaming test print. */
 static long     g_map_serve, g_map_copy;
 static int      g_map_active, g_map_all;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
@@ -1982,25 +1995,17 @@ static double memory_total_gb(void) {
 }
 
 static double memory_available_gb(void) {
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0.0;
-    char line[256];
-    double gb = 0.0;
-    while (fgets(line, sizeof(line), f)) {
-        long kb;
-        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gb = kb / 1048576.0; break; }
-    }
-    fclose(f);
-    return gb;
+    /* #1375: era una lettura di /proc/meminfo, che su Windows e macOS non
+     * esiste: 0 -> budget 1 GB -> uno slot per layer, in silenzio. */
+    return compat_mem_available_gb();
 }
 
-/* Un pezzo e' mappabile se il suo file e' mappato, ci sta dentro, ed e'
- * allineato a 4 byte (le scale si leggono come float *). */
-static int piece_mappable(const GModel *m, const ERef *ref, int q) {
-    const int fd = ref->fd[q];
-    if (fd <= 0 || fd >= GLM53_MAXFD || !g_fmap[fd]) return 0;
-    if ((size_t)ref->off[q] + (size_t)m->e_len[q] > g_fmaplen[fd]) return 0;
-    return (ref->off[q] & 3) == 0;
+/* Un pezzo e' servibile dalla mappatura se st.h riesce a mapparne il file,
+ * l'intervallo ci sta dentro (lo verifica st_map_shard_range) ed e' allineato
+ * a 4 byte: le scale si rileggono come float *, e st.h non lo sa. */
+static const uint8_t *piece_mapped(const GModel *m, const ERef *ref, int q) {
+    if (ref->fd[q] <= 0 || (ref->off[q] & 3)) return NULL;
+    return (const uint8_t *)st_map_shard_range(ref->fd[q], ref->off[q], m->e_len[q]);
 }
 
 /* Port of qwen38_core.h's q38_populate_range: same MADV_POPULATE_READ
@@ -2074,6 +2079,10 @@ static void glm53_populate_range(const uint8_t *p, int64_t nbytes) {
 static void expert_map_init(GModel *m) {
     if (getenv("GLM53_NO_MMAP") || !m->eref) return;
     const Cfg *c = &m->c;
+    /* Le mappature si forzano QUI, su un thread solo. st.h mappa pigramente al
+     * primo uso e la sua tabella per-fd non e' sincronizzata; expert_read gira
+     * dentro a una regione OpenMP, quindi il primo tocco non puo' stare li'. */
+    static unsigned char seen[ST_MAX_MAPPED_FD];
     int files = 0;
     for (int i = 0; i < c->n_layers; i++)
         for (int e = 0; e < c->n_experts; e++) {
@@ -2081,13 +2090,12 @@ static void expert_map_init(GModel *m) {
             if (ref->fd[0] <= 0) continue;
             for (int q = 0; q < GLM53_EXPERT_PIECES; q++) {
                 const int fd = ref->fd[q];
-                if (fd <= 0 || fd >= GLM53_MAXFD || g_fmap[fd]) continue;
+                if (fd <= 0 || fd >= ST_MAX_MAPPED_FD || seen[fd]) continue;
+                seen[fd] = 1;
                 struct stat st;
                 if (fstat(fd, &st) != 0 || st.st_size <= 0) continue;
-                void *pm = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-                if (pm == MAP_FAILED) continue;
-                g_fmap[fd] = (uint8_t *)pm;
-                g_fmaplen[fd] = (size_t)st.st_size;
+                const void *base = st_map_shard_range(fd, 0, (int64_t)st.st_size);
+                if (!base) continue;
                 files++;
                 /* GLM53_POPULATE_LOAD: fault the whole shard in right here,
                  * instead of leaving it to the first per-expert bind. Default
@@ -2100,7 +2108,7 @@ static void expert_map_init(GModel *m) {
                  * exactly the assumption a bad interaction could violate, so
                  * this stays opt-in until it has its own A/B on record. */
                 if (getenv("GLM53_POPULATE_LOAD") && atoi(getenv("GLM53_POPULATE_LOAD")))
-                    glm53_populate_range((const uint8_t *)pm, (int64_t)st.st_size);
+                    glm53_populate_range((const uint8_t *)base, (int64_t)st.st_size);
             }
         }
     if (!files) return;
@@ -2112,11 +2120,11 @@ static void expert_map_init(GModel *m) {
             if (ref->fd[0] <= 0) continue;
             int ok = 1;
             for (int q = 0; q < GLM53_EXPERT_PIECES; q++)
-                if (!piece_mappable(m, ref, q)) { ok = 0; break; }
+                if (!piece_mapped(m, ref, q)) { ok = 0; break; }
             if (ok) full++; else partial++;
         }
     g_map_all = (partial == 0 && full > 0);
-    fprintf(stderr, "[MAP] %d file mappati, esperti mappabili %ld/%ld%s\n",
+    fprintf(stderr, "[MAP] %d file mappati (st_map_shard_range), esperti mappabili %ld/%ld%s\n",
             files, full, full + partial, g_map_all ? " (tutti: nessuna copia)" : "");
 }
 
@@ -2198,12 +2206,12 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
     if (g_map_active) {
+        const uint8_t *pc[GLM53_EXPERT_PIECES];
         int ok = 1;
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-            if (!piece_mappable(m, ref, p)) { ok = 0; break; }
+            if (!(pc[p] = piece_mapped(m, ref, p))) { ok = 0; break; }
         if (ok) {
-            for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-                slot->piece[p] = g_fmap[ref->fd[p]] + ref->off[p];
+            for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = (uint8_t *)pc[p];
             /* Prefault on the thread that binds this expert, not inside the
              * matmul that first touches it -- see glm53_populate_range above.
              *
@@ -2242,7 +2250,6 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
                         glm53_populate_range(slot->piece[p], m->e_len[p]);
                 }
             }
-            slot->mapped = 1;
             slot->eid = eid;
 #ifdef _OPENMP
 #pragma omp atomic
@@ -2253,10 +2260,14 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     }
     /* Fallback: si torna a scrivere in memoria NOSTRA, non nella mappatura di
      * sola lettura che questo slot poteva star usando prima. */
-    slot->mapped = 0;
     if (!slot->own) {
         slot->own = malloc((size_t)m->e_slot);
-        if (!slot->own) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+        if (!slot->own) {
+            fprintf(stderr, "OOM su uno slot esperto (%.1f MB): la cache esperti non ci sta "
+                            "in memoria; riduci con --ram N o GLM53_EXPERT_GB=N (#1375)\n",
+                    m->e_slot / 1e6);
+            exit(1);
+        }
     }
     for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + m->e_at[p];
 #ifdef _OPENMP
@@ -2286,7 +2297,12 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
 
 /* Lo slot dell'esperto chiesto, letto se non c'e'. La vittima e' quella usata
  * meno di recente. */
+static double now_s(void);
+static void ehit_mark(GModel *m, int layer, int eid);
+static void hits_emit(GModel *m);
+static void emap_emit(GModel *m);
 static Slot *expert_slot(GModel *m, int layer, int eid) {
+    ehit_mark(m, layer, eid);
     Slot *slot = slot_find(m, layer, eid);
     if (slot) return slot;
     LCache *cache = &m->ecache[layer];
@@ -2297,7 +2313,9 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
             if (cache->s[j].used < cache->s[lru].used) lru = j;
         slot = &cache->s[lru];
     }
+    double t_read0 = now_s();
     expert_read(m, layer, eid, slot);
+    m->t_disk += now_s() - t_read0;
     slot->used = ++m->clock;
     return slot;
 }
@@ -3032,6 +3050,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         int reads = 0;
         for (int i = 0; i < here; i++) {
             const int eid = union_ids[base + i];
+            ehit_mark(m, index, eid);
             Slot *hit = slot_find(m, index, eid);
             if (hit) { slot_of[i] = (int)(hit - cache->s); continue; }
             Slot *victim;
@@ -3048,6 +3067,8 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             slot_of[i] = (int)(victim - cache->s);
             to_read[reads++] = i;
         }
+        double t_batch0;
+        t_batch0 = now_s();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
@@ -3055,6 +3076,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             const int i = to_read[r];
             expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
         }
+        m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 
         /* Un esperto per volta, e per ognuno tutti i token che lo hanno
          * scelto. Nell'ordine opposto i suoi 12,6 MB di pesi verrebbero
@@ -3742,6 +3764,10 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                         site ? l->post_ln : l->in_ln, D, c->eps);
             }
             if (timed) { g_ot_hc += optime_now() - t0; g_on_hc++; t0 = optime_now(); }
+            /* dev's per-site wall clock, kept next to the fork's op timers:
+             * it feeds the serve PROF frame (attn/ffn split) the dashboard
+             * reads, which optime's stderr table does not. */
+            const double t_phase = now_s();
             if (!site) {
                 GLayerState *st = &s->layer[i];
                 /* Lo stato non si azzera a ogni chiamata: e' della
@@ -3762,6 +3788,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                     else                    { g_ot_ffn_moe   += optime_now() - t0; g_on_ffn_moe++; }
                 }
             }
+            /* Un solo paio di letture del clock per sito, il ramo dice a chi
+             * va il tempo. */
+            *(site ? &m->t_ffn : &m->t_attn) += now_s() - t_phase;
             if (timed) t0 = optime_now();
             if (hc_par) {
 #ifdef _OPENMP
@@ -3956,6 +3985,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     const double t_head0 = optime_on() ? optime_now() : 0.0;
+    const double t_head_wall = now_s();
     /* P2.3: a prefill chunk whose caller keeps only the last row (the serve
      * path, forward_prefill keep_all == 0) gets the head for that row only;
      * the teacher-forcing oracle keeps every row and pays every head. */
@@ -3963,6 +3993,8 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     for (int t = t_first; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
     if (optime_on()) { g_ot_head += optime_now() - t_head0; g_on_head++; }
+    m->t_head += now_s() - t_head_wall;   /* dev's PROF frame */
+    m->forwards++;
 
     free(normed); free(collapsed);
     free(next); free(streams);
@@ -4102,7 +4134,11 @@ static int load_stops(const char *dir, int *out, int max) {
  * questo motore riprefilla ogni volta invece di riprendere la conversazione da
  * dove era. E' piu' lento e non e' sbagliato, e il giorno che ci sara' una
  * cache il protocollo non cambia. */
-static double now_s(void) {
+/* noinline: GCC 16.1 (MSYS2 UCRT64) crashes in its IPA inliner when this
+ * clock is inlined into run_layers/forward_span at every phase timer; the
+ * bisect on the CI runner points at the inlining, not the timers, and a call
+ * per phase costs nothing next to a layer. */
+__attribute__((noinline)) static double now_s(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
@@ -4855,6 +4891,8 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
 
     const double started = now_s();
+    const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
+    const uint64_t s_fw = m->forwards;
     int emitted = 0, limited = 0;
     const int budget = q->max_tokens > 0 ? q->max_tokens : 256;
 
@@ -4999,11 +5037,82 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * occhi di chi voleva solo la risposta. */
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
+    hits_emit(m);
+    {
+        const double disk = m->t_disk - s_disk, ffn = m->t_ffn - s_ffn;
+        serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", elapsed,
+                   prompt_tokens, emitted, disk, 0.0, ffn > disk ? ffn - disk : 0.0,
+                   m->t_attn - s_attn, m->t_head - s_head,
+                   (unsigned long long)(m->forwards - s_fw));
+    }
     serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d\n", q->id, emitted,
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
                rss_gb(), prompt_tokens, limited);
     free(sequence);
+}
+
+/* --- Dashboard: Brain e Profile ------------------------------------------
+ * Il server legge quattro righe dallo stdout del motore e nient'altro:
+ *   EMAP rows cols hex   griglia (layer sparsi x esperti), una volta all'avvio
+ *   HITS rows cols hex   bitmap degli esperti toccati nel turno, a fine turno
+ *   PROF + 9 numeri      tempi per fase del turno
+ * colibri.c le emette da mesi (telemetry.h); deepseek_v4.c anche. Qui non
+ * c'erano, e le due schede su GLM-5.3-Flash restavano vuote: non c'era
+ * niente da attivare, mancava l'emissione. Stesso formato byte per byte,
+ * cosi' la dashboard non distingue i motori.
+ *
+ * Fasi che questo motore misura: disco (expert_read, muro del batch),
+ * matmul esperti (ffn_layer meno il disco), attention (mla/kda), testa
+ * (mv su lm_head). L'attesa asincrona non esiste qui: glm53 legge in modo
+ * sincrono, quindi expert_wait_s e' 0 per costruzione, non per omissione. */
+static void ehit_mark(GModel *m, int layer, int eid) {
+    const Cfg *c = &m->c;
+    if (!m->ehit) {
+        m->ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
+        for (int i = 0; i < c->n_layers; i++) m->ehit[i] = calloc((size_t)c->n_experts, 1);
+    }
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
+}
+static int dash_rows(const GModel *m) {
+    int rows = 0;
+    for (int i = m->c.first_dense; i < m->c.n_layers; i++) if (i >= m->layer_begin && i < m->layer_end) rows++;
+    return rows;
+}
+static void emap_emit(GModel *m) {
+    const Cfg *c = &m->c;
+    const int rows = dash_rows(m), cols = c->n_experts;
+    char *hex = malloc((size_t)rows * cols * 2 + 1); int w = 0;
+    for (int i = c->first_dense; i < c->n_layers; i++) {
+        if (i < m->layer_begin || i >= m->layer_end) continue;
+        for (int e = 0; e < cols; e++) {
+            int tier = 0;                       /* 0 = su disco, 1 = in RAM (cache) */
+            if (m->ecache) { const LCache *cache = &m->ecache[i];
+                for (int j = 0; j < cache->n; j++) if (cache->s[j].eid == e) { tier = 1; break; } }
+            const int b = tier << 6;            /* nessun contatore di calore qui: heat = 0 */
+            hex[w++] = "0123456789abcdef"[b >> 4]; hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    hex[w] = 0;
+    serve_line("EMAP %d %d %s\n", rows, cols, hex); free(hex);
+}
+static void hits_emit(GModel *m) {
+    const Cfg *c = &m->c;
+    /* Un turno che non ha toccato esperti (tutto denso, o tutto riuso) emette
+     * una bitmap a zero: la dashboard deve vedere QUESTO turno, non l'ultimo
+     * che ha avuto hit. */
+    if (!m->ehit) ehit_mark(m, -1, -1);
+    const int rows = dash_rows(m), cols = c->n_experts, nb = (rows * cols + 7) / 8;
+    uint8_t *bm = calloc((size_t)nb, 1); int bit = 0;
+    for (int i = c->first_dense; i < c->n_layers; i++) {
+        if (i < m->layer_begin || i >= m->layer_end) continue;
+        for (int e = 0; e < cols; e++, bit++)
+            if (m->ehit[i][e]) { bm[bit >> 3] |= (uint8_t)(1 << (bit & 7)); m->ehit[i][e] = 0; }
+    }
+    char *hex = malloc((size_t)nb * 2 + 1); int w = 0;
+    for (int b = 0; b < nb; b++) { hex[w++] = "0123456789abcdef"[bm[b] >> 4]; hex[w++] = "0123456789abcdef"[bm[b] & 15]; }
+    hex[w] = 0;
+    serve_line("HITS %d %d %s\n", rows, cols, hex); free(hex); free(bm);
 }
 
 static void serve_loop(GModel *m, Tok *tokenizer) {
@@ -5012,6 +5121,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     slots_init(m);
     serve_line("\x01\x01READY\x01\x01\n");
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
+    /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
+     * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */
+    emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
         if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
@@ -5210,11 +5322,12 @@ int main(int argc, char **argv) {
     if (has_tokenizer) tok_free(&tokenizer);
     /* Contatori della cache esperti: servono a un test per accorgersi se lo
      * streaming e' stato aggirato invece che esercitato. */
-    if (model.streaming)
-        if (g_map_active)
-            printf("[MAP] serviti da mmap %ld, copiati %ld\n", g_map_serve, g_map_copy);
-        printf("experts hits %ld miss %ld bytes %llu\n",
-               model.hits, model.miss, (unsigned long long)model.ebytes);
+    /* Le graffe mancavano: la riga "experts hits" e' SEMPRE stampata, ed e'
+     * quella che il test legge. Comportamento invariato, resa esplicita. */
+    if (model.streaming && g_map_active)
+        printf("[MAP] serviti da mmap %ld, copiati %ld\n", g_map_serve, g_map_copy);
+    printf("experts hits %ld miss %ld bytes %llu\n",
+           model.hits, model.miss, (unsigned long long)model.ebytes);
     free(logits);
     session_close(&model, session);
     free(vision);

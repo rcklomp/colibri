@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import math
+import os
 import socket
 import tempfile
 import threading
@@ -17,7 +18,7 @@ from pathlib import Path
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
+                           _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
@@ -1009,8 +1010,41 @@ class DispatcherTest(unittest.TestCase):
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
         output = []
+        # Il consumatore se ne va DOPO aver ricevuto qualcosa: e' lo scenario che
+        # il nome promette, e va costruito invece che sperato. Con cancelled che
+        # tornava True da subito, la corsa era fra il ramo idle -- che cancella
+        # prima di ogni dato -- e l'arrivo del frame: su Windows vinceva il primo
+        # e l'asserzione su output falliva senza che nulla fosse rotto (#1328).
+        # Qui il flag si alza dentro il sink, e nel ramo "data" decode() consegna
+        # il token PRIMA che cancelled() venga interrogato: l'ordine e' garantito
+        # dal codice, non dallo scheduler.
+        #
+        # Il tetto sui poll non e' decorativo. Senza, un guasto che impedisce la
+        # consegna del token lascerebbe il flag basso per sempre: niente cancel,
+        # niente eccezione, e il test si APPENDE invece di fallire -- misurato
+        # rompendo decode() apposta. Il ramo idle interroga cancelled() ogni 50 ms,
+        # quindi dopo un secondo si cancella comunque e l'asserzione su output
+        # fallisce subito, dicendo la cosa giusta. Deterministico quando funziona,
+        # rapido a fallire quando no.
+        #
+        # Il caso "cancella prima del primo frame" resta coperto, in modo
+        # deterministico, da test_cancels_generation_before_first_frame (#908):
+        # prima i due si sovrapponevano a caso e uno dei due vinceva a sorte.
+        disconnected = False
+        polls = 0
+
+        def sink(text):
+            nonlocal disconnected
+            output.append(text)
+            disconnected = True
+
+        def consumer_gone():
+            nonlocal polls
+            polls += 1
+            return disconnected or polls > 20
+
         with self.assertRaises(ClientCancelled):
-            engine.generate("hello", 8, 0.7, 0.9, output.append, cancelled=lambda: True)
+            engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=consumer_gone)
         engine.close()
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
@@ -1990,6 +2024,21 @@ class ThinkingSplitUnitTest(unittest.TestCase):
         self.assertEqual(split_thinking_reply("plain answer", enable_thinking=False),
                          ("", "plain answer"))
 
+    def test_glm53_starts_in_reasoning_even_with_thinking_off(self):
+        """#1278: render_chat_glm53 opens <think> unconditionally (the template
+        has no switch; "off" only lowers the effort), so the reply always starts
+        inside the block. With the splitter started in text mode the reasoning
+        streamed as `content`, glued in front of the answer. The family, not the
+        client flag, decides where the output starts."""
+        import openai_server as srv
+        with patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(srv.starts_in_reasoning(False))
+            self.assertEqual(split_thinking_reply("why</think>answer", enable_thinking=False),
+                             ("why", "answer"))
+        with patch("openai_server.ARCH", "glm"):
+            self.assertFalse(srv.starts_in_reasoning(False),
+                             "GLM-5.2 closes the block in the prompt when thinking is off")
+
     def test_missing_close_tag_surfaces_reasoning(self):
         self.assertEqual(split_thinking_reply("thought with no end"),
                          ("thought with no end", ""))
@@ -2532,6 +2581,79 @@ class ReasoningEffortTest(unittest.TestCase):
         text = render_chat(self.MESSAGES, enable_thinking=False,
                            reasoning_effort="xhigh")
         self.assertNotIn("Reasoning Effort", text)
+
+
+class ImageUrlPathGuard(unittest.TestCase):
+    """image_url.url points at a local file read with the server's rights.
+    A '..' path is refused; COLI_IMAGE_ROOT confines reads; errors stay
+    generic so a reply never confirms a path or its permissions."""
+
+    def setUp(self):
+        self._saved = os.environ.pop("COLI_IMAGE_ROOT", None)
+
+    def tearDown(self):
+        os.environ.pop("COLI_IMAGE_ROOT", None)
+        if self._saved is not None:
+            os.environ["COLI_IMAGE_ROOT"] = self._saved
+
+    def test_reads_a_plain_file_by_default(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"\x89PNG\r\n")
+            self.assertEqual(_image_bytes_from_url(str(img)), b"\x89PNG\r\n")
+            self.assertEqual(_image_bytes_from_url("file://" + str(img)),
+                             b"\x89PNG\r\n")
+
+    def test_dotdot_is_refused(self):
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url("/var/data/../../etc/passwd")
+        self.assertEqual(caught.exception.status, 400)
+        self.assertNotIn("passwd", str(caught.exception))
+
+    def test_image_root_confines_reads(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile() as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            inside = Path(root) / "ok.png"
+            inside.write_bytes(b"ok")
+            self.assertEqual(_image_bytes_from_url(str(inside)), b"ok")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(outside.name)
+
+    def test_error_does_not_leak_the_path(self):
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url("/no/such/secret-name.png")
+        self.assertNotIn("secret-name", str(caught.exception))
+
+
+class ContextExceededMessageTest(unittest.TestCase):
+    """#1376: the engine writes `CONTEXT_EXCEEDED prompt_tokens=N requested=M
+    capacity=C`. The message took fields[2] ("requested=M", the completion
+    budget) as the limit and printed the raw key=value token, so a user with a
+    9000-token prompt on an 8192 ceiling read "maximum context length is
+    requested=4 tokens". The number that mattered, capacity, appeared nowhere."""
+
+    def test_limit_is_capacity_and_used_is_prompt_tokens(self):
+        from openai_server import _engine_error
+        err = _engine_error(["CONTEXT_EXCEEDED", "prompt_tokens=9000", "requested=4",
+                             "capacity=8192"], "ignored")
+        text = str(err)
+        self.assertIn("8192", text)
+        self.assertIn("9000", text)
+        self.assertNotIn("requested=", text)
+        self.assertNotIn("prompt_tokens=", text)
+        self.assertNotIn("capacity=", text)
+
+    def test_the_positional_spelling_of_colibri_and_deepseek_still_reads(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED", "8321", "4094"], "ignored"))
+        self.assertIn("4094", text)
+        self.assertIn("8321", text)
+
+    def test_missing_fields_do_not_crash_the_message(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED"], "ignored"))
+        self.assertIn("the context", text)
 
 
 if __name__ == "__main__":

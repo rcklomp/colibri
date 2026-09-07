@@ -117,8 +117,16 @@ echo "step 1 rc=$rc1"
 # ---------------------------------------------------------------- (2)
 echo
 echo "### step 2 — prefill_gate.sh at one slot (the pool must be neutral)"
+# GLM53_PREFIX_CKPT=0, and not for tidiness. prefill_gate runs the PRISTINE side
+# first and the CANDIDATE second against ONE checkpoint directory, and its sizes
+# 30/300/1000 share a prefix: with checkpoints on, the 1 000-token run plans an
+# LCP capture at ~300 tokens, writes it to disk, and the candidate's FIRST
+# 1 000-token run then RESTORES what the pristine's runs stored. The candidate
+# would come out faster because it went second. P6b changes no prefill path, so
+# the honest comparison is with the feature off -- the same reason p7_gate.sh
+# step 1 turns it off.
 if run_step 2; then
-COLI_CKPT_DIR="$OUT/ckpt" MIN_SPEEDUP=${MIN_SPEEDUP:-0.97} \
+COLI_CKPT_DIR="$OUT/ckpt" GLM53_PREFIX_CKPT=0 MIN_SPEEDUP=${MIN_SPEEDUP:-0.97} \
   "$HERE/prefill_gate.sh" "$PRISTINE" "$CAND" "$TAG-one" 2>&1 | tee "$OUT/step2.txt"
 rc2=${PIPESTATUS[0]}
 wait_no_engine || exit 2
@@ -136,6 +144,7 @@ decode_row() {   # <label> <binary> <slots>
       COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695 \
       COLI_VK_SHADERS="$SHADERS" COLI_USAGE_PATH="$OUT/hist.bin" \
       COLI_CKPT_DIR="$OUT/ckpt" COLI_KDA_GPU=2 GLM53_VERBOSE=1 \
+      GLM53_PREFIX_CKPT=0 \
       python3 "$HERE/ttft_serve.py" --engine "$bin" --kv-slots "$slots" \
         --sizes 30 --repeat 2 --gen 64 --warm --min-resident 96 \
         --tag "$TAG-$label" --json "$OUT/decode.jsonl" \

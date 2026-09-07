@@ -3931,6 +3931,433 @@ static void slot_remember(KVSlot *slot, const int *tokens, int n) {
     slot->n = n;
 }
 
+/* ---------- P7: checkpoint del prefisso ----------
+ *
+ * Uno slot riusa solo IN AVANTI e solo la propria conversazione. Il prefisso
+ * che Open WebUI mette davanti a ogni primo turno -- il blocco degli strumenti
+ * piu' il system -- e' identico fra conversazioni diverse, ma nessuno slot lo
+ * possiede: la conversazione nuova finisce su un altro slot (o sullo stesso
+ * dopo un reset) e ripaga 5 400 token di prefill, misurati 876 s il 2026-09-07.
+ *
+ * Il rimedio e' quello di deepseek_v4.c (v4_ckpt_*, :12470-12760): una copia
+ * dello stato della sessione presa AL confine del prefisso e rimessa in una
+ * sessione fresca. Lo stato e' esattamente quello che il segment adapter
+ * dichiara (glm53_segment_spans): per i layer DSA le `len` righe di latente,
+ * chiavi e gate dell'indexer; per i layer KDA la ricorrenza e la finestra
+ * della convoluzione, che non dipendono dalla lunghezza.
+ *
+ * Il confine non si dichiara, si scopre: o e' il prefisso comune di due
+ * prompt freschi successivi (il piano), o e' il byte offset che il gateway
+ * manda nell'ottavo campo del SUBMIT (il suggerimento). In entrambi i casi il
+ * motore verifica che cada su un confine di token e che i primi `len` id
+ * coincidano davvero, perche' un confine sbagliato darebbe risposte plausibili
+ * e sbagliate.
+ *
+ * GLM53_PREFIX_CKPT=0 spegne tutto e riporta esattamente il percorso di prima.
+ */
+enum { GLM53_CKPT_MAX_SLOTS = 8, GLM53_CKPT_MAX_SPANS = 512 };
+
+typedef struct {
+    int *ids;                 /* il prefisso, esattamente i token macinati */
+    int len;
+    unsigned char *blob;      /* gli span in ordine, uno dietro l'altro */
+    size_t bytes;
+    unsigned long long used;  /* orologio LRU */
+    int kind;                 /* 0 = prefisso (piano/suggerimento), 1 = fine prompt */
+} PrefixCkpt;
+
+static PrefixCkpt g_ckpt[GLM53_CKPT_MAX_SLOTS];
+static unsigned long long g_ckpt_clock;
+static int *g_ckpt_prev_ids;
+static int g_ckpt_prev_len;
+
+static int ckpt_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("GLM53_PREFIX_CKPT");
+        cached = setting ? atoi(setting) != 0 : 1;
+    }
+    return cached;
+}
+
+static int ckpt_slot_count(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("GLM53_PREFIX_CKPT_SLOTS");
+        cached = setting ? atoi(setting) : 4;
+        if (cached < 1) cached = 1;
+        if (cached > GLM53_CKPT_MAX_SLOTS) cached = GLM53_CKPT_MAX_SLOTS;
+    }
+    return cached;
+}
+
+static int ckpt_min_tokens(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("GLM53_PREFIX_CKPT_MIN");
+        cached = setting ? atoi(setting) : 128;
+        if (cached < 8) cached = 8;
+    }
+    return cached;
+}
+
+static int ckpt_disk_wanted(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("GLM53_PREFIX_CKPT_DISK");
+        cached = setting ? atoi(setting) : 1;
+    }
+    return cached;
+}
+
+/* Una copia intera per richiesta non e' gratis qui (334 MB a 5 400 token),
+ * quindi la cattura a fine prompt -- il kind 1 di DeepSeek V4 -- e' spenta di
+ * default e si accende solo dove serve. */
+static int ckpt_end_wanted(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("GLM53_PREFIX_CKPT_END");
+        cached = setting ? atoi(setting) != 0 : 0;
+    }
+    return cached;
+}
+
+typedef struct { float *ptr; size_t bytes; } CkptSpan;
+
+/* Gli stessi pezzi, nello stesso ordine, di glm53_segment_spans -- con `rows`
+ * righe invece della capienza intera della sessione. */
+static size_t ckpt_spans(const GModel *m, GSession *s, int rows,
+                         CkptSpan *out, size_t capacity) {
+    const Cfg *c = &m->c;
+    size_t count = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        GLayerState *st = &s->layer[i];
+        if (c->is_full[i]) {
+            if (count + 3 > capacity) return 0;
+            if (!st->latent || !st->ikeys || !st->igates) return 0;
+            out[count++] = (CkptSpan){ st->latent, (size_t)rows * (size_t)c->kv_lora * sizeof(float) };
+            out[count++] = (CkptSpan){ st->ikeys,  (size_t)rows * (size_t)c->index_hd * sizeof(float) };
+            out[count++] = (CkptSpan){ st->igates, (size_t)rows * (size_t)c->index_hd * sizeof(float) };
+        } else if (c->kda_proj) {
+            if (count + 2 > capacity) return 0;
+            if (!st->kda_state || !st->kda_window) return 0;
+            out[count++] = (CkptSpan){ st->kda_state,
+                (size_t)c->kda_heads * (size_t)c->kda_hd * (size_t)c->kda_hd * sizeof(float) };
+            out[count++] = (CkptSpan){ st->kda_window,
+                3u * (size_t)c->kda_proj * (size_t)c->conv_k * sizeof(float) };
+        }
+    }
+    return count;
+}
+
+static size_t ckpt_span_bytes(const CkptSpan *spans, size_t count) {
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) total += spans[i].bytes;
+    return total;
+}
+
+/* G12: con la ricorrenza sul dispositivo le due copie host sono STALE. Sono i
+ * due soli punti in cui il checkpoint le fa combaciare col dispositivo, e sono
+ * esattamente le due direzioni di glm53_kda_sync_out / _in (:4433, :4445). */
+static void ckpt_sync_out(const GModel *m, GSession *s) {
+#ifdef COLI_VULKAN
+    const Cfg *c = &m->c;
+    for (int i = 0; i < c->n_layers; i++) {
+        GLayerState *st = &s->layer[i];
+        if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
+            coli_vk_kda_sync(i, st->kda_state, st->kda_window);
+    }
+#else
+    (void)m; (void)s;
+#endif
+}
+
+static void ckpt_sync_in(const GModel *m, GSession *s) {
+#ifdef COLI_VULKAN
+    const Cfg *c = &m->c;
+    for (int i = 0; i < c->n_layers; i++) {
+        GLayerState *st = &s->layer[i];
+        if (!c->is_full[i] && c->kda_proj && st->kda_gpu)
+            coli_vk_kda_upload(i, st->kda_state, st->kda_window);
+    }
+#else
+    (void)m; (void)s;
+#endif
+}
+
+static void ckpt_free(PrefixCkpt *slot) {
+    free(slot->ids);
+    free(slot->blob);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static int ckpt_have(const int *ids, int len) {
+    for (int i = 0; i < ckpt_slot_count(); i++)
+        if (g_ckpt[i].ids && g_ckpt[i].len == len &&
+            !memcmp(g_ckpt[i].ids, ids, (size_t)len * sizeof(int)))
+            return 1;
+    return 0;
+}
+
+/* ---- persistenza su disco ----
+ *
+ * Gli slot in memoria muoiono col processo, e il gateway si riavvia: senza il
+ * file il primo turno dopo ogni riavvio ripaga il prefisso intero. Il
+ * fingerprint dice che il file descrive QUESTO modello con QUESTA config; se
+ * non combacia il file si cancella invece di essere interpretato. */
+static char g_ckpt_dir[1024];
+static uint32_t g_ckpt_fp;
+static int g_ckpt_disk_loaded;
+
+static uint32_t ckpt_fingerprint(const GModel *m) {
+    const Cfg *c = &m->c;
+    uint32_t h = 2166136261u;
+    const int fields[] = { c->n_layers, c->kv_lora, c->index_hd, c->kda_heads,
+                           c->kda_hd, c->conv_k, glm53_dense_bits() };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        h ^= (uint32_t)fields[i]; h *= 16777619u;
+    }
+    for (int i = 0; i < c->n_layers; i++) { h ^= (uint32_t)c->is_full[i]; h *= 16777619u; }
+    const char *snap = getenv("SNAP");
+    for (const char *p = snap ? snap : ""; *p; p++) { h ^= (uint32_t)(unsigned char)*p; h *= 16777619u; }
+    return h;
+}
+
+static void ckpt_disk_init(const GModel *m) {
+    if (g_ckpt_dir[0]) return;
+    const char *dir = getenv("COLI_CKPT_DIR");
+    const char *snap = getenv("SNAP");
+    if (dir && *dir) snprintf(g_ckpt_dir, sizeof(g_ckpt_dir), "%s", dir);
+    else if (snap && *snap) snprintf(g_ckpt_dir, sizeof(g_ckpt_dir), "%s/.coli_ckpt", snap);
+    else { g_ckpt_dir[0] = '-'; return; }        /* CLI: nessun disco */
+    g_ckpt_fp = ckpt_fingerprint(m);
+}
+
+static void ckpt_disk_path(char *out, size_t size, int index) {
+    snprintf(out, size, "%s/ckpt_%08x_%d.bin", g_ckpt_dir, g_ckpt_fp, index);
+}
+
+static void ckpt_disk_write(const GModel *m, int index) {
+    if (!ckpt_disk_wanted()) return;
+    ckpt_disk_init(m);
+    if (!g_ckpt_dir[0] || g_ckpt_dir[0] == '-') return;
+    PrefixCkpt *slot = &g_ckpt[index];
+    if (!slot->ids || !slot->blob) return;
+    char path[1200], tmp[1260];
+    ckpt_disk_path(path, sizeof(path), index);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        mkdir(g_ckpt_dir, 0755);
+        f = fopen(tmp, "wb");
+        if (!f) return;
+    }
+    const char magic[8] = { 'G','5','3','C','K','P','T','1' };
+    const int32_t head[2] = { slot->len, slot->kind };
+    const uint64_t bytes = (uint64_t)slot->bytes;
+    int ok = fwrite(magic, 8, 1, f) == 1 &&
+             fwrite(&g_ckpt_fp, sizeof(g_ckpt_fp), 1, f) == 1 &&
+             fwrite(head, sizeof(head), 1, f) == 1 &&
+             fwrite(&bytes, sizeof(bytes), 1, f) == 1 &&
+             fwrite(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len &&
+             fwrite(slot->blob, 1, slot->bytes, f) == slot->bytes;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) { remove(tmp); return; }
+    remove(path);
+    if (rename(tmp, path)) { remove(tmp); return; }
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "CKPT disk write prefix=%d (%.0f MB) %s\n",
+                slot->len, slot->bytes / 1e6, path);
+}
+
+static void ckpt_disk_load(const GModel *m) {
+    if (g_ckpt_disk_loaded || !ckpt_disk_wanted()) return;
+    g_ckpt_disk_loaded = 1;
+    ckpt_disk_init(m);
+    if (!g_ckpt_dir[0] || g_ckpt_dir[0] == '-') return;
+    for (int i = 0; i < ckpt_slot_count(); i++) {
+        if (g_ckpt[i].ids) continue;
+        char path[1200];
+        ckpt_disk_path(path, sizeof(path), i);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        char magic[8]; uint32_t fp = 0; int32_t head[2] = {0, 0}; uint64_t bytes = 0;
+        PrefixCkpt *slot = &g_ckpt[i];
+        int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "G53CKPT1", 8) &&
+                 fread(&fp, sizeof(fp), 1, f) == 1 && fp == g_ckpt_fp &&
+                 fread(head, sizeof(head), 1, f) == 1 &&
+                 fread(&bytes, sizeof(bytes), 1, f) == 1 &&
+                 head[0] > 0 && head[0] < (1 << 22) && (head[1] == 0 || head[1] == 1) &&
+                 bytes > 0 && bytes < (1ull << 36);
+        if (ok) {
+            slot->len = head[0];
+            slot->kind = head[1];
+            slot->bytes = (size_t)bytes;
+            slot->ids = malloc((size_t)slot->len * sizeof(int));
+            slot->blob = malloc(slot->bytes);
+            ok = slot->ids && slot->blob &&
+                 fread(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len &&
+                 fread(slot->blob, 1, slot->bytes, f) == slot->bytes;
+        }
+        fclose(f);
+        if (!ok) { ckpt_free(slot); remove(path); continue; }
+        slot->used = ++g_ckpt_clock;
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "CKPT disk load prefix=%d (%.0f MB) kind=%d\n",
+                    slot->len, slot->bytes / 1e6, slot->kind);
+    }
+}
+
+/* La copia. Il vittimario e' quello di DeepSeek V4: prima uno slot vuoto, poi
+ * il piu' vecchio di fine prompt, poi il piu' vecchio in assoluto -- il
+ * prefisso e' l'ultimo a uscire. */
+static void ckpt_store(const GModel *m, GSession *s, const int *ids, int len, int kind) {
+    if (!ckpt_on() || len < ckpt_min_tokens() || len > s->filled) return;
+    CkptSpan spans[GLM53_CKPT_MAX_SPANS];
+    const size_t count = ckpt_spans(m, s, len, spans, GLM53_CKPT_MAX_SPANS);
+    if (!count) return;
+    const size_t bytes = ckpt_span_bytes(spans, count);
+    const int slots = ckpt_slot_count();
+    int victim = -1;
+    for (int i = 0; i < slots && victim < 0; i++) if (!g_ckpt[i].ids) victim = i;
+    for (int pass = 1; victim < 0 && pass >= 0; pass--)
+        for (int i = 0; i < slots; i++)
+            if (g_ckpt[i].kind >= pass &&
+                (victim < 0 || g_ckpt[i].used < g_ckpt[victim].used))
+                victim = i;
+    if (victim < 0) return;
+    PrefixCkpt *slot = &g_ckpt[victim];
+    ckpt_free(slot);
+    slot->ids = malloc((size_t)len * sizeof(int));
+    slot->blob = malloc(bytes);
+    if (!slot->ids || !slot->blob) { ckpt_free(slot); return; }
+    size_t at = 0;
+    for (size_t i = 0; i < count; i++) {
+        memcpy(slot->blob + at, spans[i].ptr, spans[i].bytes);
+        at += spans[i].bytes;
+    }
+    memcpy(slot->ids, ids, (size_t)len * sizeof(int));
+    slot->len = len;
+    slot->bytes = bytes;
+    slot->kind = kind;
+    slot->used = ++g_ckpt_clock;
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "CKPT store prefix=%d %.0f MB kind=%d slot=%d\n",
+                len, bytes / 1e6, kind, victim);
+    if (kind == 0) ckpt_disk_write(m, victim);
+    else if (ckpt_disk_wanted()) {
+        /* Il file di questo slot descrive ormai un'altra cattura. */
+        ckpt_disk_init(m);
+        if (g_ckpt_dir[0] && g_ckpt_dir[0] != '-') {
+            char path[1200];
+            ckpt_disk_path(path, sizeof(path), victim);
+            remove(path);
+        }
+    }
+}
+
+/* Il checkpoint piu' lungo che sia prefisso STRETTO di questa sequenza, rimesso
+ * nella sessione (fresca) dello slot. Torna quante posizioni valgono, 0 se
+ * nessuno serve. */
+static int ckpt_restore(const GModel *m, KVSlot *slot, const int *sequence, int total) {
+    if (!ckpt_on()) return 0;
+    ckpt_disk_load(m);
+    int best = -1, best_len = 0;
+    for (int i = 0; i < ckpt_slot_count(); i++) {
+        PrefixCkpt *ck = &g_ckpt[i];
+        if (!ck->ids || ck->len <= best_len || ck->len >= total ||
+            ck->len < ckpt_min_tokens()) continue;
+        if (memcmp(ck->ids, sequence, (size_t)ck->len * sizeof(int))) continue;
+        best = i; best_len = ck->len;
+    }
+    if (best < 0) return 0;
+    GSession *s = slot->session;
+    CkptSpan spans[GLM53_CKPT_MAX_SPANS];
+    const size_t count = ckpt_spans(m, s, best_len, spans, GLM53_CKPT_MAX_SPANS);
+    if (!count || ckpt_span_bytes(spans, count) != g_ckpt[best].bytes) {
+        /* Una sessione con un'altra forma: il checkpoint non la riguarda. */
+        fprintf(stderr, "CKPT layout mismatch prefix=%d: ignorato\n", best_len);
+        return 0;
+    }
+    size_t at = 0;
+    for (size_t i = 0; i < count; i++) {
+        memcpy(spans[i].ptr, g_ckpt[best].blob + at, spans[i].bytes);
+        at += spans[i].bytes;
+    }
+    s->filled = best_len;
+    ckpt_sync_in(m, s);
+    slot_remember(slot, sequence, best_len);
+    g_ckpt[best].used = ++g_ckpt_clock;
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "CKPT hit prefix=%d slot=%d\n", best_len, best);
+    return best_len;
+}
+
+/* Dove catturare durante QUESTO prefill fresco, o 0. La regola e' quella di
+ * v4_ckpt_plan: il prefisso comune con il prompt fresco precedente e' il
+ * prefisso di sistema stabile, mai il prompt intero, con almeno otto token di
+ * coda da macinare dopo. */
+static int ckpt_plan(const int *ids, int count) {
+    int plan = 0;
+    if (ckpt_on() && g_ckpt_prev_ids) {
+        const int minimum = ckpt_min_tokens();
+        int limit = g_ckpt_prev_len < count ? g_ckpt_prev_len : count;
+        if (limit >= count) limit = count - 1;     /* mai tutto il prompt */
+        int lcp = 0;
+        while (lcp < limit && g_ckpt_prev_ids[lcp] == ids[lcp]) lcp++;
+        if (lcp > count - 8) lcp = 0;              /* una coda minuscola non paga */
+        if (lcp >= minimum) {
+            plan = lcp;
+            if (ckpt_have(ids, plan)) plan = 0;    /* gia' catturato */
+        }
+    }
+    free(g_ckpt_prev_ids);
+    g_ckpt_prev_ids = malloc((size_t)count * sizeof(int));
+    if (g_ckpt_prev_ids) {
+        memcpy(g_ckpt_prev_ids, ids, (size_t)count * sizeof(int));
+        g_ckpt_prev_len = count;
+    } else {
+        g_ckpt_prev_len = 0;
+    }
+    return plan;
+}
+
+/* L'ottavo campo del SUBMIT: il gateway sa dove finisce la parte condivisa e
+ * la manda in byte. Il motore ritokenizza quel pezzo e lo accetta SOLO se cade
+ * su un confine di token e i suoi id sono davvero il prefisso del prompt --
+ * altrimenti lo ignora e il piano trovera' il confine vero al prossimo prompt
+ * fresco. */
+static int ckpt_hint(Tok *tokenizer, const char *payload, int prefix_bytes,
+                     const int *sequence, int total, int shared) {
+    if (!ckpt_on() || prefix_bytes <= 0 || prefix_bytes >= total * 64) return 0;
+    const int cap = total + 16;
+    int *pids = malloc((size_t)cap * sizeof(int));
+    if (!pids) return 0;
+    const int pn = tok_encode(tokenizer, payload, prefix_bytes, pids, cap);
+    int at = 0;
+    if (pn >= ckpt_min_tokens() && pn > shared && pn <= total - 8 &&
+        !memcmp(pids, sequence, (size_t)pn * sizeof(int)) &&
+        !ckpt_have(sequence, pn))
+        at = pn;
+    free(pids);
+    return at;
+}
+
+/* L'oracolo del percorso di servizio: i logit della prima posizione generata,
+ * uno per richiesta. Il percorso CLI ha il teacher forcing; questo non lo
+ * aveva, e una modifica al prefill si giudica dove gira davvero. */
+static void ckpt_logit_dump(unsigned long long id, const float *logits, int vocab) {
+    const char *dir = getenv("GLM53_LOGIT_DUMP");
+    if (!dir || !*dir || !logits) return;
+    mkdir(dir, 0755);
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/req_%llu.f32", dir, id);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(logits, sizeof(float), (size_t)vocab, f);
+    fclose(f);
+}
+
 /* Un'immagine annunciata prima della richiesta a cui appartiene.
  *
  * Il protocollo porta testo; le patch sono binarie e grosse, quindi arrivano
@@ -3958,6 +4385,9 @@ typedef struct {
     float temp, top_p;
     char *payload;
     int plen;
+    /* P7: ottavo campo del SUBMIT -- il byte offset dove finisce la parte
+     * condivisa del prompt. 0 = il gateway non l'ha mandato. */
+    int prefix_bytes;
 } ServeReq;
 
 static int g_stop[16], g_nstop = 0;
@@ -4038,11 +4468,21 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
         return 1;
     }
     if (strcmp(verb, "SUBMIT")) return 1;
-    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f", &q->id, &q->slot, &q->plen,
-               &q->max_tokens, &q->temp, &q->top_p) != 6) {
+    /* Sei campi come sempre; otto quando il gateway manda anche la lunghezza
+     * del payload extra (grammatica/audio) e il suggerimento di prefisso. Il
+     * suggerimento vale solo con xlen == 0, perche' a glm53 il gateway non
+     * manda mai un frame extra e altrimenti andrebbe consumato prima. Un
+     * motore vecchio ne legge sei e ignora il resto: il cambio lato gateway e'
+     * sicuro contro il binario in servizio. */
+    int xlen = 0, hint_bytes = 0;
+    const int fields = sscanf(header, "SUBMIT %llu %d %d %d %f %f %d %d",
+                              &q->id, &q->slot, &q->plen, &q->max_tokens,
+                              &q->temp, &q->top_p, &xlen, &hint_bytes);
+    if (fields < 6) {
         strcpy(verb, "BAD_FRAME");
         return 1;
     }
+    if (fields == 8 && xlen == 0 && hint_bytes > 0) q->prefix_bytes = hint_bytes;
     if (q->plen < 0 || q->plen > (1 << 24)) { strcpy(verb, "BAD_FRAME"); return 1; }
     q->payload = malloc((size_t)q->plen + 1);
     if (!q->payload) { strcpy(verb, "BAD_FRAME"); return 1; }
@@ -4133,9 +4573,65 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         pending_clear();
     }
 
+    /* P7: il checkpoint del prefisso.
+     *
+     * Nell'ordine, e mai al posto del riuso di slot -- quello copre sempre
+     * almeno quanto un checkpoint potrebbe:
+     *   1. riuso di slot (sopra, invariato);
+     *   2. se non ha coperto niente e non c'e' un'immagine, si rimette il
+     *      checkpoint piu' lungo che sia prefisso stretto di questa sequenza;
+     *   3. se non si e' riusato niente, si PIANIFICA una cattura, o dal
+     *      prefisso comune col prompt fresco precedente o dal suggerimento del
+     *      gateway;
+     *   4. il prefill si spezza in due al confine e la copia si prende in
+     *      mezzo.
+     * Un'immagine annunciata annulla sia il ripristino sia la cattura, per la
+     * stessa ragione per cui annulla il riuso: gli embedding della torre
+     * appartengono a posizioni precise di questo prompt. */
+    int ckpt_at = 0;
+    const int has_image = (vision != NULL);
+    if (ckpt_on() && !has_image) {
+        if (shared == 0) shared = ckpt_restore(m, slot, sequence, total);
+        if (shared == 0) {
+            const char *why = "lcp";
+            ckpt_at = ckpt_plan(sequence, total);
+            if (!ckpt_at && q->prefix_bytes > 0 && q->prefix_bytes < q->plen) {
+                ckpt_at = ckpt_hint(tokenizer, q->payload, q->prefix_bytes,
+                                    sequence, total, shared);
+                why = "hint";
+            }
+            if (ckpt_at && getenv("GLM53_VERBOSE"))
+                fprintf(stderr, "CKPT plan prefix=%d src=%s\n", ckpt_at, why);
+        }
+    }
+
     const int reused = shared;
-    float *logits = forward_prefill(m, slot->session, sequence + shared,
-                                    total - shared, vision, n_vision, 0);
+    float *logits;
+    if (ckpt_at > shared) {
+        /* Due chiamate invece di una. Il confine diventa un bordo di pezzo:
+         * P2/P3/P4 sono indipendenti per riga dentro il pezzo, quindi il
+         * risultato e' atteso identico -- e l'oracolo del gate dice se lo e'. */
+        float *upto = forward_prefill(m, slot->session, sequence + shared,
+                                      ckpt_at - shared, NULL, 0, 0);
+        free(upto);
+        ckpt_sync_out(m, slot->session);
+        ckpt_store(m, slot->session, sequence, ckpt_at, 0);
+        logits = forward_prefill(m, slot->session, sequence + ckpt_at,
+                                 total - ckpt_at, vision, n_vision, 0);
+    } else {
+        logits = forward_prefill(m, slot->session, sequence + shared,
+                                 total - shared, vision, n_vision, 0);
+    }
+    /* La cattura a fine prompt (kind 1 di DeepSeek V4) e' spenta di default:
+     * qui una copia intera per richiesta non e' gratis. */
+    if (ckpt_on() && ckpt_end_wanted() && !has_image && total > reused &&
+        total >= ckpt_min_tokens() && !ckpt_have(sequence, total)) {
+        ckpt_sync_out(m, slot->session);
+        ckpt_store(m, slot->session, sequence, total, 1);
+    }
+    /* L'oracolo del percorso di servizio, indipendente dal checkpoint: i logit
+     * che scelgono il primo token generato. */
+    ckpt_logit_dump(q->id, logits, m->c.vocab);
     GSession *session = slot->session;
     int rows = 1;
     for (int step = 0; step < budget; step++) {

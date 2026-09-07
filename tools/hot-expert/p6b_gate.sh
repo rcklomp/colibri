@@ -186,17 +186,44 @@ if run_step 4; then
     echo "step 4 needs a serving gateway: set P6B_URL (the chain runs it after serving)"
     rc4=2
   else
+    rm -f "$OUT/live.jsonl"
     python3 "$HERE/ttft_serve.py" --url "$P6B_URL" --multiturn --side-request \
         --system "$SYSTEM" --sizes 300 --repeat 0 --gen 16 \
         --warm --min-resident 96 --tag "$TAG-live" --json "$OUT/live.jsonl" \
         2>&1 | tee "$OUT/step4.txt"
     rc4=${PIPESTATUS[0]}
+    # --multiturn PRINTS its ratio but appends no verdict, so the harness exits
+    # 0 even when turn 2 re-prefilled the whole history. The gate judges the
+    # engine's own REUSE count, which is the authoritative answer (P1).
+    python3 - "$OUT/live.jsonl" "$TAG" <<'PY' || rc4=1
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1])]
+tag = sys.argv[2]
+def one(kind):
+    r = [x for x in recs if x["tag"] == f"{tag}-live" and x["kind"] == kind]
+    return r[-1] if r else None
+t1, sd, t2 = one("turn1"), one("side"), one("turn2")
+print("%-28s %8s %8s %10s" % ("request", "prompt", "reused", "ttft"))
+for name, r in (("turn 1 [A]", t1), ("side (title)", sd), ("turn 2 [A, reply, B]", t2)):
+    if r: print("%-28s %8s %8s %9.2fs" % (name, r["prompt_tokens"], r["reused"], r["ttft_s"] or 0))
+ok = bool(t1 and t2 and t2.get("reused") and t2["prompt_tokens"])
+if ok:
+    frac = t2["reused"] / t2["prompt_tokens"]
+    ratio = (t2["ttft_s"] / t1["ttft_s"]) if t1["ttft_s"] and t2["ttft_s"] else 9.9
+    print("turn 2 reused %d/%d = %.0f%% of its prompt; ttft(2)/ttft(1) = %.3f"
+          % (t2["reused"], t2["prompt_tokens"], 100 * frac, ratio))
+    ok = frac >= 0.8 and ratio <= 0.35
+else:
+    print("turn 2 reused nothing -- the side request took the slot, which is what P6 fixed")
+print("step 4 reuse:", "PASS" if ok else "FAIL")
+sys.exit(0 if ok else 1)
+PY
     # The server log must not carry the guard: serving at 4 slots with
     # COLI_KDA_GPU=2 and a "forcing" line means the pool did not cover the
     # gateway's slots and the whole item silently did not ship.
     forced=$(grep -c "forcing COLI_KDA_GPU=0" "${P6B_SERVER_LOG:-$HOME/glm53_server.log}" || true)
     echo "server log 'forcing COLI_KDA_GPU=0' lines: $forced"
-    grep -E "^[0-9-]+ [0-9:]+ (REUSE|KV_SLOTS=|\[VK\] KDA slot pool)" \
+    grep -E "REUSE|KV_SLOTS=|KDA slot pool" \
         "${P6B_SERVER_LOG:-$HOME/glm53_server.log}" | tail -12 || true
     [ "$forced" = 0 ] || rc4=1
   fi

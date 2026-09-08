@@ -67,6 +67,10 @@ if pgrep -x glm53 >/dev/null; then echo "REFUSED: a glm53 is running -- stop the
 for f in "$TOOLS" "$SYSTEM"; do [ -s "$f" ] || { echo "REFUSED: missing fixture $f"; exit 2; }; done
 : "${PRISTINE_SHADERS:?REFUSED: set PRISTINE_SHADERS to the pristine c/shaders copy}"
 [ -f "$PRISTINE_SHADERS/kda_step.spv" ] || { echo "REFUSED: no kda_step.spv in $PRISTINE_SHADERS"; exit 2; }
+# prefill_profile.sh -- which the pristine side of step (a) runs with
+# COLI_VK_SHADERS pointed here -- refuses unless it finds a .comp SOURCE, so a
+# snapshot of .spv alone silently turns the pristine half into no half at all.
+[ -f "$PRISTINE_SHADERS/qmatmul.comp" ] || { echo "REFUSED: $PRISTINE_SHADERS has no qmatmul.comp; prefill_profile.sh will refuse the pristine side"; exit 2; }
 export PRISTINE_SHADERS
 SHADERS=$HERE/../../c/shaders
 [ -f "$SHADERS/kda_step.spv" ] || { echo "REFUSED: no built shaders at $SHADERS"; exit 2; }

@@ -76,7 +76,10 @@ sha256sum $PRISTINE ~/src/colibri/c/glm53
 # The pristine shader set is the one IN SERVICE right now, before anything is
 # merged or built. Snapshot it here rather than trusting a directory that some
 # earlier chain left behind.
-mkdir -p $PSHADERS && cp -f $SHADERS/*.spv $PSHADERS/ || { echo "SHADER SNAPSHOT FAILED"; exit 2; }
+# The .comp sources go too, not just the .spv: prefill_profile.sh checks for
+# qmatmul.comp before it will run, and a snapshot of .spv alone made the
+# pristine side of the smoke refuse (first chain, 2026-09-08 21:52).
+mkdir -p $PSHADERS && cp -f $SHADERS/*.spv $SHADERS/*.comp $PSHADERS/ || { echo "SHADER SNAPSHOT FAILED"; exit 2; }
 PSHADER_SHA=$(sha256sum $PSHADERS/kda_step.spv | cut -d" " -f1)
 echo "pristine shaders snapshotted to $PSHADERS ($(ls $PSHADERS/*.spv | wc -l) files, kda_step $PSHADER_SHA)"
 

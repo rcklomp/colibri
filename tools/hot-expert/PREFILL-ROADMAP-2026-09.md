@@ -1,10 +1,47 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 15, 2026-09-08 01:30)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 16, 2026-09-08 21:30)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 16 (2026-09-08, 21:30): P5b is in service and the roadmap row that
+predicted it was wrong about the cause — the big term was FALSE SHARING on the
+per-thread scratch, not the 64 walks of the latent.** `mla_layer` sized its
+per-thread slices as `malloc(nthreads * L * sizeof(float))` (L = 512 → 2 048 B)
+and `malloc(nthreads * width * sizeof(float))` (width = 2 051 → 8 204 B): a
+16-byte-aligned base and a stride that is not a multiple of 64, so every pair of
+neighbouring threads shares the boundary cache lines of their `pooled` and
+`score` slices — and the pool writes them once per selected slot per head,
+1 444 times per head per layer at 3 462 tokens. **Rounding those two
+allocations up to a cache line takes `mla.attn` from 51.6 to 22.5 ms/token at
+3 462 tokens and from 23.0 to 13.7 at 781; the prefill token goes 147.3 → 118.1
+(1.25×) and 108.7 → 99.2 (1.10×) against the same binary's knobs-off row, 1.30×
+and 1.11× against the pristine binary in service.** The mechanism the row was
+named after — one blocked walk of the latent for all 64 heads instead of 64
+walks — is built, is bit-identical, is 3.6× on the pool in isolation, and is
+**neutral in the engine**: +0.2 ms/token at 781 tokens and −0.3 at 3 462, because
+once the false sharing is gone the per-head pool runs at L3 bandwidth and the
+layer's latent (7.1 MB at 3 462 tokens, 78 MB for all eleven) is L3-resident
+while it runs. So `COLI_MLA_POOL` defaults to **1** (padded scratch), not 2
+(padded + blocked pool), by this table's own rule; mode 2 keeps its number and
+its knob because it is the shape that wins if the latent stops fitting in L3.
+Everything is bit-identical at every setting: `max_abs=0` at 782 positions at
+BOTH KDA knobs, `tworeq` 4 slots IDENTICAL with 0 forcing lines, P7's capture
+still fires (REUSE 1 527/1 544 in 2.25 s, t1/t2 = 80×), serve-path TTFT
+**1.01× / 1.07× / 1.15×** at 27/390/1 236 tokens. One finding lands on an older
+row: the artefact is an allocator lottery — the pristine binary and the
+candidate's own knobs-off build differ by 5.8 ms/token in `mla.attn` on
+identical source — and that is the explanation of the contradiction rev 15
+recorded for the dev merge ("the CLI oracle run put the candidate 7 % faster
+with all of it in `mla.attn`, which nothing in the merge touches"). The merge
+moved the allocations, not the arithmetic. The gate ran twice: the first run
+(`MIN_SPEEDUP=1.0`) exited 3 on the 27-token row alone — 2.82/2.61 s against
+2.81/2.62 s, 0.4 % of a 2.7-second measurement — and the bound is now 0.97 in
+`p5b_chain.sh`, the bound P6b, RP4 and the dev merge used, committed with the
+reasoning rather than passed by hand. Binary `65d7d70d…`, serving script
+unchanged. **This table is now empty.**
 
 **Rev 15 (2026-09-08, 01:30): the upstream `dev` merge is done and in
 service — bit-identical, neutral on every row.** `JustVugg/colibri` `dev`
@@ -39,7 +76,7 @@ The eleven upstream changes that matter on this box (the GLM-5.3 prompt now
 always opens `<think>`, `RssAnon`, `compat_mem_available_gb`, the Brain/Profile
 lines, `max_kv_slots` 16 reached upstream too, the Makefile header deps, the
 `image_url` hardening) are listed in §"Upstream dev merge" of the record. Next:
-**P5b** — the only open item on this table.
+**P5b** — the only open item on this table. (P5b landed the same day — see rev 16.)
 
 **Rev 14 (2026-09-07, 23:50): P5 in service — 174.4 → 146.4 ms/token at
 3 462 tokens (1.19×), bit-identical, and none of the three sub-items needed the
@@ -328,9 +365,17 @@ Effort and effect are honest, not optimistic. Ordering is by
 (expected effect × confidence) / effort, with the instrument first and the
 cheapest possibly-decisive diagnosis second.
 
-**Order after rev 15:** P5b (the MLA weighted pool: one walk of the latent
-instead of 64 — the item P5's own microbenchmark uncovered). The upstream-`dev`
-merge landed 2026-09-08; everything else on this table is done.
+**Order after rev 16:** nothing. P5b landed 2026-09-08 21:19 and was the last
+open item; the upstream-`dev` merge landed the same morning. The next prefill
+item, if there is one, has to come from a fresh profile at the serving knob —
+the standing ranking at 3 462 tokens is now CPU experts 51.6, `eg` 54.2,
+`mla.attn` 22.3, `kda` 10.5, `router` 1.4, i.e. the MoE path, which §RP4 has
+already shown is 92 % CPU inside a GPU-named timer.
+
+**Order after rev 15 (kept for the history):** P5b (the MLA weighted pool: one
+walk of the latent instead of 64 — the item P5's own microbenchmark uncovered).
+The upstream-`dev` merge landed 2026-09-08; everything else on this table is
+done.
 
 **Order after rev 7 (kept for the history):** P5 (the recurrence's S per-token
 submits into one command buffer per layer per chunk; the sparse attention,
@@ -347,7 +392,7 @@ serving knob (rev 5's rule).
 | **P3** ✅ | Row-batched CPU expert compute (`c695a48`; **landed 2026-09-06 20:48**: bit-identical, serve-path TTFT 1.05× / 1.23× / 1.19× at 21 / 384 / 1 230 tokens vs P2, decode unchanged; profile ffn_moe 99 → 68 ms/token — §P3 in the record) | `coli_i4_rows4` decodes a weight row once per four activation rows; `cpu_expert_rows` runs each CPU expert once on the chunk rows that chose it | done | — | — | met |
 | **P4** ✅ | S-tiled GPU matmul shaders — experts **and** dense (`f0197d0`; **landed 2026-09-06 21:20**: teacher-forcing identical and logits max-abs 0 — bit-identical, no knob; serve-path TTFT 1.11× / 1.13× / 1.11× at 21 / 384 / 1 230 vs P3; kda 31.7 → 22.7 ms/token in the profile — §P4 in the record) | `qmatmul_gate_up.comp` / down / `qmatmul.comp`: one weight read per output row applied to all S rows (register tile over rows), instead of `(O/8, rows, 1)` re-reading the matrix per row. P2 showed the dense path needs it too: batched kda.proj+ko still cost 18 ms/token for ~2 of arithmetic | eg per token drops with the chunk's dedup (×~1.6 at K=16, ×~3–4 at K=128) — the MoE bucket's floor moves | 2–4 days | Opus (shader) | `prefill_gate.sh` (b) logits within tolerance — the reduction order changes, so this ships behind a knob; TTFT delta |
 | **P5** ✅ | The sequential remainder (`perf/p5-sequential`, **in service 2026-09-07 23:33**, binary `5dd26f65…`, serving script unchanged) | three sub-items, three knobs, all default ON and all bit-identical: **P5.1** `COLI_MLA_HEADVEC` — the MLA attention score pass with the 64 heads in the SIMD lanes over a transposed query slab `qT[d][h]`, each lane summing over d in the reference's order (an empty `asm` on the product stops gcc contracting mul+add into an FMA); **P5.2** `COLI_KDA_ROWS` — `kda_step.comp` gains a `tok` push constant and `coli_vk_kda_step_rows` records the chunk's S dispatches into ONE command buffer with write→read/write→write barriers, so the recurrence stays sequential and the S−1 round trips go; **P5.3** `COLI_ROUTER_LANES` — the router dot with the chunk's TOKENS in the lanes over `xT[d][t]`, which needs no reordering, so the knob this row used to budget for is not needed | measured at the serving knob, 3 462 tokens: **174.4 → 146.4 ms/token (1.19×)**, `mla.attn` 69.8 → 48.2, `router` 5.2 → 1.4, `kda.step` 5.8 → 3.8; at 781 tokens 120.5 → 109.2 (1.10×); serve path **1.06× / 1.15× / 1.25×** at 21/384/1 230; `max_abs=0` at 782 positions at both KDA knobs | done | Opus | `p5_gate.sh` exits 0 on all four steps (§P5 in the record) |
-| **P5b** | The weighted pool, and one walk of the latent instead of 64 | P5.1 made the score pass 21.5× faster in isolation and the `mla.attn` bucket only 1.48×, and `rome_mlaattn.c` says exactly why: the softmax + weighted pool that follow went **17.0 → ~39 ms/token** at `used` = 1 444. Not the strided score read-back — transposing `sc[u][h]` to `scT[h][u]` first changes it by 0.5 ms, measured. What is left is the locality the old nest had by accident (dot then pool the same rows, per head). The pool is `pooled[H][L] += w[used][H]ᵀ · latent[used][L]`, a rank-1-per-slot update run today as 64 independent walks of the layer's whole latent; one blocked GEMM microkernel over head × d tiles walks it once | `mla.attn` is **48.2 ms/token at 3 462 tokens, still the largest single bucket (33 % of the token)**; the pool is most of it. A bound: the harness's own `core cand` floor is ~2.4 ms of scores + expf, so ≤ 39 ms/token is in play | 1–2 days | Opus | `p5_gate.sh` unchanged; bit-identical is required (the accumulation order over slots must not change) |
+| **P5b** ✅ | The weighted pool — and the answer is the per-thread scratch, not the 64 walks (`perf/p5b-mla-pool`, **in service 2026-09-08 21:19**, binary `65d7d70d…`, serving script unchanged) | one knob, `COLI_MLA_POOL`, three settings, all bit-identical: **0** the code P5 left behind; **1 (default)** `pooled`/`score` per-thread slices 64-byte aligned with their stride rounded to a cache line — they were 2 048 B and 8 204 B from a 16-byte-aligned `malloc`, so neighbouring threads shared the boundary lines and the pool wrote them `used` times per head; **2** that plus the blocked pool (one walk of the latent for all 64 heads, d-tiles as the parallel axis, `acc[dt][H]` per tile in L1, eight slots folded at a time) | measured at the serving knob: `mla.attn` **51.6 → 22.5** ms/token at 3 462 tokens and **23.0 → 13.7** at 781; TOTAL 147.3 → 118.1 (**1.25×**) and 108.7 → 99.2 (**1.10×**) vs the same binary knobs-off, 1.30× and 1.11× vs the pristine binary; serve path **1.01× / 1.07× / 1.15×** at 27/390/1 236 tokens; `max_abs=0` at 782 positions at both KDA knobs. **Mode 2 is neutral in the engine (+0.2 ms/token at 781, −0.3 at 3 462) although it is 3.6× on the pool in isolation** — once the false sharing is gone the per-head pool runs at L3 bandwidth and the layer's latent is L3-resident — so it is not the default | done | Opus | `p5b_gate.sh` exits 0 on all four steps at `MIN_SPEEDUP=0.97` (§P5b in the record); the first run at 1.0 exited 3 on the 27-token row alone |
 | **P6** ✅ | Make reuse survive Open WebUI (`cb9c11e`; **in service 2026-09-06 23:30**: `--kv-slots 4`, `COLI_KDA_GPU=0`; `tworeq` identical across slots at both knobs; live-gateway side-request case turn 2 **171 s → 3.1 s**, REUSE 1 339/1 355 — §P6 in the record). Confirmed on the owner's own Open WebUI on 2026-09-07 with tools and side tasks off: follow-up turn REUSE 32/41, ttft 5.3 s, 180 tokens at 4.4 tok/s. Stability *with* memory context and the tool block on is P7's question | | | | | met |
 | **P6b** ✅ | Per-slot KDA device state — spec `P6B-KDA-SLOT-STATE-SPEC-2026-09.md`, built on `perf/p6b-kda-slots`, **in service 2026-09-07 16:50** (binary 53ccbb42…, `--kv-slots 4`, `COLI_KDA_GPU=2`) | `G.kda_slot[layer][slot]` state/window on dev0 (34 × 4.58 MB = 156 MB per slot), `coli_vk_kda_pool_init` allocates every slot's set BEFORE `vk_preload_tier` (after it, the 624 MB would eat dev0's 3.0 GB reserve); `coli_vk_kda_init/step/layer/sync/upload` and `GSession` take the slot; `slots_init` forces the CPU recurrence only when the pool is short. `coli_vk_kda_sync` goes through a `vkCmdCopyBuffer` into HOST_CACHED staging instead of a memcpy from write-combined memory | measured: decode at 4 slots **5.039 → 5.702 tok/s (+13.2 %)**, within 0.996× of the 1-slot GPU number; bit-identical at one slot (`max_abs=0`); live gateway turn 2 REUSE **1 339/1 355 in 3.08 s** with no `forcing` line; the state sync **~14 MB/s → ~2 262 MB/s** (370 MB checkpoint, 69 ms), which is what lets P7 capture at the GPU knob; price 1 296 → **1 248** preloaded experts (48, 3.7 %) | done | Opus (spec: Fable) | `p6b_gate.sh` exits 0 on all six steps (§P6b in the record) |
 | **P7** ✅ | Checkpoint the stable prefix (tools + base system) **and pin the per-turn context block** — spec `P7-PREFIX-CKPT-SPEC-2026-09.md`, built on `perf/p7-prefix-ckpt`, **in service 2026-09-07 12:25** (binary 19e28e72…, `GLM53_PREFIX_CKPT=1 COLI_PREFIX_PIN=1`, `--kv-slots 8`, `COLI_KDA_GPU=0`) | engine: the session's span list (11 DSA layers' latent/ikeys/igates rows + 34 KDA states/windows; **370 MB at 6 328 tokens**) copied at the prefix boundary the gateway sends in the 8th SUBMIT field (`src=hint`, verified against the prompt's own ids) or at the LCP of successive fresh prompts, persisted under `<SNAP>/.coli_ckpt`. Gateway: `COLI_PREFIX_PIN=1` keeps the `<memory_context>` block byte-identical across a conversation's turns | measured: new conversation with the 34-tool block **1 452 s → 5.30 s** (engine) / **8.93 s** (live gateway, restored from disk after a restart); re-ranked memory block **126.82 s → 3.00 s**, 17 tokens prefilled instead of 1 005; off (`GLM53_PREFIX_CKPT=0`) the engine is bit-identical to the pristine one | done | Opus (spec: Fable) | `p7_gate.sh` exits 0 on all five steps (§P7 in the record); live gateway `--prefix-ckpt` and `--pin-block` PASS with `CKPT hit` and `[pin] … hit` in the server log |

@@ -1633,15 +1633,26 @@ static void glm_lane_dots(float *dst, const float *aT, const float *b,
  *   0  exactly the code P5 left behind: `pooled`/`score` are plain malloc'd
  *      per-thread slices, and the pool walks the layer's selected latent once
  *      PER HEAD.
- *   1  the same nest, with the per-thread slices 64-byte aligned and their
- *      stride rounded up to a cache line. `pooled` is L = 512 floats = 2 048
- *      bytes and `score` is width = 2 051 floats = 8 204: neither the base
- *      (glibc malloc gives 16 bytes) nor the stride is a multiple of 64, so
- *      the eight threads share the boundary lines of their neighbours'
+ *   1  (DEFAULT) the same nest, with the per-thread slices 64-byte aligned and
+ *      their stride rounded up to a cache line. `pooled` is L = 512 floats =
+ *      2 048 bytes and `score` is width = 2 051 floats = 8 204: neither the
+ *      base (glibc malloc gives 16 bytes) nor the stride is a multiple of 64,
+ *      so the eight threads share the boundary lines of their neighbours'
  *      slices and write them `used` times per head. `rome_mlaattn.c` measures
  *      that artefact directly: at used = 1 444 the whole core is 43.4-45.4
- *      ms/token with the slices as they are and 14.7-15.7 with them padded.
- *   2  (default) the padded slices AND the blocked pool below.
+ *      ms/token with the slices as they are and 14.7-15.7 with them padded,
+ *      and the engine agrees -- `mla.attn` 51.6 -> 22.5 ms/token at 3 462
+ *      tokens, 23.0 -> 13.7 at 781.
+ *   2  the padded slices AND the blocked pool below. NOT the default: in the
+ *      engine it is neutral, +0.2 ms/token at 781 tokens and -0.3 at 3 462
+ *      (`mla.attn` 22.5 -> 22.3), because once the false sharing is gone the
+ *      per-head pool runs at L3 bandwidth and the layer's latent (7.1 MB at
+ *      3 462 tokens, 78 MB for all eleven) is L3-resident while it runs. The
+ *      roadmap's rule is "default on only if faster at both prompt sizes",
+ *      and it is not. The knob stays because §P5b's table is measured through
+ *      it, and because the blocked form reads 2.8 MB per token per layer
+ *      where the per-head form reads 180 -- which is the shape that wins if
+ *      the latent ever stops fitting in L3.
  *
  * The pool is pooled[h][d] = sum_u w[u][h] * latent[slot[u]][d]. Written per
  * head it reads 64 x used x L x 4 = 180 MB per token per layer at used=1444
@@ -1666,7 +1677,7 @@ static int g_mla_pool = -1;
 static int mla_pool_mode(void) {
     if (g_mla_pool < 0) {
         const char *e = getenv("COLI_MLA_POOL");
-        g_mla_pool = e ? atoi(e) : 2;
+        g_mla_pool = e ? atoi(e) : 1;
         if (g_mla_pool < 0) g_mla_pool = 0;
 #ifndef GLM53_MLA_HEADVEC
         if (g_mla_pool > 1) g_mla_pool = 1;   /* no AVX2: the blocked kernel */

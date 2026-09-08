@@ -14,8 +14,14 @@
 #                    `score` slices, one latent walk per head)
 #   COLI_MLA_POOL=1  the same nest with those slices 64-byte aligned and their
 #                    stride rounded to a cache line (P5b.1)
-#   COLI_MLA_POOL=2  (default) that, plus the blocked pool: one walk of the
-#                    layer's latent for all 64 heads (P5b.2)
+#   COLI_MLA_POOL=2  that, plus the blocked pool: one walk of the layer's
+#                    latent for all 64 heads (P5b.2). NOT the default -- it is
+#                    neutral in the engine once the false sharing is gone.
+#
+# The default is 1. MIN_SPEEDUP is 0.97 from the chain, the bound P6b, RP4 and
+# the dev merge used: the 27-token row is 4 % `mla.attn` and 2.7 s long, so a
+# 1.0 bound there is a noise gate. The first chain exited 3 on that row alone
+# with 1.06x at 390 tokens and 1.14x at 1 236 next to it.
 #
 # Steps (p5_gate.sh's, unchanged in structure):
 #

@@ -11,6 +11,20 @@
 # P5b changes NO shader, so the revert is the binary alone -- but the pristine
 # shader set is still verified by sha before the gateway comes back, and
 # p5b_gate.sh refuses if any .spv differs from ~/bench/shaders_devmerge.
+#
+# MIN_SPEEDUP defaults to 0.97, the bound P6b, RP4 and the dev merge used, not
+# 1.0. The first P5b chain (2026-09-08 06:12-09:25) exited 3 on the 27-token
+# row alone -- 2.82/2.61 s candidate against 2.81/2.62 s pristine, a 0.4 %
+# difference on a 2.7-second measurement -- while the rows that can resolve
+# anything read 1.06x at 390 tokens and 1.14x at 1 236. P5b is CPU work inside
+# `mla.attn`, which is 4 % of a 27-token prefill: the small row cannot carry a
+# claim in either direction, and 1.0 there is a noise gate, not a speed gate.
+#
+# P5B_PROFILES=0 skips the per-bucket profile block. Use it only when the
+# rows already exist for the same tree at explicitly-set knob values -- as on
+# the 2026-09-08 re-run, where all 20 profiles came from the first chain and
+# the only source change since was the DEFAULT value of COLI_MLA_POOL, which
+# every profile row overrides on the command line anyway.
 set -u
 TAG=p5b$(date +%m%d%H%M)
 OUT=~/bench/p5b_chain_out; mkdir -p $OUT
@@ -146,6 +160,7 @@ prof() {   # <tag> <bin> <prompt> <poolmode> <shaders>
     bash $HERE/prefill_profile.sh $2 ~/bench/prefill_prompt_$3.txt "$TAG-$1" 128 \
     2>&1 | tee $OUT/prof_$1.txt | tail -24
 }
+if [ "${P5B_PROFILES:-1}" = 1 ]; then
 for r in 1 2;   do prof "600_pristine_r$r" $PRISTINE 600 2 $PSHADERS; done
 for r in 1 2 3; do prof "600_m0_r$r" ~/src/colibri/c/glm53 600 0 $SHADERS; done
 for r in 1 2 3; do prof "600_m1_r$r" ~/src/colibri/c/glm53 600 1 $SHADERS; done
@@ -154,12 +169,13 @@ prof "3000_pristine" $PRISTINE 3000 2 $PSHADERS
 for r in 1 2 3; do prof "3000_m0_r$r" ~/src/colibri/c/glm53 3000 0 $SHADERS; done
 for r in 1 2;   do prof "3000_m1_r$r" ~/src/colibri/c/glm53 3000 1 $SHADERS; done
 for r in 1 2 3; do prof "3000_m2_r$r" ~/src/colibri/c/glm53 3000 2 $SHADERS; done
+else echo "(profile block skipped: P5B_PROFILES=0)"; fi
 
 # --------------------------------------------------------------- the gate
 echo
 echo "### p5b_gate.sh (steps a, a2, c, d)"
 wait_no_engine || exit 2
-PRISTINE_SHADERS=$PSHADERS MIN_SPEEDUP=${MIN_SPEEDUP:-1.0} \
+PRISTINE_SHADERS=$PSHADERS MIN_SPEEDUP=${MIN_SPEEDUP:-0.97} \
   bash $HERE/p5b_gate.sh $PRISTINE ~/src/colibri/c/glm53 $TAG 2>&1 | tee $OUT/gate.log
 GATE=${PIPESTATUS[0]}; echo "P5B GATE rc=$GATE"
 

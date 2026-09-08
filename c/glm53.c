@@ -78,6 +78,7 @@
 static int g_vk_ready = 0;
 #endif
 #include "compat.h"
+#include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -4231,8 +4232,121 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
  * Con `keep_all` si tengono i logit di ogni posizione, che serve solo al
  * confronto con l'oracolo; altrimenti si tiene l'ultima riga, che e' l'unica
  * che decide il token successivo. */
+/* ---------- CANCEL mentre il turno e' in volo ----------
+ *
+ * Misurato il 2026-09-06: un prompt di 1 230 token, CANCEL a 5 s, il motore ha
+ * confermato dopo 251,3 s -- cioe' ha macinato tutto il prefill e tutta la
+ * generazione. Il gateway intanto tiene l'ammissione dello scheduler in attesa
+ * dell'ack (openai_server.py, generate(): "releasing it before the engine
+ * confirms the cancel lets the next request SUBMIT into a pipe the busy engine
+ * is not reading"), quindi un client che si disconnette non libera niente: la
+ * richiesta dopo aspetta comunque la fine del turno.
+ *
+ * La primitiva e' serve_poll.h (#1332): "c'e' un byte leggibile su stdin,
+ * adesso?", senza mai leggere e senza mai bloccare. Il formato delle righe lo
+ * conosce questo file, ed e' lo stesso che parsa serve_read_req.
+ *
+ * Dove si guarda: FRA un pezzo di prefill e l'altro (forward_prefill) e FRA un
+ * token di decode e l'altro (serve_one). Mai dentro un pezzo: il pezzo e'
+ * atomico, e fermarsi a meta' lascerebbe la sessione in uno stato che nessuna
+ * posizione descrive. Il costo e' una select() con timeout zero ogni 128
+ * posizioni di prefill e ogni token generato -- il gate lo misura invece di
+ * assumerlo, e GLM53_NO_CANCEL_POLL=1 e' l'A/B.
+ *
+ * Cosa si fa delle righe lette:
+ *   CANCEL <id in volo>  -> si alza la bandiera; il turno finisce il pezzo (o
+ *                           il token) in corso e si ferma;
+ *   CANCEL <altro id>    -> ERROR <id> NOT_FOUND, la stessa risposta che dava
+ *                           serve_loop quando il CANCEL arrivava a turno finito;
+ *   STOP e il resto      -> si scartano, com'e' sempre stato: serve_loop le
+ *                           ignora gia' fra una richiesta e l'altra.
+ *
+ * E un SUBMIT a meta' turno? Il compito diceva che non puo' arrivare perche'
+ * il gateway serializza. NON E' VERO in questa configurazione, ed e' la cosa
+ * piu' importante che questa modifica ha dovuto scoprire da sola:
+ * GenerationScheduler nasce con `capacity = kv_slots` (openai_server.py:3258),
+ * cioe' QUATTRO in servizio, e generate() scrive il frame appena e' ammessa,
+ * sotto il solo write_lock. Con --kv-slots 4 il gateway puo' quindi avere fino
+ * a quattro SUBMIT nella stessa pipa: il motore ne serve uno per volta e gli
+ * altri aspettano nel tubo, che e' come questo motore fa concorrenza oggi.
+ * Un drain che scartasse quell'intestazione (qwen36.c:2616 fa cosi'; i suoi
+ * frame pero' passano dal codec) lascerebbe nel flusso il payload a byte
+ * contati e disallineerebbe il parser -- cioe' romperebbe il servizio invece
+ * di sistemarlo.
+ *
+ * Quindi: la riga che non e' un comando NON si consuma davvero, si mette da
+ * parte (`g_pushback`) e serve_read_req la rilegge come sua intestazione al
+ * giro dopo. Il payload resta intatto nella pipa, dove serve_read_req lo
+ * aspetta. E il drain si ferma li': i byte che seguono appartengono a QUEL
+ * frame, e leggerne un altro vorrebbe dire parsarne il corpo.
+ *
+ * Il prezzo, detto per intero: se un SUBMIT e' gia' in coda quando arriva il
+ * CANCEL del turno in volo, il CANCEL sta DIETRO quel frame e non si vede
+ * fino a fine turno -- cioe' esattamente il comportamento di prima. Non e'
+ * mai peggio di prima, e nel caso che il gate misura (una richiesta in volo,
+ * il browser che si chiude) e' la differenza fra 251 s e pochi secondi.
+ * Vederlo anche dietro un frame in coda vorrebbe dire parsare il SUBMIT per
+ * intero qui dentro -- la strada di kimi_k3 (k3_serve_poll_cancel, che
+ * risponde "engine busy") -- e quindi una fread bloccante su un payload
+ * arrivato a meta' dentro il ciclo di decode. Non con questa modifica. */
+typedef struct {
+    unsigned long long id;   /* la richiesta in volo */
+    int cancelled;           /* un CANCEL per lei e' arrivato */
+    int done;                /* posizioni macinate dall'ultima forward_prefill */
+} ServeCancel;
+
+static int cancel_poll_off(void) {
+    static int off = -1;
+    if (off < 0) {
+        const char *v = getenv("GLM53_NO_CANCEL_POLL");
+        off = (v && atoi(v) != 0) ? 1 : 0;
+    }
+    return off;
+}
+
+/* Un'intestazione letta dal drain che non era un comando: serve_read_req la
+ * riprende da qui invece che da stdin, e il corpo del frame la aspetta ancora
+ * nella pipa. */
+static char g_pushback[512];
+static int g_pushback_full = 0;
+
+static int serve_cancel_pending(ServeCancel *c) {
+    if (!c) return 0;
+    if (c->cancelled) return 1;
+    if (cancel_poll_off()) return 0;
+    while (!g_pushback_full && coli_serve_stdin_ready()) {
+        char line[512], cmd[16];
+        unsigned long long who = 0;
+        if (!fgets(line, sizeof(line), stdin)) {
+            /* EOF. Su una pipe chiusa "pronto" resta vero per sempre, quindi si
+             * esce dal ciclo -- e si tratta come un annullamento: continuare a
+             * generare per un lettore che non c'e' piu' e' l'unico esito
+             * peggiore del non fermarsi. */
+            c->cancelled = 1;
+            break;
+        }
+        if (sscanf(line, "%15s %llu", cmd, &who) < 1) continue;
+        if (!strcmp(cmd, "CANCEL")) {
+            if (who == c->id) c->cancelled = 1;
+            else { printf("ERROR %llu NOT_FOUND\n", who); fflush(stdout); }
+            continue;
+        }
+        /* STOP non porta corpo e serve_loop lo ignora gia' fra una richiesta e
+         * l'altra: scartarlo qui e' lo stesso comportamento. */
+        if (!strcmp(cmd, "STOP")) continue;
+        /* Tutto il resto (SUBMIT, IMAGE, una riga che non conosciamo) puo'
+         * avere un corpo a byte contati dietro: si rimette da parte e il drain
+         * finisce qui. */
+        snprintf(g_pushback, sizeof(g_pushback), "%s", line);
+        g_pushback_full = 1;
+        break;
+    }
+    return c->cancelled;
+}
+
 static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
-                              const float *vision, int n_vision, int keep_all) {
+                              const float *vision, int n_vision, int keep_all,
+                              ServeCancel *cancel) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
     int chunk = setting ? atoi(setting) : 128;
@@ -4244,6 +4358,7 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     float *last = NULL;
     int used_vision = 0;
 
+    if (cancel) cancel->done = 0;
     for (int at = 0; at < n; at += chunk) {
         const int here = at + chunk <= n ? chunk : n - at;
         /* Gli embedding dell'immagine vanno divisi come i token: a ogni pezzo
@@ -4276,8 +4391,16 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                 last = tail;
             }
         }
+        /* Il punto di annullamento: qui la sessione e' esattamente a
+         * `start + at + here` e nient'altro e' a meta'. */
+        if (cancel) {
+            cancel->done = at + here;
+            if (serve_cancel_pending(cancel)) break;
+        }
     }
-    if (vision && used_vision != n_vision) {
+    /* Un prefill annullato consuma solo i segnaposto dei pezzi che ha
+     * macinato: il conto non torna per costruzione, e non e' un errore. */
+    if (vision && used_vision != n_vision && !(cancel && cancel->cancelled)) {
         fprintf(stderr, "%d embedding vision forniti ma %d segnaposto nel prompt\n",
                 n_vision, used_vision);
         exit(1);
@@ -5019,7 +5142,12 @@ static void serve_data(unsigned long long id, const char *text, int n) {
  * righe: puo' contenerne. */
 static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     char header[512];
-    if (!fgets(header, sizeof(header), stdin)) return 0;
+    if (g_pushback_full) {
+        /* L'intestazione che il drain di un turno precedente ha letto e messo
+         * da parte; il suo corpo e' ancora nella pipa, subito qui sotto. */
+        memcpy(header, g_pushback, sizeof(header));
+        g_pushback_full = 0;
+    } else if (!fgets(header, sizeof(header), stdin)) return 0;
     memset(q, 0, sizeof(*q));
     if (sscanf(header, "%15s", verb) != 1) { verb[0] = 0; return 1; }
     if (!strcmp(verb, "STOP") || !strcmp(verb, "CANCEL")) {
@@ -5108,6 +5236,8 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
     const uint64_t s_fw = m->forwards;
     int emitted = 0, limited = 0;
+    ServeCancel cancel = { q->id, 0, 0 };
+    int cancel_pos = -1;                  /* >= 0: annullato DURANTE il prefill */
     const int budget = q->max_tokens > 0 ? q->max_tokens : 256;
 
     /* Quanto di questo prompt e' gia' nella sessione.
@@ -5195,19 +5325,29 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
          * P2/P3/P4 sono indipendenti per riga dentro il pezzo, quindi il
          * risultato e' atteso identico -- e l'oracolo del gate dice se lo e'. */
         float *upto = forward_prefill(m, slot->session, sequence + shared,
-                                      ckpt_at - shared, NULL, 0, 0);
+                                      ckpt_at - shared, NULL, 0, 0, &cancel);
         free(upto);
-        ckpt_sync_out(m, slot->session);
-        ckpt_store(m, slot->session, sequence, ckpt_at, 0);
-        logits = forward_prefill(m, slot->session, sequence + ckpt_at,
-                                 total - ckpt_at, vision, n_vision, 0);
+        /* Un CANCEL a meta' della prima meta' NON lascia un checkpoint: la
+         * copia descriverebbe `ckpt_at` posizioni che la sessione non ha. Si
+         * cattura solo se il confine e' stato raggiunto esatto -- e allora si
+         * cattura anche annullando, perche' quel lavoro e' gia' fatto e la
+         * copia costa un memcpy. */
+        if (cancel.done == ckpt_at - shared) {
+            ckpt_sync_out(m, slot->session);
+            ckpt_store(m, slot->session, sequence, ckpt_at, 0);
+        }
+        logits = NULL;
+        if (!cancel.cancelled)
+            logits = forward_prefill(m, slot->session, sequence + ckpt_at,
+                                     total - ckpt_at, vision, n_vision, 0, &cancel);
     } else {
         logits = forward_prefill(m, slot->session, sequence + shared,
-                                 total - shared, vision, n_vision, 0);
+                                 total - shared, vision, n_vision, 0, &cancel);
     }
+    if (cancel.cancelled) cancel_pos = slot->session->filled;
     /* La cattura a fine prompt (kind 1 di DeepSeek V4) e' spenta di default:
      * qui una copia intera per richiesta non e' gratis. */
-    if (ckpt_on() && ckpt_end_wanted() && !has_image && total > reused &&
+    if (!cancel.cancelled && ckpt_on() && ckpt_end_wanted() && !has_image && total > reused &&
         total >= ckpt_min_tokens() && !ckpt_have(sequence, total)) {
         ckpt_sync_out(m, slot->session);
         ckpt_store(m, slot->session, sequence, total, 1);
@@ -5217,7 +5357,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     ckpt_logit_dump(q->id, logits, m->c.vocab);
     GSession *session = slot->session;
     int rows = 1;
-    for (int step = 0; step < budget; step++) {
+    for (int step = 0; !cancel.cancelled && step < budget; step++) {
         if (total >= room) { limited = 1; break; }
         int next = sample_token(logits + (size_t)(rows - 1) * m->c.vocab, m->c.vocab);
         free(logits);
@@ -5228,6 +5368,10 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         char piece[512];
         int written = tok_decode(tokenizer, &next, 1, piece, sizeof(piece) - 1);
         serve_data(q->id, piece, written);
+        /* Il secondo punto di annullamento: il token appena emesso e' gia' nel
+         * client e gia' nella sequenza, quindi lo stato dello slot resta
+         * quello di una risposta piu' corta -- niente di speciale da riparare. */
+        if (serve_cancel_pending(&cancel)) break;
         if (step + 1 == budget) { limited = 1; break; }
         logits = forward_span(m, session, &next, 1, NULL, 0);
         rows = 1;
@@ -5235,8 +5379,23 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     free(logits);
     free(vision);
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
-     * davvero macinato: prompt piu' quello che ha generato. */
-    slot_remember(slot, sequence, total);
+     * davvero macinato: prompt piu' quello che ha generato.
+     *
+     * Annullato dentro il prefill, quello che ha macinato e' `filled` e basta:
+     * ricordare l'intero prompt vorrebbe dire promettere al turno dopo delle
+     * posizioni che la sessione non ha mai raggiunto, ed e' esattamente
+     * l'errore silenzioso contro cui la nota su `filled` qui sopra mette in
+     * guardia. Ricordando il pezzo vero, invece, un ritentativo identico
+     * riparte da li' -- il prefill riprendibile di DeepSeek V4. */
+    if (cancel_pos >= 0) slot_remember(slot, sequence, cancel_pos);
+    else slot_remember(slot, sequence, total);
+    if (cancel.cancelled && getenv("GLM53_VERBOSE")) {
+        if (cancel_pos >= 0)
+            fprintf(stderr, "CANCEL %llu at prefill pos=%d/%d\n",
+                    q->id, cancel_pos, prompt_tokens);
+        else
+            fprintf(stderr, "CANCEL %llu at decode tok=%d\n", q->id, emitted);
+    }
     const double elapsed = now_s() - started;
     /* Quanto prefisso lo slot ha risparmiato.
      *
@@ -5263,6 +5422,22 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
                rss_gb(), prompt_tokens, limited);
+    /* L'ack, DOPO il DONE e in quest'ordine, che e' il risultato di aver letto
+     * cosa ne fa il gateway (openai_server.py, Engine._dispatch e generate()):
+     *
+     *   - la riga ERROR fa `pending.pop(id)`, quindi un DONE che la SEGUISSE
+     *     verrebbe buttato e con lui il blocco `[req]` -- la richiesta
+     *     annullata sparirebbe da owui_report.sh, che legge proprio quelle
+     *     righe. Con il DONE davanti, `[req]` c'e' e porta prompt_tokens,
+     *     ttft e i token consegnati prima dell'annullamento;
+     *   - il ramo "done" di generate() alza ClientCancelled da solo quando ha
+     *     mandato un CANCEL ("honored it at a token boundary and still framed a
+     *     DONE"), quindi il DONE E' gia' un ack valido per il gateway;
+     *   - la riga ERROR che segue trova `pending` vuoto e viene ignorata senza
+     *     rumore. Resta perche' e' l'ack esplicito del protocollo, quello che
+     *     scrivono qwen36 e kimi_k3 e quello che legge chi non e' il gateway
+     *     (`coli chat` con SERVE=1, che di ClientCancelled non sa niente). */
+    if (cancel.cancelled) serve_line("ERROR %llu CANCELLED\n", q->id);
     free(sequence);
 }
 
@@ -5349,8 +5524,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
         } else if (!strcmp(verb, "BAD_FRAME")) {
             serve_line("ERROR %llu BAD_FRAME\n", q.id);
         } else if (!strcmp(verb, "CANCEL")) {
-            /* Le richieste qui si servono una per volta e a fine giro, quindi
-             * un CANCEL arriva sempre per una che non e' piu' in volo. */
+            /* Qui ci arriva solo un CANCEL per una richiesta che non e' piu' in
+             * volo: quello per la richiesta in corso lo vede serve_cancel_pending
+             * dentro il turno, e non arriva mai fin qui. */
             serve_line("ERROR %llu NOT_FOUND\n", q.id);
         }
         /* STOP e le righe che non riconosciamo si ignorano: la regola di
@@ -5478,7 +5654,7 @@ int main(int argc, char **argv) {
      * volta e ogni token dopo costa un token, non tutto il prefisso. */
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1, 0);
     const double prefill_start = now_s();
-    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
+    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1, NULL);
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "caricamento %.1fs, prefill %d token in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);

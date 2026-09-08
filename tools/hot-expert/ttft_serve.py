@@ -24,7 +24,20 @@ and two protocol checks:
                 reused, ttft(A+B) is a small fraction of ttft(A).
   --cancel      submit a long prompt, CANCEL after --cancel seconds, and time
                 how long the engine takes to confirm and to serve the next
-                request. This is the G16 gate.
+                request. This is the G16 gate. WHICH PHASE it lands in is a
+                property of the prompt, not of the flag: at --sizes 1000 the
+                prefill is ~170 s, so --cancel 5 is a prefill-phase cancel,
+                while at --sizes 30 the prefill is ~3 s and the 256 tokens
+                that follow take ~50 s, so --cancel 20 is a decode-phase one.
+                The engine says which it was (its "CANCEL <id> at prefill
+                pos=P/T" / "at decode tok=N" line) and this harness prints and
+                checks that, so a run cannot claim a phase it did not exercise.
+  --cancel-resume
+                cancel a prefill, then submit the IDENTICAL prompt: the retry
+                must resume from exactly the position the cancel reported
+                (REUSE == pos) and must produce the same greedy text as an
+                uncancelled run. This is the oracle that a cancelled prefill
+                leaves a CORRECT partial state, not merely a fast one.
 
 Discipline baked in (the 2026-09-06 lessons, see the roadmap):
   * residency of the model's shards is asserted before EVERY run (fincore);
@@ -176,12 +189,17 @@ def engine_env(exe):
 # lines -- that is where they land in service.
 REUSE_RE = re.compile(r"REUSE (\d+) (\d+) (\d+)")
 CKPT_RE = re.compile(r"^(?:.*\s)?(CKPT .*)$")
+# The engine's own account of where a CANCEL landed (glm53.c, serve_one, under
+# GLM53_VERBOSE). The phase is not guessable from the outside: a cancel that
+# arrives 0.2 s after the first token looks exactly like one that arrived 0.2 s
+# before it.
+CANCEL_RE = re.compile(r"CANCEL (\d+) at (prefill pos=(\d+)/(\d+)|decode tok=(\d+))")
 
 
 def scan_engine_log(path, start):
-    """(reuse list, ckpt lines, new offset) for whatever the engine wrote since `start`."""
+    """(reuse list, ckpt lines, cancel lines, new offset) since `start`."""
     if not path or not os.path.exists(path):
-        return [], [], start
+        return [], [], [], start
     with open(path, "rb") as f:
         f.seek(start)
         chunk = f.read()
@@ -189,7 +207,15 @@ def scan_engine_log(path, start):
     text = chunk.decode("utf-8", "replace")
     reuse = [(int(a), int(b), int(c)) for a, b, c in REUSE_RE.findall(text)]
     ckpt = [m.group(1).strip() for m in (CKPT_RE.match(l) for l in text.splitlines()) if m]
-    return reuse, ckpt, end
+    cancels = []
+    for m in CANCEL_RE.finditer(text):
+        if m.group(3) is not None:
+            cancels.append({"id": int(m.group(1)), "phase": "prefill",
+                            "pos": int(m.group(3)), "total": int(m.group(4))})
+        else:
+            cancels.append({"id": int(m.group(1)), "phase": "decode",
+                            "pos": int(m.group(5)), "total": None})
+    return reuse, ckpt, cancels, end
 
 
 class EngineDriver:
@@ -260,12 +286,12 @@ class EngineDriver:
 
     # ---- the engine's own stderr, the authority on reuse and checkpoints
     def mark(self):
-        _, _, self.log_at = scan_engine_log(self.log_path, self.log_at)
+        _, _, _, self.log_at = scan_engine_log(self.log_path, self.log_at)
         return self.log_at
 
     def since_mark(self):
-        reuse, ckpt, self.log_at = scan_engine_log(self.log_path, self.log_at)
-        return reuse, ckpt
+        reuse, ckpt, cancels, self.log_at = scan_engine_log(self.log_path, self.log_at)
+        return reuse, ckpt, cancels
 
     def render(self, messages):
         return self.rt.render_chat_for_arch(messages, enable_thinking=False, tools=self.tools)
@@ -346,11 +372,16 @@ class EngineDriver:
         ev["majflt"], ev["minflt"] = f1[0] - f0[0], f1[1] - f0[1]
         ev["slot"] = slot
         ev["req_id"] = rid
-        reuse, ckpt = self.since_mark()
+        reuse, ckpt, cancels = self.since_mark()
         ev["reused"] = reuse[-1][1] if reuse else None
         ev["ckpt"] = ckpt
+        ev["cancel_mark"] = cancels[-1] if cancels else None
         for line in ckpt:
             print(f"    [engine] {line}", flush=True)
+        if ev["cancel_mark"]:
+            c = ev["cancel_mark"]
+            print(f"    [engine] CANCEL {c['id']} at {c['phase']} "
+                  f"pos={c['pos']}" + (f"/{c['total']}" if c["total"] else ""), flush=True)
         return ev
 
     def close(self):
@@ -434,11 +465,16 @@ class HttpDriver:
         # give the gateway a moment to flush its log line for this request
         if self.log_path:
             time.sleep(1.0)
-            reuse, ckpt, self.log_at = scan_engine_log(self.log_path, self.log_at)
+            reuse, ckpt, cancels, self.log_at = scan_engine_log(self.log_path, self.log_at)
             ev["reused"] = reuse[-1][1] if reuse else None
             ev["ckpt"] = ckpt
+            ev["cancel_mark"] = cancels[-1] if cancels else None
             for line in ckpt:
                 print(f"    [engine] {line}", flush=True)
+            if ev["cancel_mark"]:
+                c = ev["cancel_mark"]
+                print(f"    [engine] CANCEL {c['id']} at {c['phase']} "
+                      f"pos={c['pos']}" + (f"/{c['total']}" if c["total"] else ""), flush=True)
         return ev
 
     def close(self):
@@ -676,6 +712,130 @@ def pin_block_mode(args, drv, record):
     return ok
 
 
+def cancel_mode(args, drv, record, sizes):
+    """The G16 gate: a cancelled request must free the engine within seconds.
+
+    The verdict has four parts and all four are needed.
+
+      confirm   how long the engine took to answer. In --engine mode this is
+                the real thing: `generate()` returns only when the engine has
+                framed its DONE/ERROR. In --url mode it is NOT -- there the
+                client cancels by closing the socket, so `confirm` is just
+                when it closed, and would read ~5 s against an engine that
+                went on grinding for four minutes. The live check therefore
+                rests on the two below, and says so.
+      next      the ttft of the request AFTER the cancelled one. An engine
+                that acknowledges and keeps the turn running has moved the
+                hang, not removed it, and this is where that shows: 30 tokens
+                on a warm engine is seconds, behind an orphaned 1 236-token
+                turn it is minutes.
+      mark      the engine's own "CANCEL <id> at ..." line. In --url mode this
+                is the only direct evidence that the ENGINE stopped rather
+                than the client giving up, which is exactly the difference the
+                2026-09-06 measurement found.
+      phase     that mark also names where it stopped, so a run that asked for
+                a decode-phase cancel and got a prefill-phase one cannot pass
+                for the test its caller thinks it ran.
+    """
+    big = max(sizes)
+    assert_resident(args, "cancel")
+    ev = drv.run(build_messages(args, big), 256, cancel_after=args.cancel)
+    confirm = ev["done"] - ev["submit"]
+    mark = ev.get("cancel_mark")
+    phase = mark["phase"] if mark else "?"
+    where = ""
+    if mark and mark["phase"] == "prefill":
+        where = f", engine stopped at prefill pos {mark['pos']}/{mark['total']}"
+    elif mark:
+        where = f", engine stopped after {mark['pos']} generated tokens"
+    print(f"cancel: sent at {args.cancel:.1f}s, engine confirmed after {confirm:.1f}s "
+          f"(cancelled={ev['cancelled']} error={ev['error']} phase={phase}{where})"
+          + ("" if args.engine else "  [http mode: 'confirmed' is when the CLIENT closed "
+                                    "the socket; the next row and the engine's own line "
+                                    "are the evidence]"), flush=True)
+    nxt = drv.run(build_messages(args, 30), args.gen)
+    record("after-cancel", 30, nxt, "next request after cancel")
+    nxt_ttft = (nxt["first"] - nxt["submit"]) if nxt["first"] else None
+    ok = ev["cancelled"] and confirm < args.cancel + 30 and nxt_ttft is not None
+    # NEXT_MAX: 30 tokens warm is ~3 s here and the orphaned turn it has to
+    # prove is gone is ~250 s. Anything in between is a bug either way.
+    next_max = float(os.environ.get("CANCEL_NEXT_MAX", "60"))
+    if nxt_ttft is None or nxt_ttft > next_max:
+        print(f"cancel: FAIL -- the next request needed {nxt_ttft}s (bound {next_max:.0f}s): "
+              f"the engine was still busy with the cancelled turn", flush=True)
+        ok = False
+    if not args.engine and mark is None:
+        print("cancel: FAIL -- no 'CANCEL ... at ...' line from the engine. In http mode "
+              "that line is the only proof the ENGINE stopped; without it all this "
+              "measured is that the client hung up.", flush=True)
+        ok = False
+    if args.cancel_phase and phase != args.cancel_phase:
+        print(f"cancel: FAIL -- asked for a {args.cancel_phase}-phase cancel, the engine "
+              f"reports {phase}. Move --cancel or --sizes, do not move the bound.", flush=True)
+        ok = False
+    print(f"cancel: {'PASS' if ok else 'FAIL'} -- a cancelled request must free the engine "
+          f"within seconds, not run to max_tokens", flush=True)
+    return ok, confirm, phase
+
+
+def cancel_resume_mode(args, drv, record, sizes):
+    """Gate step (c): a cancelled prefill is RESUMABLE and its state is sound.
+
+    A cancel that stops the prefill must leave the slot describing exactly the
+    positions the session reached -- no more (the slot would promise a context
+    the model never saw) and no fewer (the retry would repeat work). Two
+    claims, two checks:
+
+      resume   the identical prompt, resubmitted, reuses exactly the position
+               the CANCEL line reported;
+      oracle   its greedy text equals that of a run that was never cancelled.
+
+    The oracle is the one that matters. `reused` moving the right way has been
+    a symptom of a corrupted state before (CLAUDE.md), so the text is what says
+    the resumed state is the same state.
+    """
+    big = max(sizes)
+    msgs = build_messages(args, big)
+    gen = max(8, args.gen)
+    hs = drv.slot_for(msgs) if args.engine else None
+    ref_slot = ((hs + 1) % max(1, args.kv_slots)) if hs is not None else None
+    if ref_slot == hs:
+        ref_slot = None
+
+    assert_resident(args, "resume-ref")
+    ref = drv.run(list(msgs), gen, slot=ref_slot)
+    record("resume-ref", big, ref, "reference run, never cancelled")
+    ref_text = "".join(ref.get("text", []))
+
+    assert_resident(args, "resume-cancel")
+    ev = drv.run(list(msgs), 256, slot=hs, cancel_after=args.cancel_resume)
+    confirm = ev["done"] - ev["submit"]
+    record("resume-cancelled", big, ev, f"cancelled at {args.cancel_resume:.0f}s")
+    mark = ev.get("cancel_mark")
+
+    assert_resident(args, "resume-retry")
+    again = drv.run(list(msgs), gen, slot=hs)
+    record("resume-retry", big, again, "identical prompt resubmitted")
+    again_text = "".join(again.get("text", []))
+
+    pos = mark["pos"] if mark and mark["phase"] == "prefill" else None
+    reused = again.get("reused")
+    resumed = pos is not None and pos > 0 and reused == pos
+    same = bool(ref_text) and ref_text == again_text
+    print(f"cancel-resume: cancelled after {confirm:.1f}s at prefill pos={pos}"
+          f"/{mark['total'] if mark else '?'}; the retry REUSED {reused} "
+          f"({'resumed from exactly there' if resumed else 'DID NOT resume from there'})", flush=True)
+    print(f"cancel-resume: greedy text {'IDENTICAL' if same else 'DIFFERS'} to the "
+          f"uncancelled run ({len(ref_text)} bytes, {ref['ntok']} tokens vs "
+          f"{len(again_text)} bytes, {again['ntok']} tokens)", flush=True)
+    if not same:
+        print(f"  ref  : {ref_text[:200]!r}", flush=True)
+        print(f"  retry: {again_text[:200]!r}", flush=True)
+    ok = resumed and same
+    print(f"cancel-resume: {'PASS' if ok else 'FAIL'}", flush=True)
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     m = ap.add_mutually_exclusive_group(required=True)
@@ -694,6 +854,12 @@ def main():
     ap.add_argument("--system", help="text file used as a system message on every multiturn prompt (a stable prefix)")
     ap.add_argument("--kv-slots", type=int, default=1, help="engine KV slots; >1 routes conversations like the gateway does")
     ap.add_argument("--cancel", type=float, metavar="SECONDS", help="CANCEL check after this many seconds")
+    ap.add_argument("--cancel-phase", choices=("prefill", "decode"),
+                    help="--cancel: require the engine to report this phase (it names it)")
+    ap.add_argument("--cancel-resume", type=float, metavar="SECONDS",
+                    help="cancel a prefill after N s, then resubmit the identical prompt: "
+                         "REUSE must equal the cancelled position and the text must match "
+                         "an uncancelled run")
     ap.add_argument("--min-resident", type=float, default=96.0,
                     help="refuse below this; 100%% is unreachable with an engine up (see assert_resident)")
     ap.add_argument("--warm", action="store_true", help="re-warm the shards if below --min-resident")
@@ -805,19 +971,15 @@ def main():
         if args.pin_block:
             verdicts.append(("pin-block", pin_block_mode(args, drv, record)))
         if args.cancel is not None:
-            big = max(sizes)
-            assert_resident(args, "cancel")
-            ev = drv.run(build_messages(args, big), 256, cancel_after=args.cancel)
-            confirm = ev["done"] - ev["submit"]
-            print(f"cancel: sent at {args.cancel:.1f}s, engine confirmed after {confirm:.1f}s "
-                  f"(cancelled={ev['cancelled']} error={ev['error']})", flush=True)
-            nxt = drv.run(build_messages(args, 30), args.gen)
-            record("after-cancel", 30, nxt, "next request after cancel")
-            ok = ev["cancelled"] and confirm < args.cancel + 30 and nxt["first"] is not None
-            print(f"cancel: {'PASS' if ok else 'FAIL'} -- a cancelled request must free the engine "
-                  f"within seconds, not run to max_tokens", flush=True)
+            ok, confirm, phase = cancel_mode(args, drv, record, sizes)
+            # This check used to print its verdict and leave the exit code at 0,
+            # so a chain could serve an engine that ignores CANCEL and call it
+            # gated. It is a verdict now, like every other named check here.
+            verdicts.append(("cancel", ok))
             records.append({"tag": args.tag, "kind": "cancel", "confirm_s": confirm,
-                            "pass": ok, "t": time.time()})
+                            "phase": phase, "pass": ok, "t": time.time()})
+        if args.cancel_resume is not None:
+            verdicts.append(("cancel-resume", cancel_resume_mode(args, drv, record, sizes)))
     finally:
         drv.close()
         if args.engine:

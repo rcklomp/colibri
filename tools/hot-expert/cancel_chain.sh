@@ -170,8 +170,12 @@ start_gateway
 # --------------------------------------------------------------- (e) live
 echo
 echo "### (e) live, through the gateway"
+# --cancel-phase DECODE, not prefill: over HTTP the harness only sees the
+# stream once the first token exists, so a cancel here is a decode-phase one
+# whatever the number says (found 2026-09-08 23:18, by the phase check).
+# The live PREFILL-phase case is (e2) below: curl hanging up before any token.
 python3 $HERE/ttft_serve.py --url http://127.0.0.1:8081 --sizes 1000 --repeat 1 --warm \
-    --cancel 5 --cancel-phase prefill \
+    --cancel 5 --cancel-phase decode \
     --tag $TAG-live --json $OUT/live.jsonl 2>&1 | tee $OUT/live.txt | tail -25
 LIVE=${PIPESTATUS[0]}; echo "live cancel rc=$LIVE"
 ~/bench/owui_report.sh 3
@@ -197,7 +201,8 @@ print(json.dumps({"model": sys.argv[1], "stream": False, "max_tokens": 8,
                   "temperature": 0,
                   "messages": [{"role": "user", "content": "Say OK."}]}))
 PY
-echo "--- curl -m 8 (the browser tab closing)"
+for round in 1 2; do   # twice: one row is an anecdote
+echo "--- curl -m 8 (the browser tab closing), round $round"
 date -Is
 curl -s -m 8 -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
      -d @$OUT/curl_big.json http://127.0.0.1:8081/v1/chat/completions > $OUT/curl_big.out
@@ -213,6 +218,7 @@ E=$(date +%s.%N)
 echo "curl exit=$rc"
 python3 -c "print(f'short request after the disconnect: {$E - $S:.2f} s')"
 head -c 400 $OUT/curl_small.out; echo
+done
 echo "--- the gateway's own record"
 ~/bench/owui_report.sh 4
 grep -E "CANCEL [0-9]+ at " ~/glm53_server.log | tail -5

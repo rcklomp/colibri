@@ -430,6 +430,15 @@ class HttpDriver:
                 self.model = json.load(r)["data"][0]["id"]
             print(f"[http] model id from /v1/models: {self.model}", flush=True)
 
+    # NOTE, found by asserting the phase (2026-09-08 23:18): this driver CANNOT
+    # cancel during a prefill. `urlopen` returns when the response headers
+    # arrive, and the gateway commits the SSE stream on the engine's first
+    # DATA frame (glm53 sends no ACCEPT), so the loop below -- where the cancel
+    # is decided -- does not start running until the first token exists. A
+    # `--cancel 5` here has always meant "hang up 5 s after the first token",
+    # which is a DECODE-phase cancel however long the prefill was. The live
+    # prefill-phase case is the `curl -m 8` in cancel_chain.sh: a client that
+    # stops reading before any token, which is what a browser tab closing is.
     def run(self, messages, gen, slot=None, cancel_after=None, cancel_from_first=False):
         body = {"model": self.model, "messages": messages, "stream": True,
                 "max_tokens": gen, "temperature": 0, "stream_options": {"include_usage": True}}
@@ -922,6 +931,11 @@ def main():
         # the ON side dumps from the very first spawn, so this must be set
         # before EngineDriver builds the engine
         os.environ["GLM53_LOGIT_DUMP"] = os.path.join(args.logit_dir, "on")
+
+    if args.url and args.cancel_phase == "prefill":
+        sys.exit("--cancel-phase prefill is unreachable over --url: this driver only sees the "
+                 "stream once the first token exists (see HttpDriver.run). Use --engine for "
+                 "the prefill phase, and cancel_chain.sh's `curl -m 8` for the live one.")
 
     sizes = [int(s) for s in args.sizes.split(",") if s]
     others = other_engines()

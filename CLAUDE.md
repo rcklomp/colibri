@@ -58,10 +58,20 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   deliberately does not fire there, and changing the tier changes routing.
   Preload from the histogram with the most history (`~/.glm53_explain.bin`).
   Note an *unset* cap does not fill the tier, it skips dev2/dev3 entirely.
-- **Never run a `glm53` built from `fix/expert-cache-vs-page-cache*` or
-  commit `eabeb9a` here:** its cache sizing takes MemAvailable and thrashes
-  the box until the OOM killer acts. If SSH stops answering, that is why;
-  it recovers on its own.
+- **Never run a `glm53` built from the branch `fix/expert-cache-vs-page-cache*`
+  at any commit before its fix `d9d38c5`:** that cache sizing took
+  MemAvailable and thrashed the box until the OOM killer acted. (An older
+  version of this rule named commit `eabeb9a`; that sha is #1325's harmless
+  `st.h` mapping primitive and has been an ancestor of `hot-expert-tier`
+  since the upstream `dev` merge on 2026-09-08 — the branch is the warning,
+  not the sha.) If SSH stops answering, that is why; it recovers on its own.
+- **Expert mapping** lives in `c/st.h` since the dev merge
+  (`st_map_shard_range`, `COLI_MAP_EXPERTS_DEFAULT`): on by default for
+  `glm53` and `qwen38`, off for every other engine; `COLI_MAP_EXPERTS=0` is
+  the A/B next to `GLM53_NO_MMAP` / `Q38_NO_MMAP`. The startup line reads
+  `[MAP] 59 file mappati (st_map_shard_range), esperti mappabili 12096/12096`;
+  `majflt` per request stays 0 and `[MAP] … copy=0` — if either moves, the
+  mapping is the first suspect.
 - **One benchmark at a time.** The rig serialises measurements. Parallel
   sessions or subagents may edit and build concurrently; only one may run an
   engine. Check `pgrep -x glm53`, `pgrep -x qwen38`, `pgrep -x qwen38-vk`
@@ -123,16 +133,22 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - Shared: `c/quant.h` (CPU kernels; `matmul_fp8` is Qwen-only in practice),
   `c/backend_vulkan.c`, `c/shaders/*.comp`. A shared-file change must
   rebuild and re-measure both engines.
-- Build: `make -C c qwen38 qwen38-vk glm53 VK=1` (the tiled shaders
+- Build: `make -C c qwen38 qwen38-vk glm53 VK=1` (header prerequisites are in
+  the Makefile since the dev merge, so a `st.h`/`quant.h` change rebuilds both
+  engines by itself; the tiled shaders
   `shaders/qmatmul_tile.spv` / `qmatmul_gate_up_tile.spv` are built by the
   same Makefile and loaded from `c/shaders` — a binary copied elsewhere must
   still point `COLI_VK_SHADERS` at the repo's `c/shaders`; the harness
   refuses to run without them).
 - Binary copies for gates live in `~/bench/` (`glm53.pristine` = pre-prefill
   track, `glm53.p2`, `glm53.p4base`, `glm53.p4c_base`, `glm53.p6base`,
-  `glm53.p7base` = pre-P7, `glm53.p6bbase` = P7, `glm53.p6b` = the P6b binary
-  in service since 2026-09-07 16:50); each gate's pristine is the binary in
-  service before the item. **All four qwen38 C tests
+  `glm53.p7base` = pre-P7, `glm53.p6bbase` = P7, `glm53.p6b`, `glm53.rp4`,
+  `glm53.p5` (+ `shaders_p5`), `glm53.devmerge` (+ `shaders_devmerge`) = the
+  binary in service since 2026-09-08 01:00); each gate's pristine is the
+  binary in service before the item. **Every gate runs with
+  `GLM53_PREFIX_CKPT=0` and a private `COLI_CKPT_DIR`**: two gates nearly
+  passed for the wrong reason because the candidate restored a checkpoint
+  the pristine had just written. **All four qwen38 C tests
   pass** as of 2026-09-06. `tests/test_qwen38_prefix` used to SIGFPE on every
   tree; that was C1's merge blocker and it is fixed (unguarded
   `m->max_t / c->idx_ratio` in `ensure_kv`, which the test's fabricated Model

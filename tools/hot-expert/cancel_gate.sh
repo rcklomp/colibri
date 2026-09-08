@@ -28,10 +28,11 @@
 #      identical is required: nothing here touches arithmetic.
 #  (b) the cancel, in BOTH phases. Which phase a cancel lands in is a property
 #      of the prompt, not of the flag: at 1 236 prompt tokens the prefill is
-#      ~170 s, so --cancel 5 is inside it; at 27 tokens the prefill is ~3 s and
-#      the 256 tokens after it take ~50 s, so --cancel 20 is inside the decode.
-#      --cancel-phase makes the harness check the engine's own account of where
-#      it stopped instead of trusting the arithmetic above.
+#      ~170 s, so --cancel 5 is inside it. The decode-phase one does not guess:
+#      --cancel-phase decode asks for an answer long enough to have a decode
+#      worth cancelling and counts the seconds from the FIRST TOKEN. It also
+#      makes the harness check the engine's own account of where it stopped,
+#      so a run cannot pass for a phase it did not exercise.
 #  (c) resume. A cancelled prefill must leave the slot describing exactly the
 #      positions the session reached: the identical prompt resubmitted must
 #      REUSE that number, and must produce the same greedy text as a run that
@@ -119,12 +120,16 @@ wait_no_engine || exit 2
 grep -E "^cancel:|^VERDICT " "$OUT/step_b1.txt"
 [ "$rb1" = 0 ] || rcb=1
 
-# b2: 27 prompt tokens and 256 requested -- at 20 s the prefill is long over
-# (~3 s) and the decode is running at ~5.5 tok/s.
-echo "--- b2 decode-phase cancel (--sizes 30 --cancel 20)"
+# b2: --cancel-phase decode makes the harness ask for a long answer AND count
+# the seconds from the first token, so this is a decode-phase cancel however
+# long the prefill takes and however briefly the model chooses to talk. The
+# first attempt at this asked for 20 s from SUBMIT on a 27-token prompt whose
+# whole turn lasted 12.3 s: the cancel never fired and the step measured
+# nothing (2026-09-08 22:14).
+echo "--- b2 decode-phase cancel (--sizes 30 --cancel 10 after the first token)"
 serve_env GLM53_PREFIX_CKPT=0 \
     python3 "$HERE/ttft_serve.py" --engine "$CAND" --sizes 30 --repeat 0 \
-      --cancel 20 --cancel-phase decode --kv-slots "$SLOTS" --gen 8 \
+      --cancel 10 --cancel-phase decode --kv-slots "$SLOTS" --gen 8 \
       --warm --min-resident 96 --tag "$TAG-c20" --json "$OUT/cancel.jsonl" \
       --engine-log "$OUT/engine_c20.log" 2>&1 | tee "$OUT/step_b2.txt"
 rb2=${PIPESTATUS[0]}

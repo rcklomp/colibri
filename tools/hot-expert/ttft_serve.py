@@ -296,7 +296,7 @@ class EngineDriver:
     def render(self, messages):
         return self.rt.render_chat_for_arch(messages, enable_thinking=False, tools=self.tools)
 
-    def _one(self, prompt, gen, slot, cancel_after=None):
+    def _one(self, prompt, gen, slot, cancel_after=None, cancel_from_first=False):
         ev = {"submit": time.time(), "accept": None, "first": None, "done": None,
               "ntok": 0, "prompt_tokens": None, "cancelled": False, "error": None}
         stop_flag = {"v": False}
@@ -314,7 +314,17 @@ class EngineDriver:
             ev["prompt_tokens"] = info.get("prompt_tokens")
 
         def cancelled():
-            return cancel_after is not None and time.time() - ev["submit"] >= cancel_after
+            if cancel_after is None:
+                return False
+            # A decode-phase cancel timed from SUBMIT is a guess about two
+            # numbers nobody controls: how long the prefill takes and how long
+            # the model chooses to talk. The first decode-phase attempt
+            # (2026-09-08 22:14) asked for 20 s on a 27-token prompt whose turn
+            # was OVER at 12.3 s -- the answer ended, the cancel never fired,
+            # and the run measured nothing. Timed from the FIRST TOKEN it is
+            # decode-phase by construction.
+            base = ev["first"] if cancel_from_first else ev["submit"]
+            return base is not None and time.time() - base >= cancel_after
 
         try:
             stats = self.eng.generate(prompt, gen, 0.0, 1.0, on_text, cache_slot=slot,
@@ -354,7 +364,7 @@ class EngineDriver:
         request (title generation) lands elsewhere."""
         return self.rt.conversation_cache_slot(messages, self.kv_slots) if self.kv_slots > 1 else 0
 
-    def run(self, messages, gen, slot=None, cancel_after=None):
+    def run(self, messages, gen, slot=None, cancel_after=None, cancel_from_first=False):
         # P7: the pin runs BEFORE the slot hash, exactly where the gateway puts
         # it (chat_completion, before render and before conversation_cache_slot).
         # Pinning inside render() instead left turn 2 hashing the UNPINNED
@@ -367,7 +377,7 @@ class EngineDriver:
         f0 = self.faults()
         self.mark()
         rid = self.eng.next_request_id
-        ev = self._one(self.render(messages), gen, slot, cancel_after)
+        ev = self._one(self.render(messages), gen, slot, cancel_after, cancel_from_first)
         f1 = self.faults()
         ev["majflt"], ev["minflt"] = f1[0] - f0[0], f1[1] - f0[1]
         ev["slot"] = slot
@@ -420,7 +430,7 @@ class HttpDriver:
                 self.model = json.load(r)["data"][0]["id"]
             print(f"[http] model id from /v1/models: {self.model}", flush=True)
 
-    def run(self, messages, gen, slot=None, cancel_after=None):
+    def run(self, messages, gen, slot=None, cancel_after=None, cancel_from_first=False):
         body = {"model": self.model, "messages": messages, "stream": True,
                 "max_tokens": gen, "temperature": 0, "stream_options": {"include_usage": True}}
         if self.tools:
@@ -449,7 +459,9 @@ class HttpDriver:
                             ev["ntok"] += 1
                             if d.get("content"):
                                 ev["text"].append(d["content"])
-                    if cancel_after is not None and time.time() - ev["submit"] >= cancel_after:
+                    base = ev["first"] if cancel_from_first else ev["submit"]
+                    if (cancel_after is not None and base is not None
+                            and time.time() - base >= cancel_after):
                         ev["cancelled"] = True
                         break   # closing the socket is how a browser cancels
         except urllib.error.HTTPError as e:
@@ -738,8 +750,17 @@ def cancel_mode(args, drv, record, sizes):
                 for the test its caller thinks it ran.
     """
     big = max(sizes)
+    # For a decode-phase cancel the prompt has to have a decode worth
+    # cancelling: the default 27-token prompt is answered in ~55 tokens and the
+    # turn is over in 12.3 s. Asking for a list makes the 256-token budget the
+    # limit (~46 s of decode), and --cancel-after-first starts the clock at the
+    # first token so the prefill's length stops mattering at all.
+    suffix = ("Then list twenty short facts about it, one per line."
+              if args.cancel_phase == "decode" else None)
+    from_first = args.cancel_after_first or args.cancel_phase == "decode"
     assert_resident(args, "cancel")
-    ev = drv.run(build_messages(args, big), 256, cancel_after=args.cancel)
+    ev = drv.run(build_messages(args, big, suffix), 256, cancel_after=args.cancel,
+                 cancel_from_first=from_first)
     confirm = ev["done"] - ev["submit"]
     mark = ev.get("cancel_mark")
     phase = mark["phase"] if mark else "?"
@@ -748,7 +769,8 @@ def cancel_mode(args, drv, record, sizes):
         where = f", engine stopped at prefill pos {mark['pos']}/{mark['total']}"
     elif mark:
         where = f", engine stopped after {mark['pos']} generated tokens"
-    print(f"cancel: sent at {args.cancel:.1f}s, engine confirmed after {confirm:.1f}s "
+    sent = f"{args.cancel:.1f}s after the first token" if from_first else f"{args.cancel:.1f}s"
+    print(f"cancel: sent at {sent}, engine confirmed after {confirm:.1f}s "
           f"(cancelled={ev['cancelled']} error={ev['error']} phase={phase}{where})"
           + ("" if args.engine else "  [http mode: 'confirmed' is when the CLIENT closed "
                                     "the socket; the next row and the engine's own line "
@@ -756,7 +778,8 @@ def cancel_mode(args, drv, record, sizes):
     nxt = drv.run(build_messages(args, 30), args.gen)
     record("after-cancel", 30, nxt, "next request after cancel")
     nxt_ttft = (nxt["first"] - nxt["submit"]) if nxt["first"] else None
-    ok = ev["cancelled"] and confirm < args.cancel + 30 and nxt_ttft is not None
+    ttft = (ev["first"] - ev["submit"]) if ev["first"] else 0.0
+    ok = ev["cancelled"] and confirm < ttft + args.cancel + 30 and nxt_ttft is not None
     # NEXT_MAX: 30 tokens warm is ~3 s here and the orphaned turn it has to
     # prove is gone is ~250 s. Anything in between is a bug either way.
     next_max = float(os.environ.get("CANCEL_NEXT_MAX", "60"))
@@ -855,7 +878,11 @@ def main():
     ap.add_argument("--kv-slots", type=int, default=1, help="engine KV slots; >1 routes conversations like the gateway does")
     ap.add_argument("--cancel", type=float, metavar="SECONDS", help="CANCEL check after this many seconds")
     ap.add_argument("--cancel-phase", choices=("prefill", "decode"),
-                    help="--cancel: require the engine to report this phase (it names it)")
+                    help="--cancel: require the engine to report this phase (it names it). "
+                         "'decode' also lengthens the prompt's answer and starts the cancel "
+                         "clock at the first token, so the phase is by construction")
+    ap.add_argument("--cancel-after-first", action="store_true",
+                    help="--cancel: count the seconds from the FIRST TOKEN, not from SUBMIT")
     ap.add_argument("--cancel-resume", type=float, metavar="SECONDS",
                     help="cancel a prefill after N s, then resubmit the identical prompt: "
                          "REUSE must equal the cancelled position and the text must match "

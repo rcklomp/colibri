@@ -66,6 +66,7 @@ static double now(void) {
 #define H 64
 #define L 512
 #define WIDTH 2051
+#define DTILE 8           /* P5b: d per accumulator tile (measured best of 8/16/32/64) */
 
 /* ---------------- the engine's kernel, verbatim in shape ---------------- */
 static void base_scores(float *score, const float *q, const float *latent,
@@ -132,11 +133,106 @@ static void transpose_q(float *qT, const float *q) {   /* [H][L] -> [L][H] */
                     qT[(size_t)(d + dd) * H + h + hh] = q[(size_t)(h + hh) * L + d + dd];
 }
 
+/* ---------------- P5b: the weighted pool, blocked over head x d -----------
+ *
+ * The reference, per head, is
+ *
+ *     for u:  w = (float)(score[u]/total);
+ *             for d:  pooled[d] += w * latent[idx[u]][d];
+ *
+ * and gcc 15 -O3 -march=native CONTRACTS that into vfmadd213ps (checked in the
+ * objdump; -ffp-contract=fast is the GNU default), so the reference term is
+ * fmaf(w, c, acc) -- ONE rounding. That is the opposite of the score pass,
+ * where the reduction cannot vectorise and each product is rounded before an
+ * in-order scalar add. A bit-identical blocked pool therefore has to USE fma,
+ * and to keep u ascending for every (h, d).
+ *
+ * As written the pool walks the layer's selected latent ONCE PER HEAD:
+ * 64 x used x L x 4 = 180 MB per token per layer at used = 1444, 2.0 GB per
+ * token over the 11 DSA layers, of which only 2.8 MB is distinct. Blocking it
+ * over (d-tile x head group) reads each latent byte once. The d-tiles are the
+ * parallel axis (L = 512 -> 16 tiles of 32 for 8 threads), each tile keeps its
+ * own accumulator plane acc[dt][H] (h contiguous, 8 KB at dt = 32) in L1, and
+ * eight slots are folded at a time so one accumulator load+store serves eight
+ * FMAs. Every (h, d) still accumulates u = 0, 1, 2, ... in order. */
+static void pool_blocked(float *pooled_all, const float *wT, const float *lat,
+                         const int *idx, int used, int dtile, float *accbuf) {
+    const int ntiles = (L + dtile - 1) / dtile;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int tb = 0; tb < ntiles; tb++) {
+        const int d0 = tb * dtile;
+        const int dt = (L - d0 < dtile) ? (L - d0) : dtile;
+        float *acc = accbuf + (size_t)tb * dtile * H;
+        memset(acc, 0, (size_t)dt * H * sizeof(float));
+        int u = 0;
+#ifdef MLAATTN_AVX2
+        for (; u + 8 <= used; u += 8) {
+            const float *r[8], *w[8];
+            for (int k = 0; k < 8; k++) {
+                r[k] = lat + (size_t)idx[u + k] * L + d0;
+                w[k] = wT + (size_t)(u + k) * H;
+            }
+            for (int hg = 0; hg + 8 <= H; hg += 8) {
+                const __m256 v0=_mm256_loadu_ps(w[0]+hg), v1=_mm256_loadu_ps(w[1]+hg);
+                const __m256 v2=_mm256_loadu_ps(w[2]+hg), v3=_mm256_loadu_ps(w[3]+hg);
+                const __m256 v4=_mm256_loadu_ps(w[4]+hg), v5=_mm256_loadu_ps(w[5]+hg);
+                const __m256 v6=_mm256_loadu_ps(w[6]+hg), v7=_mm256_loadu_ps(w[7]+hg);
+                float *a = acc + hg;
+                for (int dd = 0; dd < dt; dd++, a += H) {
+                    __m256 x = _mm256_loadu_ps(a);
+                    x = _mm256_fmadd_ps(v0, _mm256_broadcast_ss(r[0]+dd), x);
+                    x = _mm256_fmadd_ps(v1, _mm256_broadcast_ss(r[1]+dd), x);
+                    x = _mm256_fmadd_ps(v2, _mm256_broadcast_ss(r[2]+dd), x);
+                    x = _mm256_fmadd_ps(v3, _mm256_broadcast_ss(r[3]+dd), x);
+                    x = _mm256_fmadd_ps(v4, _mm256_broadcast_ss(r[4]+dd), x);
+                    x = _mm256_fmadd_ps(v5, _mm256_broadcast_ss(r[5]+dd), x);
+                    x = _mm256_fmadd_ps(v6, _mm256_broadcast_ss(r[6]+dd), x);
+                    x = _mm256_fmadd_ps(v7, _mm256_broadcast_ss(r[7]+dd), x);
+                    _mm256_storeu_ps(a, x);
+                }
+            }
+        }
+        for (; u < used; u++) {
+            const float *r = lat + (size_t)idx[u] * L + d0;
+            const float *w = wT + (size_t)u * H;
+            for (int hg = 0; hg + 8 <= H; hg += 8) {
+                const __m256 v = _mm256_loadu_ps(w + hg);
+                float *a = acc + hg;
+                for (int dd = 0; dd < dt; dd++, a += H)
+                    _mm256_storeu_ps(a, _mm256_fmadd_ps(v, _mm256_broadcast_ss(r+dd),
+                                                        _mm256_loadu_ps(a)));
+            }
+        }
+#else
+        for (; u < used; u++) {
+            const float *r = lat + (size_t)idx[u] * L + d0;
+            const float *w = wT + (size_t)u * H;
+            for (int h = 0; h < H; h++)
+                for (int dd = 0; dd < dt; dd++)
+                    acc[(size_t)dd*H+h] = fmaf(w[h], r[dd], acc[(size_t)dd*H+h]);
+        }
+#endif
+        for (int h = 0; h < H; h++)
+            for (int dd = 0; dd < dt; dd++)
+                pooled_all[(size_t)h * L + d0 + dd] = acc[(size_t)dd * H + h];
+    }
+}
+
 int main(int argc, char **argv) {
     const int layers = 11;
     int seen = argc > 1 ? atoi(argv[1]) : 1442;      /* mean `used` at 3 462 tok */
     int reps  = argc > 2 ? atoi(argv[2]) : 20;
     int pool_layers = argc > 3 ? atoi(argv[3]) : 1;  /* 1 = one layer, 11 = 78 MB */
+    /* P5b: the per-thread `pooled`/`score` slices are L and width floats wide
+     * in the engine -- 2 048 and 8 204 bytes, NEITHER a multiple of 64 -- so
+     * adjacent threads share the boundary cache lines and ping-pong them for
+     * the whole pool. pad=1 rounds each slice up to a cache line, which is
+     * the engine's P5b.1. Run the bench both ways: the difference is the
+     * artefact, and it is most of what P5 recorded as "softmax+pool 17->39". */
+    int pad = argc > 4 ? atoi(argv[4]) : 1;
+    int dtile = argc > 5 ? atoi(argv[5]) : DTILE;  /* P5b accumulator tile */
     if (seen > WIDTH) seen = WIDTH;
 
     const int cap = 3600;
@@ -186,13 +282,74 @@ int main(int argc, char **argv) {
     printf("oracle: %d scores compared (%d heads x %d slots), mismatches %d -> %s\n",
            used * H, H, used, bad, bad ? "FAIL" : "BIT-IDENTICAL");
 
+    /* ---------------- oracle 2: every pooled value, bit for bit -------------
+     * The pool is what P5b replaces, so the check is the same shape as the
+     * score one: the reference nest (per head: softmax, then the rank-1
+     * accumulate over slots) against the blocked nest, all H x L values. */
+    float *pooled_ref = malloc((size_t)H * L * sizeof(float));
+    float *pooled_c1  = malloc((size_t)H * L * sizeof(float));
+    float *pooled_c2  = malloc((size_t)H * L * sizeof(float));
+    float *wT_o       = malloc((size_t)WIDTH * H * sizeof(float));
+    float *accbuf     = aligned_alloc(64, (size_t)L * H * sizeof(float));
+    float *sco        = malloc((size_t)WIDTH * sizeof(float));
+    if (!pooled_ref || !pooled_c1 || !pooled_c2 || !wT_o || !accbuf || !sco) {
+        fprintf(stderr, "OOM\n"); return 1;
+    }
+    for (int h = 0; h < H; h++) {
+        int ub; float top;
+        base_scores(sco, q + (size_t)h * L, latent, chosen, WIDTH, cap, scale, &ub, &top);
+        double total = 0.0;
+        for (int u = 0; u < ub; u++) { sco[u] = expf(sco[u] - top); total += sco[u]; }
+        float *pooled = pooled_ref + (size_t)h * L;
+        memset(pooled, 0, (size_t)L * sizeof(float));
+        for (int u = 0; u < ub; u++) {
+            const float w = (float)(sco[u] / total);
+            const float *c_j = latent + (size_t)idx[u] * L;
+            for (int d = 0; d < L; d++) pooled[d] += w * c_j[d];
+        }
+    }
+    /* candidate: the scores are already in sc[u][h]; the softmax turns each
+     * head's column into its weights IN PLACE, then the blocked pool runs. */
+    for (int h = 0; h < H; h++) {
+        float top = -INFINITY;
+        for (int u = 0; u < used; u++) {
+            sco[u] = sc[(size_t)u * H + h];
+            if (sco[u] > top) top = sco[u];
+        }
+        double total = 0.0;
+        for (int u = 0; u < used; u++) { sco[u] = expf(sco[u] - top); total += sco[u]; }
+        for (int u = 0; u < used; u++) wT_o[(size_t)u * H + h] = (float)(sco[u] / total);
+    }
+    pool_blocked(pooled_c1, wT_o, latent, idx, used, dtile, accbuf);
+    pool_blocked(pooled_c2, wT_o, latent, idx, used, 8, accbuf);
+    int badp1 = 0, badp2 = 0;
+    for (int i = 0; i < H * L; i++) {
+        unsigned a, b, c2;
+        memcpy(&a, &pooled_ref[i], 4); memcpy(&b, &pooled_c1[i], 4); memcpy(&c2, &pooled_c2[i], 4);
+        if (a != b) { if (badp1 < 3) printf("ORACLE pool dt=32: i=%d %.9g vs %.9g\n", i, pooled_ref[i], pooled_c1[i]); badp1++; }
+        if (a != c2) { if (badp2 < 3) printf("ORACLE pool dt=8:  i=%d %.9g vs %.9g\n", i, pooled_ref[i], pooled_c2[i]); badp2++; }
+    }
+    printf("oracle: %d pooled values (%d heads x %d), dtile=32 mismatches %d -> %s, dtile=8 mismatches %d -> %s\n",
+           H * L, H, L, badp1, badp1 ? "FAIL" : "BIT-IDENTICAL",
+           badp2, badp2 ? "FAIL" : "BIT-IDENTICAL");
+    bad += badp1 + badp2;
+
     /* ---------------- timing ---------------- */
     int nthr = 1;
 #ifdef _OPENMP
     nthr = omp_get_max_threads();
 #endif
     double macs = (double)H * used * L;      /* per token per layer */
-    float *out_base = malloc((size_t)nthr * WIDTH * sizeof(float));
+    /* pad=0 reproduces the engine's `malloc(nthreads * L * sizeof(float))`:
+     * glibc hands back a 16-byte-aligned pointer, so the per-thread slices are
+     * NOT cache-line aligned and every pair of neighbouring threads shares the
+     * two boundary lines -- which they then write `used` times per head. The
+     * +4 float offset below makes that misalignment deterministic instead of
+     * whatever the allocator happened to do; pad=1 is the fix (64-byte base,
+     * stride rounded up to a cache line). */
+    const int sstride = pad ? ((WIDTH + 15) & ~15) : WIDTH;
+    const int pstride = pad ? ((L + 15) & ~15) : L;
+    float *out_base = (float *)aligned_alloc(64, (size_t)nthr * sstride * sizeof(float) + 64) + (pad ? 0 : 4);
     float *out_cand = malloc((size_t)nthr * WIDTH * H * sizeof(float));
 
     /* baseline: one token's 64 heads, parallel over heads, as the engine does */
@@ -209,7 +366,7 @@ int main(int argc, char **argv) {
                 tid = omp_get_thread_num();
 #endif
                 int ub; float tp;
-                base_scores(out_base + (size_t)tid * WIDTH, q + (size_t)h * L, lat,
+                base_scores(out_base + (size_t)tid * sstride, q + (size_t)h * L, lat,
                             chosen, WIDTH, cap, scale, &ub, &tp);
             }
         }
@@ -241,10 +398,12 @@ int main(int argc, char **argv) {
      * pool over the same rows, and the kvb_v projection are the rest, and the
      * candidate additionally reads its 64 scores back out of sc[u][h]. Running
      * both whole cores says how much of the bucket the score pass ever was. */
-    float *pool_pool = malloc((size_t)nthr * L * sizeof(float));
-    double tfb = 0, tfc = 0, tft = 0;
+    float *pool_pool = (float *)aligned_alloc(64, (size_t)nthr * pstride * sizeof(float) + 64) + (pad ? 0 : 4);
+    float *pooled_big = malloc((size_t)H * L * sizeof(float));
+    double tfb = 0, tfc = 0, tft = 0, tf1 = 0, tf2 = 0;
+    double tpb = 0, tp1 = 0, tp2 = 0;   /* the pool phase alone */
     float *scT = malloc((size_t)WIDTH * H * sizeof(float));
-    for (int pass = 0; pass < 3; pass++) {
+    for (int pass = 0; pass < 5; pass++) {
         t0 = now();
         for (int r = 0; r < reps; r++) for (int lay = 0; lay < layers; lay++) {
             const float *lat = latent + (size_t)(lay % pool_layers) * cap * L;
@@ -267,6 +426,35 @@ int main(int argc, char **argv) {
                     for (int u = 0; u < used; u++)
                         scT[(size_t)h * WIDTH + u] = out_cand[(size_t)u * H + h];
             }
+            if (pass >= 3) {
+                /* P5b: softmax per head turns sc[u][h] into the weights in
+                 * place, then ONE walk of the latent serves all 64 heads. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int h = 0; h < H; h++) {
+                    int tid = 0;
+#ifdef _OPENMP
+                    tid = omp_get_thread_num();
+#endif
+                    float *score = out_base + (size_t)tid * sstride;
+                    float top = -INFINITY;
+                    for (int u = 0; u < used; u++) {
+                        score[u] = out_cand[(size_t)u * H + h];
+                        if (score[u] > top) top = score[u];
+                    }
+                    double total = 0.0;
+                    for (int u = 0; u < used; u++) { score[u] = expf(score[u] - top); total += score[u]; }
+                    for (int u = 0; u < used; u++)
+                        out_cand[(size_t)u * H + h] = (float)(score[u] / total);
+                }
+                double tp0 = now();
+                pool_blocked(pooled_big, out_cand, lat, idx, used,
+                             pass == 3 ? dtile : 8, accbuf);
+                if (pass == 3) tp1 += now() - tp0; else tp2 += now() - tp0;
+                continue;
+            }
+            double tpool0 = 0;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -275,8 +463,8 @@ int main(int argc, char **argv) {
 #ifdef _OPENMP
                 tid = omp_get_thread_num();
 #endif
-                float *score = out_base + (size_t)tid * WIDTH;
-                float *pooled = pool_pool + (size_t)tid * L;
+                float *score = out_base + (size_t)tid * sstride;
+                float *pooled = pool_pool + (size_t)tid * pstride;
                 float top = -INFINITY;
                 if (pass == 0) {
                     int ub; base_scores(score, q + (size_t)h * L, lat, chosen, WIDTH, cap,
@@ -300,15 +488,19 @@ int main(int argc, char **argv) {
                     const float *c_j = lat + (size_t)idx[u] * L;
                     for (int d = 0; d < L; d++) pooled[d] += w * c_j[d];
                 }
+                memcpy(pooled_big + (size_t)h * L, pooled, (size_t)L * sizeof(float));
             }
+            (void)tpool0;
         }
         double el = (now() - t0) / reps;
-        if (pass == 0) tfb = el; else if (pass == 1) tfc = el; else tft = el;
+        if (pass == 0) tfb = el; else if (pass == 1) tfc = el;
+        else if (pass == 2) tft = el; else if (pass == 3) tf1 = el; else tf2 = el;
     }
+    tp1 /= reps; tp2 /= reps;
 
-    printf("threads=%d used=%d layers=%d pool=%d layer(s) = %.1f MB\n",
+    printf("threads=%d used=%d layers=%d pool=%d layer(s) = %.1f MB  per-thread scratch %s\n",
            nthr, used, layers, pool_layers,
-           (double)lat_n * 4 / 1048576.0);
+           (double)lat_n * 4 / 1048576.0, pad ? "CACHE-LINE PADDED" : "as the engine has it");
     printf("  baseline  %8.3f ms/token   %6.2f GMAC/s\n", tb * 1e3, macs * layers / tb / 1e9);
     printf("  candidate %8.3f ms/token   %6.2f GMAC/s   speedup %.2fx\n",
            tc * 1e3, macs * layers / tc / 1e9, tb / tc);
@@ -321,6 +513,13 @@ int main(int argc, char **argv) {
            tfc * 1e3, tfb / tfc, (tfb - tb) * 1e3);
     printf("  core cand+T %6.3f ms/token   speedup %.2fx  (sc transposed to [h][u] first)\n",
            tft * 1e3, tfb / tft);
-    free(scT); free(pool_pool);
+    printf("  core P5b    %6.3f ms/token   speedup %.2fx  (blocked pool, dtile %d; pool alone %.3f ms)\n",
+           tf1 * 1e3, tfb / tf1, dtile, tp1 * 1e3);
+    printf("  core P5b/8  %6.3f ms/token   speedup %.2fx  (blocked pool, dtile 8;  pool alone %.3f ms)\n",
+           tf2 * 1e3, tfb / tf2, tp2 * 1e3);
+    printf("  softmax+pool: P5 %.3f ms/token, P5b %.3f (of which the pool %.3f)\n",
+           (tfc - tc - tt) * 1e3, (tf1 - tc - tt) * 1e3, tp1 * 1e3);
+    free(scT); free(pooled_big);
+    free(pooled_ref); free(pooled_c1); free(pooled_c2); free(wT_o); free(accbuf); free(sco);
     return bad ? 1 : 0;
 }

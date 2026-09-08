@@ -1625,6 +1625,140 @@ static void glm_lane_dots(float *dst, const float *aT, const float *b,
     }
 }
 
+/* P5b: the MLA weighted pool.
+ *
+ * COLI_MLA_POOL selects one of three shapes, so the profile can attribute the
+ * two findings separately in ONE binary:
+ *
+ *   0  exactly the code P5 left behind: `pooled`/`score` are plain malloc'd
+ *      per-thread slices, and the pool walks the layer's selected latent once
+ *      PER HEAD.
+ *   1  the same nest, with the per-thread slices 64-byte aligned and their
+ *      stride rounded up to a cache line. `pooled` is L = 512 floats = 2 048
+ *      bytes and `score` is width = 2 051 floats = 8 204: neither the base
+ *      (glibc malloc gives 16 bytes) nor the stride is a multiple of 64, so
+ *      the eight threads share the boundary lines of their neighbours'
+ *      slices and write them `used` times per head. `rome_mlaattn.c` measures
+ *      that artefact directly: at used = 1 444 the whole core is 43.4-45.4
+ *      ms/token with the slices as they are and 14.7-15.7 with them padded.
+ *   2  (default) the padded slices AND the blocked pool below.
+ *
+ * The pool is pooled[h][d] = sum_u w[u][h] * latent[slot[u]][d]. Written per
+ * head it reads 64 x used x L x 4 = 180 MB per token per layer at used=1444
+ * of which 2.8 MB is distinct. Blocked over (d-tile x head group) it reads
+ * each latent byte once: the d-tiles are the parallel axis, each tile owns an
+ * accumulator plane acc[dt][H] (h contiguous, 2 KB at dt = 8) that stays in
+ * L1, and eight slots are folded at a time so one accumulator load+store
+ * serves eight FMAs.
+ *
+ * Bit-identical, and the reason is the opposite of the score pass's: gcc 15
+ * -O3 -march=native CONTRACTS `pooled[d] += w * c_j[d]` into vfmadd213ps
+ * (-ffp-contract=fast is the GNU default; verified in the objdump), so the
+ * reference term is fmaf(w, c, acc) with ONE rounding, and the blocked kernel
+ * uses _mm256_fmadd_ps -- no MLA_MULADD barrier here, that one is for the
+ * score reduction, which cannot vectorise and therefore rounds its products.
+ * Every (h, d) still accumulates u = 0, 1, 2, ... in ascending order.
+ * `rome_mlaattn.c` compares all 32 768 pooled values against the reference
+ * nest and reports 0 mismatches. */
+#define GLM53_POOL_DTILE 8
+
+static int g_mla_pool = -1;
+static int mla_pool_mode(void) {
+    if (g_mla_pool < 0) {
+        const char *e = getenv("COLI_MLA_POOL");
+        g_mla_pool = e ? atoi(e) : 2;
+        if (g_mla_pool < 0) g_mla_pool = 0;
+#ifndef GLM53_MLA_HEADVEC
+        if (g_mla_pool > 1) g_mla_pool = 1;   /* no AVX2: the blocked kernel */
+#endif
+    }
+    return g_mla_pool;
+}
+
+/* malloc + hand-rounded to a 64-byte boundary: portable, and it avoids the
+ * posix_memalign/_aligned_free asymmetry compat.h warns about. */
+static float *glm_alloc64(size_t floats, void **raw) {
+    char *p = malloc(floats * sizeof(float) + 64);
+    *raw = p;
+    if (!p) return NULL;
+    return (float *)(void *)(((uintptr_t)p + 63) & ~(uintptr_t)63);
+}
+
+static void glm_pool_blocked(float *pooled_all, const float *wT,
+                             const float *latent, const int *slot_at,
+                             int used, int L, int H, float *accbuf, int dtile) {
+    const int ntiles = (L + dtile - 1) / dtile;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int tb = 0; tb < ntiles; tb++) {
+        const int d0 = tb * dtile;
+        const int dt = (L - d0 < dtile) ? (L - d0) : dtile;
+        float *acc = accbuf + (size_t)tb * dtile * H;
+        memset(acc, 0, (size_t)dt * H * sizeof(float));
+        int u = 0;
+#ifdef GLM53_MLA_HEADVEC
+        for (; u + 8 <= used; u += 8) {
+            const float *r[8]; const float *w[8];
+            for (int k = 0; k < 8; k++) {
+                r[k] = latent + (size_t)slot_at[u + k] * L + d0;
+                w[k] = wT + (size_t)(u + k) * H;
+            }
+            for (int hg = 0; hg + 8 <= H; hg += 8) {
+                const __m256 v0 = _mm256_loadu_ps(w[0] + hg), v1 = _mm256_loadu_ps(w[1] + hg);
+                const __m256 v2 = _mm256_loadu_ps(w[2] + hg), v3 = _mm256_loadu_ps(w[3] + hg);
+                const __m256 v4 = _mm256_loadu_ps(w[4] + hg), v5 = _mm256_loadu_ps(w[5] + hg);
+                const __m256 v6 = _mm256_loadu_ps(w[6] + hg), v7 = _mm256_loadu_ps(w[7] + hg);
+                float *a = acc + hg;
+                for (int dd = 0; dd < dt; dd++, a += H) {
+                    __m256 y = _mm256_loadu_ps(a);
+                    y = _mm256_fmadd_ps(v0, _mm256_broadcast_ss(r[0] + dd), y);
+                    y = _mm256_fmadd_ps(v1, _mm256_broadcast_ss(r[1] + dd), y);
+                    y = _mm256_fmadd_ps(v2, _mm256_broadcast_ss(r[2] + dd), y);
+                    y = _mm256_fmadd_ps(v3, _mm256_broadcast_ss(r[3] + dd), y);
+                    y = _mm256_fmadd_ps(v4, _mm256_broadcast_ss(r[4] + dd), y);
+                    y = _mm256_fmadd_ps(v5, _mm256_broadcast_ss(r[5] + dd), y);
+                    y = _mm256_fmadd_ps(v6, _mm256_broadcast_ss(r[6] + dd), y);
+                    y = _mm256_fmadd_ps(v7, _mm256_broadcast_ss(r[7] + dd), y);
+                    _mm256_storeu_ps(a, y);
+                }
+            }
+            const int htail = H & ~7;
+            for (int h = htail; h < H; h++)
+                for (int k = 0; k < 8; k++)
+                    for (int dd = 0; dd < dt; dd++)
+                        acc[(size_t)dd * H + h] = fmaf(w[k][h], r[k][dd], acc[(size_t)dd * H + h]);
+        }
+        for (; u < used; u++) {
+            const float *r = latent + (size_t)slot_at[u] * L + d0;
+            const float *w = wT + (size_t)u * H;
+            int hg = 0;
+            for (; hg + 8 <= H; hg += 8) {
+                const __m256 v = _mm256_loadu_ps(w + hg);
+                float *a = acc + hg;
+                for (int dd = 0; dd < dt; dd++, a += H)
+                    _mm256_storeu_ps(a, _mm256_fmadd_ps(v, _mm256_broadcast_ss(r + dd),
+                                                        _mm256_loadu_ps(a)));
+            }
+            for (; hg < H; hg++)
+                for (int dd = 0; dd < dt; dd++)
+                    acc[(size_t)dd * H + hg] = fmaf(w[hg], r[dd], acc[(size_t)dd * H + hg]);
+        }
+#else
+        for (; u < used; u++) {
+            const float *r = latent + (size_t)slot_at[u] * L + d0;
+            const float *w = wT + (size_t)u * H;
+            for (int h = 0; h < H; h++)
+                for (int dd = 0; dd < dt; dd++)
+                    acc[(size_t)dd * H + h] = fmaf(w[h], r[dd], acc[(size_t)dd * H + h]);
+        }
+#endif
+        for (int h = 0; h < H; h++)
+            for (int dd = 0; dd < dt; dd++)
+                pooled_all[(size_t)h * L + d0 + dd] = acc[(size_t)dd * H + h];
+    }
+}
+
 static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
@@ -1751,8 +1885,25 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
      * coli_kda_threads() (delta_attention.h, included above) already has the
      * #ifdef _OPENMP guard this needs. */
     const int nthreads_mla = coli_kda_threads();
-    float *pooled_pool = malloc((size_t)nthreads_mla * L * sizeof(float));
-    float *score_pool = malloc((size_t)nthreads_mla * width * sizeof(float));
+    /* P5b.1: at mode 0 these are the plain malloc'd slices P5 left behind --
+     * 2 048 and 8 204 bytes per thread from a 16-byte-aligned base, so the
+     * neighbours' boundary cache lines are shared and written `used` times
+     * per head. At mode >= 1 the base is 64-byte aligned and the stride is
+     * rounded up to a cache line, which is the whole of P5b.1. */
+    const int pool_mode = mla_pool_mode();
+    const int pstride = pool_mode ? ((L + 15) & ~15) : L;
+    const int sstride = pool_mode ? ((width + 15) & ~15) : width;
+    void *pooled_raw = NULL, *score_raw = NULL;
+    float *pooled_pool, *score_pool;
+    if (pool_mode) {
+        pooled_pool = glm_alloc64((size_t)nthreads_mla * pstride, &pooled_raw);
+        score_pool  = glm_alloc64((size_t)nthreads_mla * sstride, &score_raw);
+    } else {
+        pooled_pool = malloc((size_t)nthreads_mla * pstride * sizeof(float));
+        score_pool  = malloc((size_t)nthreads_mla * sstride * sizeof(float));
+        pooled_raw = pooled_pool; score_raw = score_pool;
+    }
+    if (!pooled_pool || !score_pool) { fprintf(stderr, "OOM nell'attenzione MLA\n"); exit(1); }
     const float scale = 1.0f / sqrtf((float)QK);
     /* P5.1: the head-lane score pass wants the token's queries as qT[d][h] and
      * a place to leave the 64 scores of each slot. 128 KB + width*H floats
@@ -1762,6 +1913,17 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *sc = headvec ? malloc((size_t)width * H * sizeof(float)) : NULL;
     int *slot_at = headvec ? malloc((size_t)width * sizeof(int)) : NULL;
     if (headvec && (!qT || !sc || !slot_at)) { fprintf(stderr, "OOM nell'attenzione MLA\n"); exit(1); }
+    /* P5b: the blocked pool's H x L output plane and the per-tile accumulator
+     * planes, once per layer per chunk (128 KB each at H = 64, L = 512). */
+    const int blocked = headvec && pool_mode >= 2;
+    void *pool_all_raw = NULL, *acc_raw = NULL;
+    float *pooled_all = NULL, *accbuf = NULL;
+    if (blocked) {
+        const int ntiles = (L + GLM53_POOL_DTILE - 1) / GLM53_POOL_DTILE;
+        pooled_all = glm_alloc64((size_t)H * L, &pool_all_raw);
+        accbuf     = glm_alloc64((size_t)ntiles * GLM53_POOL_DTILE * H, &acc_raw);
+        if (!pooled_all || !accbuf) { fprintf(stderr, "OOM nell'attenzione MLA\n"); exit(1); }
+    }
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
         if (headvec) {
@@ -1783,13 +1945,53 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             for (int u = 0; u < used_all; u++)
                 glm_lane_dots(sc + (size_t)u * H, qT, latent + (size_t)slot_at[u] * L,
                               H, L, scale);
+            if (blocked) {
+                /* P5b: the softmax turns each head's column of sc[u][h] into
+                 * that head's weights IN PLACE -- same max, same expf, same
+                 * double total, same (float) cast -- and then ONE walk of the
+                 * latent serves all H heads. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int h = 0; h < H; h++) {
+#ifdef _OPENMP
+                    float *score = score_pool + (size_t)omp_get_thread_num() * sstride;
+#else
+                    float *score = score_pool;
+#endif
+                    float top = -INFINITY;
+                    for (int u = 0; u < used_all; u++) {
+                        score[u] = sc[(size_t)u * H + h];
+                        if (score[u] > top) top = score[u];
+                    }
+                    if (!used_all) continue;
+                    double total = 0.0;
+                    for (int i = 0; i < used_all; i++) { score[i] = expf(score[i] - top); total += score[i]; }
+                    for (int u = 0; u < used_all; u++)
+                        sc[(size_t)u * H + h] = (float)(score[u] / total);
+                }
+                if (!used_all) {
+                    memset(context, 0, (size_t)H * V * sizeof(float));
+                } else {
+                    glm_pool_blocked(pooled_all, sc, latent, slot_at, used_all, L, H,
+                                     accbuf, GLM53_POOL_DTILE);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                    for (int h = 0; h < H; h++)
+                        mv_rows(context + (size_t)h * V, &l->kvb_v,
+                                pooled_all + (size_t)h * L, h * V, V);
+                }
+                mv(out + (size_t)t * c->hidden, &l->o, context);
+                continue;
+            }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
             for (int h = 0; h < H; h++) {
 #ifdef _OPENMP
-                float *pooled = pooled_pool + (size_t)omp_get_thread_num() * L;
-                float *score = score_pool + (size_t)omp_get_thread_num() * width;
+                float *pooled = pooled_pool + (size_t)omp_get_thread_num() * pstride;
+                float *score = score_pool + (size_t)omp_get_thread_num() * sstride;
 #else
                 float *pooled = pooled_pool;
                 float *score = score_pool;
@@ -1828,8 +2030,8 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
 #endif
         for (int h = 0; h < H; h++) {
 #ifdef _OPENMP
-            float *pooled = pooled_pool + (size_t)omp_get_thread_num() * L;
-            float *score = score_pool + (size_t)omp_get_thread_num() * width;
+            float *pooled = pooled_pool + (size_t)omp_get_thread_num() * pstride;
+            float *score = score_pool + (size_t)omp_get_thread_num() * sstride;
 #else
             float *pooled = pooled_pool;
             float *score = score_pool;
@@ -1867,7 +2069,8 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     }
     if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
     free(slot_at); free(sc); free(qT);
-    free(score_pool); free(pooled_pool);
+    free(pool_all_raw); free(acc_raw);
+    free(score_raw); free(pooled_raw);
 
     free(context); free(selected); free(valid); free(head_w);
     free(iq); free(absorbed); free(queries); free(qa);

@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import io
 import json
@@ -1092,6 +1093,59 @@ class DispatcherTest(unittest.TestCase):
         engine.close()
         self.assertEqual(outcome, ["cancelled"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
+    def test_cancelled_request_still_logs_its_req_line(self):
+        # COLI_REQ_LOG=1 writes one "[req]" line per request, and
+        # ~/bench/owui_report.sh reads exactly those lines. A CANCELLED request
+        # used to produce none -- the "done" branch raised ClientCancelled
+        # before reaching the write -- so the request an operator most wants to
+        # see, the one somebody gave up on, was the one missing from the report.
+        # glm53 answers a mid-turn CANCEL with its DONE...STAT and then
+        # ERROR CANCELLED, in that order, precisely so the counts exist here.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                process.stdout.feed(b"DONE " + request_id +
+                                    b" STAT 3 5.00 90.0 44.0 1236 0\n")
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        flag = {"cancelled": False}
+        outcome = []
+        errs = io.StringIO()
+
+        def generate():
+            try:
+                engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                                cancelled=lambda: flag["cancelled"])
+            except ClientCancelled:
+                outcome.append("cancelled")
+
+        with patch.dict(os.environ, {"COLI_REQ_LOG": "1"}), \
+                contextlib.redirect_stderr(errs):
+            thread = threading.Thread(target=generate)
+            thread.start()
+            for _ in range(200):
+                if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                    break
+                time.sleep(0.01)
+            flag["cancelled"] = True
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        engine.close()
+        self.assertEqual(outcome, ["cancelled"])
+        line = [l for l in errs.getvalue().splitlines() if l.startswith("[req] ")]
+        self.assertEqual(len(line), 1, errs.getvalue())
+        self.assertIn("prompt_tokens=1236", line[0])
+        self.assertIn("gen=3", line[0])
+        self.assertTrue(line[0].endswith("cancelled"), line[0])
 
     def test_stops_generation_through_successful_done_path(self):
         request_id = None

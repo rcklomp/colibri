@@ -3088,6 +3088,25 @@ class Engine:
         stop_sent = False
         accepted = False
 
+        def req_log_line(value, outcome, now=None):
+            """The one `[req]` line per request that COLI_REQ_LOG=1 exists for.
+
+            Lifted out of the "done" branch because a CANCELLED request used to
+            get none: the branch raises ClientCancelled before reaching the
+            write, so every cancelled turn was invisible to
+            ~/bench/owui_report.sh -- which reads exactly these lines, and which
+            a cancel gate has to be able to point at. It is the request the
+            operator most wants to see: the one somebody gave up on.
+            """
+            if not req_log:
+                return
+            now = now if now is not None else time.monotonic()
+            ttft = (req_first[0] - req_t0) if req_first[0] is not None else now - req_t0
+            sys.stderr.write("[req] id=%s slot=%d prompt_tokens=%d ttft=%.2fs gen=%d total=%.2fs %s\n" % (
+                request_id, cache_slot, value.get("prompt_tokens", 0), ttft,
+                value.get("completion_tokens", 0), now - req_t0, outcome))
+            sys.stderr.flush()
+
         def _accept(info):
             # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
             # ACCEPT before any output, so on_accept fires before prefill and a preceding
@@ -3163,7 +3182,10 @@ class Engine:
                     # The engine finished the turn before seeing the CANCEL
                     # (or honored it at a token boundary and still framed a
                     # DONE). Either way the client is gone: the ack is what
-                    # mattered, the output is not deliverable.
+                    # mattered, the output is not deliverable. The line is
+                    # still logged -- the counts in this DONE are how many
+                    # tokens the cancel actually saved.
+                    req_log_line(value, "cancelled")
                     raise ClientCancelled()
                 tail = decoder.decode(b"", final=True)
                 if tail:
@@ -3171,16 +3193,12 @@ class Engine:
                 tool_tail = tool_decoder.decode(b"", final=True)
                 if tool_tail and on_tool is not None:
                     on_tool(tool_tail)
-                if req_log:
-                    now = time.monotonic()
-                    ttft = (req_first[0] - req_t0) if req_first[0] is not None else now - req_t0
-                    sys.stderr.write("[req] id=%s slot=%d prompt_tokens=%d ttft=%.2fs gen=%d total=%.2fs %s\n" % (
-                        request_id, cache_slot, value.get("prompt_tokens", 0), ttft,
-                        value.get("completion_tokens", 0), now - req_t0,
-                        "length" if value.get("length_limited") else "stop"))
-                    sys.stderr.flush()
+                req_log_line(value, "length" if value.get("length_limited") else "stop")
                 return value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
+                # An engine that acks with ERROR alone and no DONE: there are no
+                # counts to log, but the request must not vanish from the log.
+                req_log_line({}, "cancelled")
                 raise ClientCancelled()
             else:
                 raise value

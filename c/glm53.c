@@ -4274,21 +4274,45 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
  * contati e disallineerebbe il parser -- cioe' romperebbe il servizio invece
  * di sistemarlo.
  *
- * Quindi: la riga che non e' un comando NON si consuma davvero, si mette da
- * parte (`g_pushback`) e serve_read_req la rilegge come sua intestazione al
- * giro dopo. Il payload resta intatto nella pipa, dove serve_read_req lo
- * aspetta. E il drain si ferma li': i byte che seguono appartengono a QUEL
- * frame, e leggerne un altro vorrebbe dire parsarne il corpo.
+ * La prima versione di questo drain si limitava a rimettere da parte
+ * l'intestazione e a FERMARSI, con scritto qui che il caso "CANCEL dietro un
+ * SUBMIT in coda" restava scoperto ma non era mai peggio di prima. La misura
+ * live ha detto che quel caso non e' un angolo: e' il caso normale. Nel test
+ * `curl -m 8` del 2026-09-08 alle 23:44 e alle 23:46 il client si chiude, la
+ * shell manda subito la richiesta corta successiva, il gateway la AMMETTE su
+ * un altro slot e ne scrive il SUBMIT nella pipa -- e solo dopo si accorge
+ * della disconnessione e scrive il CANCEL, che finisce dietro quel frame. Il
+ * motore ha macinato tutto: 132 s di turno annullato e 126 s di attesa per la
+ * richiesta corta, due volte su due. Un turno prima, nella stessa serie, la
+ * corsa era andata dall'altra parte e il conto era 7 s. Una correzione che
+ * dipende da chi vince una corsa di millisecondi non e' una correzione.
  *
- * Il prezzo, detto per intero: se un SUBMIT e' gia' in coda quando arriva il
- * CANCEL del turno in volo, il CANCEL sta DIETRO quel frame e non si vede
- * fino a fine turno -- cioe' esattamente il comportamento di prima. Non e'
- * mai peggio di prima, e nel caso che il gate misura (una richiesta in volo,
- * il browser che si chiude) e' la differenza fra 251 s e pochi secondi.
- * Vederlo anche dietro un frame in coda vorrebbe dire parsare il SUBMIT per
- * intero qui dentro -- la strada di kimi_k3 (k3_serve_poll_cancel, che
- * risponde "engine busy") -- e quindi una fread bloccante su un payload
- * arrivato a meta' dentro il ciclo di decode. Non con questa modifica. */
+ * Quindi il drain CONSUMA il frame in coda invece di fermarcisi: legge il
+ * corpo a byte contati, lo mette in una coda di richieste (`g_queue`) e
+ * continua a leggere, cosi' il CANCEL che gli sta dietro si vede. serve_loop
+ * serve la coda prima di tornare a stdin, nello stesso ordine: per il gateway
+ * non cambia niente, le richieste in eccesso aspettavano nel tubo e adesso
+ * aspettano qui.
+ *
+ * La fread del corpo BLOCCA, e va detto perche' e' l'unica cosa che questo
+ * ciclo fa e che serve_poll.h vieta in generale. Il divieto riguarda
+ * l'attesa di un comando che potrebbe non arrivare mai; qui l'intestazione e'
+ * gia' in mano, e generate() scrive intestazione+corpo con una sola write
+ * sotto write_lock e poi flush (openai_server.py), quindi i byte stanno
+ * arrivando. L'attesa e' limitata dallo scrittore, esattamente come quella che
+ * serve_read_req fa a ogni richiesta -- la differenza e' solo che avviene
+ * dentro il turno invece che in cima al ciclo.
+ *
+ * Restano fuori due cose, apposta:
+ *   - un frame IMAGE si rimette da parte e il drain si ferma. Il motore tiene
+ *     UNA immagine annunciata alla volta (g_pending) e metterla in coda
+ *     vorrebbe dire che la seconda cancella la prima prima che la sua
+ *     richiesta parta. Le immagini non arrivano da questo gateway per questo
+ *     modello, e un caso raro trattato come prima e' meglio di un caso raro
+ *     trattato male;
+ *   - se la coda e' piena (non puo' succedere: il gateway ne ammette al
+ *     massimo kv_slots e uno e' in volo) si torna a rimettere da parte e
+ *     fermarsi, che e' il comportamento di prima. */
 typedef struct {
     unsigned long long id;   /* la richiesta in volo */
     int cancelled;           /* un CANCEL per lei e' arrivato */
@@ -4304,45 +4328,9 @@ static int cancel_poll_off(void) {
     return off;
 }
 
-/* Un'intestazione letta dal drain che non era un comando: serve_read_req la
- * riprende da qui invece che da stdin, e il corpo del frame la aspetta ancora
- * nella pipa. */
-static char g_pushback[512];
-static int g_pushback_full = 0;
-
-static int serve_cancel_pending(ServeCancel *c) {
-    if (!c) return 0;
-    if (c->cancelled) return 1;
-    if (cancel_poll_off()) return 0;
-    while (!g_pushback_full && coli_serve_stdin_ready()) {
-        char line[512], cmd[16];
-        unsigned long long who = 0;
-        if (!fgets(line, sizeof(line), stdin)) {
-            /* EOF. Su una pipe chiusa "pronto" resta vero per sempre, quindi si
-             * esce dal ciclo -- e si tratta come un annullamento: continuare a
-             * generare per un lettore che non c'e' piu' e' l'unico esito
-             * peggiore del non fermarsi. */
-            c->cancelled = 1;
-            break;
-        }
-        if (sscanf(line, "%15s %llu", cmd, &who) < 1) continue;
-        if (!strcmp(cmd, "CANCEL")) {
-            if (who == c->id) c->cancelled = 1;
-            else { printf("ERROR %llu NOT_FOUND\n", who); fflush(stdout); }
-            continue;
-        }
-        /* STOP non porta corpo e serve_loop lo ignora gia' fra una richiesta e
-         * l'altra: scartarlo qui e' lo stesso comportamento. */
-        if (!strcmp(cmd, "STOP")) continue;
-        /* Tutto il resto (SUBMIT, IMAGE, una riga che non conosciamo) puo'
-         * avere un corpo a byte contati dietro: si rimette da parte e il drain
-         * finisce qui. */
-        snprintf(g_pushback, sizeof(g_pushback), "%s", line);
-        g_pushback_full = 1;
-        break;
-    }
-    return c->cancelled;
-}
+/* Definita in fondo, con il parser dei frame: da qui serve solo poterla
+ * chiamare fra un pezzo di prefill e l'altro. */
+static int serve_cancel_pending(ServeCancel *c);
 
 static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                               const float *vision, int n_vision, int keep_all,
@@ -5138,16 +5126,11 @@ static void serve_data(unsigned long long id, const char *text, int n) {
     fflush(stdout);
 }
 
-/* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
- * righe: puo' contenerne. */
-static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
-    char header[512];
-    if (g_pushback_full) {
-        /* L'intestazione che il drain di un turno precedente ha letto e messo
-         * da parte; il suo corpo e' ancora nella pipa, subito qui sotto. */
-        memcpy(header, g_pushback, sizeof(header));
-        g_pushback_full = 0;
-    } else if (!fgets(header, sizeof(header), stdin)) return 0;
+/* Il corpo del frame, data la sua intestazione gia' letta. Il payload si legge
+ * a byte contati, non a righe: puo' contenerne. Separata da serve_read_req
+ * perche' il drain di meta' turno legge l'intestazione da solo e poi ha
+ * bisogno esattamente di questo -- un parser solo, non due. */
+static int serve_read_body(const char *header, ServeReq *q, char *verb, size_t verb_size) {
     memset(q, 0, sizeof(*q));
     if (sscanf(header, "%15s", verb) != 1) { verb[0] = 0; return 1; }
     if (!strcmp(verb, "STOP") || !strcmp(verb, "CANCEL")) {
@@ -5204,6 +5187,94 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     int trailing = fgetc(stdin);
     (void)trailing;                        /* il '\n' di chiusura del frame */
     return 1;
+}
+
+/* ---------- la coda dei frame letti a meta' turno ----------
+ * Il gateway ne ammette al massimo `kv_slots` insieme e uno e' in volo, quindi
+ * GLM53_MAX_SLOTS posti bastano per costruzione. */
+typedef struct { ServeReq q; char verb[16]; } QueuedFrame;
+static QueuedFrame g_queue[GLM53_MAX_SLOTS];
+static int g_queue_head = 0, g_queue_n = 0;
+
+/* L'intestazione che il drain ha letto e non ha potuto consumare (IMAGE, o una
+ * coda piena): il suo corpo e' ancora nella pipa e serve_read_req la riprende
+ * da qui invece che da stdin. */
+static char g_pushback[512];
+static int g_pushback_full = 0;
+
+/* Una richiesta intera, o 0 su EOF: dalla coda se un turno precedente ne ha
+ * letta una, altrimenti da stdin. */
+static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
+    char header[512];
+    if (g_queue_n > 0) {
+        /* Un frame gia' letto per intero mentre un turno era in corso. */
+        const QueuedFrame *f = &g_queue[g_queue_head];
+        *q = f->q;
+        snprintf(verb, verb_size, "%s", f->verb);
+        g_queue_head = (g_queue_head + 1) % GLM53_MAX_SLOTS;
+        g_queue_n--;
+        return 1;
+    }
+    if (g_pushback_full) {
+        memcpy(header, g_pushback, sizeof(header));
+        g_pushback_full = 0;
+    } else if (!fgets(header, sizeof(header), stdin)) return 0;
+    return serve_read_body(header, q, verb, verb_size);
+}
+
+/* Il drain: vedere un CANCEL per il turno in volo senza mai fermare la
+ * generazione ad aspettarne uno. La spiegazione lunga sta sopra
+ * forward_prefill, dove si decide di chiamarlo. */
+static int serve_cancel_pending(ServeCancel *c) {
+    if (!c) return 0;
+    if (c->cancelled) return 1;
+    if (cancel_poll_off()) return 0;
+    while (!g_pushback_full && coli_serve_stdin_ready()) {
+        char line[512], cmd[16];
+        unsigned long long who = 0;
+        if (!fgets(line, sizeof(line), stdin)) {
+            /* EOF. Su una pipe chiusa "pronto" resta vero per sempre, quindi si
+             * esce dal ciclo -- e si tratta come un annullamento: continuare a
+             * generare per un lettore che non c'e' piu' e' l'unico esito
+             * peggiore del non fermarsi. */
+            c->cancelled = 1;
+            break;
+        }
+        if (sscanf(line, "%15s %llu", cmd, &who) < 1) continue;
+        if (!strcmp(cmd, "CANCEL")) {
+            if (who == c->id) c->cancelled = 1;
+            else { printf("ERROR %llu NOT_FOUND\n", who); fflush(stdout); }
+            continue;
+        }
+        /* STOP non porta corpo e serve_loop lo ignora gia' fra una richiesta e
+         * l'altra: scartarlo qui e' lo stesso comportamento. */
+        if (!strcmp(cmd, "STOP")) continue;
+        if (!strcmp(cmd, "SUBMIT") && g_queue_n < GLM53_MAX_SLOTS) {
+            /* Si legge il frame INTERO e si mette in coda, cosi' il CANCEL che
+             * gli sta dietro nella pipa si puo' ancora vedere. */
+            QueuedFrame *f = &g_queue[(g_queue_head + g_queue_n) % GLM53_MAX_SLOTS];
+            memset(f, 0, sizeof(*f));
+            /* serve_read_body non torna 0 su un corpo troncato -- mette
+             * BAD_FRAME nel verbo e serve_loop risponde -- ma la guardia resta:
+             * il giorno che lo facesse, un frame a meta' vuol dire gateway
+             * andato, e un turno che continua per nessuno. */
+            if (!serve_read_body(line, &f->q, f->verb, sizeof(f->verb))) {
+                c->cancelled = 1;
+                break;
+            }
+            g_queue_n++;
+            if (getenv("GLM53_VERBOSE"))
+                fprintf(stderr, "QUEUE %s %llu mid-turn (%d in coda)\n",
+                        f->verb, f->q.id, g_queue_n);
+            continue;
+        }
+        /* IMAGE, o una coda piena: si rimette da parte e il drain finisce qui,
+         * perche' i byte che seguono appartengono a QUEL frame. */
+        snprintf(g_pushback, sizeof(g_pushback), "%s", line);
+        g_pushback_full = 1;
+        break;
+    }
+    return c->cancelled;
 }
 
 /* Genera per una richiesta e chiude col suo DONE. */

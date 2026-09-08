@@ -101,7 +101,7 @@ sha256sum ~/src/colibri/c/glm53 $SHADERS/kda_step.spv
 cmp -s $SHADERS/kda_step.spv $PSHADERS/kda_step.spv && echo "shaders unchanged by the build" \
   || { echo "A SHADER CHANGED -- this item must not touch one"; revert_and_serve_pristine; exit 4; }
 
-echo "--- the four qwen38 C tests + test_serve_poll (glm53.c now includes serve_poll.h)"
+echo "--- the four qwen38 C tests + test_serve_poll + the glm53 frame test"
 QT=0
 for t in prefix config metrics serve_framing; do
   make -C c tests/test_qwen38_$t VK=1 >/dev/null 2>&1
@@ -110,6 +110,11 @@ for t in prefix config metrics serve_framing; do
 done
 make -C c tests/test_serve_poll >/dev/null 2>&1
 ./c/tests/test_serve_poll >/dev/null 2>&1; r=$?; echo "  test_serve_poll exit=$r"
+[ "$r" = 0 ] || QT=1
+# The mid-turn drain against a real pipe: no model, seconds, and it fails on
+# the exact line the live run failed on (a CANCEL behind a queued SUBMIT).
+make -C c tests/test_glm53_cancel_frames >/dev/null 2>&1
+./c/tests/test_glm53_cancel_frames >/dev/null 2>&1; r=$?; echo "  test_glm53_cancel_frames exit=$r"
 [ "$r" = 0 ] || QT=1
 [ "$QT" = 0 ] || { echo "C TESTS FAILED"; revert_and_serve_pristine; exit 4; }
 

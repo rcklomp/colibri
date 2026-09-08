@@ -183,6 +183,8 @@ python3 $HERE/ttft_serve.py --url http://127.0.0.1:8081 --sizes 1000 --repeat 1 
     --cancel 5 --cancel-phase decode \
     --tag $TAG-live --json $OUT/live.jsonl 2>&1 | tee $OUT/live.txt | tail -25
 LIVE=${PIPESTATUS[0]}; echo "live cancel rc=$LIVE"
+LIVEFAIL=0
+[ "$LIVE" = 0 ] || LIVEFAIL=1
 ~/bench/owui_report.sh 3
 
 echo
@@ -222,8 +224,32 @@ rc=$?
 E=$(date +%s.%N)
 echo "curl exit=$rc"
 python3 -c "print(f'short request after the disconnect: {$E - $S:.2f} s')"
+# The bound. 15 tokens on a warm engine is ~3 s; behind an orphaned
+# 1 428-token turn it is 126 s, which is what this check measured on
+# 2026-09-08 23:44 and what the queue in the drain exists to remove. A live
+# step that only PRINTS the number is how a regression gets served: this one
+# reverts on it, like the gate.
+python3 -c "import sys; t=$E-$S; print(f'round $round: {\"PASS\" if t<30 else \"FAIL\"} (bound 30 s)'); sys.exit(0 if t<30 else 1)" || LIVEFAIL=1
 head -c 400 $OUT/curl_small.out; echo
 done
+# and the engine has to SAY it stopped the prefill, not merely be fast
+if grep -qE "CANCEL [0-9]+ at prefill" ~/glm53_server.log; then
+  echo "live: the engine reported a prefill-phase cancel"
+else
+  echo "live: FAIL -- no 'CANCEL ... at prefill' line: the disconnect never reached the engine"
+  LIVEFAIL=1
+fi
 echo "--- the gateway's own record"
-~/bench/owui_report.sh 4
-grep -E "CANCEL [0-9]+ at " ~/glm53_server.log | tail -5
+~/bench/owui_report.sh 6
+grep -E "CANCEL [0-9]+ at " ~/glm53_server.log | tail -6
+
+if [ "$LIVEFAIL" != 0 ]; then
+  echo
+  echo "=== THE LIVE STEP FAILED -- the gate passed but the served binary does not"
+  echo "    honour a real disconnect. Reverting to $PRISTINE."
+  SERVED=0
+  revert_and_serve_pristine
+  exit 5
+fi
+echo
+echo "=== live step PASSED; $(sha256sum ~/src/colibri/c/glm53 | cut -c1-16) stays in service"

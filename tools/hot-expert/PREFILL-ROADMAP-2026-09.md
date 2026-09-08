@@ -1,10 +1,45 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 14, 2026-09-07 23:50)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 15, 2026-09-08 01:30)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 15 (2026-09-08, 01:30): the upstream `dev` merge is done and in
+service — bit-identical, neutral on every row.** `JustVugg/colibri` `dev`
+`1ccee43` merged into `hot-expert-tier` (merge base `12a5c46`, 149 ahead / 125
+behind), binary `5ed096a6…`, serving script unchanged. Three files conflicted —
+the file list the 2026-09-07 dry run predicted, with **eight hunks instead of
+five**: three of the new ones are not about mapping at all but about `dev`'s new
+per-turn `PROF`/`HITS` dashboard clocks landing in the same lines as the fork's
+G10/P2.3 parallel hyper-connections and P2.3's last-row head, and were resolved
+as a **union**. The mapping hunks took `dev`'s `st_map_shard_range` (#1325 —
+the fork's own PR, upstreamed as `eabeb9a`) and kept three things `dev`'s hunk
+drops, because measurements here depend on them: the mapping stays **on by
+default** for these two engines (`st.h` gained `COLI_MAP_EXPERTS_DEFAULT`;
+upstream ships it opt-in), `expert_map_init` stays so `g_map_all` can still size
+the LRU at one slot per expert and so `st.h`'s unsynchronised per-fd table is
+never filled from inside an OpenMP region, and both prefaults stay
+(`GLM53_MMAP_POPULATE` is §G1/§G1b's knob; qwen38's is worth 4–6× and is on).
+`~/bench/devmerge_chain.sh` exits 0 on all six steps: 790 python tests and the
+four qwen38 C tests green, the chat-template pin **25 renders byte-identical**
+to the checkpoint's `chat_template.jinja`; `[MAP]`, `mmap serve=7446 copy=0`,
+the bind counters and the 44.3 GB budget **identical to the pristine's**, with
+`majflt` 0 and MemAvailable 12 GB *higher*, not lower; `prefill_gate.sh` at
+`MIN_SPEEDUP=0.97` **`max_abs=0` at 782 positions** and TTFT **0.99×/1.00×/0.99×**;
+`tworeq` at 4 slots IDENTICAL at both KDA knobs with **0 forcing lines**;
+`--prefix-ckpt` t1/t2 = **91.8×** and `--pin-block` REUSE 994/1 010; and
+`rome_bench.sh` paired against the P5 binary in the same session at
+**1.004× / 1.003× / 1.013×** (rotating 2.60 vs the 2026-09-05 row's 2.59). One
+number is recorded as a contradiction rather than a win: the CLI oracle run put
+the candidate 7 % faster with all of it in `mla.attn`, which nothing in the merge
+touches — the serving regime says neutral, and that is what the record keeps.
+The eleven upstream changes that matter on this box (the GLM-5.3 prompt now
+always opens `<think>`, `RssAnon`, `compat_mem_available_gb`, the Brain/Profile
+lines, `max_kv_slots` 16 reached upstream too, the Makefile header deps, the
+`image_url` hardening) are listed in §"Upstream dev merge" of the record. Next:
+**P5b** — the only open item on this table.
 
 **Rev 14 (2026-09-07, 23:50): P5 in service — 174.4 → 146.4 ms/token at
 3 462 tokens (1.19×), bit-identical, and none of the three sub-items needed the
@@ -293,9 +328,9 @@ Effort and effect are honest, not optimistic. Ordering is by
 (expected effect × confidence) / effort, with the instrument first and the
 cheapest possibly-decisive diagnosis second.
 
-**Order after rev 14:** P5b (the MLA weighted pool: one walk of the latent
-instead of 64 — the item P5's own microbenchmark uncovered), then the
-upstream-`dev` merge. Everything else on this table is done.
+**Order after rev 15:** P5b (the MLA weighted pool: one walk of the latent
+instead of 64 — the item P5's own microbenchmark uncovered). The upstream-`dev`
+merge landed 2026-09-08; everything else on this table is done.
 
 **Order after rev 7 (kept for the history):** P5 (the recurrence's S per-token
 submits into one command buffer per layer per chunk; the sparse attention,
@@ -317,7 +352,7 @@ serving knob (rev 5's rule).
 | **P6b** ✅ | Per-slot KDA device state — spec `P6B-KDA-SLOT-STATE-SPEC-2026-09.md`, built on `perf/p6b-kda-slots`, **in service 2026-09-07 16:50** (binary 53ccbb42…, `--kv-slots 4`, `COLI_KDA_GPU=2`) | `G.kda_slot[layer][slot]` state/window on dev0 (34 × 4.58 MB = 156 MB per slot), `coli_vk_kda_pool_init` allocates every slot's set BEFORE `vk_preload_tier` (after it, the 624 MB would eat dev0's 3.0 GB reserve); `coli_vk_kda_init/step/layer/sync/upload` and `GSession` take the slot; `slots_init` forces the CPU recurrence only when the pool is short. `coli_vk_kda_sync` goes through a `vkCmdCopyBuffer` into HOST_CACHED staging instead of a memcpy from write-combined memory | measured: decode at 4 slots **5.039 → 5.702 tok/s (+13.2 %)**, within 0.996× of the 1-slot GPU number; bit-identical at one slot (`max_abs=0`); live gateway turn 2 REUSE **1 339/1 355 in 3.08 s** with no `forcing` line; the state sync **~14 MB/s → ~2 262 MB/s** (370 MB checkpoint, 69 ms), which is what lets P7 capture at the GPU knob; price 1 296 → **1 248** preloaded experts (48, 3.7 %) | done | Opus (spec: Fable) | `p6b_gate.sh` exits 0 on all six steps (§P6b in the record) |
 | **P7** ✅ | Checkpoint the stable prefix (tools + base system) **and pin the per-turn context block** — spec `P7-PREFIX-CKPT-SPEC-2026-09.md`, built on `perf/p7-prefix-ckpt`, **in service 2026-09-07 12:25** (binary 19e28e72…, `GLM53_PREFIX_CKPT=1 COLI_PREFIX_PIN=1`, `--kv-slots 8`, `COLI_KDA_GPU=0`) | engine: the session's span list (11 DSA layers' latent/ikeys/igates rows + 34 KDA states/windows; **370 MB at 6 328 tokens**) copied at the prefix boundary the gateway sends in the 8th SUBMIT field (`src=hint`, verified against the prompt's own ids) or at the LCP of successive fresh prompts, persisted under `<SNAP>/.coli_ckpt`. Gateway: `COLI_PREFIX_PIN=1` keeps the `<memory_context>` block byte-identical across a conversation's turns | measured: new conversation with the 34-tool block **1 452 s → 5.30 s** (engine) / **8.93 s** (live gateway, restored from disk after a restart); re-ranked memory block **126.82 s → 3.00 s**, 17 tokens prefilled instead of 1 005; off (`GLM53_PREFIX_CKPT=0`) the engine is bit-identical to the pristine one | done | Opus (spec: Fable) | `p7_gate.sh` exits 0 on all five steps (§P7 in the record); live gateway `--prefix-ckpt` and `--pin-block` PASS with `CKPT hit` and `[pin] … hit` in the server log |
 | P9 (parked) | Pin mapped expert slots (`compat_mlock` at fill, unlock at evict) | upstream's datapoint on PR #1324 (2026-09-06): below ~1:1 model:RAM the kernel page LRU and the engine slot LRU disagree and a hit re-faults inside the matmul; rome sits near 1:1 once the engine's anon memory is counted, but shows ~0 major faults per request at 99 % residency — a robustness item (deterministic residency), not speed | none measured here; `ttft_serve.py` now prints majflt per request — build this only if that number stops being ~0 | 1 day | Sonnet | majflt per request stays 0 across a full gate with no `--warm` |
-| — | Housekeeping (not this track): merge upstream `dev` | #1325 (portable `st.h` mapping) and #1350 (RSS counts owned memory — the fix for the `eabeb9a` thrash CLAUDE.md warns about) are in upstream `dev` since 2026-09-05; this fork is 103 ahead / 64 behind since 2026-08-31. **Known conflict:** the fork's `glm53.c` still carries the #1324-style engine-local expert mapping (`expert_map_init`, `[MAP] … file mappati`); #1324 was closed as superseded on 2026-09-07 and the merge must replace that path with `dev`'s `st_map_shard_range` one, then re-run `prefill_gate.sh` and `rome_bench.sh`. #1321 (cache budget) is rebased on `dev` and open | — | 1–2 days | Opus | all four qwen38 tests pass, `prefill_gate.sh` and `rome_bench.sh` reproduce their last rows |
+| — ✅ | Housekeeping (not this track): merge upstream `dev` — **done 2026-09-08 01:11**, `dev` `1ccee43` in service as `5ed096a6…` | merge base `12a5c46`, 149 ahead / 125 behind. Three files conflicted, **eight hunks**: the two mapping hunks took `dev`'s #1325 `st_map_shard_range` (`eabeb9a`, the fork's own PR upstreamed) while keeping the mapping ON by default (`st.h::COLI_MAP_EXPERTS_DEFAULT`), `g_map_all`'s LRU sizing, the one-thread `expert_map_init` (`st.h` maps lazily and its per-fd table is unsynchronised) and both prefaults; the three new hunks are `dev`'s per-turn `PROF`/`HITS` clocks against the fork's G10/P2.3 parallel hyper-connections and were unioned; `family_registry.py` kept ours. #1350 (`RssAnon`) is in and is upstream's precondition for that default; #1321 is still not in `dev`. `DEV-MERGE-NOTE-2026-09-07.md` has the full table | four qwen38 C tests + chat-template pin + 790 python tests green; `max_abs=0` at 782 positions; TTFT 0.99×/1.00×/0.99×; `tworeq` 4 slots IDENTICAL at both knobs, 0 forcing lines; `--prefix-ckpt` 91.8×, `--pin-block` 994/1 010; `rome_bench` paired 1.004×/1.003×/1.013×; `[MAP]` `copy=0`, `majflt` 0, MemAvailable unmoved | done | Opus | met — `~/bench/devmerge_chain.sh` exits 0 on all six steps (§"Upstream dev merge" in the record) |
 | **P4b** ✗ / **P4c** ✅ | Tile shader variants: LDS staging measured 0.91× and was refused by the gate; vec4 x loads passed at 1.03× (neutral profile) and are in service. **RP4 settled why neither moved the expert group: the 58 ms/token bucket is 92 % CPU experts overlapping inside the same timer, GPU busy on the busiest device is 1.97 ms/token, and the GPU makes the engine wait 0.068 ms/token.** There was nothing there to move; a shader that ran in zero time would have saved 0.06 % of the token. P4b's premise (get the activations out of global memory) was right — the tile re-reads 67.1 MB of activations per row, 4.7× its whole weight stream — and its implementation wrong; P4c's premise (too many loads, not too many bytes) was wrong. **No further expert-shader work on this track** | | | | Opus | `prefill_gate.sh` |
 | **RP4** ✅ | GPU-side timestamps on the expert group (`COLI_VK_TIMESTAMPS`, off by default; `perf/rp4-vk-timestamps`, **in service 2026-09-07 20:00**, binary `325c9c7a…`, serving script unchanged) | per-device `VK_QUERY_TYPE_TIMESTAMP` pool written at the top of the expert group's command buffer, between the gate+up and down phases and after the down phase (`=1`), plus per expert (`=2`, serializing and honest about it); `VK_EXT_calibrated_timestamps` (asked for only when the knob is set) maps the device clock onto `CLOCK_MONOTONIC`, which splits the CPU-side `eg` wait into queue latency / GPU busy per phase / fence tail, and yields `gpu_late` — the only part of the wait the GPU owns. `prefill_profile.sh` prints it as a row group under `eg` | measured at 781 and 3 462 tokens, three repeats each: GPU busy **1.97 / 0.93 / 0.89** ms/token on dev0/dev2/dev3, `gpu_late` **0.068** ms/token (0.12 % of `eg`), `queue_lat` 0.07–0.25; per-expert 232–235 µs (dev0, 9.3 rows) vs 84–86 µs (dev2/dev3, ~5 rows); a **one-row** expert costs 2.7–3.4× a two-row one because `vk_tile_ok4` requires `S > 1` and the per-row shader hits an LDS bank conflict. Prefill wall identical off / `=1` / `=2` | done | Opus | `rp4_chain.sh`: `prefill_gate.sh` OFF **rc 0** (bit-identical, TTFT 0.99×/1.00×/1.00×), `tworeq` 4 slots at `COLI_KDA_GPU=2` IDENTICAL with 0 forcing lines, `prefill_gate.sh` ON **rc 0** (bit-identical, TTFT 1.00× at every size) — §RP4 in the record |
 | P8 | Capacity (cross-ref) | int3 experts (`ROADMAP-2026-09.md` 4h / G15) | partial; tracked on the main roadmap | weeks | Opus | its own gate |

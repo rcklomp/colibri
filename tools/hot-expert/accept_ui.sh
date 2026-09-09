@@ -78,6 +78,10 @@ if [ -n "$fa" ] && [ -n "$fb" ] && [ "$(echo "$fb > 1.5 * $fa + 2" | bc -l)" = 1
   printf '%-38s %s\n' "   B against A" "FAIL B ${fb}s vs A ${fa}s -- the second chat is not warm"; FAIL=1
 fi
 echo "--- rig-side acceptance (accept_live.sh)"
-ssh "$RIG" '~/src/colibri/tools/hot-expert/accept_live.sh' 2>&1 | grep -v "^\[pin\]\|^CKPT\|^20[0-9][0-9]-" || FAIL=1
+# PIPESTATUS, not the pipeline's: `ssh … | grep -v …` reports grep's status, so a FAILING
+# accept_live was reported as PASS on 2026-09-09 — the same "gate that cannot fail" defect
+# this file exists to prevent, in this file.
+ssh "$RIG" '~/src/colibri/tools/hot-expert/accept_live.sh' 2>&1 | grep -v "^\[pin\]\|^CKPT\|^20[0-9][0-9]-"
+[ "${PIPESTATUS[0]}" = 0 ] || FAIL=1
 echo "=== accept_ui $([ $FAIL = 0 ] && echo PASS || echo FAIL) $(date +%Y-%m-%dT%H:%M:%S%z)"
 exit $FAIL

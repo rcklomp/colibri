@@ -96,16 +96,19 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   appears in it, and kills the session: always use the bracket form
   (`"openai_[s]erver.py"`, `"p7_[c]hain.sh"`). Never `scp` over a bash
   script that is running on the rig; git merges are safe (new inode).
-- **Open WebUI** (docker `open-webui`, port 3000): its builtin tools put
-  6 300 tokens in front of every first turn; since P7 that prefix is
-  checkpointed (one cold prefill of ~24 min per distinct tool block, then
-  ~5 s) and its per-turn memory block is pinned. The preset's `builtin_tools`
-  and `memory` capabilities are still OFF in `webui.db` (2026-09-07) — the
-  owner decides when to turn them back on. The server caches presets: after
-  a `webui.db` edit call `GET /api/models` or nothing changes. Drive its
+- **Open WebUI** is the container `open-webui-new` (image
+  `ghcr.io/open-webui/open-webui:main` = 0.11.3, port 3000) since 2026-09-09;
+  the old `open-webui` (0.11.0) is stopped with restart off — the 09-06
+  rollback blamed the UI for the broken G16 engine commit. The preset's
+  `builtin_tools` and `memory` capabilities are ON again; the title/tags/
+  follow-up tasks stay off. Its 24-tool block (~4 000 tokens) is
+  checkpointed (`CKPT hit prefix=4011` in the server log): a new
+  conversation answers in ~20 s, a follow-up turn in ~2 s; a changed tool
+  set pays one cold prefill (~10 min) and is captured again. The server
+  caches presets: after a `webui.db` edit call `GET /api/models`. Drive its
   backend from inside the container (PyJWT token from `WEBUI_SECRET_KEY`;
-  never `import open_webui` in a side process, it runs the migrations). `tools/hot-expert/chat.py` is the plain client;
-  `ttft_serve.py --url` the measuring one.
+  never `import open_webui` in a side process, it runs the migrations); the
+  builtin tools attach only to requests carrying a `session_id`.
 - Dropping caches needs sudo; ask the owner or run it yourself in an
   interactive shell. Never write the password into a file or a script.
 

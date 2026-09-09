@@ -69,10 +69,29 @@ if run_step 1; then
   echo
   echo "### step 1 — prefill_gate.sh, checkpoints off (P8 touches no engine code)"
   if pgrep -x glm53 >/dev/null; then echo "REFUSED: a glm53 is running -- stop the gateway first"; exit 2; fi
+  SELF=0
+  [ "$(sha256sum "$PRISTINE" | cut -d" " -f1)" = "$(sha256sum "$CAND" | cut -d" " -f1)" ] && SELF=1
+  echo "    pristine and candidate are $([ $SELF = 1 ] && echo "THE SAME BYTES" || echo "different binaries")"
   GLM53_PREFIX_CKPT=0 COLI_CKPT_DIR="$OUT/ckpt/step1" MIN_SPEEDUP=${MIN_SPEEDUP:-0.97} \
     "$HERE/prefill_gate.sh" "$PRISTINE" "$CAND" "$TAG-off" 2>&1 | tee "$OUT/step1.txt"
   rc1=${PIPESTATUS[0]}
   wait_no_engine || exit 2
+  # A file compared with ITSELF cannot be slower than itself: when the two
+  # binaries are byte-identical the speed half of prefill_gate measures the
+  # harness, not a change, and its verdict is not evidence about this item.
+  # Measured here 2026-09-09 on exactly that comparison: 2.84/2.72 s (pristine)
+  # against 2.92/2.82 s (candidate) on the 27-token row -> 0.97x -> rc 3, with
+  # 1.00x at 390 and 1 236 tokens and `teacher_forcing IDENTICAL (782
+  # positions), cosine=1.0000000 max_abs=0`. So the ORACLE half still has to
+  # pass (rc 1 stays fatal) and the numbers still go in the commit body; only
+  # the speed verdict is downgraded, and only when the bytes are identical.
+  # This is not a threshold: a candidate whose binary differs is judged at
+  # MIN_SPEEDUP as before.
+  if [ "$rc1" = 3 ] && [ "$SELF" = 1 ]; then
+    echo "step 1: the speed check FAILED on a self-comparison (identical bytes) -- INFORMATIONAL"
+    echo "        the oracle half passed; the table above is the harness's noise floor at 27 tokens"
+    rc1=0
+  fi
   echo "step 1 rc=$rc1"
 fi
 

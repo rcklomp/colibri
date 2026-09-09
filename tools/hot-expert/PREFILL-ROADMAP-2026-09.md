@@ -1,10 +1,41 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 19, 2026-09-09 09:00)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 20, 2026-09-09 16:05)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 20 (2026-09-09, 16:05): P8 — the reply pin. Built, the bug reproduced on
+the served gateway, and UNGATED: the pristine stays in service.** When GLM-5.3
+emits a `<think>` block, Open WebUI gives it back as visible `content` only
+(confirmed here by reading `webui.db`, not by inference), the rendered prompt
+stops matching the tokens the KV slot holds, the KDA state cannot rewind past
+prompt + reply, and the turn falls back to the checkpoint. Measured through Open
+WebUI's own backend against the binary in service, before any change: turn 1
+**prompt 4 718, gen 29, 6 characters of visible answer**; turn 2 **REUSE 4 419
+and 54.07 s** where it should be **4 747 and ~2.7 s**. The fix is gateway-side
+(`c/openai_server.py`, `COLI_REPLY_PIN`, default 1): remember the RAW generated
+text per conversation and render it back verbatim, so the prompt reproduces the
+engine's own tokens. `c/glm53.c` is untouched and the built binary is
+**byte-identical** to the one in service. Offline oracle passes — `teacher_forcing
+IDENTICAL (782 positions)`, `cosine=1.0000000 max_abs=0`, TTFT 0.97×/1.00×/1.00×
+— and 16 new offline tests assert the invariant that matters,
+`render(turn 2) startswith render(turn 1) + RAW`. **Two things stopped it.**
+(1) The gate's speed check exited 3 at the 27-token row **comparing a file with
+itself**, sha256 equal: the same 2.7-second noise floor that made P5b's first run
+exit 3. `p8_gate.sh` now downgrades the speed verdict to informational when the
+two binaries are byte-identical — categorical, not a threshold move — and the
+oracle half stays fatal. (2) The Mac left the rig's network before the live half
+could be re-run, so steps 3 and 4, `accept_live.sh`, `accept_ui.sh` and the
+browser matrix were never run. **The item is not done.** One instrument finding
+belongs on the previous rev's matrix: its own 500-token filler plus "Reply with
+the single word OK." answers `gen=2` with an EMPTY `<think>` block at
+temperature 0 and at 0.8 — the browser rows that reasoned did so by SAMPLING,
+3 of 5 — so the regression case uses a small system of equations, which reasons
+every time (gen 29, 34 B reasoning, 6 B visible). Gate `p8_gate.sh`, chain
+`p8_chain.sh`, case `p8_reasoning_case.sh`, §P8 in the record. Binary in service
+unchanged, **f68d1cac…**, serving script unchanged.
 
 **Rev 18 (2026-09-09, 09:00): P7b — a partial checkpoint was terminal, and a
 new chat in the owner's browser now starts warm in 20.98 s instead of
@@ -459,7 +490,8 @@ serving knob (rev 5's rule).
 | — ✅ | Housekeeping (not this track): merge upstream `dev` — **done 2026-09-08 01:11**, `dev` `1ccee43` in service as `5ed096a6…` | merge base `12a5c46`, 149 ahead / 125 behind. Three files conflicted, **eight hunks**: the two mapping hunks took `dev`'s #1325 `st_map_shard_range` (`eabeb9a`, the fork's own PR upstreamed) while keeping the mapping ON by default (`st.h::COLI_MAP_EXPERTS_DEFAULT`), `g_map_all`'s LRU sizing, the one-thread `expert_map_init` (`st.h` maps lazily and its per-fd table is unsynchronised) and both prefaults; the three new hunks are `dev`'s per-turn `PROF`/`HITS` clocks against the fork's G10/P2.3 parallel hyper-connections and were unioned; `family_registry.py` kept ours. #1350 (`RssAnon`) is in and is upstream's precondition for that default; #1321 is still not in `dev`. `DEV-MERGE-NOTE-2026-09-07.md` has the full table | four qwen38 C tests + chat-template pin + 790 python tests green; `max_abs=0` at 782 positions; TTFT 0.99×/1.00×/0.99×; `tworeq` 4 slots IDENTICAL at both knobs, 0 forcing lines; `--prefix-ckpt` 91.8×, `--pin-block` 994/1 010; `rome_bench` paired 1.004×/1.003×/1.013×; `[MAP]` `copy=0`, `majflt` 0, MemAvailable unmoved | done | Opus | met — `~/bench/devmerge_chain.sh` exits 0 on all six steps (§"Upstream dev merge" in the record) |
 | **P4b** ✗ / **P4c** ✅ | Tile shader variants: LDS staging measured 0.91× and was refused by the gate; vec4 x loads passed at 1.03× (neutral profile) and are in service. **RP4 settled why neither moved the expert group: the 58 ms/token bucket is 92 % CPU experts overlapping inside the same timer, GPU busy on the busiest device is 1.97 ms/token, and the GPU makes the engine wait 0.068 ms/token.** There was nothing there to move; a shader that ran in zero time would have saved 0.06 % of the token. P4b's premise (get the activations out of global memory) was right — the tile re-reads 67.1 MB of activations per row, 4.7× its whole weight stream — and its implementation wrong; P4c's premise (too many loads, not too many bytes) was wrong. **No further expert-shader work on this track** | | | | Opus | `prefill_gate.sh` |
 | **RP4** ✅ | GPU-side timestamps on the expert group (`COLI_VK_TIMESTAMPS`, off by default; `perf/rp4-vk-timestamps`, **in service 2026-09-07 20:00**, binary `325c9c7a…`, serving script unchanged) | per-device `VK_QUERY_TYPE_TIMESTAMP` pool written at the top of the expert group's command buffer, between the gate+up and down phases and after the down phase (`=1`), plus per expert (`=2`, serializing and honest about it); `VK_EXT_calibrated_timestamps` (asked for only when the knob is set) maps the device clock onto `CLOCK_MONOTONIC`, which splits the CPU-side `eg` wait into queue latency / GPU busy per phase / fence tail, and yields `gpu_late` — the only part of the wait the GPU owns. `prefill_profile.sh` prints it as a row group under `eg` | measured at 781 and 3 462 tokens, three repeats each: GPU busy **1.97 / 0.93 / 0.89** ms/token on dev0/dev2/dev3, `gpu_late` **0.068** ms/token (0.12 % of `eg`), `queue_lat` 0.07–0.25; per-expert 232–235 µs (dev0, 9.3 rows) vs 84–86 µs (dev2/dev3, ~5 rows); a **one-row** expert costs 2.7–3.4× a two-row one because `vk_tile_ok4` requires `S > 1` and the per-row shader hits an LDS bank conflict. Prefill wall identical off / `=1` / `=2` | done | Opus | `rp4_chain.sh`: `prefill_gate.sh` OFF **rc 0** (bit-identical, TTFT 0.99×/1.00×/1.00×), `tworeq` 4 slots at `COLI_KDA_GPU=2` IDENTICAL with 0 forcing lines, `prefill_gate.sh` ON **rc 0** (bit-identical, TTFT 1.00× at every size) — §RP4 in the record |
-| P8 | Capacity (cross-ref) | int3 experts (`ROADMAP-2026-09.md` 4h / G15) | partial; tracked on the main roadmap | weeks | Opus | its own gate |
+| **P8** ⏸ | **The reply pin** — `perf/p8-reply-pin`, built and measured, **UNGATED, not in service** | Open WebUI stores an assistant turn as its VISIBLE `content` only (`webui.db`: `content`, `done`, `model`, `output`, `usage`), so the `<think>` block the engine generated never comes back; the rendered prompt stops matching the tokens the KV slot holds and the KDA state cannot rewind past prompt + reply, so the turn re-prefills from the checkpoint. Amplified by the `dev` merge (#1327/#1278): `render_chat_glm53` now always ends `<|assistant|><think>`. Fix, gateway-side only, `COLI_REPLY_PIN` (default 1): remember the RAW generated text per conversation — before the reasoning splitter, before any strip — and render it back VERBATIM when a later request carries that turn's visible content, so the prompt reproduces the engine's own tokens. Reassembling `<think>{reasoning}</think>{content.strip()}` is what breaks it, so the pinned path never does. A reply truncated inside `<think>` has no visible part, so each remembered turn carries its INDEX and an empty content is restored only against an empty remembered one at the same index | measured on the SERVED pristine gateway, through Open WebUI's own backend: turn 1 **prompt 4 718 gen 29** (6 chars visible), turn 2 **REUSE 4 419, ttft 54.07 s** against an expected **4 747 and ~2.7 s** — the bug, reproduced on demand. Engine untouched: built binary byte-identical, `teacher_forcing IDENTICAL (782 positions)`, `cosine=1.0000000 max_abs=0`, TTFT 0.97×/1.00×/1.00× (the 0.97× is a file compared with itself). 16 offline tests + 207 existing gateway tests green. **The pin's own effect is NOT measured yet** | built, ungated | Opus | `p8_gate.sh` steps 1,2 pass (step 1's speed verdict informational on identical bytes); **steps 3 and 4, `accept_live.sh`, `accept_ui.sh` and `ui_matrix.sh` still to run** — §P8 in the record |
+| PCAP | Capacity (cross-ref; this row used to be called P8) | int3 experts (`ROADMAP-2026-09.md` 4h / G15) | partial; tracked on the main roadmap | weeks | Opus | its own gate |
 
 Rev 1's "P4 — 4-accumulator BF16 prefill kernel (Q5)" is dropped from this
 track: it is a Qwen-engine BF16 kernel, and the finding above is that the call
@@ -472,7 +504,7 @@ shape, not the kernel, is the problem.
   to ~10 min: better, still not interactive. **P6/P7 remain necessary for
   Open WebUI with tools**; P2–P5 make everything P6 cannot cache tolerable.
 - A 32k-token document summarised cold is ~2.7 h today and ~1 h after P2–P5.
-  Only capacity (P8 / more VRAM) changes that, and only partly.
+  Only capacity (PCAP / more VRAM) changes that, and only partly.
 
 ## The alternative this track must not bury
 

@@ -1,4 +1,4 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 18, 2026-09-09 09:00)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 19, 2026-09-09 09:00)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
@@ -503,6 +503,12 @@ way.
    shown to the user, reproducible.
 6. **Read the profile before asserting the bottleneck.** Rev 1 of this file is
    the counter-example.
+7. **Measure the request after the one under test, on the user's client.**
+   P7's gates proved every restore and never looked at what the restoring
+   request left behind; the owner paid 380 s per new chat until he said so
+   (P7b). `accept_live.sh` is that check, `serve_candidate.sh` makes it the
+   last step of every chain, and a daily canary keeps the tool-block
+   checkpoint current. Added at rev 19.
 
 ## Closed dependency: CANCEL (fixed 2026-09-09, binary f41fc5cc…)
 

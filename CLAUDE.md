@@ -127,6 +127,20 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - Repeat the headline number at least twice; report both.
 - The numbers go in the commit body and one row goes into the record. A
   change without a measured delta does not merge.
+- **A binary is in service only when `tools/hot-expert/accept_live.sh`
+  exits 0 on it**, run on the rig against the live gateway: two UI-shaped
+  new chats through Open WebUI's own backend (the second must restore the
+  prefix and answer in seconds), a follow-up turn with memory on, and a
+  short request behind an abandoned one. Every chain ends with
+  `tools/hot-expert/serve_candidate.sh <candidate> <pristine> [shaders]`,
+  which restarts, runs it, and reverts on failure. It exists because P7b
+  (2026-09-09): every P7 gate proved the request under test and none looked
+  at the request after it, and the owner found the 380-second new chat
+  himself. **A gate must measure the request after the one it tests** — the
+  state a request leaves behind is what the next user turn pays for.
+- A daily canary (`accept_live.sh --canary`, cron 05:00 UTC, log
+  `~/bench/accept_live.log`) re-checks the user's path and captures the tool
+  block again whenever Open WebUI's tool list drifts.
 
 ## Engines
 

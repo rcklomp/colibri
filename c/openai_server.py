@@ -1899,6 +1899,17 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         elif role == "tool":
             prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
         elif role == "assistant":
+            pinned = message.get(REPLY_PIN_FIELD)
+            if isinstance(pinned, str) and pinned:
+                # P8: the exact text THIS gateway generated for this turn, placed
+                # verbatim after the `<think>` the generation prompt had opened --
+                # not reassembled from (reasoning, content). The strip and the
+                # rebuild below are precisely what makes the rendered prompt stop
+                # matching the tokens the KV slot holds; reproducing the raw text
+                # is the whole point of the pin. Tool-call markup, if this turn
+                # had any, is already inside it in the model's own form.
+                prompt.append(f"<|assistant|><think>{pinned}")
+                continue
             reasoning = message.get("reasoning_content")
             if not isinstance(reasoning, str) and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1]
@@ -2344,6 +2355,198 @@ def pin_context_blocks(messages):
         print(f"[pin] key={key[:8]} {'hit' if hit else 'new'} "
               f"block={len(pinned.encode('utf-8'))}", file=sys.stderr, flush=True)
     return messages
+
+
+# ---- P8 (2026-09-09): the reply pin ------------------------------------------
+#
+# Open WebUI stores an assistant turn as its VISIBLE content only (verified in
+# webui.db: the keys are `content`, `done`, `model`), so the `<think>` block
+# GLM-5.3 generated never comes back on the next turn. The rendered prompt then
+# stops matching the token sequence the KV slot holds and the whole
+# conversation re-prefills. Measured in the browser matrix of 2026-09-09: three
+# follow-up turns out of five cost 45-321 s instead of ~3 s, and the arithmetic
+# named the cause -- turn 1 generated 17/18/14 tokens while the next prompt grew
+# by only 16 (the follow-up question alone is ~14), so ~15 generated tokens
+# vanished. The upstream `dev` merge amplified it (#1327/#1278):
+# render_chat_glm53 now always ends `<|assistant|><think>`, so the model reasons
+# far more often than the fork's pre-merge prompt did.
+#
+# The gateway is the only party that still has that text: it generated it. So
+# remember the RAW generated text of each assistant turn -- before the reasoning
+# splitter removes <think>...</think> and before any strip -- keyed by
+# conversation, and when a later request carries that turn's visible content
+# back, render the remembered text VERBATIM in its place. The prompt then
+# reproduces the engine's own tokens byte for byte and the slot reuses the whole
+# history.
+#
+# Knob: COLI_REPLY_PIN, default 1; 0 restores the pre-P8 behaviour. The pin
+# changes only what is sent BACK to the engine, never what the client is sent.
+#
+# Deliberate limits, all fail-safe -- a miss renders exactly what today renders:
+#   * a client that sends `reasoning_content` back needs nothing from us;
+#   * an assistant turn that carried tool_calls is not pinned: its visible
+#     content has had the call markup parsed out of it, so "matches the visible
+#     part" would stop being a byte comparison;
+#   * the match is on the STRIPPED visible text, because clients (Open WebUI
+#     included) strip what they store, and on the part after `</think>` in case
+#     a client hands the whole block back inside `content`.
+#
+# One case needs the assistant turn's INDEX and not its text: a reply that ran
+# into `--max-tokens` while still inside <think> has NO visible part at all, so
+# the client stores an empty assistant message and there is nothing to compare.
+# Each remembered generation therefore carries the index of the assistant turn
+# it is, and an empty stored content is restored only against a remembered
+# generation whose visible part is also empty, at the same index, in the same
+# conversation. A wrong guess there could only render a reply the user did not
+# see -- so it is deliberately the narrowest rule that covers the case, and
+# everything else still matches on the text.
+REPLY_PIN_FIELD = "_coli_reply_pin"      # private, set on a COPY of the message
+REPLY_PIN_MAX_CONV = 64                  # conversations kept (LRU)
+REPLY_PIN_MAX_TURNS = 8                  # assistant turns kept per conversation
+_reply_pin_cache = collections.OrderedDict()
+_reply_pin_lock = threading.Lock()
+
+
+def reply_pin_enabled():
+    return os.environ.get("COLI_REPLY_PIN", "1") == "1"
+
+
+def conversation_pin_key(messages):
+    """A key that stays constant for the life of one conversation.
+
+    The same idea conversation_cache_slot uses -- the leading system messages
+    plus the first user message -- with the per-turn context block stripped out
+    of the system text, so the key does not move when Open WebUI re-ranks its
+    memory block. That re-ranking is what COLI_PREFIX_PIN absorbs, and this key
+    has to work whether that knob is on or off.
+    """
+    if not isinstance(messages, list) or not messages:
+        return None
+    tags = prefix_pin_tags()
+    parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        text = message_text(message)
+        if role == "system":
+            split = split_context_block(text, tags)
+            parts.append("s:" + (split[0] if split else text))
+        elif role == "user":
+            parts.append("u:" + text)
+            break
+    if not parts:
+        return None
+    return hashlib.sha1("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def reply_pin_visible(raw, enable_thinking, tools=None, tool_reply=None):
+    """The part of a raw generation the client keeps -- what the gateway sent back."""
+    if ARCH == "inkling":
+        text, _reasoning = split_inkling(raw)
+    else:
+        _reasoning, text = split_thinking_reply(raw, enable_thinking)
+    if tools:
+        try:
+            text, _calls = parse_arch_tool_calls(text, tools, tool_reply)
+        except Exception:
+            return None            # no longer a byte comparison: do not remember it
+    return text
+
+
+def reply_pin_norm(text):
+    """Normalise a visible reply for comparison: clients strip what they store."""
+    if not isinstance(text, str):
+        return ""
+    if THINK_CLOSE in text:
+        text = text.split(THINK_CLOSE)[-1]
+    return text.strip()
+
+
+def assistant_turn_count(messages):
+    """How many assistant turns this request already carries.
+
+    Which is the index the turn about to be generated will have when the client
+    sends the conversation back.
+    """
+    return sum(1 for m in messages
+               if isinstance(m, dict) and m.get("role") == "assistant")
+
+
+def remember_reply(messages, raw, visible):
+    """Record one assistant turn's RAW generated text against its conversation."""
+    if not reply_pin_enabled() or not raw:
+        return
+    key = conversation_pin_key(messages)
+    if key is None:
+        return
+    entry = (assistant_turn_count(messages), reply_pin_norm(visible), raw)
+    with _reply_pin_lock:
+        turns = _reply_pin_cache.get(key)
+        if turns is None:
+            turns = []
+            _reply_pin_cache[key] = turns
+        _reply_pin_cache.move_to_end(key)
+        # A regenerated turn replaces the one it regenerates, rather than
+        # sitting next to it: the client will only ever send back one of them.
+        turns[:] = [t for t in turns if t[0] != entry[0]] + [entry]
+        del turns[:-REPLY_PIN_MAX_TURNS]
+        while len(_reply_pin_cache) > REPLY_PIN_MAX_CONV:
+            _reply_pin_cache.popitem(last=False)
+
+
+def apply_reply_pin(messages):
+    """Attach this conversation's remembered raw generations to its assistant turns.
+
+    Returns a list whose matched entries are COPIES carrying REPLY_PIN_FIELD, so
+    the caller's body is untouched and only the renderer sees the annotation.
+    """
+    if not reply_pin_enabled() or not isinstance(messages, list) or not messages:
+        return messages
+    key = conversation_pin_key(messages)
+    if key is None:
+        return messages
+    with _reply_pin_lock:
+        turns = list(_reply_pin_cache.get(key) or ())
+        if turns:
+            _reply_pin_cache.move_to_end(key)
+    if not turns:
+        return messages
+    used = set()
+    out = list(messages)
+    restored = []
+    turn = -1
+    for index, message in enumerate(out):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        turn += 1
+        if isinstance(message.get("reasoning_content"), str):
+            continue               # the client kept the reasoning: render it as before
+        if message.get("tool_calls"):
+            continue               # the call markup was parsed out of the visible text
+        norm = reply_pin_norm(message_text(message))
+        hit = None
+        for slot, (at, remembered, _raw) in enumerate(turns):
+            if slot not in used and at == turn and remembered == norm:
+                hit = slot                     # same turn, same visible text
+                break
+        if hit is None and norm:
+            for slot, (_at, remembered, _raw) in enumerate(turns):
+                if slot not in used and remembered == norm:
+                    hit = slot                 # edited/branched history: match on the text
+                    break
+        if hit is None:
+            continue
+        pinned = dict(message)
+        pinned[REPLY_PIN_FIELD] = turns[hit][2]
+        out[index] = pinned
+        used.add(hit)
+        restored.append((turn, len(turns[hit][2])))
+    if restored and os.environ.get("COLI_REQ_LOG"):
+        for turn_no, chars in restored:      # turn=1 is the first assistant reply
+            print(f"[reply-pin] key={key[:8]} turn={turn_no + 1} restored={chars}",
+                  file=sys.stderr, flush=True)
+    return out
 
 
 def glm53_prefix_cut(prompt):
@@ -3734,7 +3937,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None, image=None):
+                   enable_thinking=False, audio=None, image=None, pin_messages=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -3757,6 +3960,20 @@ class APIHandler(BaseHTTPRequestHandler):
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
+
+        def remember_generated(raw_text, tool_reply=None):
+            """P8: keep this turn's RAW generated text for the next request.
+
+            `pin_messages` is the very list the renderer saw, so the key here and
+            the key apply_reply_pin() computes next turn are the same string.
+            """
+            if not chat or not raw_text:
+                return
+            conversation = pin_messages if pin_messages is not None else body.get("messages")
+            if not isinstance(conversation, list):
+                return
+            remember_reply(conversation, raw_text,
+                           reply_pin_visible(raw_text, enable_thinking, tools, tool_reply))
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -3803,6 +4020,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
+                remember_generated(text, sideband.reply() if tools else None)
                 reasoning = ""
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
@@ -3933,6 +4151,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "logprobs": None, "finish_reason": None}])
                 ka_thread[0] = threading.Thread(target=_keepalive, daemon=True)
                 ka_thread[0].start()
+            pin_raw = []                # P8: the raw generated text, before any splitter
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
@@ -3968,6 +4187,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                              initial_thinking=starts_in_reasoning(enable_thinking))
                          if glm_think else None)
                 def emit_tools(chunk):
+                    pin_raw.append(chunk)
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (think.feed if think else feed_content)(chunk)
@@ -3988,6 +4208,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
+                remember_generated("".join(pin_raw), sideband.reply())
                 _content, calls = parse_arch_tool_calls("".join(raw), tools,
                                                         sideband.reply())
                 for i, tc in enumerate(calls):
@@ -4005,6 +4226,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     content_split = None
                 def emit_plain(chunk):
+                    pin_raw.append(chunk)
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (content_split.feed if content_split else emit)(chunk)
@@ -4017,6 +4239,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
+                remember_generated("".join(pin_raw))
                 finish = "length" if stats["length_limited"] else "stop"
             # generate() returned, so the prompt was ACCEPTed and start_stream() ran; guard anyway.
             start_stream()
@@ -4113,12 +4336,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")
             image = images[0] if images else None
-        prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
+        # P8: give back the reasoning the client dropped, so the rendered prompt
+        # reproduces the tokens the KV slot already holds. A no-op unless this
+        # conversation has a remembered generation whose visible part matches.
+        render_messages = apply_reply_pin(messages)
+        prompt = render_chat_for_arch(render_messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
                         audio=b"".join(audio_clips) if audio_clips else None,
-                        image=image)
+                        image=image, pin_messages=render_messages)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}

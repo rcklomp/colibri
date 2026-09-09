@@ -1,10 +1,43 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 16, 2026-09-08 21:30)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 17, 2026-09-09 01:00)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 17 (2026-09-09, 01:00): the CANCEL dependency is CLOSED — a
+1 230-token prompt cancelled at 5 s is confirmed in 12.9 s instead of 251.3 s,
+and the live path is where the design turned out to be wrong.** `glm53` now
+polls stdin between prefill chunks and between decode steps (`serve_poll.h`,
+#1332, the pattern `qwen36` already used), stops at the chunk or token boundary,
+and answers `PROF` + `DONE … STAT` + `ERROR <id> CANCELLED`. Bit-identical
+(`max_abs=0` at 782 positions) and the poll is free: TTFT **1.02× / 0.99× /
+0.99×** at 27/390/1 236 tokens with decode unmoved, against a pristine that has
+no poll at all. A cancelled prefill is **resumable**: the slot records exactly
+`session->filled`, so the identical prompt resubmitted reuses **384 of 1 236**
+— the position the cancel line reported, exactly — and returns **the same greedy
+text** as an uncancelled run (89 bytes, 24 tokens), in 99.73 s instead of
+140.01 s. Live, an abandoned `curl` goes from **132.32 s to 13.18 s** and the
+request waiting behind it from **126.35 s to 7.13 s**. **Two things the plan had
+wrong, both found by measuring and not by reading:** (1) a SUBMIT *can* arrive
+mid-turn — `GenerationScheduler` is built with `capacity = kv_slots`, four in
+service — and the first design's "push the header back and stop draining" left
+the CANCEL stranded behind it, which the live check showed is the NORMAL case,
+not a corner: two runs out of two at 132 s, and an earlier round at 7 s only
+because the race went the other way. The drain now reads the queued frame in
+full onto a FIFO and keeps looking. (2) A cancelled request had never appeared in
+`owui_report.sh` at all: `generate()` raises `ClientCancelled` before its
+`[req]` write. Fixed in `openai_server.py`, and that fix is what made (1)
+visible. Three instrument findings are in the record's §CANCEL, all caught by
+the new `--cancel-phase` check: a decode-phase cancel timed from SUBMIT is a
+guess about two clocks; `--cancel-phase prefill` is unreachable over `--url`;
+and `--cancel` used to print its verdict and leave the exit code at 0. Gate
+`cancel_gate.sh` (b, c, a, d — the two steps a CANCEL change can break run
+before the four-hour half), chain `cancel_chain.sh` with the live step now a
+gate of its own, regression test `c/tests/test_glm53_cancel_frames.c` (no model,
+seconds, and it fails on the exact line the live run failed on). Binary
+**f41fc5cc…**, serving script unchanged. **This table is still empty.**
 
 **Rev 16 (2026-09-08, 21:30): P5b is in service and the roadmap row that
 predicted it was wrong about the cause — the big term was FALSE SHARING on the
@@ -445,13 +478,35 @@ way.
 6. **Read the profile before asserting the bottleneck.** Rev 1 of this file is
    the counter-example.
 
-## Open dependency: CANCEL (still unfixed)
+## Closed dependency: CANCEL (fixed 2026-09-09, binary f41fc5cc…)
 
-`glm53` does not honour CANCEL — **measured 2026-09-06 with the new gate**: a
-1 230-token prompt cancelled at 5 s held the engine for 251 s (the whole
-prefill and the generation). Prefill work makes this worse: a 17-minute tool
-prompt a user gives up on holds the engine for 17 minutes. The G16 attempt
-failed for lack of a serve-path oracle; `ttft_serve.py --cancel 5` is that
-oracle now (PASS = engine confirms within seconds and the next request is
-served). Fix it as the next engine change after P2, or before P2 if a user is
-actively hitting it: it is also what makes every measurement session safe.
+For two days this section read "still unfixed": `glm53` ignored CANCEL, and a
+1 230-token prompt cancelled at 5 s held the engine **251.3 s** — the whole
+prefill and the whole generation. Prefill work made it worse, because a
+17-minute tool prompt a user gives up on held the engine for 17 minutes. The
+G16 attempt failed for lack of a serve-path oracle.
+
+It is fixed. Confirmed in **12.9 s** in the prefill phase and **13.9 s** in the
+decode phase, twice each; the next request is served in 2.6 s; a cancelled
+prefill **resumes** at exactly the position it stopped, with the same greedy
+text as an uncancelled run; live, an abandoned `curl` costs 13.18 s instead of
+132.32 s and the request behind it 7.13 s instead of 126.35 s. Bit-identical,
+`tworeq` IDENTICAL at both KDA knobs, P7 capture/restore unmoved, and the poll
+itself measured free (1.02×/0.99×/0.99× TTFT against a binary that has no poll).
+The whole table is in §CANCEL of the record.
+
+Three things this leaves for whoever works here next:
+
+1. **The engine's concurrency is the pipe.** The gateway admits up to
+   `kv_slots` requests at once and writes each SUBMIT as soon as it is admitted;
+   the engine serves one and the others wait in the pipe (now in a small FIFO
+   inside the engine, read by the same parser). Anything that reads stdin
+   mid-turn has to consume whole frames — the frames are byte-counted, so
+   skipping a header desyncs everything behind it.
+2. **`--cancel-phase` is the check that keeps this honest.** It caught three
+   instrument bugs before it caught anything in the engine, including a
+   decode-phase run whose turn had ended before the cancel was due. Ask for the
+   phase; do not infer it from arithmetic about prefill speed.
+3. **A live step that only prints a number is not a gate.** The gate passed
+   (rc=0) on a binary whose live disconnect behaviour was still broken, and the
+   chain served it. `cancel_chain.sh` now reverts on the live bound too.

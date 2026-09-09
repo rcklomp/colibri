@@ -26,9 +26,11 @@ IDENTICAL (782 positions)`, `cosine=1.0000000 max_abs=0`, TTFT 0.97×/1.00×/1.0
 itself**, sha256 equal: the same 2.7-second noise floor that made P5b's first run
 exit 3. `p8_gate.sh` now downgrades the speed verdict to informational when the
 two binaries are byte-identical — categorical, not a threshold move — and the
-oracle half stays fatal. (2) The Mac left the rig's network before the live half
-could be re-run, so steps 3 and 4, `accept_live.sh`, `accept_ui.sh` and the
-browser matrix were never run. **The item is not done.** One instrument finding
+oracle half stays fatal. (2) The Mac left the rig's network mid-chain, so steps 3
+and 4, `accept_live.sh`, `accept_ui.sh` and the browser matrix were never run;
+the chain is detached and reverts to the pristine and restarts the gateway on
+every exit path, but that end state was **not observed** from here — read
+`~/bench/p8_chain.log` before doing anything else. **The item is not done.** One instrument finding
 belongs on the previous rev's matrix: its own 500-token filler plus "Reply with
 the single word OK." answers `gen=2` with an EMPTY `<think>` block at
 temperature 0 and at 0.8 — the browser rows that reasoned did so by SAMPLING,

@@ -5364,28 +5364,64 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      *   1. riuso di slot (sopra, invariato);
      *   2. se non ha coperto niente e non c'e' un'immagine, si rimette il
      *      checkpoint piu' lungo che sia prefisso stretto di questa sequenza;
-     *   3. se non si e' riusato niente, si PIANIFICA una cattura, o dal
-     *      prefisso comune col prompt fresco precedente o dal suggerimento del
-     *      gateway;
+     *   3. se non si e' riusato niente DA UNO SLOT, si PIANIFICA una cattura,
+     *      o dal prefisso comune col prompt fresco precedente o dal
+     *      suggerimento del gateway;
      *   4. il prefill si spezza in due al confine e la copia si prende in
      *      mezzo.
      * Un'immagine annunciata annulla sia il ripristino sia la cattura, per la
      * stessa ragione per cui annulla il riuso: gli embedding della torre
-     * appartengono a posizioni precise di questo prompt. */
+     * appartengono a posizioni precise di questo prompt.
+     *
+     * P7b: il punto 3 vale anche DOPO un ripristino.
+     *
+     * Prima si pianificava solo con `shared == 0`, cioe' mai dopo un CKPT hit:
+     * una volta esistito un checkpoint parziale il prefisso stabile completo
+     * non veniva piu' catturato, e ogni conversazione nuova rimacinava la
+     * stessa coda. Misurato in servizio il 2026-09-09: il prompt della UI
+     * condivide 2 163 token col riscaldamento in forma API, il motore aveva
+     * catturato 2 163 per prefisso comune, e da li' ogni richiesta della UI
+     * ripristinava 2 163 e macinava gli altri ~2 500 (~7 minuti) senza mai una
+     * riga `CKPT plan`.
+     *
+     * La distinzione che conta e' DA DOVE viene `shared`:
+     *   - da un checkpoint (`restored`): il prompt e' comunque fresco, la
+     *     sessione e' stata aperta ora, e spezzare il prefill piu' avanti non
+     *     toglie niente a nessuno -- si pianifica;
+     *   - dal riuso di slot: quella sessione sta continuando una
+     *     conversazione, e non la si spezza per fare una copia.
+     * Dopo un ripristino si accetta solo un confine STRETTAMENTE oltre
+     * `shared` (sotto, `ckpt_at > shared`, che era gia' la condizione dello
+     * split) e non gia' catturato (`ckpt_have`, dentro plan e hint).
+     *
+     * E si prende il PIU' LUNGO fra piano e suggerimento, non piu' il piano
+     * appena esiste: il suggerimento e' il confine che il gateway SA stabile
+     * (l'inizio del blocco pinnato, o il primo `<|user|>`), mentre il piano e'
+     * il prefisso comune con l'ultimo prompt fresco -- che il 2026-09-09 era
+     * il piu' corto dei due, ed e' esattamente il caso che ha fatto male. */
     int ckpt_at = 0;
+    int restored = 0;
     const int has_image = (vision != NULL);
     if (ckpt_on() && !has_image) {
-        if (shared == 0) shared = ckpt_restore(m, slot, sequence, total);
         if (shared == 0) {
+            shared = ckpt_restore(m, slot, sequence, total);
+            restored = shared > 0;
+        }
+        if (shared == 0 || restored) {
             const char *why = "lcp";
-            ckpt_at = ckpt_plan(sequence, total);
-            if (!ckpt_at && q->prefix_bytes > 0 && q->prefix_bytes < q->plen) {
-                ckpt_at = ckpt_hint(tokenizer, q->payload, q->prefix_bytes,
-                                    sequence, total, shared);
-                why = "hint";
-            }
+            /* ckpt_plan tiene anche la contabilita' di `prev_ids`, quindi si
+             * chiama su OGNI prompt fresco, ripristinato o no. */
+            int plan = ckpt_plan(sequence, total);
+            int hint = 0;
+            if (plan <= shared) plan = 0;      /* dentro il ripristino: inutile */
+            if (q->prefix_bytes > 0 && q->prefix_bytes < q->plen)
+                hint = ckpt_hint(tokenizer, q->payload, q->prefix_bytes,
+                                 sequence, total, shared);
+            ckpt_at = plan;
+            if (hint > ckpt_at) { ckpt_at = hint; why = "hint"; }
             if (ckpt_at && getenv("GLM53_VERBOSE"))
-                fprintf(stderr, "CKPT plan prefix=%d src=%s\n", ckpt_at, why);
+                fprintf(stderr, "CKPT plan prefix=%d src=%s%s\n", ckpt_at, why,
+                        restored ? " after-restore" : "");
         }
     }
 

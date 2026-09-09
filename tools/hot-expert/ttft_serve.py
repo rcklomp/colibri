@@ -521,8 +521,16 @@ def fmt(ev, label):
 
 # ------------------------------------------------------------------ P7 modes
 CKPT_LEN_RE = re.compile(r"CKPT (?:store|hit|disk (?:load|write)) prefix=(\d+)")
+CKPT_HIT_RE = re.compile(r"CKPT hit prefix=(\d+)")
+CKPT_STORE_RE = re.compile(r"CKPT store prefix=(\d+)")
+CKPT_PLAN_RE = re.compile(r"CKPT plan prefix=(\d+) src=(\w+)(?:\s+(after-restore))?")
 DEFAULT_PIN_SYSTEM = ("You are a careful assistant running on a small machine. "
                       "Answer briefly and never invent facts.")
+
+
+def ckpt_lines(ev, rx):
+    """Every match of `rx` in the CKPT lines the engine printed for `ev`."""
+    return [m for line in (ev.get("ckpt") or ()) for m in (rx.search(line),) if m]
 
 
 def ckpt_prefix_len(events):
@@ -667,6 +675,190 @@ def prefix_ckpt_mode(args, drv, record):
             print("oracle logits: MISSING (no --logit-dir)", flush=True)
         ok = ok and same and lok
         print(f"prefix-ckpt --oracle: {'PASS' if ok else 'FAIL'}", flush=True)
+    return ok
+
+
+# ------------------------------------------------------------------ P7b
+# The extra system block that makes the FULL prefix longer than the partial
+# one. It is a second system message, not more text inside the first, and that
+# is the whole trick: `<|system|>` is a special token, so the shorter shape's
+# prefix ends exactly at a token boundary the longer shape also has, and the
+# partial checkpoint is a STRICT TOKEN PREFIX of the longer prompt.
+#
+# The obvious fixture -- two tools versus four -- cannot do this. glm53 renders
+# the tool block before the system message (openai_server.render_chat_glm53:
+# effort line, tool block, system, user), so a 2-tool prefix ends with the tool
+# epilogue and the system text, and the 4-tool prompt has tool 3 where the
+# epilogue is: the bytes diverge INSIDE the captured span, the ids differ, and
+# ckpt_restore would never fire. It would test nothing.
+P7B_EXTRA_SYSTEM = (
+    "Additional operating context for this deployment.\n"
+    "- The machine is an 8-core EPYC 7F32 with 247 GB of RAM and three RX 7900 XTX.\n"
+    "- The model is served by a single process that keeps four KV slots.\n"
+    "- Prefill dominates the wait on a first turn; decode is a few tokens a second.\n"
+    "- Answers are graded on being short, literal and free of invention.\n"
+    "- When a question has no answer in the context, say so in one sentence.\n"
+    "- Never restate the question, never add a preamble, never add a summary.\n"
+    "- Units are SI. Times are seconds unless the question says otherwise.\n"
+    "- The operator reads every answer, so length is a cost paid by a person.\n"
+    "- Tool calls are allowed only when the question cannot be answered directly.\n"
+) * 3
+
+
+def prefix_ckpt_partial_mode(args, drv, record):
+    """P7b: a PARTIAL checkpoint must not stop the rest of the prefix being captured.
+
+    The failure this reproduces was seen in service on 2026-09-09: the engine
+    held a 2 163-token checkpoint (the common prefix of the owner's UI prompt
+    and an API-shaped warm-up), every UI-shaped request restored those 2 163
+    and prefilled the remaining ~2 500 (380-713 s), and no `CKPT plan` line was
+    ever printed again -- serve_one planned a capture only when `shared == 0`,
+    and after a restore `shared` is not 0.
+
+    Three conversations, all sharing the tool block and the first system
+    message S:
+
+      conv 1  [S, A]              -- the gateway hints the cut before <|user|>,
+                                     so the engine captures len(S) = the PARTIAL
+                                     prefix;
+      conv 2  [S, T, B]           -- a second system message T makes the stable
+                                     prefix longer. The partial checkpoint is a
+                                     strict prefix of this prompt, so it must be
+                                     RESTORED, and the hint at len(S+T) must
+                                     still be planned and stored -- the
+                                     `after-restore` line;
+      conv 3  [S, T, C]           -- another conversation of the same shape must
+                                     now reuse the WHOLE len(S+T), not len(S).
+
+    On the pristine engine conv 2 prints no plan and conv 3 reuses len(S): that
+    is the measurement this step exists to make, and it is why the step fails
+    on the binary in service before the fix."""
+    system = (open(args.system, encoding="utf-8").read() if args.system
+              else DEFAULT_PIN_SYSTEM)
+    users = ["In one sentence: what is this assistant for?",
+             "In one sentence: what is the difference between prefill and decode?",
+             "In one sentence: why can a recurrent state not be rewound?"]
+
+    def short(i):
+        return [{"role": "system", "content": system},
+                {"role": "user", "content": users[i]}]
+
+    def full(i):
+        return [{"role": "system", "content": system},
+                {"role": "system", "content": P7B_EXTRA_SYSTEM},
+                {"role": "user", "content": users[i]}]
+
+    gen3 = 128 if args.oracle else 48
+    assert_resident(args, "p7b-1")
+    e1 = drv.run(short(0), 24)
+    record("p7b-conv1", 0, e1, "conv 1 [S, A] (partial capture)")
+    assert_resident(args, "p7b-2")
+    e2 = drv.run(full(1), 24)
+    record("p7b-conv2", 0, e2, "conv 2 [S, T, B] (restore + capture)")
+    assert_resident(args, "p7b-3")
+    e3 = drv.run(full(2), gen3)
+    record("p7b-conv3", 0, e3, "conv 3 [S, T, C] (warm start)")
+
+    on_dump = None
+    if args.oracle and args.engine and args.logit_dir:
+        src = os.path.join(args.logit_dir, "on", f"req_{e3['req_id']}.f32")
+        on_dump = os.path.join(args.logit_dir, "p7b_conv3_on.f32")
+        if os.path.exists(src):
+            with open(src, "rb") as a, open(on_dump, "wb") as b:
+                b.write(a.read())
+        else:
+            on_dump = None
+
+    store1 = ckpt_lines(e1, CKPT_STORE_RE)
+    hit2 = ckpt_lines(e2, CKPT_HIT_RE)
+    plan2 = ckpt_lines(e2, CKPT_PLAN_RE)
+    store2 = ckpt_lines(e2, CKPT_STORE_RE)
+    la = int(store1[-1].group(1)) if store1 else None      # the partial prefix
+    lb = int(store2[-1].group(1)) if store2 else None      # the full prefix
+    r1, r2, r3 = e1.get("reused"), e2.get("reused"), e3.get("reused")
+    t1 = (e1["first"] - e1["submit"]) if e1["first"] else None
+    t3 = (e3["first"] - e3["submit"]) if e3["first"] else None
+    restored2 = int(hit2[-1].group(1)) if hit2 else None
+    planned = (int(plan2[-1].group(1)), plan2[-1].group(2),
+               bool(plan2[-1].group(3))) if plan2 else None
+
+    print(f"prefix-ckpt-partial: conv 1 stored len(S)={la} (REUSE {r1}/{e1['prompt_tokens']}), "
+          f"conv 2 restored {restored2} (REUSE {r2}/{e2['prompt_tokens']}) and planned "
+          f"{planned}, stored len(S+T)={lb}; conv 3 REUSE {r3}/{e3['prompt_tokens']} "
+          f"in {t3 if t3 is None else round(t3, 2)}s (conv 1 cold: "
+          f"{t1 if t1 is None else round(t1, 2)}s)", flush=True)
+
+    ok = True
+    def check(cond, what):
+        nonlocal ok
+        print(f"  [{'ok  ' if cond else 'FAIL'}] {what}", flush=True)
+        if not cond:
+            ok = False
+
+    check(la is not None, "conv 1 captured a partial prefix")
+    check(lb is not None and la is not None and lb > la,
+          f"conv 2 captured a LONGER prefix than conv 1 ({lb} > {la})")
+    check(restored2 is not None and la is not None and restored2 == la,
+          f"conv 2 restored the partial checkpoint ({restored2} == {la})")
+    check(r2 is not None and la is not None and r2 == la,
+          f"conv 2's REUSE is the restored prefix ({r2} == {la})")
+    check(planned is not None and planned[2],
+          "conv 2 printed `CKPT plan ... after-restore` (the P7b line)")
+    check(planned is not None and lb is not None and planned[0] == lb,
+          "the plan is the prefix that got stored")
+    check(r3 is not None and lb is not None and r3 >= lb - 32,
+          f"conv 3 reused the WHOLE prefix ({r3} >= {(lb - 32) if lb else '?'})")
+    # conv 1 is cold by construction in the gate (a private, empty COLI_CKPT_DIR);
+    # if a checkpoint on disk made it warm, the ttft ratio is warm/warm and says
+    # nothing -- the reuse counts above are the verdict then, exactly as in
+    # prefix_ckpt_mode.
+    if r1:
+        print("  [note] conv 1 was itself a restore, so the ttft ratio is warm/warm "
+              "and is not a criterion here", flush=True)
+    else:
+        check(bool(t1 and t3 and t3 < 0.25 * t1),
+              f"conv 3 is fast ({t3:.2f}s < 0.25 x {t1:.2f}s)" if t1 and t3
+              else "conv 3 is fast (no ttft)")
+    print(f"prefix-ckpt-partial: {'PASS' if ok else 'FAIL'}", flush=True)
+
+    if args.oracle:
+        if not args.engine:
+            print("prefix-ckpt-partial oracle: SKIPPED (engine mode only)", flush=True)
+            return ok
+        print("--- oracle: conv 3 again on an engine with GLM53_PREFIX_CKPT=0", flush=True)
+        off_dir = os.path.join(args.logit_dir, "off") if args.logit_dir else None
+        drv.respawn(gen3, {"GLM53_PREFIX_CKPT": "0", "GLM53_LOGIT_DUMP": off_dir})
+        assert_resident(args, "p7b-oracle")
+        e4 = drv.run(full(2), gen3)
+        record("p7b-oracle", 0, e4, "conv 3 [S, T, C] ckpt OFF")
+        ton = "".join(e3.get("text", []))
+        toff = "".join(e4.get("text", []))
+        same = ton == toff
+        print(f"oracle text: {'IDENTICAL' if same else 'DIFFERS'} "
+              f"({len(ton)} vs {len(toff)} bytes over {e3['ntok']}/{e4['ntok']} tokens)", flush=True)
+        if not same:
+            print(f"  ON : {ton[:300]!r}\n  OFF: {toff[:300]!r}", flush=True)
+        lok = False
+        if on_dump and off_dir:
+            other = os.path.join(off_dir, f"req_{e4['req_id']}.f32")
+            cmp = compare_logits(on_dump, other) if os.path.exists(other) else None
+            if cmp:
+                cos, mx, ia, ib = cmp
+                lok = cos >= 1 - 1e-4 and ia == ib
+                print(f"oracle logits: cosine={cos:.7f} max_abs={mx:.4g} "
+                      f"argmax {ia} vs {ib} {'OK' if ia == ib else 'DIFFERS'}", flush=True)
+            else:
+                print(f"oracle logits: MISSING ({on_dump} / {other})", flush=True)
+        else:
+            print("oracle logits: MISSING (no --logit-dir)", flush=True)
+        ok = ok and same and lok
+        print(f"prefix-ckpt-partial --oracle: {'PASS' if ok else 'FAIL'}", flush=True)
+        # Leave the engine the way this mode found it: another P7 mode in the
+        # same process (--prefix-ckpt, --pin-block) needs checkpoints ON.
+        if args.prefix_ckpt or args.pin_block:
+            drv.respawn(args.gen, {"GLM53_PREFIX_CKPT": None,
+                                   "GLM53_LOGIT_DUMP": os.path.join(args.logit_dir, "on")
+                                   if args.logit_dir else None})
     return ok
 
 
@@ -908,9 +1100,14 @@ def main():
     ap.add_argument("--prefix-ckpt", action="store_true",
                     help="P7: a NEW conversation sharing the system+tools prefix must start warm "
                          "(and stay warm across an engine restart)")
+    ap.add_argument("--prefix-ckpt-partial", action="store_true",
+                    help="P7b: a PARTIAL checkpoint must not stop the rest of the stable "
+                         "prefix from being captured -- conv 2 must restore it AND plan "
+                         "a longer capture (`CKPT plan ... after-restore`)")
     ap.add_argument("--oracle", action="store_true",
-                    help="--prefix-ckpt: re-serve the same request on an engine with "
-                         "GLM53_PREFIX_CKPT=0 and compare text and first-token logits")
+                    help="--prefix-ckpt/--prefix-ckpt-partial: re-serve the same request on "
+                         "an engine with GLM53_PREFIX_CKPT=0 and compare text and "
+                         "first-token logits")
     ap.add_argument("--pin-block", action="store_true",
                     help="P7: a re-ranked <memory_context> block must not cost a re-prefill "
                          "(COLI_PREFIX_PIN)")
@@ -921,8 +1118,8 @@ def main():
     ap.add_argument("--logit-dir", help="--oracle: directory for GLM53_LOGIT_DUMP vectors")
     args = ap.parse_args()
     args.exe = args.engine
-    if args.oracle and not args.prefix_ckpt:
-        sys.exit("--oracle only means something with --prefix-ckpt")
+    if args.oracle and not (args.prefix_ckpt or args.prefix_ckpt_partial):
+        sys.exit("--oracle only means something with --prefix-ckpt or --prefix-ckpt-partial")
     if args.oracle and args.engine:
         if not args.logit_dir:
             args.logit_dir = os.path.join(tempfile.gettempdir(), f"p7_logits_{os.getpid()}")
@@ -1007,6 +1204,9 @@ def main():
                 print(f"multiturn: ttft(turn2)/ttft(turn1) = {tb/ta:.2f}; turn 2 added ~{new} new tokens "
                       f"after the reply -> {'PREFIX REUSED' if tb < 0.35 * ta else 'NO REUSE (turn 2 re-prefilled the history)'}; "
                       f"the engine's own verdict is the REUSE line above (reused-token count)", flush=True)
+        if args.prefix_ckpt_partial:
+            verdicts.append(("prefix-ckpt-partial",
+                             prefix_ckpt_partial_mode(args, drv, record)))
         if args.prefix_ckpt:
             verdicts.append(("prefix-ckpt", prefix_ckpt_mode(args, drv, record)))
         if args.pin_block:

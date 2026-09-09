@@ -53,7 +53,14 @@ for side in pristine candidate; do
 done
 
 echo "--- (a) teacher forcing"
-if cmp -s "$OUT/tf_pristine.txt" "$OUT/tf_candidate.txt"; then
+# An empty comparison is not a pass. Both oracle runs aborted on residency during the P8 gate
+# (2026-09-09) and this printed "IDENTICAL (0 positions)" with TF=0 -- a gate that passes on
+# nothing. The oracle needs a plausible number of positions before its verdict means anything.
+TF_N=$(wc -w < "$OUT/tf_pristine.txt"); TF_M=$(wc -w < "$OUT/tf_candidate.txt")
+if [ "${TF_N:-0}" -lt 100 ] || [ "${TF_M:-0}" -lt 100 ]; then
+  echo "teacher_forcing: NO DATA (pristine $TF_N words, candidate $TF_M) -- the oracle run did not produce a comparison"
+  TF=1
+elif cmp -s "$OUT/tf_pristine.txt" "$OUT/tf_candidate.txt"; then
   echo "teacher_forcing: IDENTICAL ($(wc -w < "$OUT/tf_pristine.txt") positions)"; TF=0
 else
   python3 - "$OUT/tf_pristine.txt" "$OUT/tf_candidate.txt" <<'PY'

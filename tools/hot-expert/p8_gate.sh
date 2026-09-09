@@ -83,7 +83,7 @@ if run_step 1; then
   [ "$(sha256sum "$PRISTINE" | cut -d" " -f1)" = "$(sha256sum "$CAND" | cut -d" " -f1)" ] && SELF=1
   echo "    pristine and candidate are $([ $SELF = 1 ] && echo "THE SAME BYTES" || echo "different binaries")"
   GLM53_PREFIX_CKPT=0 COLI_CKPT_DIR="$OUT/ckpt/step1" MIN_SPEEDUP=${MIN_SPEEDUP:-0.97} \
-    "$HERE/prefill_gate.sh" "$PRISTINE" "$CAND" "$TAG-off" 2>&1 | tee "$OUT/step1.txt"
+    PROFILE_MIN_RESIDENT=97 "$HERE/prefill_gate.sh" "$PRISTINE" "$CAND" "$TAG-off" 2>&1 | tee "$OUT/step1.txt"
   rc1=${PIPESTATUS[0]}; ran1=1
   wait_no_engine || exit 2
   # A file compared with ITSELF cannot be slower than itself: when the two

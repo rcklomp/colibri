@@ -51,14 +51,23 @@ for line in open(sys.argv[2]).read().splitlines()[1:]:
     n+=1; size=int(f[-2]); r=int(f[-1]); want=-(-size//PAGE)*PAGE
     tot+=want; res+=r
     if r<want: short+=1
-print(f'[resid {sys.argv[1]}] shards={n} resident={res/tot*100:.4f}% short={short}')
-sys.exit(0 if (n==62 and short==0) else 1)
+pct = res/tot*100
+import os
+floor = float(os.environ.get('PROFILE_MIN_RESIDENT', '100'))
+print(f'[resid {sys.argv[1]}] shards={n} resident={pct:.4f}% short={short} floor={floor}')
+sys.exit(0 if (n==62 and (short==0 or pct >= floor)) else 1)
 PY
 }
 warm() { find "$M" -type f -name "*.safetensors" -print0 | while IFS= read -r -d '' f; do cat "$f" >/dev/null; done; }
 
+# PROFILE_MIN_RESIDENT (default 100) is the floor this run will accept. 100 is right for a
+# timing campaign; a gate's ORACLE half cares about numerics, which residency cannot change,
+# and 100 is unreachable minutes after the gateway's engine was killed (its anon memory
+# forced reclaim: 98.6 % and 99.2 % measured 2026-09-09, which aborted both halves of the P8
+# gate and left it comparing two EMPTY files -- reported as "IDENTICAL (0 positions)").
 warm
-resid "$TAG-pre" || { echo "ABORT: not 100% resident after warm"; exit 1; }
+resid "$TAG-pre" || { echo "residency below the floor -- warming again"; warm; \
+  resid "$TAG-pre2" || { echo "ABORT: below PROFILE_MIN_RESIDENT=${PROFILE_MIN_RESIDENT:-100} after two warms"; exit 1; }; }
 P=$(cat "$PF")
 echo "### prefill_profile tag=$TAG bin=$BIN prompt=$PF chunk=$CHUNK $(date -Is)" | tee "$LOG"
 t0=$(date +%s.%N)

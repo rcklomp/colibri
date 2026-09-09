@@ -79,10 +79,15 @@ echo "pristine shaders: $PSHADERS ($(ls $PSHADERS/*.spv | wc -l) files, kda_step
 
 echo "--- the owner's last requests (nothing may be in flight)"
 ~/bench/owui_report.sh 2
+# `grep -c` already prints 0 when it matches nothing -- and exits 1 while doing
+# it, so the `|| echo 0` that serve_candidate.sh writes here appends a SECOND
+# zero and the comparison becomes `[ "0\n0" -le "0\n0" ]`, which is not a
+# number, never breaks, and parks the chain in this loop for an hour. Measured
+# 2026-09-09 20:30 on an idle log (no requests since the gateway restart).
 for _ in $(seq 1 360); do
-  posts=$(grep -c "POST /v1/chat/completions\|POST /v1/completions" $LOG 2>/dev/null || echo 0)
-  reqs=$(grep -c "\[req\] " $LOG 2>/dev/null || echo 0)
-  [ "$posts" -le "$reqs" ] && break
+  posts=$(grep -c "POST /v1/chat/completions\|POST /v1/completions" $LOG 2>/dev/null)
+  reqs=$(grep -c "\[req\] " $LOG 2>/dev/null)
+  [ "${posts:-0}" -le "${reqs:-0}" ] && break
   echo "    a request is in flight ($posts posted, $reqs finished) -- waiting"
   sleep 10
 done

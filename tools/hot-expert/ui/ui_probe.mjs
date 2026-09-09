@@ -41,7 +41,10 @@ const arg = (name, dflt = null) => {
   return (!next || next.startsWith('--')) ? true : next;
 };
 const url = String(arg('url', 'http://rome.local:3000')).replace(/\/$/, '');
-const question = String(arg('question', 'Which day comes after Tuesday? Answer in one word.'));
+let question = String(arg('question', 'Which day comes after Tuesday? Answer in one word.'));
+const textFile = arg('text-file', null);
+if (textFile) question = (await import('node:fs')).readFileSync(String(textFile), 'utf8');
+const followUp = arg('follow-up', null);
 const timeoutMs = Number(arg('timeout', 900)) * 1000;
 const shot = arg('shot', null);
 const token = process.env.OWUI_TOKEN;
@@ -50,6 +53,7 @@ if (!token) { console.log('RESULT ok=0 error=no_OWUI_TOKEN'); process.exit(2); }
 const out = { ok: 0, first_token_s: '-', done_s: '-', chars: 0, chat: '-', error: '-', reply: '', cleaned: '-', browser: 'bundled' };
 const done = (code) => {
   console.log(`RESULT ok=${out.ok} first_token_s=${out.first_token_s} done_s=${out.done_s} ` +
+              `follow_first_s=${out.follow_first_s ?? '-'} follow_done_s=${out.follow_done_s ?? '-'} ` +
               `chars=${out.chars} chat=${out.chat} cleaned=${out.cleaned} browser=${out.browser} error=${out.error}` +
               (out.reply ? ` reply="${out.reply}"` : ''));
   process.exit(code);
@@ -91,7 +95,10 @@ try {
   const box = page.locator('#chat-input, textarea#chat-textarea, [contenteditable="true"]').first();
   await box.waitFor({ state: 'visible', timeout: 60000 });
   await box.click();
-  await box.type(question, { delay: 8 });
+  // insertText, not per-character typing: a 4 000-token paste would otherwise spend two
+  // minutes in the keyboard before the request is even sent, which is not what we measure.
+  if (question.length > 400) await page.keyboard.insertText(question);
+  else await box.type(question, { delay: 8 });
 
   // The turns already on screen, so the new assistant bubble can be told apart.
   const before = await page.evaluate(() => [...document.querySelectorAll('[id^="message-"]')].map((n) => n.id));
@@ -146,6 +153,35 @@ try {
   out.chat = m ? m[1] : '-';
   out.ok = out.chars > 0 ? 1 : 0;
   if (!out.ok) out.error = 'empty_reply';
+
+  console.log(`TURN 1 first_token_s=${out.first_token_s} done_s=${out.done_s} chars=${out.chars}`);
+
+  // A second turn in the SAME chat: what every reply after the first costs.
+  if (followUp) {
+    const before2 = await page.evaluate(() => [...document.querySelectorAll('[id^="message-"]')].map((n) => n.id));
+    const box2 = page.locator('#chat-input, textarea#chat-textarea, [contenteditable="true"]').first();
+    await box2.click();
+    await box2.type(String(followUp), { delay: 8 });
+    const t1 = Date.now();
+    await page.keyboard.press('Enter');
+    const first2 = await page.waitForFunction((known) => {
+      const isAssistant = (n) => n.id !== 'message-input-container' &&
+        !(n.className || '').toString().includes('user-message');
+      for (const n of document.querySelectorAll('[id^="message-"]')) {
+        if (!isAssistant(n) || known.includes(n.id)) continue;
+        const body = n.querySelector('.markdown-prose, .prose');
+        if (body && (body.innerText || '').trim().length > 0) return Date.now();
+      }
+      return false;
+    }, before2, { timeout: timeoutMs, polling: 250 }).then((h) => h.jsonValue());
+    await page.waitForFunction(() => {
+      const stop = document.querySelector('#stop-response-button, button[aria-label*="Stop" i]');
+      return !stop || stop.offsetParent === null;
+    }, null, { timeout: timeoutMs, polling: 800 }).catch(() => {});
+    out.follow_first_s = ((first2 - t1) / 1000).toFixed(2);
+    out.follow_done_s = ((Date.now() - t1) / 1000).toFixed(2);
+    console.log(`TURN 2 first_token_s=${out.follow_first_s} done_s=${out.follow_done_s}`);
+  }
 
   // Leave no trace: the probe's chat is deleted unless --keep-chat.
   if (out.chat !== '-' && arg('keep-chat') !== true) {

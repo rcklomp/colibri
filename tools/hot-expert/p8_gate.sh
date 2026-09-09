@@ -63,6 +63,16 @@ echo "    pristine=$PRISTINE candidate=$CAND"
 echo "    outputs in $OUT"
 
 rc1=0; rc2=0; rc3=0; rc4=0
+# A step that did not RUN must not read like a step that passed. The 2026-09-09
+# run printed "step 3 rc=0 / step 4 rc=0" under GATE_STEPS=12, for two steps
+# that were never started -- the same class of defect the track keeps recording
+# ("a live step that only prints a number is not a gate"). Each step says
+# whether it ran, and the verdict prints "-- (not run)" when it did not.
+ran1=0; ran2=0; ran3=0; ran4=0
+verdict_line() {  # verdict_line <label> <ran> <rc>
+  if [ "$2" = 1 ]; then printf "  %-34s rc=%s\n" "$1" "$3"
+  else printf "  %-34s -- (not run)\n" "$1"; fi
+}
 
 # ---------------------------------------------------------------- (1)
 if run_step 1; then
@@ -74,7 +84,7 @@ if run_step 1; then
   echo "    pristine and candidate are $([ $SELF = 1 ] && echo "THE SAME BYTES" || echo "different binaries")"
   GLM53_PREFIX_CKPT=0 COLI_CKPT_DIR="$OUT/ckpt/step1" MIN_SPEEDUP=${MIN_SPEEDUP:-0.97} \
     "$HERE/prefill_gate.sh" "$PRISTINE" "$CAND" "$TAG-off" 2>&1 | tee "$OUT/step1.txt"
-  rc1=${PIPESTATUS[0]}
+  rc1=${PIPESTATUS[0]}; ran1=1
   wait_no_engine || exit 2
   # A file compared with ITSELF cannot be slower than itself: when the two
   # binaries are byte-identical the speed half of prefill_gate measures the
@@ -102,6 +112,7 @@ if run_step 2; then
   if pgrep -x glm53 >/dev/null; then echo "REFUSED: a glm53 is running"; exit 2; fi
   # A COPY of the histogram, never the canonical file: the engine rewrites
   # COLI_USAGE_PATH at exit and a benchmark must not teach the serving tier.
+  ran2=1
   cp -f "$HOME/.glm53_explain.bin" "$OUT/hist_tworeq.bin" 2>/dev/null || true
   for knob in 2 0; do
     echo "--- tworeq COLI_KDA_GPU=$knob TWOREQ_SLOTS=4"
@@ -170,9 +181,9 @@ if run_step 3 || run_step 4; then
   echo "### steps 3 and 4 — the live half, on the SERVED gateway"
   pgrep -f "openai_[s]erver.py" >/dev/null || { echo "REFUSED: the gateway is not running"; exit 2; }
   echo "--- arm A: COLI_REPLY_PIN default (1)"
-  run_step 4 && identity_run on
+  run_step 4 && { ran4=1; identity_run on; }
   ONP=0; ONF=0
-  if run_step 3; then read -r ONP ONF <<<"$(case_arm on)"; fi
+  if run_step 3; then ran3=1; read -r ONP ONF <<<"$(case_arm on)"; fi
 
   echo "--- restarting the gateway with COLI_REPLY_PIN=0 (the control arm)"
   gw_stop || exit 2
@@ -217,10 +228,11 @@ fi
 # ---------------------------------------------------------------- verdict
 echo
 echo "=== p8_gate $TAG verdict $(date -Is)"
-printf "  step 1  prefill_gate (ckpt off)      rc=%s\n" "$rc1"
-printf "  step 2  tworeq 4 slots, both knobs   rc=%s\n" "$rc2"
-printf "  step 3  reasoning case, on vs off    rc=%s\n" "$rc3"
-printf "  step 4  text identity                rc=%s\n" "$rc4"
+verdict_line "step 1  prefill_gate (ckpt off)" "$ran1" "$rc1"
+verdict_line "step 2  tworeq 4 slots, both knobs" "$ran2" "$rc2"
+verdict_line "step 3  reasoning case, on vs off" "$ran3" "$rc3"
+verdict_line "step 4  text identity" "$ran4" "$rc4"
+[ "$ran3$ran4" = "11" ] || echo "  NOTE: this run did NOT gate the item -- the live half is what P8 is about"
 echo "  outputs in $OUT"
 [ "$rc1" = 2 ] && exit 2
 [ "$rc1" = 1 ] && exit 1

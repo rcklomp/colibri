@@ -141,6 +141,19 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - A daily canary (`accept_live.sh --canary`, cron 05:00 UTC, log
   `~/bench/accept_live.log`) re-checks the user's path and captures the tool
   block again whenever Open WebUI's tool list drifts.
+- **Before telling the owner that anything about serving works, run
+  `tools/hot-expert/accept_ui.sh` from the Mac.** It drives Open WebUI in a
+  real Chromium at the rig's IPv4 (mDNS gives only a link-local IPv6, which
+  Chrome refuses): a new chat, a typed question, and the first token as it
+  appears ON SCREEN — then the rig-side `accept_live.sh` over ssh. Measured
+  2026-09-09: first token 3.58 s and 3.82 s in the browser against 2.2–2.6 s
+  at the gateway; the difference is front end and network, and it is the
+  number the owner actually waits for. The probe signs in with a token minted
+  inside the container (no password), deletes the chats it creates, and
+  labels `browser=system-chrome` when it had to fall back — those numbers are
+  ~10 s slower and not comparable. The rig has no browser and no Node, so
+  this gate cannot run there and is not the canary: it is what a session owes
+  the owner before saying "it works".
 
 ## Engines
 

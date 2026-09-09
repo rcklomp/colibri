@@ -45,7 +45,11 @@ def visible_of(raw):
 class ReplyPinRender(unittest.TestCase):
     def setUp(self):
         S._reply_pin_cache.clear()
-        self.env = patch.dict(S.os.environ, {"COLI_REPLY_PIN": "1"})
+        # P9 (2026-09-10): the conversation ledger subsumes this pin and turns it
+        # OFF when COLI_LEDGER=1 (its default), so these tests -- which are the
+        # fallback path's tests now -- state the knob they exercise. The ledger's
+        # own state machine is tested in test_glm53_ledger.py.
+        self.env = patch.dict(S.os.environ, {"COLI_REPLY_PIN": "1", "COLI_LEDGER": "0"})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -84,7 +88,7 @@ class ReplyPinRender(unittest.TestCase):
         self.assertEqual(p2, p1 + RAW + f"<|user|>{U2}<|assistant|><think>")
 
     def test_without_the_pin_the_reasoning_is_lost(self):
-        """The regression itself: this is what today's gateway renders."""
+        """The regression itself: this is what the pre-P8 gateway renders."""
         p1 = self.render(self.turn1())
         self.remember(self.turn1(), RAW)
         with patch.dict(S.os.environ, {"COLI_REPLY_PIN": "0"}):
@@ -97,6 +101,15 @@ class ReplyPinRender(unittest.TestCase):
         with patch.dict(S.os.environ, {"COLI_REPLY_PIN": "0"}):
             self.remember(self.turn1(), RAW)
         self.assertEqual(len(S._reply_pin_cache), 0)
+
+    def test_the_ledger_turns_this_pin_off(self):
+        """P9: not "unused" -- off, so a measurement can only be about one of them."""
+        with patch.object(S, "ARCH", "glm53"), patch.dict(S.os.environ, {"COLI_LEDGER": "1"}):
+            self.assertFalse(S.reply_pin_enabled())
+            self.remember(self.turn1(), RAW)
+            self.assertEqual(len(S._reply_pin_cache), 0)
+        with patch.object(S, "ARCH", "glm53"), patch.dict(S.os.environ, {"COLI_LEDGER": "0"}):
+            self.assertTrue(S.reply_pin_enabled())
 
     # ---- matching --------------------------------------------------------
     def test_trailing_whitespace_tolerance(self):

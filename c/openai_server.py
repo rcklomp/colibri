@@ -1824,7 +1824,7 @@ def _glm53_tool_calls(calls):
 
 
 def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                      tool_choice=None):
+                      tool_choice=None, parts=None):
     """Render the text-only subset of the official GLM-5.3-Flash chat template.
 
     Not a variant of the GLM-5.2 renderer above, and the differences are not
@@ -1841,6 +1841,14 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     The whole thing is pinned byte for byte against chat_template.jinja rendered
     with jinja2 (tests/test_glm53_chat_template.py). Getting the prompt nearly
     right is the failure mode worth guarding: the model answers either way.
+
+    P9: `parts`, when a list is passed, receives one `(owner, piece)` pair per
+    appended piece, `owner` being the index of the message that produced it or
+    None for the pieces the template owns (the opener, the effort line, the tool
+    block, the generation prompt). `"".join(piece for _, piece in parts)` IS the
+    returned prompt -- the ledger records those pieces and hands them back on a
+    later turn, so what it replays is the renderer's own output and not a
+    re-derivation of it.
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
@@ -1855,7 +1863,14 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     elif tool_choice == "none":
         tools = None                              # il client li ha vietati: non si offrono
 
-    prompt = ["[gMASK]<sop>"]
+    prompt = []
+    owners = []
+
+    def put(piece, owner=None):
+        prompt.append(piece)
+        owners.append(owner)
+
+    put("[gMASK]<sop>")
     # La riga di effort esce SEMPRE, come nel template: `effective_reasoning_effort`
     # ha un ramo else che vale 'max', quindi non e' mai none. GLM-5.3 non ha un modo
     # "non ragionare" -- in questo template `enable_thinking` non esiste proprio, e
@@ -1879,25 +1894,36 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     effort = {"minimal": "Low", "low": "Low", "medium": "High",
               "high": "High", "xhigh": "Max"}.get(reasoning_effort,
                                                   "Max" if enable_thinking else "Low")
-    prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    put(f"<|system|>Reasoning Effort: {effort}")
     if tools:
-        prompt.append(_glm53_tool_block(tools))
+        put(_glm53_tool_block(tools))
 
-    for message in messages:
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "each message must be an object.", "messages")
         role = message.get("role")
+        if role not in ("user", "system", "tool", "assistant"):
+            raise APIError(400, f"unsupported message role {role!r}.", "messages")
+        # P9: the exact piece THIS gateway rendered for this turn when the engine
+        # ground it. Set only on a COPY of a message whose visible text still
+        # matches what the ledger recorded, and only ever one piece per message
+        # the client sent -- the ledger cannot add a turn, it can only re-spell
+        # one. Subsumes REPLY_PIN_FIELD below, which stays for COLI_LEDGER=0.
+        replay = message.get(LEDGER_FIELD)
+        if isinstance(replay, str) and replay:
+            put(replay, index)
+            continue
         content = message.get("content")
         if isinstance(content, list):                 # parti multimodali: solo il testo
             content = "".join(part.get("text", "") for part in content
                               if isinstance(part, dict) and part.get("type") == "text")
         content = content or ""
         if role == "user":
-            prompt.append(f"<|user|>{content}")
+            put(f"<|user|>{content}", index)
         elif role == "system":
-            prompt.append(f"<|system|>{content}")
+            put(f"<|system|>{content}", index)
         elif role == "tool":
-            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
+            put(f"<|observation|><tool_response>{content}</tool_response>", index)
         elif role == "assistant":
             pinned = message.get(REPLY_PIN_FIELD)
             if isinstance(pinned, str) and pinned:
@@ -1908,17 +1934,15 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                 # matching the tokens the KV slot holds; reproducing the raw text
                 # is the whole point of the pin. Tool-call markup, if this turn
                 # had any, is already inside it in the model's own form.
-                prompt.append(f"<|assistant|><think>{pinned}")
+                put(f"<|assistant|><think>{pinned}", index)
                 continue
             reasoning = message.get("reasoning_content")
             if not isinstance(reasoning, str) and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1]
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
-            prompt.append(f"<|assistant|>{opened}{content.strip()}"
-                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
-        else:
-            raise APIError(400, f"unsupported message role {role!r}.", "messages")
+            put(f"<|assistant|>{opened}{content.strip()}"
+                f"{_glm53_tool_calls(message.get('tool_calls'))}", index)
 
     # Il prompt di generazione apre il blocco, sempre, come il template:
     #     {%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}
@@ -1926,18 +1950,27 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     # su cui il modello e' addestrato" perche' il template lo scrive davanti a un
     # TURNO PASSATO senza ragionamento. E' vero per un turno passato e falso per il
     # prompt di generazione: la posizione da cui il modello scrive non e' mai quella.
-    prompt.append("<|assistant|><think>")
+    put("<|assistant|><think>")
+    if parts is not None:
+        parts.extend(zip(owners, prompt))
     return "".join(prompt)
 
 
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                         tool_choice=None, audio_out=None):
-    """Render a chat request with the active engine's native prompt contract."""
+                         tool_choice=None, audio_out=None, parts=None):
+    """Render a chat request with the active engine's native prompt contract.
+
+    `parts` (P9) is honoured by the glm53 renderer only -- it is the engine the
+    ledger runs for, and the other renderers must not grow a parameter no caller
+    of theirs passes.
+    """
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out)
-    renderer = (render_chat_glm53 if ARCH == "glm53" else
-                render_chat_kimi if ARCH == "kimi" else
+    if ARCH == "glm53":
+        return render_chat_glm53(messages, enable_thinking, reasoning_effort, tools,
+                                 tool_choice, parts=parts)
+    renderer = (render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
@@ -2319,6 +2352,13 @@ def pin_context_blocks(messages):
     """
     if os.environ.get("COLI_PREFIX_PIN", "0") != "1":
         return messages
+    if ledger_enabled():
+        # P9: the ledger replays the head system messages as the renderer wrote
+        # them on turn 1, context block included, so this pin has nothing left to
+        # do. Two mechanisms rewriting the same message would make every
+        # measurement ambiguous about which one fired; COLI_LEDGER=0 brings this
+        # one back exactly as it was.
+        return messages
     if not isinstance(messages, list) or not messages:
         return messages
     head = messages[0]
@@ -2408,10 +2448,15 @@ _reply_pin_lock = threading.Lock()
 
 
 def reply_pin_enabled():
+    # P9: the ledger records the raw generation as one of its turn pieces, which
+    # is this pin generalised -- so under COLI_LEDGER=1 the pin is off, not
+    # merely unused. COLI_LEDGER=0 is the fallback path, pins included.
+    if ledger_enabled():
+        return False
     return os.environ.get("COLI_REPLY_PIN", "1") == "1"
 
 
-def conversation_pin_key(messages):
+def conversation_pin_key(messages, normalise=False):
     """A key that stays constant for the life of one conversation.
 
     The same idea conversation_cache_slot uses -- the leading system messages
@@ -2419,10 +2464,18 @@ def conversation_pin_key(messages):
     of the system text, so the key does not move when Open WebUI re-ranks its
     memory block. That re-ranking is what COLI_PREFIX_PIN absorbs, and this key
     has to work whether that knob is on or off.
+
+    `normalise=True` (P9) strips the identifying text the same way the ledger
+    normalises a turn. A client that trims trailing whitespace off the first
+    message must not land in a different conversation from the one it is
+    continuing -- that is the same class of defect as every other one this week,
+    and it would be invisible except as latency. P8's callers keep the exact
+    text, so their recorded behaviour does not move.
     """
     if not isinstance(messages, list) or not messages:
         return None
     tags = prefix_pin_tags()
+    fold = (lambda t: t.strip()) if normalise else (lambda t: t)
     parts = []
     for message in messages:
         if not isinstance(message, dict):
@@ -2431,9 +2484,9 @@ def conversation_pin_key(messages):
         text = message_text(message)
         if role == "system":
             split = split_context_block(text, tags)
-            parts.append("s:" + (split[0] if split else text))
+            parts.append("s:" + fold(split[0] if split else text))
         elif role == "user":
-            parts.append("u:" + text)
+            parts.append("u:" + fold(text))
             break
     if not parts:
         return None
@@ -2547,6 +2600,484 @@ def apply_reply_pin(messages):
             print(f"[reply-pin] key={key[:8]} turn={turn_no + 1} restored={chars}",
                   file=sys.stderr, flush=True)
     return out
+
+
+# ---- P9 (2026-09-10): the conversation ledger --------------------------------
+#
+# Spec: tools/hot-expert/P9-CONVERSATION-LEDGER-SPEC-2026-09.md.
+#
+# Prefix reuse rests on a contract nobody enforced: the transcript the client
+# re-sends must re-render to exactly the token sequence the engine already
+# holds. Open WebUI broke it three times in three days and each break cost the
+# owner minutes per turn and showed up as nothing but latency -- a re-ranked
+# <memory_context> block (P7, turn 2 reused 0/195, 21.6 s), a UI-shaped prompt
+# the engine had never planned a capture beyond (P7b, 362.94 s per new chat),
+# and an assistant turn stored as visible content with the <think> block dropped
+# (P8, 54.07 s against 2.7 s). Three patches, three knobs, and no reason to
+# think there is not a fourth behaviour.
+#
+# So stop patching behaviours. The gateway is the only party that knows what it
+# caused the engine to grind, so it keeps that text per conversation -- the
+# renderer's own pieces, not a re-derivation -- and renders every later turn
+# from its record rather than from the client's copy of it. The client's copy is
+# used only to IDENTIFY each turn.
+#
+# The safety rule, which nothing below may break:
+#
+#   The ledger DECORATES the client's transcript; it never replaces it. A turn
+#   is replayed only when its visible content still matches what was recorded,
+#   there is exactly one rendered piece per message the client sent, and no
+#   content ever crosses from one conversation to another. The ledger never
+#   injects a turn the client did not send and never changes what the user sees:
+#   it changes only what is sent BACK to the engine.
+#
+# That rule is what makes the derived key harmless. Open WebUI pops `metadata`
+# (with `chat_id`) before forwarding upstream (routers/openai.py:1490), so the
+# gateway sees only the OpenAI body and two chats opening with the same first
+# message share a key by construction. The match rule makes the collision a
+# miss: the other conversation's transcript does not match, so the record is
+# dropped rather than injected.
+#
+# And the check this project has been missing (§3.3): before submitting a
+# continuation the gateway asserts that the new prompt really does start with
+# `ledger.prompt + ledger.generated`. It is a string comparison over text the
+# gateway produced itself, so it is cheap and total, and it would have caught
+# all three defects above before a user saw one. On failure the request falls
+# back to the client's own rendering -- slow, correct, and loud.
+#
+# Knobs (§5):
+#   COLI_LEDGER            1  0 = today's path exactly, P7's pin and P8's reply
+#                             pin included, for A/B and for a fast rollback
+#   COLI_LEDGER_MAX_CONV  64  LRU size, ~50 KB of text per conversation
+#   COLI_LEDGER_STRICT     0  1 = refuse the request on a broken invariant
+#                             instead of falling back (gates only)
+#
+# When COLI_LEDGER=1 the two older pins are OFF, not merely unused: the ledger
+# subsumes both (its `prefix` holds turn 1's context block, its turn pieces hold
+# the raw generation), and two mechanisms rewriting the same messages would make
+# every measurement ambiguous about which one fired.
+LEDGER_FIELD = "_coli_ledger_rendered"    # private, set on a COPY of the message
+LEDGER_DEFAULT_MAX_CONV = 64
+_ledger_cache = collections.OrderedDict()
+_ledger_lock = threading.RLock()
+
+
+def ledger_enabled():
+    """The ledger runs for glm53 only: it is the engine whose renderer reports
+    its pieces, and the one whose serving path this track measures."""
+    return ARCH == "glm53" and os.environ.get("COLI_LEDGER", "1") == "1"
+
+
+def ledger_strict():
+    return os.environ.get("COLI_LEDGER_STRICT", "0") == "1"
+
+
+def ledger_max_conv():
+    try:
+        return max(1, int(os.environ.get("COLI_LEDGER_MAX_CONV", "")
+                          or LEDGER_DEFAULT_MAX_CONV))
+    except ValueError:
+        return LEDGER_DEFAULT_MAX_CONV
+
+
+def ledger_log(line, force=False):
+    if force or os.environ.get("COLI_REQ_LOG"):
+        print(line, file=sys.stderr, flush=True)
+
+
+def ledger_split_head(messages):
+    """(head, turns): the LEADING system messages, then everything after them.
+
+    The head is what every turn of the conversation shares -- the tool block is
+    rendered before it, the pinned memory block sits at the end of it. A system
+    message that arrives LATER in the history is a turn like any other (P7b's
+    fixture had one), so the split stops at the first non-system message.
+    """
+    cut = 0
+    while (cut < len(messages) and isinstance(messages[cut], dict)
+           and messages[cut].get("role") == "system"):
+        cut += 1
+    return messages[:cut], messages[cut:]
+
+
+def ledger_tools_sig(tools, tool_choice):
+    """A conversation keeps the tool block it started with, or it starts over.
+
+    The spec would rather pin the block (a mid-session tool-list change would
+    then cost nothing until the next new chat). It is NOT pinned here, and the
+    reason is the safety rule above: rendering a declaration the client no
+    longer sends would let the model call a tool the client cannot execute, and
+    the answer the user sees would change. A changed tool list is a genuinely
+    different prefix, the engine cannot reuse it either way, and P7's checkpoint
+    already covers what is shared. So the signature is a GUARD, not a pin.
+    """
+    try:
+        raw = json.dumps([tools, tool_choice], sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        raw = repr((tools, tool_choice))
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def ledger_tool_call_sig(message):
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    if not calls:
+        return ""
+    try:
+        return json.dumps(calls, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(calls)
+
+
+def ledger_turn_key(message):
+    """How a turn is IDENTIFIED in the client's copy: role + normalised text.
+
+    Assistant turns use P8's normalisation, because that is what clients do to
+    what they store: strip, and keep only the part after `</think>` when the
+    whole block came back inside `content`. User and tool turns are stripped for
+    the same reason -- a client that trims trailing whitespace off a message is
+    the fourth behaviour this item exists to make harmless, and it is the one
+    neither existing pin covers.
+    """
+    role = message.get("role")
+    text = message_text(message)
+    if role == "assistant":
+        return (role, reply_pin_norm(text), ledger_tool_call_sig(message))
+    return (role, text.strip(), "")
+
+
+def ledger_decide(recorded, client_turns):
+    """The state machine, as a pure function of two lists of turn keys.
+
+    Returns `(state, matched)`:
+      * `continuation` -- every recorded turn matched in order and the client
+        may add new ones after them;
+      * `shorter`      -- the client stopped early (regenerate, edit, branch):
+        truncate the record to `matched` and render from there. The engine
+        cannot rewind, so this re-prefills; that is correct, not a regression;
+      * `diverged`     -- the content differs mid-history: drop the record,
+        render the client's version verbatim, start again.
+    """
+    matched = 0
+    while (matched < len(recorded) and matched < len(client_turns)
+           and recorded[matched] == client_turns[matched]):
+        matched += 1
+    if matched == len(recorded):
+        return "continuation", matched
+    if matched == len(client_turns):
+        return "shorter", matched
+    return "diverged", matched
+
+
+def ledger_expect_reuse(entry):
+    """How many tokens of the next prompt the engine should already hold.
+
+    `slot_remember(slot, sequence, total)` leaves prompt + generated in the
+    slot, and `session->filled` reaches the same number because every generated
+    token but the last is fed back -- and the last one is too, except when the
+    turn stopped on its token budget, where `forward_span` is skipped and the
+    session is one position short (glm53.c serve_one). So the prediction is the
+    previous turn's `prompt_tokens + completion_tokens`, minus one when that
+    turn was length-limited. A cancelled turn stopped somewhere the gateway
+    cannot name, so it predicts nothing at all.
+    """
+    if entry.get("partial") or entry.get("prompt_tokens") is None:
+        return None
+    total = entry["prompt_tokens"] + entry.get("gen_tokens", 0)
+    return total - 1 if entry.get("length_limited") else total
+
+
+def ledger_pick_slot(key, kv_slots):
+    """The conversation owns a slot for its life (§3.5).
+
+    This replaces the hash-modulo routing of conversation_cache_slot for chat
+    requests: two conversations that hash alike stop evicting each other, and a
+    conversation that is still being used keeps its slot against one that is
+    not. Called under _ledger_lock.
+    """
+    if kv_slots <= 1:
+        return 0
+    taken = {e["slot"] for k, e in _ledger_cache.items() if k != key}
+    for slot in range(kv_slots):
+        if slot not in taken:
+            return slot
+    return _ledger_cache[next(iter(_ledger_cache))]["slot"]     # the LRU one
+
+
+def _ledger_new_entry(key, kv_slots):
+    return {"key": key, "slot": ledger_pick_slot(key, kv_slots), "head": [],
+            "turns": [], "prefix": "", "prompt": "", "generated": "",
+            "tools_sig": None, "effort": None, "prompt_tokens": None,
+            "gen_tokens": 0, "length_limited": False, "partial": False,
+            "used": time.time()}
+
+
+class LedgerPlan:
+    """What one request decided, carried from the render to the record."""
+
+    def __init__(self, key, slot, state, matched, messages, expect_reuse, turn_no,
+                 replayed=None):
+        self.key = key
+        self.slot = slot
+        self.state = state            # continuation | shorter | diverged | new | broken
+        self.matched = matched        # where the walk stopped (diagnostics)
+        self.replayed = matched if replayed is None else replayed
+        self.messages = messages      # the list the renderer saw (copies where annotated)
+        self.expect_reuse = expect_reuse
+        self.turn_no = turn_no
+        self.parts = None
+        self.prompt = None
+        self.tools_sig = None
+        self.effort = None
+
+
+def ledger_render(messages, enable_thinking, reasoning_effort, tools, tool_choice,
+                  kv_slots, audio_out=None):
+    """Render this request the ledger's way. Returns `(prompt, plan)`.
+
+    `plan` is None when the ledger is off or unusable, and the caller then does
+    exactly what it did before. ANY exception inside this function falls back to
+    the client's rendering and logs: the ledger may never be the reason a
+    request fails (§5).
+    """
+    plain = lambda: render_chat_for_arch(messages, enable_thinking, reasoning_effort,
+                                         tools, tool_choice, audio_out=audio_out)
+    if not ledger_enabled():
+        return plain(), None
+    try:
+        return _ledger_render(messages, enable_thinking, reasoning_effort, tools,
+                              tool_choice, kv_slots)
+    except APIError:
+        raise                       # a malformed request is the client's error, not ours
+    except Exception as exc:        # pragma: no cover - the fail-safe itself
+        ledger_log(f"[ledger] error={type(exc).__name__}:{str(exc)[:120]!r} "
+                   f"-- falling back to the client's rendering", force=True)
+        return plain(), None
+
+
+def _ledger_render(messages, enable_thinking, reasoning_effort, tools, tool_choice,
+                   kv_slots):
+    key = conversation_pin_key(messages, normalise=True)
+    if key is None or not isinstance(messages, list):
+        return render_chat_for_arch(messages, enable_thinking, reasoning_effort,
+                                    tools, tool_choice), None
+    head, turns = ledger_split_head(messages)
+    client_keys = [ledger_turn_key(m) for m in turns if isinstance(m, dict)]
+    if len(client_keys) != len(turns):
+        return render_chat_for_arch(messages, enable_thinking, reasoning_effort,
+                                    tools, tool_choice), None
+    tools_sig = ledger_tools_sig(tools, tool_choice)
+    effort = (bool(enable_thinking), reasoning_effort)
+
+    with _ledger_lock:
+        entry = _ledger_cache.get(key)
+        if entry is not None:
+            _ledger_cache.move_to_end(key)
+        prev_slot = entry["slot"] if entry is not None else None
+        reason = None
+        if entry is not None:
+            # The head is replayed only when it is still THE SAME head: same
+            # number of leading system messages (the key already pins their text
+            # with the per-turn context block stripped out), same tool block,
+            # same reasoning effort. Anything else is a different prefix, and
+            # the engine agrees -- it would re-prefill either way.
+            if len(entry["head"]) != len(head):
+                reason = "head"
+            elif entry["tools_sig"] != tools_sig:
+                reason = "tools"
+            elif entry["effort"] != effort:
+                reason = "effort"
+            if reason:
+                entry = None
+        if entry is None:
+            state, matched = ("new", 0)
+            replayed = 0
+            if reason:
+                state = "reset"
+            entry = _ledger_new_entry(key, kv_slots)
+            if prev_slot is not None:
+                entry["slot"] = prev_slot     # the conversation keeps its slot
+            _ledger_cache[key] = entry
+            _ledger_cache.move_to_end(key)
+            while len(_ledger_cache) > ledger_max_conv():
+                _ledger_cache.popitem(last=False)
+            if reason:
+                ledger_log(f"[ledger] key={key[:8]} ledger=reset reason={reason}")
+        else:
+            state, matched = ledger_decide([t["id"] for t in entry["turns"]], client_keys)
+            replayed = matched
+            if state == "diverged":
+                ledger_log(f"[ledger] key={key[:8]} ledger=reset reason=diverged "
+                           f"at={matched + 1}")
+                entry["turns"] = []
+                entry["prompt"] = entry["generated"] = ""
+                entry["prompt_tokens"] = None
+                entry["partial"] = False
+                replayed = 0
+            elif state == "shorter":
+                ledger_log(f"[ledger] key={key[:8]} ledger=reset reason=shorter "
+                           f"at={matched + 1} kept={matched}")
+                del entry["turns"][matched:]
+                entry["prompt"] = entry["generated"] = ""
+                entry["prompt_tokens"] = None
+                entry["partial"] = False
+        # The slot is chosen ONCE, when the record is created, and kept: this is
+        # what replaces conversation_cache_slot's hash-modulo routing, and
+        # re-picking it per request would put the collisions straight back.
+        slot = entry["slot"] if kv_slots > 1 else 0
+        entry["used"] = time.time()
+        replay_head = list(entry["head"])
+        replay_turns = [t["rendered"] for t in entry["turns"][:replayed]]
+        expect = ledger_expect_reuse(entry) if state == "continuation" else None
+        recorded_prompt = entry["prompt"] + entry["generated"]
+
+    # Decorate: one piece per message the client sent, never one more. The
+    # annotated entries are COPIES, so the caller's body is untouched.
+    annotated = list(messages)
+    for index, piece in enumerate(replay_head):
+        annotated[index] = dict(annotated[index], **{LEDGER_FIELD: piece})
+    for offset, piece in enumerate(replay_turns):
+        index = len(head) + offset
+        annotated[index] = dict(annotated[index], **{LEDGER_FIELD: piece})
+    if len(annotated) != len(messages):     # structurally impossible; assert it anyway
+        raise RuntimeError("the ledger changed the number of turns")
+
+    parts = []
+    prompt = render_chat_for_arch(annotated, enable_thinking, reasoning_effort,
+                                  tools, tool_choice, parts=parts)
+    turn_no = len(client_keys)
+
+    # (§3.3) The check. Only a continuation claims a prefix, so only a
+    # continuation can claim one it does not have.
+    if state == "continuation" and replayed and recorded_prompt:
+        if not prompt.startswith(recorded_prompt):
+            offset = next((i for i in range(min(len(prompt), len(recorded_prompt)))
+                           if prompt[i] != recorded_prompt[i]), min(len(prompt), len(recorded_prompt)))
+            ledger_log(f"[ledger] key={key[:8]} turn={turn_no} ledger=broken at={offset} "
+                       f"expected={recorded_prompt[offset:offset + 40]!r} "
+                       f"got={prompt[offset:offset + 40]!r}", force=True)
+            if ledger_strict():
+                raise APIError(500, "the conversation ledger's prefix invariant failed.",
+                               None, "ledger_broken", "server_error")
+            with _ledger_lock:
+                stale = _ledger_cache.get(key)
+                if stale is not None:
+                    stale["turns"] = []
+                    stale["prompt"] = stale["generated"] = ""
+                    stale["prompt_tokens"] = None
+            plan = LedgerPlan(key, slot, "broken", matched, messages, None, turn_no,
+                              replayed=0)
+            plan.parts = []
+            plan.prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
+                                               tools, tool_choice, parts=plan.parts)
+            plan.tools_sig, plan.effort = tools_sig, effort
+            return plan.prompt, plan
+
+    plan = LedgerPlan(key, slot, state, matched, annotated, expect, turn_no,
+                      replayed=replayed)
+    plan.parts = parts
+    plan.prompt = prompt
+    plan.tools_sig, plan.effort = tools_sig, effort
+    return prompt, plan
+
+
+def ledger_record(plan, raw, visible, stats, cancelled=False):
+    """(§3.4) On DONE, keep what the engine now holds: the pieces of the prompt
+    it just ground plus the raw text it generated.
+
+    The assistant turn appended here is the gateway's own record of what it
+    caused, NOT a message injected into anybody's transcript: it is used on a
+    later turn only if the client sends an assistant turn whose visible content
+    matches it, at that position.
+    """
+    if plan is None or not ledger_enabled():
+        return
+    try:
+        _ledger_record(plan, raw, visible, stats, cancelled)
+    except Exception as exc:        # pragma: no cover - the fail-safe itself
+        ledger_log(f"[ledger] record error={type(exc).__name__}:{str(exc)[:120]!r}",
+                   force=True)
+        with _ledger_lock:
+            _ledger_cache.pop(plan.key, None)
+
+
+def _ledger_record(plan, raw, visible, stats, cancelled):
+    parts = plan.parts or []
+    head, turns = ledger_split_head(plan.messages)
+    head_count = len(head)
+    owned = [(owner, piece) for owner, piece in parts if owner is not None]
+    head_pieces = [piece for owner, piece in owned if owner < head_count]
+    body_pieces = [piece for owner, piece in owned if owner >= head_count]
+    if len(head_pieces) != head_count or len(body_pieces) != len(turns):
+        raise RuntimeError("the renderer did not report one piece per message")
+    # Everything the template owns before the first turn -- the opener, the
+    # effort line, the tool block -- plus the head messages themselves. Kept for
+    # the log and for glm53_prefix_cut's boundary, never replayed on its own.
+    first_body = next((i for i, (owner, _) in enumerate(parts)
+                       if owner is not None and owner >= head_count), len(parts))
+    prefix = "".join(piece for _owner, piece in parts[:first_body])
+    # The generation prompt: the last piece the template owns.
+    tail = next((piece for owner, piece in reversed(parts) if owner is None), "")
+
+    ids = [ledger_turn_key(m) for m in turns]
+    records = [{"id": i, "rendered": p} for i, p in zip(ids, body_pieces)]
+    if raw and not cancelled:
+        records.append({"id": ("assistant", reply_pin_norm(visible or ""),
+                               ""),
+                        "rendered": tail + raw})
+
+    with _ledger_lock:
+        entry = _ledger_cache.get(plan.key)
+        if entry is None:
+            entry = _ledger_new_entry(plan.key, 1)
+            entry["slot"] = plan.slot
+            _ledger_cache[plan.key] = entry
+        _ledger_cache.move_to_end(plan.key)
+        entry["head"] = head_pieces
+        entry["turns"] = records
+        entry["prefix"] = prefix
+        entry["tools_sig"] = plan.tools_sig
+        entry["effort"] = plan.effort
+        entry["slot"] = plan.slot
+        entry["used"] = time.time()
+        if cancelled:
+            # The engine kept `filled` positions and the gateway cannot name the
+            # number, so the record keeps the transcript (an identical retry then
+            # renders the same bytes and resumes where the cancel stopped -- P7's
+            # resumable prefill) and marks itself partial, which silences the
+            # reuse comparison for exactly one turn instead of raising a false
+            # MISMATCH.
+            entry["prompt"] = plan.prompt or ""
+            entry["generated"] = ""
+            entry["prompt_tokens"] = None
+            entry["partial"] = True
+        else:
+            entry["prompt"] = plan.prompt or ""
+            entry["generated"] = raw or ""
+            entry["prompt_tokens"] = (stats or {}).get("prompt_tokens")
+            entry["gen_tokens"] = (stats or {}).get("completion_tokens", 0)
+            entry["length_limited"] = bool((stats or {}).get("length_limited"))
+            entry["partial"] = False
+        while len(_ledger_cache) > ledger_max_conv():
+            _ledger_cache.popitem(last=False)
+
+
+def ledger_report(plan, stats):
+    """(§4) The one line per request that makes the engine's agreement visible.
+
+    `expect_reuse` is the gateway's arithmetic; `engine_reuse` is the 8th STAT
+    field. Every prefix regression this week was invisible except as latency;
+    this is the alarm, and accept_live.sh fails the daily canary on a MISMATCH.
+    """
+    if plan is None or not ledger_enabled():
+        return
+    engine = (stats or {}).get("reused")
+    head = f"[ledger] key={plan.key[:8]} turn={plan.turn_no} state={plan.state}"
+    if plan.expect_reuse is None or engine is None:
+        ledger_log(f"{head} expect_reuse=- engine_reuse={engine if engine is not None else '-'}")
+        return
+    ok = engine == plan.expect_reuse
+    ledger_log(f"{head} expect_reuse={plan.expect_reuse} engine_reuse={engine} "
+               f"{'ok' if ok else 'MISMATCH'}", force=not ok)
 
 
 def glm53_prefix_cut(prompt):
@@ -3051,6 +3582,10 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+            # P9: the engine's own prefix reuse, 8th field, append-only. None on
+            # an engine that does not send it -- the ledger's comparison then
+            # switches itself off rather than reporting a false MISMATCH.
+            "reused": int(fields[7]) if len(fields) > 7 else None,
         }
 
     def _fail_pending(self, error):
@@ -3937,7 +4472,8 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None, image=None, pin_messages=None):
+                   enable_thinking=False, audio=None, image=None, pin_messages=None,
+                   ledger=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -3974,6 +4510,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             remember_reply(conversation, raw_text,
                            reply_pin_visible(raw_text, enable_thinking, tools, tool_reply))
+
+        def record_ledger(raw_text, stats, tool_reply=None, cancelled=False):
+            """P9: what the engine now holds, kept for the next turn of this
+            conversation -- the renderer's own pieces plus the raw generation."""
+            if not chat or ledger is None:
+                return
+            ledger_record(ledger, raw_text,
+                          reply_pin_visible(raw_text, enable_thinking, tools, tool_reply),
+                          stats, cancelled=cancelled)
+            ledger_report(ledger, stats)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -3984,9 +4530,19 @@ class APIHandler(BaseHTTPRequestHandler):
             # #634: pin each conversation to a stable KV slot so multi-turn reuses its
             # cached prefix instead of re-prefilling. Only when the request carries a
             # conversation; raw /v1/completions keeps the scheduler's free-slot pick.
-            conversation = body.get("messages")
-            if isinstance(conversation, list) and conversation:
-                cache_slot = conversation_cache_slot(conversation, self.server.kv_slots)
+            #
+            # P9 (§3.5): when the ledger holds this conversation, IT owns the slot
+            # for the conversation's life. The hash-modulo rule below is blind to
+            # which slot already holds which conversation, so two conversations
+            # that hash alike evict each other for as long as both are live; the
+            # ledger knows, and picks a free slot first and the least recently
+            # used one only when there is none.
+            if ledger is not None:
+                cache_slot = ledger.slot
+            else:
+                conversation = body.get("messages")
+                if isinstance(conversation, list) and conversation:
+                    cache_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
@@ -4011,16 +4567,27 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
-                stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
-                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                    **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                try:
+                    stats = self.server.engine.generate(
+                        prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                        self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                        **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                        **({"audio": audio} if audio else {}),
+                        **({"image": image} if image is not None else {}))
+                except ClientCancelled:
+                    # P9 (§3.4): the slot is consistent at `filled` and the
+                    # gateway cannot name that number, so the record keeps the
+                    # transcript and marks itself partial -- an identical retry
+                    # renders the same bytes and resumes, and the reuse
+                    # comparison stays quiet for one turn instead of crying
+                    # MISMATCH at a cancel.
+                    record_ledger("".join(output), None, cancelled=True)
+                    raise
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
                 remember_generated(text, sideband.reply() if tools else None)
+                record_ledger(text, stats, sideband.reply() if tools else None)
                 reasoning = ""
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
@@ -4196,12 +4763,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
-                stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
-                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                    on_accept=start_stream, **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                try:
+                    stats = self.server.engine.generate(
+                        prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                        self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                        **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                        on_accept=start_stream, **({"audio": audio} if audio else {}),
+                        **({"image": image} if image is not None else {}))
+                except ClientCancelled:
+                    record_ledger("".join(pin_raw), None, sideband.reply(), cancelled=True)
+                    raise
                 stop_filter.finish()
                 sideband.finish()
                 if think:
@@ -4209,6 +4780,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 remember_generated("".join(pin_raw), sideband.reply())
+                record_ledger("".join(pin_raw), stats, sideband.reply())
                 _content, calls = parse_arch_tool_calls("".join(raw), tools,
                                                         sideband.reply())
                 for i, tc in enumerate(calls):
@@ -4231,15 +4803,20 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (content_split.feed if content_split else emit)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
-                stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                try:
+                    stats = self.server.engine.generate(
+                        prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                        self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
+                        on_accept=start_stream, **({"audio": audio} if audio else {}),
+                        **({"image": image} if image is not None else {}))
+                except ClientCancelled:
+                    record_ledger("".join(pin_raw), None, cancelled=True)
+                    raise
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
                 remember_generated("".join(pin_raw))
+                record_ledger("".join(pin_raw), stats)
                 finish = "length" if stats["length_limited"] else "stop"
             # generate() returned, so the prompt was ACCEPTed and start_stream() ran; guard anyway.
             start_stream()
@@ -4336,16 +4913,27 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")
             image = images[0] if images else None
-        # P8: give back the reasoning the client dropped, so the rendered prompt
-        # reproduces the tokens the KV slot already holds. A no-op unless this
-        # conversation has a remembered generation whose visible part matches.
-        render_messages = apply_reply_pin(messages)
-        prompt = render_chat_for_arch(render_messages, enable_thinking, reasoning_effort,
-                                      tools, tool_choice, audio_out=audio_clips)
+        # P9: render this turn from what the gateway RECORDED it made the engine
+        # grind, not from the client's re-derivation of it, and check the prefix
+        # claim before submitting. Falls back to the P8 path (which falls back to
+        # the plain render) whenever the ledger has nothing that matches, and
+        # when COLI_LEDGER=0 it is not consulted at all.
+        prompt, plan = ledger_render(messages, enable_thinking, reasoning_effort,
+                                     tools, tool_choice, self.server.kv_slots,
+                                     audio_out=audio_clips)
+        render_messages = plan.messages if plan is not None else None
+        if plan is None:
+            # P8: give back the reasoning the client dropped, so the rendered
+            # prompt reproduces the tokens the KV slot already holds. A no-op
+            # unless this conversation has a remembered generation whose visible
+            # part matches.
+            render_messages = apply_reply_pin(messages)
+            prompt = render_chat_for_arch(render_messages, enable_thinking, reasoning_effort,
+                                          tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
                         audio=b"".join(audio_clips) if audio_clips else None,
-                        image=image, pin_messages=render_messages)
+                        image=image, pin_messages=render_messages, ledger=plan)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}

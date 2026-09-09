@@ -5525,10 +5525,24 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                    m->t_attn - s_attn, m->t_head - s_head,
                    (unsigned long long)(m->forwards - s_fw));
     }
-    serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d\n", q->id, emitted,
+    /* P9 (2026-09-10): `reused` come ULTIMO campo di STAT.
+     *
+     * Fino a ieri quel numero usciva solo su stderr (la riga REUSE qui sopra) e
+     * nessuno lo leggeva a macchina: ogni regressione di riuso di prefisso di
+     * questa settimana e' stata invisibile se non come latenza. Il gateway ora
+     * confronta il riuso che si ASPETTA -- prompt_tokens + gen del turno prima,
+     * che e' esattamente quanto `slot_remember` ha lasciato nello slot -- con
+     * quello che il motore ha davvero fatto, e stampa MISMATCH quando i due non
+     * coincidono.
+     *
+     * Aggiunta IN CODA e basta: `Engine._stats` legge per posizione e ignora i
+     * campi che non conosce, quindi un gateway vecchio con questo motore
+     * continua a funzionare identico. Il contrario -- questo gateway con un
+     * motore vecchio -- da' `reused=None` e il confronto si spegne da solo. */
+    serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d %d\n", q->id, emitted,
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
-               rss_gb(), prompt_tokens, limited);
+               rss_gb(), prompt_tokens, limited, reused);
     /* L'ack, DOPO il DONE e in quest'ordine, che e' il risultato di aver letto
      * cosa ne fa il gateway (openai_server.py, Engine._dispatch e generate()):
      *

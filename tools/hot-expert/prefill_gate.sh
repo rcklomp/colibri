@@ -28,6 +28,20 @@ OUT=$HOME/bench/prefill_gate_$TAG
 mkdir -p "$OUT"
 
 if pgrep -x glm53 >/dev/null; then echo "REFUSED: a glm53 is running -- stop the gateway first"; exit 2; fi
+
+# Every step here spawns an engine that maps 180 GiB; unmapping it takes seconds to a minute,
+# and the NEXT step refuses while it lives ("one engine at a time"). Without this wait the
+# candidate's oracle run never starts and the gate compares a full file against an empty one
+# -- which is exactly how the P8 gate failed on 2026-09-09 (`teacher_forcing: NO DATA
+# (pristine 782 words, candidate 0)`). CLAUDE.md states the rule; the shared gate did not
+# honour it. Same shape as wait_no_engine() in p7_gate.sh.
+wait_no_engine() {
+  for _ in $(seq 1 120); do pgrep -x glm53 >/dev/null || return 0; sleep 2; done
+  echo "an engine is still alive after 240 s (pids $(pgrep -x glm53 | tr "\n" " ")) -- killing it"
+  pkill -9 -x glm53; sleep 3
+  pgrep -x glm53 >/dev/null && { echo "REFUSED: cannot clear the engine"; return 1; }
+  return 0
+}
 if [ ! -s "$PROMPT" ]; then
   # deterministic ~600-token prompt: the head of the measurement record
   python3 - "$HERE/ROME-3x7900XTX-2026-09-04.md" > "$PROMPT" <<'PY'
@@ -48,8 +62,9 @@ for side in pristine candidate; do
   # numerics) unless ORACLE_KDA_GPU says otherwise; the TTFT half below runs
   # the serving default (ttft_serve.py's engine_env: COLI_KDA_GPU=2).
   COLI_KDA_GPU=${ORACLE_KDA_GPU:-0} "$HERE/prefill_profile.sh" "$bin" "$PROMPT" "$TAG-$side" | tee "$OUT/profile_$side.txt" | grep -v "^teacher_forcing\|^last_logits"
-  grep "^teacher_forcing" "$HOME/bench/prefill_profile_$TAG-$side.log" > "$OUT/tf_$side.txt"
-  grep "^last_logits" "$HOME/bench/prefill_profile_$TAG-$side.log" > "$OUT/logits_$side.txt"
+  grep "^teacher_forcing" "$HOME/bench/prefill_profile_$TAG-$side.log" > "$OUT/tf_$side.txt" 2>/dev/null
+  grep "^last_logits" "$HOME/bench/prefill_profile_$TAG-$side.log" > "$OUT/logits_$side.txt" 2>/dev/null
+  wait_no_engine || exit 2
 done
 
 echo "--- (a) teacher forcing"
@@ -89,8 +104,10 @@ echo "--- (c) serve-path TTFT (ttft_serve.py --engine), twice per size"
 for side in pristine candidate; do
   bin=$PRISTINE; [ $side = candidate ] && bin=$CAND
   export COLI_VK_SHADERS="$(shaders_for $side)"
+  wait_no_engine || exit 2
   python3 "$HERE/ttft_serve.py" --engine "$bin" --sizes 30,300,1000 --repeat 2 --warm \
       --tag "$TAG-$side" --json "$OUT/ttft.jsonl" | tee "$OUT/ttft_$side.txt" | grep -v "^\[resid"
+  wait_no_engine || exit 2
 done
 # MIN_SPEEDUP (default 1.0): the candidate's median TTFT speedup at EVERY size
 # must reach it and its decode sanity window must stay within 10% of the

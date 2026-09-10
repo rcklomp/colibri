@@ -3844,7 +3844,7 @@ class Engine:
             raise
 
         cancel_sent = False
-        cancel_pending = False        # disconnect seen before the engine's ACCEPT
+        cancel_retries = 0            # NOT_FOUND acks: the SUBMIT was not dequeued yet
         stop_sent = False
         accepted = False
 
@@ -3877,14 +3877,6 @@ class Engine:
                 accepted = True
                 if on_accept is not None:
                     on_accept(info)
-                # A disconnect seen while this request was still queued: the
-                # engine knows the id only now, so this is the first moment a
-                # CANCEL can land on it rather than on nothing.
-                if cancel_pending and not cancel_sent and not stop_sent:
-                    cancel_sent = True
-                    with self.write_lock:
-                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                        self.process.stdin.flush()
 
         while True:
             try:
@@ -3914,13 +3906,10 @@ class Engine:
                 # engine log, while the other 2 cancelled in ~13 s. Remember the
                 # intent and fire it the moment ACCEPT lands.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
-                    if not accepted:
-                        cancel_pending = True
-                    else:
-                        cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
+                    cancel_sent = True
+                    with self.write_lock:
+                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                        self.process.stdin.flush()
                 continue
             if kind == "accept":
                 if accepted:
@@ -3976,6 +3965,25 @@ class Engine:
                     on_tool(tool_tail)
                 req_log_line(value, "length" if value.get("length_limited") else "stop")
                 return value
+            elif (cancel_sent and isinstance(value, RuntimeError)
+                  and str(value) == "NOT_FOUND" and cancelled and cancelled()):
+                # The genuine race: the CANCEL reached the engine before it had
+                # dequeued this SUBMIT, so it cancelled nothing and answered
+                # NOT_FOUND -- and the request then ran to completion, holding
+                # every later one behind it (measured 2026-09-09: 1 abandoned
+                # request in 3 left the next waiting 158-255 s). Do NOT defer the
+                # first CANCEL to the ACCEPT frame instead: ACCEPT only arrives
+                # once prefill is done, so that kills the path that works
+                # ("CANCEL 5 at prefill pos=128/1321") and made it 4/4 at ~150 s.
+                # Send again, backing off, while the client stays gone.
+                cancel_retries += 1
+                if cancel_retries <= 20:
+                    time.sleep(0.25)
+                    with self.write_lock:
+                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                        self.process.stdin.flush()
+                else:
+                    raise value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
                 # An engine that acks with ERROR alone and no DONE: there are no
                 # counts to log, but the request must not vanish from the log.

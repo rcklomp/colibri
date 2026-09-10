@@ -43,8 +43,10 @@ say "1. UI new chat A (may be cold)" "prompt=$pa reused=$ra ttft=${ta}s"
 if [ -n "$pb" ] && [ "$rb" -ge $((pb - 256)) ] && [ "${tb%.*}" -le 60 ]; then say "2. UI new chat B warm" "PASS prompt=$pb reused=$rb ttft=${tb}s";
 else say "2. UI new chat B warm" "FAIL prompt=$pb reused=$rb ttft=${tb}s (need reused>=$((pb-256)), ttft<=60)"; FAIL=1; fi
 # 2b. P9: the ledger's agreement with the engine, for the turns just driven.
-ledger_check() {
-  local since=$1 rows mism broken checked
+ledger_check() {          # ledger_check <since> [strict]
+  # Checks 1-2 are NEW chats, so they produce no continuation and nothing to verify; only the
+  # call after check 3 is strict, because that one drove a follow-up.
+  local since=$1 strict=${2:-} rows mism broken checked
   rows=$(grep "\[ledger\] " "$LOG" 2>/dev/null | tail -n +$((since + 1)))
   if [ -z "$rows" ]; then
     say "2b. ledger invariant" "SKIP no [ledger] lines (COLI_LEDGER=0, or an older gateway)"
@@ -53,6 +55,16 @@ ledger_check() {
   mism=$(printf '%s\n' "$rows" | grep -c "MISMATCH")
   broken=$(printf '%s\n' "$rows" | grep -c "ledger=broken")
   checked=$(printf '%s\n' "$rows" | grep -c "expect_reuse=[0-9]")
+  if [ "${checked:-0}" -lt 1 ] && [ -z "$strict" ]; then
+    say "2b. ledger invariant" "INFO no continuation yet (new chats only), 0 MISMATCH"
+    return 0
+  fi
+  if [ "${checked:-0}" -lt 1 ]; then
+    # Zero checked is not a pass: it means no continuation reached the ledger, so the alarm
+    # this check exists to read was never armed. (Seen 2026-09-09: "PASS 0 checked".)
+    say "2b. ledger invariant" "FAIL no continuation was checked (of ${#rows} lines) -- the alarm was never armed"
+    return 1
+  fi
   if [ "$mism" = 0 ] && [ "$broken" = 0 ]; then
     say "2b. ledger invariant" "PASS $checked checked, 0 MISMATCH, 0 broken"
   else
@@ -99,7 +111,8 @@ curl -s -m 300 -o /dev/null -H "Authorization: Bearer $K" -H "Content-Type: appl
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Say OK."}],"max_tokens":8}'
 t4=$(python3 -c "print(round($(date +%s.%N) - $t0, 1))")
 if [ "${t4%.*}" -le 45 ]; then say "4. request behind an abandoned one" "PASS answered in ${t4}s"; else say "4. request behind an abandoned one" "FAIL ${t4}s (need <=45)"; FAIL=1; fi
-ledger_check "$L0" || FAIL=1        # again, now covering checks 3 and 4 as well
+ledger_check "$L0" strict || FAIL=1  # again, now covering checks 3 and 4 — and a follow-up
+                                     # ran, so at least one continuation MUST have been checked
 grep "CANCEL" "$LOG" | tail -1 | cut -c1-120
 echo "=== accept_live $([ $FAIL = 0 ] && echo PASS || echo FAIL) $(date -Is)"
 exit $FAIL

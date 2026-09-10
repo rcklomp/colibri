@@ -64,7 +64,11 @@ echo "--- the rig's [ledger] lines for those $TURNS turns"
 ssh "$RIG" "python3 - ~/glm53_server.log $MARK" <<'PY' | tee "${OUT:-/dev/null}"
 import sys
 log, mark = sys.argv[1], int(sys.argv[2])
-rows = [l.strip() for l in open(log, errors="replace") if l.startswith("[ledger] ")][mark:]
+# The server log is timestamped by the awk pipe in ~/start_glm53.sh, so every line reads
+# "2026-09-10 01:44:53 [ledger] …". startswith() therefore matched NOTHING and this check
+# could only ever report zero rows — it happened to fail closed, but a real MISMATCH would
+# have been just as invisible. Match the marker anywhere in the line.
+rows = [l.strip() for l in open(log, errors="replace") if "[ledger] " in l][mark:]
 for l in rows:
     print("  " + l[:150])
 mism = [l for l in rows if "MISMATCH" in l]

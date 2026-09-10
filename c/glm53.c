@@ -73,6 +73,7 @@
 #define COLI_MAP_EXPERTS_DEFAULT 1
 #include "st.h"
 #include "quant.h"
+#include "i3_sim.h"      /* G15 probe kernels (item 4h); inert unless GLM53_I3_SIM=1 */
 #include "tok.h"
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
@@ -2550,6 +2551,48 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
 
+/* ---- G15 / roadmap item 4h: the int3 numerics probe, two knobs ---------
+ * The simulation itself and its rationale live in c/i3_sim.h, which
+ * tools/hot-expert/rome_i3sim.c oracles against quant.h's real fmt=5
+ * pack_int3_g64 + matmul_i3. Both knobs are OFF by default and neither is
+ * a shipping configuration: GLM53_I3_SIM=1 re-quantises the routed experts'
+ * int4 weights to 3 bits on the fly, GLM53_EXPERTS_CPU=1 forces every routed
+ * expert down the CPU path so the ~79% the GPU tier serves from unmodified
+ * int4 cannot mask the effect. The shared expert and the dense layers are
+ * untouched: item 4h converts the ROUTED expert slots, nothing else.
+ *
+ * THE ANSWER IS NO, AND IT IS RECORDED (§G15, 2026-09-11). Against an
+ * identically-placed int4 control, int3 changes 13 of 42 short-prompt and 16 of
+ * 1232 long-prompt teacher_forcing predictions, last_logits cosine 0.9726 /
+ * 0.8778, and the greedy text at both lengths. §G12 shipped opt-in at 0.99992
+ * with identical text; §G14 rejected int8 activations at 0.98964. The item is
+ * dead and no converter, shader or fmt=5 CPU kernel was built. Do not re-open it
+ * without a DIFFERENT format -- finer groups, or int3 only for the cold tail.
+ *
+ * These two knobs stay because §G15's rows depend on them (CLAUDE.md: do not
+ * remove a knob a recorded measurement depends on) and because
+ * GLM53_EXPERTS_CPU is the instrument for the thing the probe found on the way:
+ * the routed-expert GPU kernel does not apply GLM-5.3's swiglu clamp, which is
+ * worth 6 of 42 and 8 of 1232 teacher-forced predictions on its own. Neither is
+ * a trap in §G14's sense -- both are strictly SLOWER than the default, so no
+ * one benchmarking will switch one on by accident. */
+static int g_i3_sim = -1;
+static int i3_sim_on(void) {
+    if (g_i3_sim < 0) g_i3_sim = getenv("GLM53_I3_SIM") ? atoi(getenv("GLM53_I3_SIM")) : 0;
+    return g_i3_sim;
+}
+/* Force every routed expert through the CPU path even when the tier holds it.
+ * 1 = force CPU. 2 = force CPU and do not clamp the routed swiglu, which is
+ * what the GPU kernel does (§G13); see the `rlimit` comment in ffn_layer for
+ * why the difference had to be measured rather than assumed. On its own this
+ * is the control run for GLM53_I3_SIM. */
+static int g_experts_cpu = -1;
+static int experts_cpu_on(void) {
+    if (g_experts_cpu < 0)
+        g_experts_cpu = getenv("GLM53_EXPERTS_CPU") ? atoi(getenv("GLM53_EXPERTS_CPU")) : 0;
+    return g_experts_cpu;
+}
+
 /* Il MoE, in due tempi.
  *
  * Prima si decide: per ogni token del blocco quali esperti servono e con che
@@ -2792,6 +2835,16 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
         return;
     }
     const int Ig = g->columns, Og = g->rows, Id = d->columns, Od = d->rows;
+    /* G15 probe: same three stages, int3-simulated weights. Deliberately the
+     * unfused three-region shape (like GLM53_EXPERT_SPLIT) -- this path exists
+     * to answer a numerics question, not a speed one. */
+    if (i3_sim_on()) {
+        matmul_i4_sim3(sg, x, g->q4, g->s, 1, Ig, Og, g->gs);
+        matmul_i4_sim3(su, x, u->q4, u->s, 1, u->columns, u->rows, u->gs);
+        swiglu_clamped(sg, su, Og, limit);
+        matmul_i4_sim3(out, sg, d->q4, d->s, 1, Id, Od, d->gs);
+        return;
+    }
     /* G14: the fused float path below, with the row kernel swapped for the
      * four-accumulator bit-trick decode. Structure, swiglu and down projection
      * are otherwise identical -- the only change is summation order inside a
@@ -2886,6 +2939,7 @@ static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const
     const int grb = (Ig + 1) / 2, gng = (Ig + g->gs - 1) / g->gs;
     const int drb = (Id + 1) / 2, dng = (Id + d->gs - 1) / d->gs;
     const int S4 = S & ~3;
+    const int sim3 = i3_sim_on();      /* G15 probe; 0 in every shipped config */
 #ifdef _OPENMP
     #pragma omp parallel
 #endif
@@ -2902,12 +2956,12 @@ static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const
             float o4[4];
             int r = 0;
             for (; r < S4; r += 4) {
-                coli_i4_rows4(wr, sr, x + (int64_t)r * Ig, Ig, Ig, w->gs, o4);
+                i4_rows4_sel(sim3, wr, sr, x + (int64_t)r * Ig, Ig, Ig, w->gs, o4);
                 dst[(size_t)r * Og + o] = o4[0]; dst[(size_t)(r + 1) * Og + o] = o4[1];
                 dst[(size_t)(r + 2) * Og + o] = o4[2]; dst[(size_t)(r + 3) * Og + o] = o4[3];
             }
             for (; r < S; r++)
-                dst[(size_t)r * Og + o] = coli_i4_row(wr, sr, x + (int64_t)r * Ig, Ig, w->gs);
+                dst[(size_t)r * Og + o] = i4_row_sel(sim3, wr, sr, x + (int64_t)r * Ig, Ig, w->gs);
         }
 #ifdef _OPENMP
         #pragma omp for schedule(static)
@@ -2926,12 +2980,12 @@ static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const
             float o4[4];
             int r = 0;
             for (; r < S4; r += 4) {
-                coli_i4_rows4(wr, sr, sg + (int64_t)r * Id, Id, Id, d->gs, o4);
+                i4_rows4_sel(sim3, wr, sr, sg + (int64_t)r * Id, Id, Id, d->gs, o4);
                 out[(size_t)r * Od + o] = o4[0]; out[(size_t)(r + 1) * Od + o] = o4[1];
                 out[(size_t)(r + 2) * Od + o] = o4[2]; out[(size_t)(r + 3) * Od + o] = o4[3];
             }
             for (; r < S; r++)
-                out[(size_t)r * Od + o] = coli_i4_row(wr, sr, sg + (int64_t)r * Id, Id, d->gs);
+                out[(size_t)r * Od + o] = i4_row_sel(sim3, wr, sr, sg + (int64_t)r * Id, Id, d->gs);
         }
     }
 }
@@ -3189,6 +3243,20 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                        c->swiglu_limit, sg, su);
     if (optime_on()) g_ot_shared += optime_now() - t_shared0;
 
+    /* G15 probe, diagnostic arm: GLM53_EXPERTS_CPU=2 is =1 plus "do not clamp
+     * the routed experts' swiglu". It exists because the =1 control run moved
+     * the model far more than float reassociation can explain, and §G13 names
+     * the only semantic difference between the two expert paths: the routed
+     * GPU kernel (c/shaders/qmatmul_gate_up.comp) computes silu(gate)*up with
+     * NO clamp and has no `limit` push constant, while mlp3_cpu applies
+     * swiglu_clamped at GLM-5.3's limit of 10.0. Forcing every expert to the
+     * CPU therefore also switches ~79% of them from unclamped to clamped. With
+     * =2 the CPU path computes what the GPU path computes, so the two runs
+     * differ only in placement -- which turns that attribution into a
+     * measurement. Routed experts only; the shared expert and the dense MLP
+     * keep the real limit. */
+    const float rlimit = experts_cpu_on() == 2 ? INFINITY : c->swiglu_limit;
+
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
             for (int k = 0; k < topk; k++) {
@@ -3305,7 +3373,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             Mat gate, up, down;
             expert_mats(m, slot, &gate, &up, &down);
 #ifdef COLI_VULKAN
-                if (g_vk_ready && vk_reg_at(index, eid)[0] != NULL) {
+                /* G15 probe: GLM53_EXPERTS_CPU=1 sends every routed expert down
+                 * the CPU path even when the tier holds it, so the ~79% the GPU
+                 * serves from unmodified int4 cannot mask a simulated int3. */
+                if (g_vk_ready && !experts_cpu_on() && vk_reg_at(index, eid)[0] != NULL) {
                     void **reg = vk_reg_at(index, eid);
                     int dv = coli_vk_tensor_dev((ColiVkTensor *)reg[0]);
                     if (dv < 0 || dv > 2) dv = 0;
@@ -3347,7 +3418,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 #ifdef COLI_VULKAN
             if (g_vk_ready && cpu_rows.xr && mlp3_cpu_rows_ok(&gate, &up, &down)) {
                 cpu_expert_rows(&cpu_rows, eid, chosen, weight, tokens, topk, x, c->hidden,
-                                &gate, &up, &down, c->swiglu_limit, out);
+                                &gate, &up, &down, rlimit, out);
                 continue;
             }
 #endif
@@ -3362,12 +3433,12 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 #ifdef COLI_VULKAN
                 if (g_vk_ready) {
                     double _tc = prof_now_s();
-                    mlp3_cpu(tmp, x + (size_t)t * c->hidden, &gate, &up, &down, c->swiglu_limit, sg, su);
+                    mlp3_cpu(tmp, x + (size_t)t * c->hidden, &gate, &up, &down, rlimit, sg, su);
                     g_t_cpu += prof_now_s() - _tc; g_n_cpu++;
                 } else
 #endif
                 mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
-                     c->swiglu_limit, sg, su);
+                     rlimit, sg, su);
                 float *dst = out + (size_t)t * c->hidden;
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
@@ -3427,7 +3498,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             if (first_round && can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
                 ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
                                          chosen, weight, tokens, topk, x, c->hidden,
-                                         c->swiglu_limit, sg, su, tmp, out, &cpu_rows);
+                                         rlimit, sg, su, tmp, out, &cpu_rows);
                 cpu_deferred_done = 1;
             }
             first_round = 0;
@@ -3479,7 +3550,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
          * still have to run. */
         ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
                                  chosen, weight, tokens, topk, x, c->hidden,
-                                 c->swiglu_limit, sg, su, tmp, out, &cpu_rows);
+                                 rlimit, sg, su, tmp, out, &cpu_rows);
     }
     free(cpu_gate); free(cpu_up); free(cpu_down); free(cpu_eid);
 #endif

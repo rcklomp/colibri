@@ -1,10 +1,74 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 22, 2026-09-10 04:45)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 23, 2026-09-10 08:45)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 23 (2026-09-10, 08:45): P10 — the checkpoint cache evicts by worth, and
+the same flood that costs 668 s today costs 4.6 s.** The four slots were an LRU,
+and LRU asks the wrong question of a cache that holds prefixes rather than
+pages. The live gateway said so before anything was changed: four captures of
+~305 MB each — 4 707, 4 307, 4 712 and **4 418** — and only the 4 418 (Open WebUI's
+tool block) had ever been restored, **9 times against 0, 0, 0**, with all four
+`used` clocks set within one loop of the disk load. The tool block was surviving
+by the accident of being popular. **The score is now `len × hits`** — a capture
+is born at `hits = 1`, so its score is its length, which is the length-only rule
+as the opening guess; `ckpt_restore` increments the winner; `used` stays as the
+tie-break. `GLM53_CKPT_VALUE_EVICT` (default 1); 0 is the old LRU exactly.
+**The flood, 20 short chats then one UI chat, both arms seeded from the same
+byte-identical copy of the live directory:**
+
+| arm | first store evicted | UI chat after the flood |
+|---|---|---|
+| **value (on)** | `4307/1` — the lowest score | **reused 4 418/4 442, ttft 4.57 s** |
+| LRU (off) | `4707/1` — the oldest | **reused 0/4 442, ttft 668.56 s** |
+
+**146×**, and the control's 4th store names its own victim: `evicted=4418/4` — LRU
+threw away the only capture anything had ever used. Every one of the 20 stores in
+the value arm went to the same slot 1, evicting the previous ~145-token flood
+capture: the flood eats itself and never reaches a ≥ 4 300 capture. **The hits
+term is isolated separately** (`p10_hits_case.sh`), because the flood alone would
+also pass for a length-only rule: two slots seeded {4 418, a longer stale 4 712},
+same binary, same knob, same trigger, only the counter different —
+
+| the tool block's counter | evicted | UI chat after |
+|---|---|---|
+| **hits = 9** (earned) | `4712/1`, the stale one | **4.98 s** |
+| hits = 1 (a pre-P10 file, i.e. length only) | **`4418/1`** | **667.82 s** |
+
+Bit-identical where it must be: `teacher_forcing IDENTICAL (782 positions)`,
+`cosine=1.0000000 max_abs=0`, TTFT **1.02×/1.00×/1.00×** with `GLM53_PREFIX_CKPT=0`
+(where none of the new code runs), `tworeq` IDENTICAL at both KDA knobs with
+**0 forcing lines**, all six C tests green. **`GLM53_PREFIX_CKPT_MIN` is back to
+128** (was 1 024): the threshold was only ever the blunt half of this fix, and the
+500-token prefix is cacheable again. `accept_live` PASS twice, `accept_ui` PASS
+with **first token 4.83 s and 4.32 s in a real Chromium**, and `ui_matrix
+--sizes 0,500,2000` turn-2 rows unchanged — `engine_new = 14` on all three, ttft
+2.73–2.87 s against P9's 2.74–2.89 s. One measurement worth keeping: a
+**145-token capture costs 161 MB** against the tool block's 305 MB, so the blob is
+~154 MB fixed plus ~34 KB/token — the thing LRU kept preferring returned 3.8 % of
+the tokens for 52 % of the memory. Persistence is a trailing `uint32` under the
+**unchanged** `G53CKPT1` magic, so no existing checkpoint was invalidated and
+nobody paid a cold prefill for the format: verified on disk, slot 3's file grew
+by exactly 4 bytes while the other three stayed old-format, and the counter came
+back from a restart (`hits=4` on the first restore after it). **Four defects were
+in the gate, not the engine, and all four are on the record**: step 2 ran
+`tworeq` with none of the required environment (no `COLI_VULKAN`, no
+`COLI_VK_EXPERTS2/3=1695`, no pinning, the binary passed as argv where
+`TWOREQ_EXE` is read) so the P6b guard fired and the chain **failed the candidate
+for the harness's own mistake and reverted** — correctly, and it cost 40 minutes;
+a single `local a=$1 b="…$a"` is unbound under `set -u`; the seed read a log that
+every restart truncates; and **P10's own persistence defeated the cold arm** —
+skipping the warm-ups does not make an arm cold when the counter is on disk, so
+the cold arm now truncates the counter off and is a genuine pre-P10 file. Spec
+`P10-VALUE-EVICTION-SPEC-2026-09.md`, gate `p10_gate.sh`, chain `p10_chain.sh`,
+case `p10_hits_case.sh`, matrix `ui/matrix-p10-2026-09-10.tsv`, §P10 in the
+record. Binary in service **0cbf48a54e2d0cc8…**, serving script changed in one
+line. **Next: nothing is open on this table.** The follow-ups P10 names for
+itself are an aging term on `hits` (a prefix popular last month keeps its score)
+and more than four slots, neither of which this workload has asked for yet.
 
 **Rev 22 (2026-09-10, 04:45): P9's owed steps done, the checkpoint minimum
 raised, and one item named for the owner to schedule.** The ten-turn browser

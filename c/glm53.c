@@ -63,6 +63,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdarg.h>
 
 #include "cli_args.h"
@@ -4643,7 +4644,8 @@ typedef struct {
     int len;
     unsigned char *blob;      /* gli span in ordine, uno dietro l'altro */
     size_t bytes;
-    unsigned long long used;  /* orologio LRU */
+    unsigned long long used;  /* orologio LRU, ormai solo lo spareggio (P10) */
+    unsigned hits;            /* P10: quante volte ckpt_restore ha scelto QUESTO slot */
     int kind;                 /* 0 = prefisso (piano/suggerimento), 1 = fine prompt */
 } PrefixCkpt;
 
@@ -4680,6 +4682,54 @@ static int ckpt_min_tokens(void) {
         if (cached < 8) cached = 8;
     }
     return cached;
+}
+
+/* ---- P10: si sfratta per VALORE, non per eta' ----
+ *
+ * Il vittimario era LRU dentro ogni passata di `kind`, e LRU qui fa la domanda
+ * sbagliata: questa cache non tiene pagine di un working set, tiene PREFISSI, e
+ * un prefisso vale quanto risparmia per quante volte lo risparmia. Il log del
+ * 2026-09-10 06:40 lo dice da solo -- quattro slot da ~305 MB, e uno solo
+ * (4 418 token, il blocco degli strumenti di Open WebUI) e' stato colpito, 9
+ * volte; gli altri tre, zero. LRU non li sa distinguere: dopo il caricamento da
+ * disco i quattro orologi sono consecutivi, e da li' in poi avanza solo quello
+ * che viene colpito. Il blocco sopravvive per il caso di essere popolare, e
+ * muore alla prima raffica di catture fra due suoi colpi -- misurato due volte
+ * (una chat API da 170 token che ne sfratta una da 4 307 dentro il gate P9, e
+ * il canary delle 05:00 che lo rifaceva ogni mattina).
+ *
+ * Il punteggio e' `len * hits`. Una cattura nuova nasce con hits = 1, cioe' col
+ * suo solo len: e' la regola per lunghezza, che e' la stima giusta per un
+ * prefisso su cui nessuno ha ancora votato, e impedisce che l'ultima arrivata
+ * sia automaticamente la prossima vittima. `used` resta come spareggio, cosi'
+ * l'ordine e' totale e deterministico.
+ *
+ * GLM53_CKPT_VALUE_EVICT=0 rimette esattamente l'LRU di prima.
+ */
+static int ckpt_value_evict(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("GLM53_CKPT_VALUE_EVICT");
+        cached = setting ? atoi(setting) != 0 : 1;
+    }
+    return cached;
+}
+
+/* Quanto vale questo slot. `hits` non si azzera mai per ricattura, perche'
+ * ckpt_plan e ckpt_hint chiedono entrambi a ckpt_have() e rifiutano un prefisso
+ * gia' in uno slot: il blocco degli strumenti ACCUMULA invece di essere
+ * riscritto a hits = 1 ogni mattina. E' il perno di tutto il disegno, ed e' gia'
+ * vero oggi. */
+static double ckpt_score(const PrefixCkpt *slot) {
+    return (double)slot->len * (double)(slot->hits ? slot->hits : 1u);
+}
+
+/* 1 se `a` e' una vittima migliore (vale meno) di `b`. */
+static int ckpt_worse(const PrefixCkpt *a, const PrefixCkpt *b) {
+    if (!ckpt_value_evict()) return a->used < b->used;
+    const double sa = ckpt_score(a), sb = ckpt_score(b);
+    if (sa != sb) return sa < sb;
+    return a->used < b->used;
 }
 
 static int ckpt_disk_wanted(void) {
@@ -4850,6 +4900,14 @@ static void ckpt_disk_write(const GModel *m, int index) {
              fwrite(&bytes, sizeof(bytes), 1, f) == 1 &&
              fwrite(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len &&
              fwrite(slot->blob, 1, slot->bytes, f) == slot->bytes;
+    /* P10: il contatore in coda. La magic resta G53CKPT1 apposta -- un file
+     * vecchio finisce dopo il blob e il lettore nuovo ci mette hits = 1 (la
+     * regola per sola lunghezza, che e' il ripiego giusto); un file nuovo letto
+     * da un binario vecchio e' identico fino alla fine del blob e quel lettore
+     * non va oltre. Nessun checkpoint esistente viene invalidato, e nessuno paga
+     * i ~10 minuti di prefill freddo che un cambio di magic avrebbe imposto. */
+    const uint32_t hits = slot->hits ? slot->hits : 1u;
+    ok = ok && fwrite(&hits, sizeof(hits), 1, f) == 1;
     ok = (fclose(f) == 0) && ok;
     if (!ok) { remove(tmp); return; }
     remove(path);
@@ -4857,6 +4915,28 @@ static void ckpt_disk_write(const GModel *m, int index) {
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "CKPT disk write prefix=%d (%.0f MB) %s\n",
                 slot->len, slot->bytes / 1e6, path);
+}
+
+/* P10: aggiorna SOLO il contatore in coda, in loco. Riscrivere 305 MB a ogni
+ * colpo non e' in discussione, e lasciare la copia su disco ferma vorrebbe dire
+ * che il blocco degli strumenti torna da ogni riavvio a hits = 1. Quattro byte a
+ * un offset calcolato, con la rete: se il file non e' almeno lungo cosi', non e'
+ * questo checkpoint e non si tocca. Qualunque errore si ignora -- il contatore
+ * in memoria e' gia' giusto e su disco perdiamo al massimo dei voti. */
+static void ckpt_disk_touch(int index) {
+    if (!ckpt_disk_wanted()) return;
+    if (!g_ckpt_dir[0] || g_ckpt_dir[0] == '-') return;
+    const PrefixCkpt *slot = &g_ckpt[index];
+    if (!slot->ids || !slot->blob) return;
+    char path[1200];
+    ckpt_disk_path(path, sizeof(path), index);
+    const long off = 28L + (long)slot->len * (long)sizeof(int) + (long)slot->bytes;
+    FILE *f = fopen(path, "r+b");
+    if (!f) return;
+    const uint32_t hits = slot->hits ? slot->hits : 1u;
+    if (!fseek(f, 0, SEEK_END) && ftell(f) >= off && !fseek(f, off, SEEK_SET))
+        (void)fwrite(&hits, sizeof(hits), 1, f);
+    fclose(f);
 }
 
 static void ckpt_disk_load(const GModel *m) {
@@ -4888,18 +4968,27 @@ static void ckpt_disk_load(const GModel *m) {
                  fread(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len &&
                  fread(slot->blob, 1, slot->bytes, f) == slot->bytes;
         }
+        /* P10: il contatore in coda, se il file lo ha. Un file scritto prima di
+         * P10 finisce qui e la fread torna corta: hits = 1, cioe' la regola per
+         * sola lunghezza. Non e' un motivo per buttare il file. */
+        uint32_t hits = 0;
+        if (ok && fread(&hits, sizeof(hits), 1, f) == 1 && hits >= 1 && hits < (1u << 24))
+            slot->hits = hits;
+        else if (ok)
+            slot->hits = 1;
         fclose(f);
         if (!ok) { ckpt_free(slot); remove(path); continue; }
         slot->used = ++g_ckpt_clock;
         if (getenv("GLM53_VERBOSE"))
-            fprintf(stderr, "CKPT disk load prefix=%d (%.0f MB) kind=%d\n",
-                    slot->len, slot->bytes / 1e6, slot->kind);
+            fprintf(stderr, "CKPT disk load prefix=%d (%.0f MB) kind=%d hits=%u score=%.0f\n",
+                    slot->len, slot->bytes / 1e6, slot->kind, slot->hits, ckpt_score(slot));
     }
 }
 
-/* La copia. Il vittimario e' quello di DeepSeek V4: prima uno slot vuoto, poi
- * il piu' vecchio di fine prompt, poi il piu' vecchio in assoluto -- il
- * prefisso e' l'ultimo a uscire. */
+/* La copia. Il vittimario e' quello di DeepSeek V4 nella struttura -- prima uno
+ * slot vuoto, poi quelli di fine prompt, poi tutti: il prefisso resta l'ultimo a
+ * uscire -- ma dentro ogni passata sceglie per VALORE e non per eta' (P10,
+ * ckpt_worse). */
 static void ckpt_store(const GModel *m, GSession *s, const int *ids, int len, int kind) {
     if (!ckpt_on() || len < ckpt_min_tokens() || len > s->filled) return;
     CkptSpan spans[GLM53_CKPT_MAX_SPANS];
@@ -4912,10 +5001,14 @@ static void ckpt_store(const GModel *m, GSession *s, const int *ids, int len, in
     for (int pass = 1; victim < 0 && pass >= 0; pass--)
         for (int i = 0; i < slots; i++)
             if (g_ckpt[i].kind >= pass &&
-                (victim < 0 || g_ckpt[i].used < g_ckpt[victim].used))
+                (victim < 0 || ckpt_worse(&g_ckpt[i], &g_ckpt[victim])))
                 victim = i;
     if (victim < 0) return;
     PrefixCkpt *slot = &g_ckpt[victim];
+    /* Cosa e' stato buttato e quanto valeva: la riga che avrebbe reso ovvio, la
+     * mattina stessa, lo sfratto dentro il gate P9. */
+    const int ev_len = slot->ids ? slot->len : 0;
+    const unsigned ev_hits = slot->ids ? (slot->hits ? slot->hits : 1u) : 0u;
     ckpt_free(slot);
     slot->ids = malloc((size_t)len * sizeof(int));
     slot->blob = malloc(bytes);
@@ -4931,11 +5024,13 @@ static void ckpt_store(const GModel *m, GSession *s, const int *ids, int len, in
     slot->len = len;
     slot->bytes = bytes;
     slot->kind = kind;
+    slot->hits = 1;                 /* P10: nasce col suo len, non con zero */
     slot->used = ++g_ckpt_clock;
     if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "CKPT store prefix=%d %.0f MB kind=%d slot=%d "
-                        "sync=%.0f ms copy=%.0f ms\n",
-                len, bytes / 1e6, kind, victim, g_ckpt_sync_ms, copy_ms);
+        fprintf(stderr, "CKPT store prefix=%d %.0f MB kind=%d slot=%d hits=1 "
+                        "score=%.0f evicted=%d/%u sync=%.0f ms copy=%.0f ms\n",
+                len, bytes / 1e6, kind, victim, ckpt_score(slot),
+                ev_len, ev_hits, g_ckpt_sync_ms, copy_ms);
     if (kind == 0) ckpt_disk_write(m, victim);
     else if (ckpt_disk_wanted()) {
         /* Il file di questo slot descrive ormai un'altra cattura. */
@@ -4980,8 +5075,13 @@ static int ckpt_restore(const GModel *m, KVSlot *slot, const int *sequence, int 
     ckpt_sync_in(m, s);
     slot_remember(slot, sequence, best_len);
     g_ckpt[best].used = ++g_ckpt_clock;
+    /* Solo il vincitore: un checkpoint piu' corto che pure combaciava non ha
+     * risparmiato niente stavolta. */
+    if (g_ckpt[best].hits < UINT_MAX) g_ckpt[best].hits++;
+    ckpt_disk_touch(best);
     if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "CKPT hit prefix=%d slot=%d\n", best_len, best);
+        fprintf(stderr, "CKPT hit prefix=%d slot=%d hits=%u\n",
+                best_len, best, g_ckpt[best].hits);
     return best_len;
 }
 

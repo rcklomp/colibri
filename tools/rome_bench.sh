@@ -120,6 +120,15 @@ if pgrep -x glm53 >/dev/null 2>&1; then
   fi
 fi
 
+# EARLY pass over the caller's KEY=VALs. The late pass further down still runs
+# (so a knob can override the caps this script sets); this one exists because
+# ROME_BENCH_ENGINE_BIN is consumed by the case block BELOW, i.e. before the
+# late pass would have exported it -- an override that silently benched the
+# wrong binary would be the worst possible bug in a bisect harness.
+if [ -n "${EXTRA_ENV:-}" ]; then
+  for kv in $EXTRA_ENV; do export "${kv?}"; done
+fi
+
 # Engine-specific configuration
 case "$ENGINE" in
   qwen38)
@@ -149,7 +158,7 @@ case "$ENGINE" in
   glm53)
     # 182 GiB int4 checkpoint. Vulkan is gated on COLI_VULKAN=1 (glm53.c:2118)
     # and dev2/dev3 on COLI_VK_DEV2/3 as above.
-    ENGINE_BIN="${COLIBRI_SRC}/c/glm53"
+    ENGINE_BIN="${ROME_BENCH_ENGINE_BIN:-${COLIBRI_SRC}/c/glm53}"
     MODEL_SNAP="${HOME}/models/GLM-5.3-Flash-colibri-int4-g64"
     THREADS=8
     CAP=512
@@ -183,6 +192,19 @@ esac
 echo "[rome_bench] Starting benchmark: engine=$ENGINE config=$CONFIG_NAME"
 echo "[rome_bench] ENGINE_BIN=$ENGINE_BIN"
 echo "[rome_bench] MODEL_SNAP=$MODEL_SNAP"
+
+# A bisect harness that silently benched the wrong binary would produce exactly
+# the kind of confidently-wrong row this record has been burned by. Refuse.
+if [ ! -x "$ENGINE_BIN" ]; then
+  echo "Error: ENGINE_BIN '$ENGINE_BIN' does not exist or is not executable -- refusing" >&2
+  exit 1
+fi
+echo "[rome_bench] binary sha256=$(sha256sum "$ENGINE_BIN" | cut -c1-16)"
+if [ -n "${ROME_BENCH_ENGINE_BIN:-}" ]; then
+  echo "[rome_bench] NOTE: benching an OVERRIDE binary, not the tree's own build."
+  echo "[rome_bench]       The appended row records CONFIG_NAME only, so the name"
+  echo "[rome_bench]       must say which binary this was ('$CONFIG_NAME')."
+fi
 
 # Check for concurrent engines. ONE PATTERN PER pgrep CALL (CLAUDE.md): the old
 # form `pgrep -x qwen38 qwen38-vk glm53` passed three patterns, which pgrep

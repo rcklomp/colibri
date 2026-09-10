@@ -1188,6 +1188,9 @@ tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.
 tests/test_glm53_cancel_frames$(EXE): tests/test_glm53_cancel_frames.c glm53.c serve_poll.h st.h json.h compat.h quant.h tok.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_glm53_ckpt_touch$(EXE): tests/test_glm53_ckpt_touch.c glm53.c serve_poll.h st.h json.h compat.h quant.h tok.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c qwen38_vision.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -Wno-unused-function $< -o $@ $(LDFLAGS)
 

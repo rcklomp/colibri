@@ -13,6 +13,24 @@
 # this script or hand-rolling a one-off (added for G12's COLI_KDA_GPU). They are
 # echoed into the run log and belong in the config-name too, because the
 # datapoint row records the name, not the environment.
+#
+# 2026-09-10: this script now takes ~/bench/.rig.lock itself (rig_lock.sh) and, if
+# it finds the owner's glm53 gateway running, stops it and restarts it when done --
+# self-contained, the way run_chain.sh's chains are. Before this, the caller had to
+# stop the gateway AND hold the lock as two separate steps; a gap between them let
+# the gateway_watchdog cron race back in mid-measurement and corrupt a run (it saw
+# no lock, decided the gateway was unexpectedly down, and restarted it while
+# datapoint.py was mid-load). If some OTHER engine (not the gateway's glm53) is
+# already running, this still refuses rather than touching a process it didn't
+# start.
+#
+# This is for the DECODE-THROUGHPUT track (ROADMAP-2026-09.md, G-items):
+# short rotating prompts, no checkpoint/ledger, no kv-slots>1. It is NOT the
+# right tool to re-baseline the PREFILL track (PREFILL-ROADMAP-2026-09.md,
+# P-items) -- that one measures TTFT/checkpoint-reuse against the LIVE gateway
+# and its tool is `prefill_snapshot.sh`. Using this script for that track once
+# produced numbers that looked like a regression and were not (2026-09-10);
+# see tools/hot-expert/MEASURING.md for which tool answers which question.
 
 set -eu
 
@@ -49,6 +67,41 @@ RECORD_PATH="${COLIBRI_SRC}/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md"
 ENGINE="$1"
 CONFIG_NAME="$2"
 EXTRA_ENV="${3:-}"
+
+# --- rig lock + gateway handling (2026-09-10) ---
+. "${COLIBRI_SRC}/tools/hot-expert/rig_lock.sh"
+rig_lock_take "rome_bench-${ENGINE}-${CONFIG_NAME}" || { echo "rome_bench: rig busy, refusing (see rig_lock_holder above)" >&2; exit 3; }
+RESTART_GATEWAY=0
+cleanup() {
+  rc=$?
+  [ -n "${GLM_HIST:-}" ] && rm -f "$GLM_HIST"
+  if [ "$RESTART_GATEWAY" = 1 ]; then
+    echo "[rome_bench] restarting the owner's gateway"
+    SKIP_WARM=1 setsid nohup "${HOME}/start_glm53.sh" > "${HOME}/glm53_server.log" 2>&1 < /dev/null &
+    KEY=$(cat "${HOME}/.colibri_api_key" 2>/dev/null)
+    for i in $(seq 1 60); do
+      sleep 10
+      code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" http://127.0.0.1:8081/v1/models 2>/dev/null)
+      [ "$code" = 200 ] && break
+    done
+    echo "[rome_bench] gateway back, /v1/models=${code:-?}"
+  fi
+  rig_lock_release
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+if pgrep -x glm53 >/dev/null 2>&1; then
+  # Only ever stop OUR OWN gateway's glm53; anything else running is left alone.
+  if pgrep -f "openai_[s]erver.py" >/dev/null 2>&1; then
+    echo "[rome_bench] stopping the owner's gateway for the duration of this run"
+    pkill -f "openai_[s]erver.py" 2>&1 || true
+    sleep 2
+    pkill -9 -x glm53 2>&1 || true
+    for i in $(seq 1 15); do pgrep -x glm53 >/dev/null 2>&1 || break; sleep 1; done
+    RESTART_GATEWAY=1
+  fi
+fi
 
 # Engine-specific configuration
 case "$ENGINE" in
@@ -100,7 +153,9 @@ case "$ENGINE" in
     fi
     cp "$GLM_HIST_SRC" "$GLM_HIST"
     export COLI_USAGE_PATH="$GLM_HIST"
-    trap 'rm -f "$GLM_HIST"' EXIT
+    # NOT a separate `trap ... EXIT` here: bash keeps only the LAST trap set for a
+    # signal, and one was already installed above for the lock/gateway-restart --
+    # a second `trap EXIT` here would silently replace it and leak the lock.
     ;;
   *)
     echo "Unknown engine: $ENGINE" >&2
@@ -166,7 +221,12 @@ fi
 echo "[rome_bench] Running datapoint.py..."
 cd "$COLIBRI_SRC"
 
-# Run the benchmark and capture output
+# Run the benchmark and capture output. Do NOT let `set -e` short-circuit this:
+# a failure here used to be reported as a bare "Error: datapoint.py failed" with
+# $OUTPUT never printed, because `X=$(cmd) || { ... }` discards the assignment
+# on failure -- the real traceback was lost and had to be re-run by hand over
+# ssh to find (cost ~15 minutes, 2026-09-10). Always show what datapoint.py said.
+set +e
 OUTPUT=$(python3 c/tools/datapoint.py \
   --engine "$ENGINE_BIN" \
   --snap "$MODEL_SNAP" \
@@ -175,10 +235,14 @@ OUTPUT=$(python3 c/tools/datapoint.py \
   --max-new "$MAX_NEW" \
   --rotating-runs 4 \
   --warm-runs 1 \
-  2>&1) || {
-  echo "Error: datapoint.py failed" >&2
+  2>&1)
+DP_RC=$?
+set -e
+if [ $DP_RC -ne 0 ]; then
+  echo "Error: datapoint.py failed (rc=$DP_RC)" >&2
+  echo "$OUTPUT" >&2
   exit 1
-}
+fi
 
 echo "$OUTPUT"
 

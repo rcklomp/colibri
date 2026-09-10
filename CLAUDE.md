@@ -7,24 +7,34 @@ Follow it before forming any plan.
 
 ## Read first, in this order
 
-0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` (rev 9) — the prefill /
+0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` — the prefill /
    interactive-use track, opened 2026-09-06 when Open WebUI exposed that
-   nothing had ever measured time-to-first-token. P0–P6 landed the same
-   day; the open items are P7 (checkpoint the system+tools prefix), P6b
-   (per-slot KDA device state), RP4 (GPU timestamps on the expert group),
-   P5, then the upstream-`dev` merge. **Its gate is a script:**
-   `tools/hot-expert/prefill_gate.sh <pristine> <candidate>` exits 1 on an
-   oracle miss and 3 on a TTFT regression or a decode drop; an item is done
-   when it exits 0 with its table in the commit body. The chain scripts in
-   `~/bench/p*_chain.sh` on the rig are the pattern for running it unattended
-   (stop gateway → merge → build → gate → tworeq → serve only on rc 0 → restart).
+   nothing had ever measured time-to-first-token. **Read the top of the
+   file (the highest `Rev N` entry) for what is actually next — do not
+   trust a prior session's summary of this, including an old copy of this
+   paragraph: a stale hardcoded "the open items are ..." list here once sent
+   a session chasing an item (RP4) that had already landed a rev earlier
+   (2026-09-10). This file changes every session; the roadmap doc is the
+   only thing here that is current by construction.** **Its gate is a
+   script:** `tools/hot-expert/prefill_gate.sh <pristine> <candidate>` exits
+   1 on an oracle miss and 3 on a TTFT regression or a decode drop; an item
+   is done when it exits 0 with its table in the commit body. The chain
+   scripts in `~/bench/p*_chain.sh` on the rig are the pattern for running
+   it unattended (stop gateway → merge → build → gate → tworeq → serve only
+   on rc 0 → restart).
 1. `tools/hot-expert/ROADMAP-2026-09.md` — the two tracks (GLM-5.3, Qwen3.8),
    each item with evidence, expected delta, gate, and the model tier that
    may execute it. Work only on a named item.
 2. `tools/hot-expert/ROME-3x7900XTX-2026-09-04.md` — the measurement record:
    hardware, baselines in both regimes, the per-op placement matrix, what was
    tried and rejected. Do not re-derive anything that is in it.
-3. `git log` on the branch you are on. Commit bodies carry the numbers
+3. `tools/hot-expert/MEASURING.md` — **which tool measures which track.**
+   The decode-throughput roadmap and the prefill roadmap have different
+   headline metrics and different harnesses (`tools/rome_bench.sh` vs
+   `tools/hot-expert/prefill_snapshot.sh`); using one track's tool to
+   re-baseline the other produces a number that looks like a regression and
+   is not (2026-09-10 — read this before running any benchmark, not after).
+4. `git log` on the branch you are on. Commit bodies carry the numbers
    behind every landed change; the history is the benchmark archive.
 
 ## Where sessions run
@@ -82,6 +92,15 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   run, truncating `~/glm53_server.log` and producing a MISMATCH that was pure
   collision. **`ListAgents` shows peer sessions; if one is busy on this repo,
   say so and coordinate over `SendMessage` before touching the rig.**
+  **Take the rig lock (`~/bench/.rig.lock`, `tools/hot-expert/rig_lock.sh`)
+  before stopping the gateway for ANY reason, not only inside a chain
+  launched through `run_chain.sh`.** `gateway_watchdog.sh` runs from cron
+  every 5 minutes and restarts the gateway whenever it is down and no lock
+  is held — stop the gateway by hand without the lock and the watchdog can
+  race back in mid-measurement (happened 2026-09-10, corrupted a
+  `datapoint.py` run with a second `glm53` starting underneath it).
+  `tools/rome_bench.sh` now takes the lock and handles the stop/restart
+  itself; if you ever stop the gateway some other way, take the lock first.
 - **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
   `openai_server.py` on 8081 with `--kv-slots 4` and `COLI_KDA_GPU=2`
   (P6b, 2026-09-07: each slot has its own KDA device state, pool allocated

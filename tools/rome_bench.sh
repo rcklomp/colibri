@@ -271,6 +271,23 @@ cd "$COLIBRI_SRC"
 # $OUTPUT never printed, because `X=$(cmd) || { ... }` discards the assignment
 # on failure -- the real traceback was lost and had to be re-run by hand over
 # ssh to find (cost ~15 minutes, 2026-09-10). Always show what datapoint.py said.
+# ROME_BENCH_NO_EVICT=1 passes --no-evict. Why this knob exists (2026-09-10):
+# datapoint.py evicts the model from the page cache with posix_fadvise(DONTNEED)
+# over all 62 shards before EVERY run unless told not to, so this script's own
+# careful warm -- three minutes of `cat`, fincore asserting 100% resident -- is
+# undone one second later, and the engine re-reads 182 GiB from NVMe INSIDE the
+# measurement. Measured here on the same box, same binary, same hour:
+#
+#     with eviction (the default)   rotating 1.74-1.91   cold ttft 31-35 s
+#     --no-evict                    rotating 3.91        cold ttft  5.3 s
+#
+# So the default headline number is dominated by disk throughput, not by the
+# engine. That is legitimate for a cold-start question and useless for a kernel
+# one, and every historical row in the record was taken WITH eviction -- so the
+# default stays as it was for comparability, and the knob is how you ask the
+# other question. Say which one a row is in its config-name.
+DP_EVICT_ARG=""
+[ "${ROME_BENCH_NO_EVICT:-0}" = 1 ] && { DP_EVICT_ARG="--no-evict"; echo "[rome_bench] --no-evict: the model stays resident; this row is NOT comparable to the evicting rows"; }
 set +e
 OUTPUT=$(python3 c/tools/datapoint.py \
   --engine "$ENGINE_BIN" \
@@ -280,6 +297,7 @@ OUTPUT=$(python3 c/tools/datapoint.py \
   --max-new "$MAX_NEW" \
   --rotating-runs 4 \
   --warm-runs 1 \
+  $DP_EVICT_ARG \
   2>&1)
 DP_RC=$?
 set -e

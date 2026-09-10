@@ -107,6 +107,19 @@ one more token with the previous fresh prompt captures again (~300 MB of copy
 and disk write to gain five tokens) — a minimum *gain* rather than a minimum
 *length* is the follow-up.
 
+**Rev 18 (2026-09-10, 02:32): the CANCEL flake is closed too.** Rev 17 closed
+the engine half; what remained was a gateway race, worth 1 abandoned request in
+3 holding the engine for its whole prefill with no `CANCEL` in the log at all.
+The cancel could reach the engine before it had dequeued that SUBMIT, was
+answered `NOT_FOUND`, and was lost. Fixed by retrying on that ack (`3d80c07`)
+and by not stranding a request whose cancel failed — the dispatcher popped a
+request's routing entry on every error frame (`07fa39a`). Gate `check4.sh 6`:
+**6/6 cancelled during prefill, next request 6.6–8.7 s**, plus `accept_live`
+in full; it ran through `run_chain.sh`, the rig lock's first production run.
+The first attempt at this fix was wrong and its own chain reverted it —
+deferring the cancel to the ACCEPT frame measured 5/5 at ~155 s, worse than the
+bug. §"CANCEL retry" in the record.
+
 **Rev 17 (2026-09-09, 01:00): the CANCEL dependency is CLOSED — a
 1 230-token prompt cancelled at 5 s is confirmed in 12.9 s instead of 251.3 s,
 and the live path is where the design turned out to be wrong.** `glm53` now

@@ -1,0 +1,7 @@
+pasted_tok	turn	engine_prompt	engine_reused	engine_new	engine_ttft_s	browser_first_s	browser_total_s	gen_tok
+0	1	4427	4418	9	1.89	2.81	3.63	2
+0	2	4443	4429	14	2.77	3.79	4.60	2
+500	1	4671	4418	253	42.51	43.63	44.44	2
+500	2	4687	4673	14	2.73	4.54	5.35	4
+2000	1	5433	4418	1015	181.69	188.62	189.44	17
+2000	2	5464	5450	14	2.87	4.79	5.60	4

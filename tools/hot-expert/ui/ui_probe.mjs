@@ -8,8 +8,18 @@
 //
 //   OWUI_TOKEN=<jwt> node ui_probe.mjs --url http://rome.local:3000 [--question "..."]
 //        [--timeout 900] [--headed] [--shot out.png] [--keep-chat]
+//        [--follow-up "..."] [--follow-ups N] [--nonce TEXT]
 // Prints one machine-readable line:
 //   RESULT ok=<0|1> first_token_s=<s> done_s=<s> chars=<n> chat=<id|-> error=<...>
+// plus one `TURN <n> first_token_s=.. done_s=..` line per turn.
+//
+// P9: --follow-ups N sends N follow-up turns in the SAME chat, which is the
+// production shape the ledger's invariant has to hold in -- ten turns of a real
+// browser conversation with zero MISMATCH in the gateway's log. Each follow-up
+// carries the turn number and the nonce, because a check whose question is fixed
+// makes a second run send an identical turn that the engine cannot reuse BY
+// DESIGN (kv_prefix_reuse needs at least one new token), and that reads as a
+// regression which is really the harness repeating itself.
 //
 // The token is read from the environment and never printed. Mint it on the rig
 // (tools/hot-expert/accept_live.sh does) and pass it in; the browser then signs in as the
@@ -45,6 +55,8 @@ let question = String(arg('question', 'Which day comes after Tuesday? Answer in 
 const textFile = arg('text-file', null);
 if (textFile) question = (await import('node:fs')).readFileSync(String(textFile), 'utf8');
 const followUp = arg('follow-up', null);
+const followUps = Number(arg('follow-ups', followUp ? 1 : 0)) || 0;
+const nonce = String(arg('nonce', String(Date.now()).slice(-6)));
 const timeoutMs = Number(arg('timeout', 900)) * 1000;
 const shot = arg('shot', null);
 const token = process.env.OWUI_TOKEN;
@@ -54,7 +66,7 @@ const out = { ok: 0, first_token_s: '-', done_s: '-', chars: 0, chat: '-', error
 const done = (code) => {
   console.log(`RESULT ok=${out.ok} first_token_s=${out.first_token_s} done_s=${out.done_s} ` +
               `follow_first_s=${out.follow_first_s ?? '-'} follow_done_s=${out.follow_done_s ?? '-'} ` +
-              `chars=${out.chars} chat=${out.chat} cleaned=${out.cleaned} browser=${out.browser} error=${out.error}` +
+              `turns=${out.turns ?? 1} chars=${out.chars} chat=${out.chat} cleaned=${out.cleaned} browser=${out.browser} error=${out.error}` +
               (out.reply ? ` reply="${out.reply}"` : ''));
   process.exit(code);
 };
@@ -156,15 +168,23 @@ try {
 
   console.log(`TURN 1 first_token_s=${out.first_token_s} done_s=${out.done_s} chars=${out.chars}`);
 
-  // A second turn in the SAME chat: what every reply after the first costs.
-  if (followUp) {
-    const before2 = await page.evaluate(() => [...document.querySelectorAll('[id^="message-"]')].map((n) => n.id));
-    const box2 = page.locator('#chat-input, textarea#chat-textarea, [contenteditable="true"]').first();
-    await box2.click();
-    await box2.type(String(followUp), { delay: 8 });
-    const t1 = Date.now();
+  // Further turns in the SAME chat: what every reply after the first costs.
+  // The first of them keeps the historic follow_first_s / follow_done_s names,
+  // so ui_matrix.sh and accept_ui.sh read exactly what they read before.
+  const askedQuestions = [];
+  for (let turn = 2; turn <= followUps + 1; turn++) {
+    const text = followUps > 1
+      ? `Turn ${turn} [${nonce}]: name one ${['colour', 'animal', 'city', 'metal', 'river',
+          'planet', 'fruit', 'instrument', 'language', 'mountain'][(turn - 2) % 10]}. One word.`
+      : String(followUp);
+    askedQuestions.push(text);
+    const beforeN = await page.evaluate(() => [...document.querySelectorAll('[id^="message-"]')].map((n) => n.id));
+    const boxN = page.locator('#chat-input, textarea#chat-textarea, [contenteditable="true"]').first();
+    await boxN.click();
+    await boxN.type(text, { delay: 8 });
+    const tN = Date.now();
     await page.keyboard.press('Enter');
-    const first2 = await page.waitForFunction((known) => {
+    const firstN = await page.waitForFunction((known) => {
       const isAssistant = (n) => n.id !== 'message-input-container' &&
         !(n.className || '').toString().includes('user-message');
       for (const n of document.querySelectorAll('[id^="message-"]')) {
@@ -173,15 +193,30 @@ try {
         if (body && (body.innerText || '').trim().length > 0) return Date.now();
       }
       return false;
-    }, before2, { timeout: timeoutMs, polling: 250 }).then((h) => h.jsonValue());
+    }, beforeN, { timeout: timeoutMs, polling: 250 }).then((h) => h.jsonValue());
+    // Done: the stop button is gone AND the last bubble stopped growing. Waiting
+    // only for the button lets the next turn's Enter land while the previous
+    // reply is still streaming, which is not a conversation a person could have.
     await page.waitForFunction(() => {
       const stop = document.querySelector('#stop-response-button, button[aria-label*="Stop" i]');
-      return !stop || stop.offsetParent === null;
+      if (stop && stop.offsetParent !== null) return false;
+      const nodes = [...document.querySelectorAll('[id^="message-"]')].filter((n) =>
+        n.id !== 'message-input-container' && !(n.className || '').toString().includes('user-message'));
+      const last = nodes.pop();
+      const body = last && last.querySelector('.markdown-prose, .prose');
+      const len = body ? (body.innerText || '').trim().length : 0;
+      if (!len) return false;
+      if (window.__probeLenN === len) return true;
+      window.__probeLenN = len; return false;
     }, null, { timeout: timeoutMs, polling: 800 }).catch(() => {});
-    out.follow_first_s = ((first2 - t1) / 1000).toFixed(2);
-    out.follow_done_s = ((Date.now() - t1) / 1000).toFixed(2);
-    console.log(`TURN 2 first_token_s=${out.follow_first_s} done_s=${out.follow_done_s}`);
+    await page.evaluate(() => { window.__probeLenN = -1; });
+    const firstS = ((firstN - tN) / 1000).toFixed(2);
+    const doneS = ((Date.now() - tN) / 1000).toFixed(2);
+    if (turn === 2) { out.follow_first_s = firstS; out.follow_done_s = doneS; }
+    out.turns = turn;
+    console.log(`TURN ${turn} first_token_s=${firstS} done_s=${doneS}`);
   }
+  void askedQuestions;
 
   // Leave no trace: the probe's chat is deleted unless --keep-chat.
   if (out.chat !== '-' && arg('keep-chat') !== true) {

@@ -214,8 +214,13 @@ class LedgerCase(unittest.TestCase):
         self.assertEqual(plan.state, "shorter")
         self.assertEqual(plan.matched, 3)
         self.assertEqual(len(S._ledger_cache[plan.key]["turns"]), 3)
-        self.assertTrue(p.startswith(p1 + RAW1))     # the turns that DID match
         self.assertNotIn("A clear sky is blue.", p)  # the reply being regenerated is gone
+        # ... and nothing else is replayed either: the bytes are the client's own,
+        # which is what makes the divergence check in p9_divergence.sh possible.
+        S._ledger_cache.clear()
+        cold, _ = self.render(again)
+        self.assertEqual(p, cold)
+        del p1
 
     def test_regenerate_of_the_first_reply_is_shorter(self):
         m1 = self.t1()
@@ -546,6 +551,148 @@ class LedgerCase(unittest.TestCase):
         ):
             with self.subTest(recorded=recorded, client=client):
                 self.assertEqual(S.ledger_decide(recorded, client), want)
+
+
+# ============================================================================
+# The wiring, end to end, against a fake engine.
+#
+# The state machine above is where the bugs will be; this class is where a
+# WIRING bug would be -- chat_completion rendering one thing and generation
+# recording another, the slot not reaching the scheduler, the [ledger] line
+# never printed. It drives the real HTTP path with an engine that answers like
+# glm53 does, including the 8th STAT field.
+# ============================================================================
+import json
+import threading
+import urllib.request
+from openai_server import APIServer
+
+
+class _LedgerEngine:
+    """A glm53-shaped engine: it records the prompts it was given, and reports a
+    reuse count computed the way serve_one computes one -- the longest common
+    prefix with what it already holds for that slot, in characters, which is a
+    monotone stand-in for tokens and enough to make the arithmetic checkable."""
+
+    def __init__(self):
+        self.prompts = []
+        self.slots = []
+        self.held = {}
+        self.replies = ["Thinking about it.</think>\nBlue ",
+                        "Second thought.</think>\nGreen ",
+                        "Third thought.</think>\nRed "]
+        self.n = 0
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, **kw):
+        self.prompts.append(prompt)
+        self.slots.append(cache_slot)
+        held = self.held.get(cache_slot, "")
+        shared = 0
+        while shared < len(held) and shared < len(prompt) and held[shared] == prompt[shared]:
+            shared += 1
+        if not (0 < shared < len(prompt)):
+            shared = 0
+        raw = self.replies[self.n % len(self.replies)]
+        self.n += 1
+        if on_accept is not None:
+            on_accept({"prompt_tokens": len(prompt)})
+        on_text(raw)
+        self.held[cache_slot] = prompt + raw
+        return {"prompt_tokens": len(prompt), "completion_tokens": len(raw),
+                "length_limited": False, "reused": shared}
+
+
+class LedgerHTTP(unittest.TestCase):
+    """The gateway's own path, with COLI_LEDGER at its shipped default."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = _LedgerEngine()
+        cls.server = APIServer(("127.0.0.1", 0), cls.engine, "glm-5.3-flash", "secret",
+                               64, kv_slots=4)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def setUp(self):
+        S._ledger_cache.clear()
+        self.engine.prompts.clear()
+        self.engine.slots.clear()
+        self.engine.held.clear()
+        self.engine.n = 0
+        self.arch = patch.object(S, "ARCH", "glm53"); self.arch.start()
+        self.addCleanup(self.arch.stop)
+        self.env = patch.dict(S.os.environ, {"COLI_LEDGER": "1", "COLI_REQ_LOG": "1"})
+        self.env.start(); self.addCleanup(self.env.stop)
+
+    def post(self, messages):
+        body = json.dumps({"model": "glm-5.3-flash", "messages": messages,
+                           "max_tokens": 32, "stream": False}).encode()
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=body,
+                                     headers={"Authorization": "Bearer secret",
+                                              "Content-Type": "application/json"})
+        return json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+    def test_turn_two_extends_turn_one_through_the_whole_gateway(self):
+        m1 = [{"role": "system", "content": SYSTEM},
+              {"role": "user", "content": "Say a colour."}]
+        r1 = self.post(m1)
+        visible = r1["choices"][0]["message"]["content"]
+        self.assertEqual(visible.strip(), "Blue")
+        m2 = m1 + [{"role": "assistant", "content": visible.strip()},
+                   {"role": "user", "content": "Another one."}]
+        self.post(m2)
+        p1, p2 = self.engine.prompts
+        self.assertTrue(p2.startswith(p1 + self.engine.replies[0]),
+                        f"\n  p1 tail {p1[-40:]!r}\n  p2 at   {p2[len(p1) - 10:len(p1) + 40]!r}")
+        self.assertEqual(self.engine.slots[0], self.engine.slots[1])
+
+    def test_the_ledger_line_reports_the_engines_own_reuse(self):
+        m1 = [{"role": "user", "content": "Say a colour."}]
+        r1 = self.post(m1)
+        visible = r1["choices"][0]["message"]["content"].strip()
+        lines = []
+        with patch.object(S, "ledger_log", side_effect=lambda t, force=False: lines.append(t)):
+            self.post(m1 + [{"role": "assistant", "content": visible},
+                            {"role": "user", "content": "Another one."}])
+        report = [l for l in lines if "expect_reuse=" in l]
+        self.assertTrue(report, lines)
+        self.assertIn("state=continuation", report[-1])
+        self.assertIn(" ok", report[-1])
+        self.assertNotIn("MISMATCH", report[-1])
+
+    def test_the_response_body_is_the_same_with_the_ledger_off(self):
+        """The ledger changes the prompt, never the reply the client receives."""
+        m1 = [{"role": "user", "content": "Say a colour."}]
+        on = self.post(m1)
+        S._ledger_cache.clear(); self.engine.n = 0; self.engine.held.clear()
+        with patch.dict(S.os.environ, {"COLI_LEDGER": "0"}):
+            off = self.post(m1)
+        self.assertEqual(on["choices"][0]["message"], off["choices"][0]["message"])
+
+    def test_two_conversations_land_on_two_slots(self):
+        for opening in ("first conversation", "second conversation"):
+            self.post([{"role": "user", "content": opening}])
+        self.assertEqual(len(set(self.engine.slots)), 2)
+
+    def test_streaming_records_the_raw_generation_too(self):
+        body = json.dumps({"model": "glm-5.3-flash", "max_tokens": 32, "stream": True,
+                           "messages": [{"role": "user", "content": "Say a colour."}]}).encode()
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=body,
+                                     headers={"Authorization": "Bearer secret",
+                                              "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+        key = S.conversation_pin_key([{"role": "user", "content": "Say a colour."}],
+                                     normalise=True)
+        self.assertEqual(S._ledger_cache[key]["generated"], self.engine.replies[0])
 
 
 if __name__ == "__main__":

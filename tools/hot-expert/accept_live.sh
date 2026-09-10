@@ -13,6 +13,11 @@
 # Checks (bounds are the measured values of 2026-09-09 with headroom, not aspirations):
 #  1. UI-shaped new chat A            -> may be cold (a changed tool block is captured here)
 #  2. UI-shaped new chat B (other Q)  -> reused >= prompt-256 and ttft <= 60 s  (the P7b case)
+#  2b. the ledger's own alarm         -> zero MISMATCH and zero `ledger=broken` in the
+#                                        requests this run drove (P9). In the canary too:
+#                                        every prefix regression this week was invisible
+#                                        except as latency, and this is the line that
+#                                        makes one visible without anybody watching.
 #  3. API two-turn, memory on         -> turn 2 reused >= prompt-32 and ttft <= 15 s (P6/P7 pin)
 #  4. abandoned 1 000-token request   -> the short request behind it answers in <= 45 s (CANCEL)
 set -u
@@ -26,6 +31,9 @@ echo "=== accept_live $MODE $(date -Is) binary=$(sha256sum "$HOME/src/colibri/c/
 # (kv_prefix_reuse requires len < n), so a repeated identical turn-2 reads as a failure that
 # is really the harness repeating itself — seen 2026-09-09 (req 18, reused 0).
 N="$$-$(date +%s)"
+# Where the log stood before this run, so the ledger check below judges the
+# requests THIS run drove and not whatever the owner did an hour ago.
+L0=$(grep -c "\[ledger\] " "$LOG" 2>/dev/null); L0=${L0:-0}
 A=$("$HERE/owui_ui_turn.sh" "Which day comes after Tuesday? One word. [$N-a]" | tee /dev/stderr | grep "^RESULT")
 B=$("$HERE/owui_ui_turn.sh" "Name one prime number greater than ten. One word. [$N-b]" | tee /dev/stderr | grep "^RESULT")
 v() { echo "$2" | sed -n "s/.*$1=\([0-9.]*\).*/\1/p"; }
@@ -34,6 +42,26 @@ pb=$(v prompt "$B"); rb=$(v reused "$B"); tb=$(v ttft "$B")
 say "1. UI new chat A (may be cold)" "prompt=$pa reused=$ra ttft=${ta}s"
 if [ -n "$pb" ] && [ "$rb" -ge $((pb - 256)) ] && [ "${tb%.*}" -le 60 ]; then say "2. UI new chat B warm" "PASS prompt=$pb reused=$rb ttft=${tb}s";
 else say "2. UI new chat B warm" "FAIL prompt=$pb reused=$rb ttft=${tb}s (need reused>=$((pb-256)), ttft<=60)"; FAIL=1; fi
+# 2b. P9: the ledger's agreement with the engine, for the turns just driven.
+ledger_check() {
+  local since=$1 rows mism broken checked
+  rows=$(grep "\[ledger\] " "$LOG" 2>/dev/null | tail -n +$((since + 1)))
+  if [ -z "$rows" ]; then
+    say "2b. ledger invariant" "SKIP no [ledger] lines (COLI_LEDGER=0, or an older gateway)"
+    return 0
+  fi
+  mism=$(printf '%s\n' "$rows" | grep -c "MISMATCH")
+  broken=$(printf '%s\n' "$rows" | grep -c "ledger=broken")
+  checked=$(printf '%s\n' "$rows" | grep -c "expect_reuse=[0-9]")
+  if [ "$mism" = 0 ] && [ "$broken" = 0 ]; then
+    say "2b. ledger invariant" "PASS $checked checked, 0 MISMATCH, 0 broken"
+  else
+    say "2b. ledger invariant" "FAIL $mism MISMATCH, $broken broken (of $checked checked)"
+    printf '%s\n' "$rows" | grep "MISMATCH\|ledger=broken" | tail -4 | cut -c1-150
+    return 1
+  fi
+}
+ledger_check "$L0" || FAIL=1
 [ "$MODE" = "--canary" ] && { echo "=== accept_live canary $([ $FAIL = 0 ] && echo PASS || echo FAIL)"; exit $FAIL; }
 # 3. API two-turn with memory on (the pin), through Open WebUI's backend, no chat_id (no tools: fast)
 T=$(docker exec -i -e ACCEPT_NONCE="$N" "${OWUI_CONTAINER:-open-webui-new}" python3 - <<'PY' 2>/dev/null
@@ -71,6 +99,7 @@ curl -s -m 300 -o /dev/null -H "Authorization: Bearer $K" -H "Content-Type: appl
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Say OK."}],"max_tokens":8}'
 t4=$(python3 -c "print(round($(date +%s.%N) - $t0, 1))")
 if [ "${t4%.*}" -le 45 ]; then say "4. request behind an abandoned one" "PASS answered in ${t4}s"; else say "4. request behind an abandoned one" "FAIL ${t4}s (need <=45)"; FAIL=1; fi
+ledger_check "$L0" || FAIL=1        # again, now covering checks 3 and 4 as well
 grep "CANCEL" "$LOG" | tail -1 | cut -c1-120
 echo "=== accept_live $([ $FAIL = 0 ] && echo PASS || echo FAIL) $(date -Is)"
 exit $FAIL

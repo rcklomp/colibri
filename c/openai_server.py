@@ -2920,6 +2920,21 @@ def _ledger_render(messages, enable_thinking, reasoning_effort, tools, tool_choi
                 entry["prompt"] = entry["generated"] = ""
                 entry["prompt_tokens"] = None
                 entry["partial"] = False
+                # Nothing is replayed on a regenerate, an edit or a branch, and
+                # that is a decision worth its own paragraph. The spec would
+                # render the matched turns from the record ("truncate the ledger
+                # to the matched turns and render from there"). It buys no reuse:
+                # the slot holds MORE tokens than the shorter prompt, so
+                # `cached < total` is false and serve_one re-prefills whichever
+                # bytes it is given (glm53.c). What it would cost is the property
+                # that makes this branch checkable at all -- that the text a
+                # divergence produces is byte-identical to the text a gateway
+                # which never saw the conversation produces for the same
+                # transcript. Slow is allowed, wrong is not, so the client's own
+                # transcript is what goes to the engine here. The record is
+                # rebuilt from THIS request on DONE, so the next turn continues
+                # from what the engine actually holds.
+                replayed = 0
         # The slot is chosen ONCE, when the record is created, and kept: this is
         # what replaces conversation_cache_slot's hash-modulo routing, and
         # re-picking it per request would put the collisions straight back.
@@ -3071,7 +3086,13 @@ def ledger_report(plan, stats):
     if plan is None or not ledger_enabled():
         return
     engine = (stats or {}).get("reused")
-    head = f"[ledger] key={plan.key[:8]} turn={plan.turn_no} state={plan.state}"
+    # The slot is in the line because a MISMATCH has two possible causes and they
+    # are not the same bug: the ledger claimed a prefix the engine does not hold,
+    # or the engine lost the slot to another conversation between the two turns.
+    # With one slot per conversation the second needs more live conversations
+    # than slots, and the line says which one happened.
+    head = (f"[ledger] key={plan.key[:8]} turn={plan.turn_no} slot={plan.slot} "
+            f"state={plan.state}")
     if plan.expect_reuse is None or engine is None:
         ledger_log(f"{head} expect_reuse=- engine_reuse={engine if engine is not None else '-'}")
         return

@@ -14,7 +14,13 @@
 # Exit 0 only when the candidate is serving AND accept_live.sh passed.
 set -u
 CAND=${1:?candidate}; PRISTINE=${2:?pristine}; PSHADERS=${3:-}
-HERE=$(cd "$(dirname "$0")" && pwd); TREE="$HOME/src/colibri"; BIN="$TREE/c/glm53"; LOG="$HOME/glm53_server.log"
+HERE=$(cd "$(dirname "$0")" && pwd)
+# The rig lock: if a chain holds it, this IS that chain (run_chain.sh took it and we inherit
+# the environment). If nothing holds it, take it, so a hand-run serve can never interleave
+# with a chain. Released on every exit path.
+. "$HERE/rig_lock.sh"
+if ! rig_lock_holder >/dev/null; then rig_lock_take "serve_candidate" || exit 3
+  trap 'rig_lock_release' EXIT INT TERM; fi; TREE="$HOME/src/colibri"; BIN="$TREE/c/glm53"; LOG="$HOME/glm53_server.log"
 sha() { sha256sum "$1" | cut -c1-16; }
 restart_gateway() {
   SKIP_WARM=1 setsid nohup "$HOME/start_glm53.sh" > "$LOG" 2>&1 < /dev/null &

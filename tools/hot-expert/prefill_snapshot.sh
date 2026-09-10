@@ -25,6 +25,19 @@ URL=http://127.0.0.1:8081
 
 echo "=== prefill_snapshot $TAG $(date -Is)"
 
+# Read-only against the gateway, but still a TIMING measurement: a chain that
+# stops, restarts or floods the gateway underneath it makes these numbers a
+# measurement of that chain. So this does not TAKE the lock (it must not stop
+# anyone), but it refuses to produce numbers while someone else holds it --
+# "one benchmark at a time" applies to the passive side too.
+. "$HERE/rig_lock.sh"
+if holder=$(rig_lock_holder); then
+  echo "REFUSED: the rig lock is held by: $holder"
+  echo "         Its chain is driving this gateway; TTFT measured now would be that"
+  echo "         chain's numbers, not the served binary's. Wait for it to finish."
+  exit 3
+fi
+
 pgrep -f "openai_[s]erver.py" >/dev/null || { echo "REFUSED: gateway not running"; exit 2; }
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H "Authorization: Bearer $K" "$URL/v1/models")
 [ "$code" = 200 ] || { echo "REFUSED: /v1/models=$code"; exit 2; }
@@ -53,3 +66,9 @@ echo "=== prefill_snapshot done. accept_live=$([ "$AL_RC" = 0 ] && echo PASS || 
 echo "    Raw output kept at $OUT -- review the TTFT numbers against the historical ones above"
 echo "    (same order of magnitude, same direction as the last landed item) before writing"
 echo "    anything into $ROADMAP by hand. This script does not append for you."
+
+# Exit with accept_live's verdict, not the echo's. Anything driving this
+# non-interactively (an agent, a loop, a chain) reads the exit code, and a
+# script whose stated job is to catch a regression must not report success
+# when its own acceptance check just failed.
+exit "$AL_RC"

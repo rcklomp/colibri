@@ -74,6 +74,12 @@ rig_lock_take "rome_bench-${ENGINE}-${CONFIG_NAME}" || { echo "rome_bench: rig b
 RESTART_GATEWAY=0
 cleanup() {
   rc=$?
+  # Disarm first. Without this, the INT/TERM/HUP path calls exit, which fires
+  # the EXIT trap, which runs cleanup a SECOND time with RESTART_GATEWAY still
+  # 1 -- two `start_glm53.sh`, two engines each preloading 182 GiB on a 247 GB
+  # box, racing for port 8081. The dropped-laptop HUP case this trap was added
+  # for is exactly the one that would have hit it.
+  trap - EXIT INT TERM HUP
   [ -n "${GLM_HIST:-}" ] && rm -f "$GLM_HIST"
   if [ "$RESTART_GATEWAY" = 1 ]; then
     echo "[rome_bench] restarting the owner's gateway"
@@ -81,8 +87,14 @@ cleanup() {
     KEY=$(cat "${HOME}/.colibri_api_key" 2>/dev/null)
     for i in $(seq 1 60); do
       sleep 10
-      code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" http://127.0.0.1:8081/v1/models 2>/dev/null)
-      [ "$code" = 200 ] && break
+      # `|| true` is load-bearing under `set -e`: openai_server.py binds its
+      # socket before the model is loaded, so the early probes exit 7 (refused)
+      # or 28 (timeout). A bare assignment from a failing command substitution
+      # aborts the shell INSIDE the trap -- which skipped rig_lock_release and
+      # left ~/bench/.rig.lock behind after every successful run that stopped
+      # the gateway. Observed for real 2026-09-10.
+      code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" http://127.0.0.1:8081/v1/models 2>/dev/null) || true
+      [ "${code:-}" = 200 ] && break
     done
     echo "[rome_bench] gateway back, /v1/models=${code:-?}"
   fi
@@ -172,11 +184,17 @@ echo "[rome_bench] Starting benchmark: engine=$ENGINE config=$CONFIG_NAME"
 echo "[rome_bench] ENGINE_BIN=$ENGINE_BIN"
 echo "[rome_bench] MODEL_SNAP=$MODEL_SNAP"
 
-# Check for concurrent engines
-if pgrep -x qwen38 qwen38-vk glm53 >/dev/null 2>&1; then
-  echo "Error: Another engine is already running" >&2
-  exit 1
-fi
+# Check for concurrent engines. ONE PATTERN PER pgrep CALL (CLAUDE.md): the old
+# form `pgrep -x qwen38 qwen38-vk glm53` passed three patterns, which pgrep
+# rejects with a usage error and exit 2 -- swallowed by the redirect, so this
+# guard was dead code and never once refused anything. A hand-started engine
+# from another session could sail straight past it.
+for _eng in qwen38 qwen38-vk glm53; do
+  if pgrep -x "$_eng" >/dev/null 2>&1; then
+    echo "Error: another engine is already running ($_eng) -- refusing" >&2
+    exit 1
+  fi
+done
 
 # Drop caches (requires sudo; may prompt for password)
 echo "[rome_bench] Dropping page cache..."

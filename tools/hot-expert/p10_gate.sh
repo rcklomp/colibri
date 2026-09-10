@@ -68,6 +68,28 @@ wait_no_engine() {
 }
 gw_stop() { "$HOME/bench/p7_stop.sh"; wait_no_engine; }
 
+# Every refusal path below (`exit 2`, `wait_no_engine || exit 2`, a Ctrl-C, a
+# dropped ssh) used to return with whatever an ARM last started still serving:
+# the owner's daily service left running from $ARM_SCRIPT, with
+# GLM53_CKPT_VALUE_EVICT possibly OFF and its checkpoints going to a
+# ~/bench/p10_gate_* temp dir. p10_chain.sh does not save you either -- its
+# on_exit deliberately skips the revert while an openai_server.py is up, which
+# is exactly the case an arm leaves behind. p10_hits_case.sh got this right;
+# this gate did not. Restore the owner's own script on every exit path.
+GATE_ARM_RUNNING=0
+restore_service() {
+  rc=$?
+  trap - EXIT INT TERM HUP            # never run this handler twice
+  if [ "$GATE_ARM_RUNNING" = 1 ]; then
+    echo "[p10_gate] an arm gateway is up -- restoring the owner's service"
+    gw_stop || true
+    gw_start || echo "[p10_gate] WARNING: the owner's gateway did not come back"
+    GATE_ARM_RUNNING=0
+  fi
+  exit "$rc"
+}
+trap restore_service EXIT INT TERM HUP
+
 # ~/start_glm53.sh EXPORTS GLM53_PREFIX_CKPT_MIN=1024 unconditionally, and the
 # whole point of P10 is that the minimum can come back down once eviction can
 # rank. An arm therefore runs a copy of the owner's own script with that one
@@ -187,6 +209,7 @@ flood_arm() {   # flood_arm <label> <value_evict 0|1> <seed-dir>
   fi
   say "seeded from $seed" "$(ls "$dir" | wc -l) files, $(du -sh "$dir" | cut -f1)"
   gw_stop || return 2
+  GATE_ARM_RUNNING=1   # from here the service is an ARM, not the owner's -- see restore_service
   gw_start COLI_CKPT_DIR="$dir" GLM53_PREFIX_CKPT_MIN=128 GLM53_CKPT_VALUE_EVICT=$evict || return 2
   echo "    slots as loaded:"
   grep -a "CKPT disk load" "$LOG" | tail -8 | sed 's/^/      /' | cut -c1-140
@@ -198,9 +221,22 @@ flood_arm() {   # flood_arm <label> <value_evict 0|1> <seed-dir>
       > "$OUT/arm-$label-warm$i.txt" 2>&1
     say "warm-up $i/$WARM" "$(grep '^RESULT' "$OUT/arm-$label-warm$i.txt" || echo 'no RESULT')"
   done
+  # This count is the whole point of step (b): the arm exists to show that the
+  # HITS term defends the tool block, so if the warm-ups never restored it, the
+  # on/off verdict that follows is about something else (length alone) and is
+  # not evidence for this item. It used to be assigned and never read -- an
+  # assertion written down but not made. Fail loudly instead.
   local tb_hits
-  tb_hits=$(grep -a "CKPT hit prefix=" "$LOG" | tail -n "$WARM" | grep -c "hits=" ) || true
+  tb_hits=$(grep -a "CKPT hit prefix=" "$LOG" | tail -n "$WARM" | grep -c "hits=") || true
+  tb_hits=${tb_hits:-0}
   grep -a "CKPT hit prefix=" "$LOG" | tail -3 | sed 's/^/      /' | cut -c1-120
+  say "tool block earned hits" "$tb_hits of $WARM warm-ups"
+  if [ "$tb_hits" -lt 2 ]; then
+    echo "    REFUSED: the tool block was restored $tb_hits time(s) in $WARM warm-ups."
+    echo "             Without hits on it there is no hits term to test, and the"
+    echo "             arm would be measuring the length-only rule instead."
+    return 2
+  fi
 
   # (c) the flood: unique ~FLOOD_TOK-token system blocks, so the gateway's
   #     prefix hint lands on each one and the engine STORES it.
@@ -252,6 +288,21 @@ PY
 if run_step 3; then
   echo
   echo "### step 3 — the flood: 20 short chats must not evict the tool block"
+  # $CAND is used by steps 1 and 2 only. Steps 3 and 4 drive a GATEWAY, and the
+  # gateway serves whatever is at ~/src/colibri/c/glm53 -- not $CAND. Run this
+  # gate standalone (GATE_STEPS=34, which its own header invites) against a tree
+  # that has not been rebuilt, and it will flood-test the PRISTINE binary and
+  # report PASS for the candidate. The chain happens to install first; a gate
+  # whose exit 0 means "the item is done" must not depend on its caller.
+  gw_bin="$HOME/src/colibri/c/glm53"
+  if [ "$(sha256sum "$gw_bin" | cut -d" " -f1)" != "$(sha256sum "$CAND" | cut -d" " -f1)" ]; then
+    echo "REFUSED: the gateway would serve $(sha256sum "$gw_bin" | cut -c1-16), but the"
+    echo "         candidate under test is $(sha256sum "$CAND" | cut -c1-16). Steps 3-4 drive"
+    echo "         the gateway, so they would measure the wrong binary. Install the"
+    echo "         candidate first (the chain does this) or pass the served binary."
+    exit 2
+  fi
+  echo "    gateway will serve the candidate: $(sha256sum "$gw_bin" | cut -c1-16) ✓"
   if [ -z "$LIVE_CKPT" ]; then
     LIVE_CKPT=$(ls -d "$HOME"/models/*/.coli_ckpt 2>/dev/null | head -1)
   fi

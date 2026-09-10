@@ -3733,8 +3733,16 @@ class Engine:
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
+                    # NOT_FOUND is the one ERROR that does not end the request: it means a
+                    # CANCEL reached the engine before it had dequeued that SUBMIT, so it
+                    # cancelled nothing and the request is still coming. Popping the routing
+                    # entry here would strand every later frame of a request that is very
+                    # much alive -- and the retry that fixes the race would have nowhere to
+                    # land. Deliver it, keep the entry; DONE or ERROR CANCELLED removes it.
+                    transient = (message == "NOT_FOUND")
                     with self.pending_lock:
-                        events = self.pending.pop(request_id, None)
+                        events = (self.pending.get(request_id) if transient
+                                  else self.pending.pop(request_id, None))
                     if events is not None:
                         events.put(("error", _engine_error(fields[2:], message)))
                 else:

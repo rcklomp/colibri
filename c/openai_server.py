@@ -3844,6 +3844,7 @@ class Engine:
             raise
 
         cancel_sent = False
+        cancel_pending = False        # disconnect seen before the engine's ACCEPT
         stop_sent = False
         accepted = False
 
@@ -3876,6 +3877,14 @@ class Engine:
                 accepted = True
                 if on_accept is not None:
                     on_accept(info)
+                # A disconnect seen while this request was still queued: the
+                # engine knows the id only now, so this is the first moment a
+                # CANCEL can land on it rather than on nothing.
+                if cancel_pending and not cancel_sent and not stop_sent:
+                    cancel_sent = True
+                    with self.write_lock:
+                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                        self.process.stdin.flush()
 
         while True:
             try:
@@ -3894,11 +3903,24 @@ class Engine:
                 # reading — every later request then hangs silently behind the
                 # orphaned generation. Wait for the engine's ERROR CANCELLED /
                 # DONE frame; ClientCancelled is raised when it arrives.
+                #
+                # And do NOT send it before the engine has ACCEPTed the request.
+                # The engine only knows an id once it has dequeued that SUBMIT;
+                # a CANCEL that arrives first is answered ERROR NOT_FOUND, the
+                # gateway turns that into a 500, and the engine then runs the
+                # request to completion anyway -- holding every later request
+                # behind it. Measured 2026-09-09: 1 abandoned request in 3 left
+                # the next one waiting 158-255 s with NO `CANCEL` line in the
+                # engine log, while the other 2 cancelled in ~13 s. Remember the
+                # intent and fire it the moment ACCEPT lands.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
-                    cancel_sent = True
-                    with self.write_lock:
-                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                        self.process.stdin.flush()
+                    if not accepted:
+                        cancel_pending = True
+                    else:
+                        cancel_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                            self.process.stdin.flush()
                 continue
             if kind == "accept":
                 if accepted:

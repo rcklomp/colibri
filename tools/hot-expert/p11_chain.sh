@@ -94,10 +94,15 @@ grep -E "teacher_forcing|cosine|max_abs|TTFT|size " "$OUT/gate.log" | tail -12
 [ "$grc" = 0 ] || { echo "GATE FAILED rc=$grc -- see $OUT/gate.log"; exit 1; }
 echo "step 3 PASS (bit-identical; this change touches no compute path)"
 
-# --- 4. the guard's own regression test (the test P10's gate did not have)
-"$HERE/p11_touch_case.sh" "$PRISTINE" "$CAND" "$OUT" > "$OUT/touch_case.log" 2>&1
+# --- 4. the guard's own regression test (the test P10's gate did not have).
+#        Five cases against the real ckpt_disk_touch; case C fails on the
+#        pre-P11 binary and passes after, verified against both builds.
+( cd ~/src/colibri-p11 && make -C c tests/test_glm53_ckpt_touch VK=1 ) > "$OUT/touch_build.log" 2>&1
+[ -x ~/src/colibri-p11/c/tests/test_glm53_ckpt_touch ] || {
+  echo "GUARD TEST did not build -- see $OUT/touch_build.log"; tail -5 "$OUT/touch_build.log"; exit 1; }
+~/src/colibri-p11/c/tests/test_glm53_ckpt_touch > "$OUT/touch_case.log" 2>&1
 trc=$?
-tail -14 "$OUT/touch_case.log"
+grep -E "^[A-E] ok|check failed|all cases passed" "$OUT/touch_case.log" | head -8
 [ "$trc" = 0 ] || { echo "GUARD TEST FAILED rc=$trc -- see $OUT/touch_case.log"; exit 1; }
 echo "step 4 PASS (a foreign file is left untouched; the normal path still counts)"
 

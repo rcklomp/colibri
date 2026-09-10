@@ -3,18 +3,23 @@
 #
 # The item is explicit that the numerics probe comes FIRST and that speed does
 # not matter if accuracy fails, so this script measures no speed. It runs the
-# same prompt through four configurations of the same model and diffs their
+# same prompt through five configurations of the same model and diffs their
 # output:
 #
-#   R1 pristine  (c4a3e68)              tier on, normal    -- the reference
-#   R2 candidate                        tier on, no knobs  -- must equal R1 byte for byte
-#   R3 candidate GLM53_EXPERTS_CPU=1    every routed expert on the CPU, int4
-#   R4 candidate GLM53_EXPERTS_CPU=1
-#                GLM53_I3_SIM=1         every routed expert on the CPU, int3
+#   R1  pristine (c4a3e68)               tier on, normal   -- the reference
+#   R2  candidate                        tier on, no knobs -- must equal R1 byte for byte
+#   R3b candidate GLM53_EXPERTS_CPU=2    every routed expert on the CPU, int4,
+#                                        swiglu UNCLAMPED like the GPU kernel
+#   R3  candidate GLM53_EXPERTS_CPU=1    every routed expert on the CPU, int4
+#   R4  candidate GLM53_EXPERTS_CPU=1
+#                 GLM53_I3_SIM=1         every routed expert on the CPU, int3
 #
-# R3 exists because R4 changes two things against R1 (placement and precision);
-# R3 isolates the placement half, so a difference between R3 and R4 is int3 and
-# nothing else. R2 is this project's standing bar: a probe that perturbs the
+# R4 changes two things against R1 (placement and precision), so R3 isolates the
+# placement half and R4-vs-R3 is int3 and nothing else. R3b exists because R3 by
+# itself turned out to change TWO things as well: §G13's routed GPU kernel omits
+# GLM-5.3's swiglu clamp, so moving an expert to the CPU also clamps it. R3b is
+# the run that separates those, and R3b-vs-R1 is what proves the knob does only
+# what it claims. R2 is this project's standing bar: a probe that perturbs the
 # default path is not a probe.
 #
 # Oracles, per CLAUDE.md and §G14: the greedy text over 128 tokens, the

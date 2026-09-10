@@ -42,8 +42,12 @@ buckets blocked and recommended buying VRAM; that was wrong, and item 4f
 records why. The CPU int4 expert bucket (38.6 ms/token, and the leader knob-on
 at 28.6%) is **not** blocked — it is **~57% memory and ~43% arithmetic in situ**,
 and the arithmetic half has now been attacked to exhaustion (G14: everything
-faster than +10% changes the model's output). **The memory half is untouched,
-and `fmt=5` int3 experts attack it without new hardware — that is item 4h.**
+faster than +10% changes the model's output). **The memory half was attacked too, and it
+lost: G15 (item 4h) simulated `fmt=5` int3 experts and GLM-5.3 does not survive
+them — 16 of 1232 teacher-forced predictions change, cosine 0.878, item dead at
+its own first gate (record §G15).** Its by-product is now the open item on this
+engine: the routed-expert GPU kernel omits GLM-5.3's swiglu clamp, and that is
+worth 8 of 1232 teacher-forced predictions and the long-prompt argmax by itself.
 KDA remains solved-but-opt-in via G12.
 
 **Status 2026-09-06 — TRACK G IS FINALISED AND MERGED.** `perf/rome-cpu-path`
@@ -53,8 +57,11 @@ G0–G14 done, three re-profiles (RP1, RP2, RP3) done, SPEC-PROBE answered no.
 **C1's SIGFPE is fixed and G6 has landed**, so the two long-standing blockers
 are closed. **Only G5 remains open on track G, and it is parked on a product
 question this rig cannot answer** — what context length does the deployment
-see. G15 (int3 experts, item 4h) is specified and sized but is *new* work, not
-part of the plan being finalised. **The track is now clear for phase Q.**
+see. G15 (int3 experts, item 4h) was executed on 2026-09-11 and is
+**dead**: its numerics probe ran first, as the item required, and killed it
+before any converter or kernel was built (record §G15). **Track G is now closed
+except G5**, which is parked on a product question, plus the swiglu-clamp gap
+G15's control run uncovered. **The track is now clear for phase Q.**
 RP3 found nothing to reorder and concluded the track was out of measurable
 items; **that conclusion was wrong and is corrected in 4f**. Two profiles exist
 because `COLI_KDA_GPU=2` ships off: **156.77 ms/token knob-off, 134.90
@@ -84,6 +91,7 @@ from the original plan.
 | G14 | **DONE 09-06 (record §G14).** Four alternative int4 expert kernels, each measured *in the engine* against a pristine binary. Only the float one (bit-trick decode + 4 accumulators) preserved the output: **1.095×** on the CPU expert path, greedy text identical over 128 tokens, `teacher_forcing` exact over 1232 positions, `last_logits` relL2 3.0e-6 short. Ships as `GLM53_I4_FAST`, off by default (not bit-identical; §G10 set that bar). The three quantised-activation variants (int8 1.32×, int16 1.075×, mixed) **all changed the greedy text** and were removed — removal itself worth 4% on the survivor, 64 KB of dead stack arrays in a function called ~70×/token. **Two findings worth more than the kernel:** a probe can size throughput on synthetic data but *not accuracy* (bench said relL2 3.9e-3, engine said 0.144); and isolated-to-in-engine attenuation is 0.55–0.65×, so in situ this path is **~57% memory / 43% arithmetic**, not the ALU-bound thing §G3's isolated figure suggests | §G3's "27% of bandwidth"; §RP3's wrongly-blocked bucket (item 4f) | arithmetic half now exhausted; **memory half is item 4h** | 3 commits | Opus | knob OFF bit-identical: **met**; knob ON greedy identity: **met**; serving gate: below floor, not run |
 | G13 | **DONE 09-06 (record §G13).** Fused the shared expert's `mv(gate)`+`mv(up)` into one GPU submit via `coli_vk_matmul_pair` (already production code in `kimi_k3.c`). The routed-expert fused kernel was tried first and rejected: `qmatmul_gate_up.comp` computes `silu(gate)*up` with **no clamp**, and GLM-5.3's `swiglu_limit=10.0` is regularly exceeded — a pre-existing gap in the routed-expert GPU path, never caught before because no earlier change diffed a clamped and an unclamped computation of the same op; out of scope to fix here. `swiglu_clamped` and `down` stay unchanged. **3 submits/call → 2**, bit-identical (`--logits` exact on both G4 prompts, greedy text identical for 128 tokens). `[OPTIME] shared` 0.373 → **0.291 ms/call (−22%)**, ×42 = **−3.4 ms/token**, reproduced 3× within 1% | RP2: shared expert 14.2 ms/token in both knob positions, three round trips + a host round trip, called "round-trip-dominated" since §G3 | **−3.4 ms/token, delivered** | 1 commit | Sonnet | bit-identical: **met**; serving gate: **inconclusive at ~2.1% of the token (same class as G11 part 1), reported as such** |
 | G12 | **DONE 09-05 (record §G12 stages 1, 2a, 2b, 2c).** The KDA recurrence, its gating and its output norm run on dev0, and a layer's projections + recurrence + `ko` record into **one submit instead of two** (`COLI_KDA_GPU=2`). **`[OPTIME] kda` 1.48–1.57 → 0.93 ms/call — the < 1.0 gate is met**, repeating to three decimals; **−18.7 to −21.9 ms/token**, inside the spec's own −15 to −22 band; fresh-process +13.5%; **serving gate +11.7%** rotating (2.90 vs 2.595, paired alternating) with warm-identical agreeing at +11.1%. **The gate also found a shipping bug the numerics oracles could not**: `coli_vk_kda_init` kept the previous conversation's recurrence across sessions, so request N+1 of a warm engine continued request N — visible only as an *inverted* warm-identical column, because every oracle here runs one request per process (record §Stage 2c; `tools/hot-expert/tworeq.py` is now the oracle for that class). Greedy text identical through 128 decode tokens and 0 `teacher_forcing` mismatches across 1260 prefill positions. **Stays off by default**: the logit cosine is 0.99992 at 1260 positions and the cause is irreducible — GLSL `exp()` vs libm `expf()`, ~1.1M calls/token; matching the CPU's norm-reduction order exactly was tested and changed nothing (2.6e-7) while costing 3.6% | §RP1-CORRECTION: KDA was the largest bucket at 53.3 ms/token, 35.0 of it GPU submits | **−18.7 to −21.9 ms/token, delivered** (opt-in) | 3 commits | Opus | `kda` < 1.0 ms/call: **met at 0.93**; greedy identity: **met** |
+| G15 | **DEAD 09-11 — the probe killed it (record §G15).** Item 4h's numerics probe ran first, as the item requires, and GLM-5.3 does **not** survive int3 experts. `fmt=5` was simulated on the int4 weights on disk (`matmul_i4_sim3`, `GLM53_I3_SIM=1`) with every routed expert forced onto the CPU (`GLM53_EXPERTS_CPU=1`) so the ~79% the GPU tier serves could not mask it. Against the identically-placed int4 control: **13 of 42** short-prompt `teacher_forcing` predictions differ and **16 of 1232** long-prompt ones, `last_logits` cos **0.9726 / 0.8778**, greedy text differs, final argmax changes on the long prompt. §G12 shipped opt-in at cos 0.99992 with identical text and §G14 rejected int8 activations at cos 0.98964 — int3 is an order of magnitude past the rejection line. The transform was proved to BE int3 first (`rome_i3sim.c`: vs the tree's own `pack_int3_g64`+`matmul_i3`, relL2 1.7e-7) and the probe's double-quantisation pessimism priced at **1.08x**, so neither can explain it. **No converter, no shader, no fmt=5 kernel, and no speed measured** — the item says speed does not matter if accuracy fails. **The probe's by-product is the bigger result**: the routed-expert GPU kernel omits GLM-5.3's swiglu clamp (§G13's finding, never measured), and turning it on changes **6 of 42 / 8 of 1232** teacher-forced predictions and the long-prompt argmax — so the engine's output depends on which experts are tier-resident. Not in scope here; recorded as the next item | §G14: the bucket is bytes, not ALU | −13 to −16 ms/token, **not collected: the gate failed first** | probe only | Opus | knobs off bit-identical to pristine: **met**; greedy identity + `teacher_forcing`: **FAILED, item dead** |
 
 Target for the track, rewritten from the profile: G3 measured 373 ms per
 decode token fresh-process (585 ms rotating, G2's 1.71 tok/s). G4 and
@@ -413,32 +421,55 @@ by guess; where a position is a judgment call rather than a number, it says so.
      Solving `time = mem + alu` from the two measured points puts the bucket at
      roughly **43% arithmetic, 57% memory**.
 
-4h. **G15 — int3 experts. ← next, and it is in-premise.** If the bucket is bound
-   by streamed bytes, the lever is *fewer bytes*. `fmt=5` (int3-g64, 24 B per
-   64-group) is **already implemented** in `upload_tensor`, `scale_floats` and
-   the fused gate_up shader. An expert slot goes **13.5 → 10.5 MiB**, which does
-   two things at once:
+4h. ~~**G15 — int3 experts.**~~ **DEAD 2026-09-11 — the probe killed it**
+   (record §G15). The premise was right and the arithmetic behind it is
+   unchanged: `fmt=5` takes an expert slot 13.5 → 10.5 MiB, which is 22% fewer
+   bytes streamed per CPU expert (−4.8 ms/token) and ~28% more experts resident
+   in the same 72 GB (−13 to −16 ms/token combined). **None of that was
+   collected, because the gate this item put first says not to.**
 
-   - **22% fewer bytes streamed** per CPU expert. Worth only **1.14×** on the
-     bucket, not 1.22×, because just over half of it is memory — −4.8 ms/token.
-   - **~28% more experts resident** in the same 72 GB, so fewer activations
-     reach the CPU path at all. If the tier goes 79% → 84–86%, that is
-     **−13 to −16 ms/token** combined, i.e. **8–12% of the token** and
-     comfortably gate-resolvable.
+   The probe was built exactly as scoped — simulate int3 on the int4 weights
+   already on disk, no converter, no shader, no `fmt=5` kernel — and run with
+   every routed expert forced onto the CPU so the ~79% the GPU tier serves from
+   unmodified int4 could not mask it:
 
-   Most of the win is the tier-density half, not the bytes half — worth knowing
-   before anyone optimises the wrong one.
+   | pair | what changes | short TF (42) | long TF (1232) | `last_logits` cos |
+   |---|---|---|---|---|
+   | knobs off vs pristine | nothing | identical | — | 1.000000000, relL2 0 |
+   | `EXPERTS_CPU=2` vs pristine | placement only | identical | **identical** | 0.999999996 / 0.999024 |
+   | `EXPERTS_CPU=1` vs `=2` | the swiglu clamp | 6 differ | 8 differ | 0.992324 / 0.981143 |
+   | **`I3_SIM=1` vs `EXPERTS_CPU=1`** | **int3 alone** | **13 differ** | **16 differ** | **0.972634 / 0.877795** |
 
-   **Gate: the numerics probe comes FIRST, and it needs no converter, no shader
-   and no new kernel.** int3 weights are a real precision drop across *every*
-   expert, including the 79% served from GPU — a much bigger risk than anything
-   in G14, which only ever touched summation order or activations. Simulate int3
-   on the existing int4 weights (dequantise, re-quantise to 8 levels with a
-   fresh group scale, `matmul_i4_sim3`), run CPU-only so the GPU tier cannot
-   mask it, and take greedy identity plus `teacher_forcing`. **If GLM-5.3 does
-   not survive int3, the item is dead regardless of the speed** — and G14 is the
-   standing argument for asking that question before building anything.
-   Opus. 1 day for the probe, several more only if it passes.
+   §G12 shipped opt-in at cosine 0.99992 with **identical** greedy text; §G14
+   rejected int8 activations at 0.98964. int3 is an order of magnitude past the
+   rejection line, the greedy text differs at both prompt lengths, and the
+   long-prompt argmax changes. **3-bit absmax over 64 weights is not enough
+   resolution for this model's experts, and no kernel can fix a format.**
+
+   Two things were proved before the verdict was accepted, so that it is a
+   verdict about int3 and not about the probe. The simulation **is** int3:
+   `tools/hot-expert/rome_i3sim.c` checks it against the tree's own
+   `pack_int3_g64` + `matmul_i3` at relL2 1.7e−7, exhaustively over the
+   nibble→level map, and the probe's one structural deviation — it double-
+   quantises where a converter would go fp8→int3 once — is priced at **1.08×**
+   more RMS error, nowhere near enough to matter. Knobs off is bit-identical to
+   the pristine binary, whose sha256 matched the binary in service.
+
+   **The by-product is worth more than the verdict.** §G13 found that the
+   routed-expert GPU kernel computes `silu(gate)*up` with **no clamp** while the
+   CPU path applies `swiglu_limit = 10.0`, and left it as a finding. This probe
+   had to measure it, because the control run misbehaved until it did: placement
+   alone is `teacher_forcing`-identical over 42 **and 1232** positions, and the
+   clamp alone changes **6 of 42 and 8 of 1232** teacher-forced predictions plus
+   the long-prompt argmax. **GLM-5.3's output today therefore depends on which
+   experts happen to be tier-resident.** That is a bigger effect than several
+   landed wins on this track. It is out of scope for this item and is left as
+   the next real one; `GLM53_EXPERTS_CPU=1/2` is the instrument that measures it
+   and stays in the tree for that reason.
+
+   Opus, one day, spent as budgeted. **Do not re-open this without a different
+   format** — finer groups, or int3 only for the cold tail of experts, both of
+   which give back most of the 22%.
 
 5. ~~**G10 — mHC.**~~ **DONE 09-05** (record §G10). `[OPTIME] hc+norm`
    0.393 → **0.097 ms/site** (4.05×), rotating 2.33/2.35 → **2.60/2.75**.

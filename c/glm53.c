@@ -2559,7 +2559,23 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
  * int4 weights to 3 bits on the fly, GLM53_EXPERTS_CPU=1 forces every routed
  * expert down the CPU path so the ~79% the GPU tier serves from unmodified
  * int4 cannot mask the effect. The shared expert and the dense layers are
- * untouched: item 4h converts the ROUTED expert slots, nothing else. */
+ * untouched: item 4h converts the ROUTED expert slots, nothing else.
+ *
+ * THE ANSWER IS NO, AND IT IS RECORDED (§G15, 2026-09-11). Against an
+ * identically-placed int4 control, int3 changes 13 of 42 short-prompt and 16 of
+ * 1232 long-prompt teacher_forcing predictions, last_logits cosine 0.9726 /
+ * 0.8778, and the greedy text at both lengths. §G12 shipped opt-in at 0.99992
+ * with identical text; §G14 rejected int8 activations at 0.98964. The item is
+ * dead and no converter, shader or fmt=5 CPU kernel was built. Do not re-open it
+ * without a DIFFERENT format -- finer groups, or int3 only for the cold tail.
+ *
+ * These two knobs stay because §G15's rows depend on them (CLAUDE.md: do not
+ * remove a knob a recorded measurement depends on) and because
+ * GLM53_EXPERTS_CPU is the instrument for the thing the probe found on the way:
+ * the routed-expert GPU kernel does not apply GLM-5.3's swiglu clamp, which is
+ * worth 6 of 42 and 8 of 1232 teacher-forced predictions on its own. Neither is
+ * a trap in §G14's sense -- both are strictly SLOWER than the default, so no
+ * one benchmarking will switch one on by accident. */
 static int g_i3_sim = -1;
 static int i3_sim_on(void) {
     if (g_i3_sim < 0) g_i3_sim = getenv("GLM53_I3_SIM") ? atoi(getenv("GLM53_I3_SIM")) : 0;

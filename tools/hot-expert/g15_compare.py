@@ -73,6 +73,11 @@ def compare(ref, cand):
         cos, mx, rel, ia, ib = logit_diff(c["lg"], r["lg"])
         print("     last_logits     : cos %.9f  relL2 %.4g  maxabs %.4g  argmax %d vs %d %s"
               % (cos, rel, mx, ia, ib, "SAME" if ia == ib else "DIFF"))
+    if not r["text"] and not c["text"]:
+        # --greedy 0: prefill only, there IS no generated text. Saying
+        # "IDENTICAL" here would be a passing oracle that tested nothing.
+        print("     greedy text     : n/a (--greedy 0, prefill only)")
+        return
     same = r["text"] == c["text"]
     print("     greedy text     : %s" % ("IDENTICAL" if same else "*** DIFFERS ***"))
     if not same:
@@ -90,7 +95,7 @@ pairs = [
     ("s1_pristine", "s3b_cpu_noclamp", "control B: placement only, CPU swiglu left UNCLAMPED like the GPU kernel"),
     ("s1_pristine", "s3_cpu_int4", "control: placement AND the clamp (see G13) -- not placement alone"),
     ("s3b_cpu_noclamp", "s3_cpu_int4", "what the clamp alone is worth"),
-    ("s3_cpu_int4", "s4_cpu_int3", "THE PROBE: int3 against the same placement"),
+    ("s3_cpu_int4", "s4_cpu_int3", "THE PROBE: int3 against the same placement and the same clamp"),
     ("s1_pristine", "s4_cpu_int3", "end to end: int3 against what the model actually says"),
     ("l1_pristine", "l3b_cpu_noclamp", "long prompt, control B (unclamped, placement only)"),
     ("l1_pristine", "l3_cpu_int4", "long prompt, control (placement + clamp)"),

@@ -10,6 +10,13 @@
  * engine is perturbed.
  *
  * Requires quant.h (I3_GROUP, hsum256, coli_i4_row, coli_i4_rows4).
+ *
+ * VERDICT (record §G15, 2026-09-11): GLM-5.3 does NOT survive int3 experts.
+ * Against an identically-placed int4 control, 13 of 42 short-prompt and 16 of
+ * 1232 long-prompt teacher_forcing predictions change and last_logits cosine is
+ * 0.9726 / 0.8778, an order of magnitude past the line §G14 rejected at. This
+ * file is kept so the measurement can be reproduced and so the transform stays
+ * checkable, not because the direction is still open.
  */
 #include <math.h>
 #include <stdint.h>

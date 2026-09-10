@@ -4933,8 +4933,31 @@ static void ckpt_disk_touch(int index) {
     const long off = 28L + (long)slot->len * (long)sizeof(int) + (long)slot->bytes;
     FILE *f = fopen(path, "r+b");
     if (!f) return;
+    /* Il file a questo indice puo' NON essere la cattura che lo slot tiene in
+     * memoria. Se la scrittura fallisce (ENOSPC su ~305 MB, o fclose che torna
+     * errore) ckpt_disk_write esce PRIMA di remove(path)/rename: in memoria c'e'
+     * la cattura nuova, su disco resta la vecchia. Un offset calcolato sulla
+     * nuova cadrebbe allora DENTRO il blob della vecchia, e "ftell >= off" da
+     * solo lo permette. Quel file continua a superare ogni controllo al
+     * caricamento -- intestazione intatta, bytes invariato -- quindi il KV
+     * tornerebbe con quattro byte corrotti e nessuno se ne accorgerebbe:
+     * ckpt_restore confronta i TOTALI degli span, mai il contenuto. Rileggere
+     * l'intestazione e pretendere la taglia ESATTA e' l'unico modo di sapere che
+     * e' lo stesso checkpoint. In caso di dubbio non si scrive: il contatore in
+     * memoria e' gia' giusto e su disco si perdono al massimo dei voti. */
+    char magic[8]; uint32_t fp = 0; int32_t head[2] = {0, 0}; uint64_t nbytes = 0;
+    int same = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "G53CKPT1", 8) &&
+               fread(&fp, sizeof(fp), 1, f) == 1 && fp == g_ckpt_fp &&
+               fread(head, sizeof(head), 1, f) == 1 &&
+               fread(&nbytes, sizeof(nbytes), 1, f) == 1 &&
+               head[0] == slot->len && head[1] == slot->kind &&
+               nbytes == (uint64_t)slot->bytes;
     const uint32_t hits = slot->hits ? slot->hits : 1u;
-    if (!fseek(f, 0, SEEK_END) && ftell(f) >= off && !fseek(f, off, SEEK_SET))
+    long sz = -1;
+    if (same && !fseek(f, 0, SEEK_END)) sz = ftell(f);
+    /* off = file scritto prima di P10 (nessun contatore in coda); off + 4 = file
+     * gia' con il contatore. Qualunque altra taglia non e' questo checkpoint. */
+    if (same && (sz == off || sz == off + (long)sizeof(hits)) && !fseek(f, off, SEEK_SET))
         (void)fwrite(&hits, sizeof(hits), 1, f);
     fclose(f);
 }

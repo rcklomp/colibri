@@ -72,10 +72,16 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `[MAP] 59 file mappati (st_map_shard_range), esperti mappabili 12096/12096`;
   `majflt` per request stays 0 and `[MAP] … copy=0` — if either moves, the
   mapping is the first suspect.
-- **One benchmark at a time.** The rig serialises measurements. Parallel
-  sessions or subagents may edit and build concurrently; only one may run an
-  engine. Check `pgrep -x glm53`, `pgrep -x qwen38`, `pgrep -x qwen38-vk`
-  first (one pattern per call).
+- **One benchmark at a time, across sessions as well as inside one.** The rig
+  serialises measurements. Parallel sessions or subagents may edit and build
+  concurrently; only one may run an engine. Check `pgrep -x glm53`,
+  `pgrep -x qwen38`, `pgrep -x qwen38-vk` first (one pattern per call) — and
+  take the rig lock, because on 2026-09-10 two Claude sessions worked this rig
+  at once and neither `pgrep` nor good intentions stopped them from
+  interleaving: one restarted the gateway underneath the other's acceptance
+  run, truncating `~/glm53_server.log` and producing a MISMATCH that was pure
+  collision. **`ListAgents` shows peer sessions; if one is busy on this repo,
+  say so and coordinate over `SendMessage` before touching the rig.**
 - **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
   `openai_server.py` on 8081 with `--kv-slots 4` and `COLI_KDA_GPU=2`
   (P6b, 2026-09-07: each slot has its own KDA device state, pool allocated

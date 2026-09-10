@@ -89,7 +89,12 @@ cleanup() {
   rig_lock_release
   exit "$rc"
 }
-trap cleanup EXIT INT TERM
+# HUP is in this list deliberately: this script's remote half runs under an ssh
+# session started from the Mac, and if the Mac drops off the network the remote
+# shell gets SIGHUP. Without HUP trapped, the cleanup below never runs and the
+# gateway stays DOWN with the lock still held -- the exact "chain attached to a
+# dying ssh session" failure this project has already had once.
+trap cleanup EXIT INT TERM HUP
 
 if pgrep -x glm53 >/dev/null 2>&1; then
   # Only ever stop OUR OWN gateway's glm53; anything else running is left alone.

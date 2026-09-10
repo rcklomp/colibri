@@ -205,6 +205,81 @@ static void test_rows4(int I, int gs) {
     free(w); free(s); free(x);
 }
 
+/* ---- F: what the probe's double quantisation costs ---------------------- *
+ * The engine probe re-quantises the int4 weights on disk, where a converter
+ * would go fp8 -> int3 in one step. This measures the gap directly, as a
+ * ratio, on three weight distributions. A ratio is exactly the kind of thing
+ * a synthetic harness CAN answer (§G14): it is a property of the quantiser's
+ * arithmetic, not of any activation distribution. */
+static void test_double_quant_cost(void) {
+    const int I = 4096, O = 256, gs = 64;
+    const char *names[3] = { "gaussian", "laplace-ish", "uniform" };
+    printf("F. cost of the probe's DOUBLE quantisation (fp8->int4->int3) vs a "
+           "direct fp8->int3\n");
+    for (int dist = 0; dist < 3; dist++) {
+        float *w = malloc((size_t)O * I * sizeof(float));
+        float *d4 = malloc((size_t)O * I * sizeof(float));
+        float *d3 = malloc((size_t)O * I * sizeof(float));
+        float *d43 = malloc((size_t)O * I * sizeof(float));
+        uint8_t *q3 = malloc((size_t)O * i3_rowbytes(I));
+        float *s3 = malloc((size_t)O * i3_groups(I) * sizeof(float));
+        if (!w || !d4 || !d3 || !d43 || !q3 || !s3) { printf("OOM\n"); exit(1); }
+        for (int64_t i = 0; i < (int64_t)O * I; i++) {
+            double u = 0;
+            if (dist == 0) { for (int k = 0; k < 12; k++) u += (double)(rnd() % 1000) / 1000.0; u -= 6.0; }
+            else if (dist == 1) { double e = -log(1.0 - (double)(rnd() % 999999) / 1000000.0);
+                                  u = (rnd() & 1) ? e : -e; }
+            else u = (double)((int)(rnd() % 2001) - 1000) / 1000.0;
+            w[i] = (float)(u * 0.01);
+        }
+        /* direct int3 */
+        pack_int3_g64(w, q3, s3, O, I);
+        for (int o = 0; o < O; o++)
+            for (int g = 0; g < (int)i3_groups(I); g++) {
+                const uint8_t *lo = q3 + (int64_t)o * i3_rowbytes(I) + (int64_t)g * I3_GBYTES, *hi = lo + 16;
+                for (int k = 0; k < I3_GROUP && g * I3_GROUP + k < I; k++) {
+                    unsigned u = ((lo[k >> 2] >> ((k & 3) * 2)) & 3) | (((hi[k >> 3] >> (k & 7)) & 1) << 2);
+                    d3[(int64_t)o * I + g * I3_GROUP + k] = (float)((int)u - 4) * s3[(int64_t)o * i3_groups(I) + g];
+                }
+            }
+        /* int4-g64 first, then int3 on the result -- what the engine probe does */
+        for (int o = 0; o < O; o++)
+            for (int g = 0; g * gs < I; g++) {
+                float amax = 0;
+                for (int k = 0; k < gs && g * gs + k < I; k++) {
+                    const float a = fabsf(w[(int64_t)o * I + g * gs + k]);
+                    if (a > amax) amax = a;
+                }
+                float s = amax / 7.0f; if (s < 1e-8f) s = 1e-8f;
+                for (int k = 0; k < gs && g * gs + k < I; k++) {
+                    int v = (int)lrintf(w[(int64_t)o * I + g * gs + k] / s);
+                    if (v > 7) v = 7; if (v < -8) v = -8;
+                    d4[(int64_t)o * I + g * gs + k] = (float)v * s;
+                }
+            }
+        pack_int3_g64(d4, q3, s3, O, I);
+        for (int o = 0; o < O; o++)
+            for (int g = 0; g < (int)i3_groups(I); g++) {
+                const uint8_t *lo = q3 + (int64_t)o * i3_rowbytes(I) + (int64_t)g * I3_GBYTES, *hi = lo + 16;
+                for (int k = 0; k < I3_GROUP && g * I3_GROUP + k < I; k++) {
+                    unsigned u = ((lo[k >> 2] >> ((k & 3) * 2)) & 3) | (((hi[k >> 3] >> (k & 7)) & 1) << 2);
+                    d43[(int64_t)o * I + g * I3_GROUP + k] = (float)((int)u - 4) * s3[(int64_t)o * i3_groups(I) + g];
+                }
+            }
+        double n3 = 0, n43 = 0, n4 = 0, den = 0;
+        for (int64_t i = 0; i < (int64_t)O * I; i++) {
+            n3 += ((double)d3[i] - w[i]) * ((double)d3[i] - w[i]);
+            n43 += ((double)d43[i] - w[i]) * ((double)d43[i] - w[i]);
+            n4 += ((double)d4[i] - w[i]) * ((double)d4[i] - w[i]);
+            den += (double)w[i] * w[i];
+        }
+        printf("   %-12s int4 relL2 %.4f | int3 direct %.4f | int3 via int4 %.4f  "
+               "(probe is %.2fx the real thing)\n",
+               names[dist], sqrt(n4 / den), sqrt(n3 / den), sqrt(n43 / den), sqrt(n43 / n3));
+        free(w); free(d4); free(d3); free(d43); free(q3); free(s3);
+    }
+}
+
 int main(void) {
     printf("=== G15 int3 simulation oracle (roadmap item 4h) ===\n\n");
     test_exhaustive_map();
@@ -221,6 +296,8 @@ int main(void) {
     printf("\n");
     test_rows4(4096, 64);
     test_rows4(2048, 64);
+    printf("\n");
+    test_double_quant_cost();
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL CHECKS PASSED", fails);
     return fails ? 1 : 0;
 }

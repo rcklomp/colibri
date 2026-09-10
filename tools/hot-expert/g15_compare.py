@@ -16,11 +16,19 @@ def parse(tag):
     if not os.path.exists(p):
         return None
     tf, lg, text = None, None, []
+    # The engine prints its own timing and mmap counters on stdout after the
+    # generated text. Those lines are NOT model output and a run that is a
+    # tenth of a second slower must not read as "the text changed" -- an
+    # earlier version of this script reported exactly that against a candidate
+    # whose logits were bit-identical to the pristine.
+    STATS = ("decode ", "[MAP] ", "experts hits ", "vision_tokens ", "greedy")
     for line in open(p, errors="replace"):
         if line.startswith("teacher_forcing"):
             tf = line.split()[1:]
         elif line.startswith("last_logits"):
             lg = [float(v) for v in line.split()[1:]]
+        elif any(line.startswith(s) for s in STATS):
+            continue
         else:
             text.append(line)
     return dict(tag=tag, tf=tf, lg=lg, text="".join(text).strip())
@@ -79,10 +87,14 @@ def compare(ref, cand):
 
 pairs = [
     ("s1_pristine", "s2_cand_off", "STANDING BAR: knobs off must be identical to pristine"),
-    ("s1_pristine", "s3_cpu_int4", "control: placement only (every expert on the CPU, still int4)"),
+    ("s1_pristine", "s3b_cpu_noclamp", "control B: placement only, CPU swiglu left UNCLAMPED like the GPU kernel"),
+    ("s1_pristine", "s3_cpu_int4", "control: placement AND the clamp (see G13) -- not placement alone"),
+    ("s3b_cpu_noclamp", "s3_cpu_int4", "what the clamp alone is worth"),
     ("s3_cpu_int4", "s4_cpu_int3", "THE PROBE: int3 against the same placement"),
     ("s1_pristine", "s4_cpu_int3", "end to end: int3 against what the model actually says"),
-    ("l1_pristine", "l3_cpu_int4", "long prompt, control"),
+    ("l1_pristine", "l3b_cpu_noclamp", "long prompt, control B (unclamped, placement only)"),
+    ("l1_pristine", "l3_cpu_int4", "long prompt, control (placement + clamp)"),
+    ("l3b_cpu_noclamp", "l4_cpu_int3", "long prompt, int3 against the unclamped control"),
     ("l3_cpu_int4", "l4_cpu_int3", "long prompt, THE PROBE"),
     ("l1_pristine", "l4_cpu_int3", "long prompt, end to end"),
 ]

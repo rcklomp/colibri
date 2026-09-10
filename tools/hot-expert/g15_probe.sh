@@ -24,7 +24,7 @@
 # so gateway_watchdog.sh does not race back in, and restores the exact binary
 # that was in service on every exit path.
 #
-# Usage (on the rig):  ~/bench/g15_probe.sh [short|long|all]
+# Usage (on the rig):  ~/bench/g15_probe.sh [short|clamp|long|all|a,b]
 set -u
 
 PHASE="${1:-all}"
@@ -128,17 +128,28 @@ run() {                      # run <tag> <binary> <greedy> <prompt> [ENV=V ...]
   return $rc
 }
 
-if [ "$PHASE" = short ] || [ "$PHASE" = all ]; then
+want() { case ",$PHASE," in *,"$1",*|*,all,*) return 0;; esac; return 1; }
+
+if want short; then
   run s1_pristine  "$HOME/bench/glm53.g15pristine" 128 "$P_SHORT"
   run s2_cand_off  "$HOME/bench/glm53.g15cand"     128 "$P_SHORT"
   run s3_cpu_int4  "$HOME/bench/glm53.g15cand"     128 "$P_SHORT" GLM53_EXPERTS_CPU=1
   run s4_cpu_int3  "$HOME/bench/glm53.g15cand"     128 "$P_SHORT" GLM53_EXPERTS_CPU=1 GLM53_I3_SIM=1
 fi
 
-if [ "$PHASE" = long ] || [ "$PHASE" = all ]; then
-  run l1_pristine  "$HOME/bench/glm53.g15pristine" 0 "$P_LONG"
-  run l3_cpu_int4  "$HOME/bench/glm53.g15cand"     0 "$P_LONG" GLM53_EXPERTS_CPU=1
-  run l4_cpu_int3  "$HOME/bench/glm53.g15cand"     0 "$P_LONG" GLM53_EXPERTS_CPU=1 GLM53_I3_SIM=1
+# The first pass showed the =1 control moving the model far more than
+# reassociation can explain. =2 keeps the placement change and drops the
+# swiglu clamp, which is what the routed GPU kernel does (§G13), so the two
+# runs differ only in WHERE the expert ran.
+if want clamp; then
+  run s3b_cpu_noclamp "$HOME/bench/glm53.g15cand"  128 "$P_SHORT" GLM53_EXPERTS_CPU=2
+fi
+
+if want long; then
+  run l1_pristine     "$HOME/bench/glm53.g15pristine" 0 "$P_LONG"
+  run l3b_cpu_noclamp "$HOME/bench/glm53.g15cand"     0 "$P_LONG" GLM53_EXPERTS_CPU=2
+  run l3_cpu_int4     "$HOME/bench/glm53.g15cand"     0 "$P_LONG" GLM53_EXPERTS_CPU=1
+  run l4_cpu_int3     "$HOME/bench/glm53.g15cand"     0 "$P_LONG" GLM53_EXPERTS_CPU=1 GLM53_I3_SIM=1
 fi
 
 echo

@@ -1,10 +1,58 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 23, 2026-09-10 08:45)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 24, 2026-09-10 19:18)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 24 (2026-09-10, 19:18): P11 in service -- the checkpoint counter can no
+longer be written into a stranger's file; and the "decode regression" of this
+afternoon is NOT one.** An independent code review of P10 (run because the owner
+asked for one, not because a gate failed) found `ckpt_disk_touch` locating the
+file by size alone: `ftell(f) >= off`, with `off` computed from the IN-MEMORY
+slot and the header never re-read. Memory and disk can legitimately disagree --
+`ckpt_disk_write` returns on a failed write (ENOSPC on ~305 MB, or a failing
+`fclose`) BEFORE `remove(path)`/`rename`, so the slot holds the new capture while
+the path still holds the old one -- and the four-byte counter then lands inside
+the old capture's blob. The file still passes every load-time check afterwards,
+and `ckpt_restore` compares span byte TOTALS and never content, so the KV would
+come back with four wrong bytes **silently**; the greedy oracle never sees it
+because the oracle runs on fresh prefills, not restores. The fix re-reads the
+28-byte header, requires fp/len/kind/bytes to equal the slot's, and requires the
+size to be EXACTLY `off` or `off+4`. `c/tests/test_glm53_ckpt_touch.c` is the
+test P10's gate did not have: five cases against the real function, of which
+**case C fails on the pre-P11 binary and passes after** -- verified against both
+builds, not asserted. `p11_chain.sh` exits 0 on all four steps: `prefill_gate`
+teacher_forcing PASS / logits PASS / speedup PASS (bit-identical, as a
+disk-side-only change must be), the five guard cases, and `accept_live` PASS
+(new chat 4418 reused in 6.05 s and 5.40 s, API follow-up 147/171 in 3.4 s, the
+request behind an abandoned one 7.4 s, ledger 0 MISMATCH). Binary
+**fe5dd4be9f8277f7**, serving script unchanged. The same review's three findings
+against `p10_gate.sh` landed with it: the gate had **no trap at all**, so every
+refusal path left the owner's daily service running from an *arm* script with
+value eviction possibly off; `tb_hits` was computed and never read, an assertion
+written down but not made; and steps 3-4 drive a gateway, which serves whatever
+is installed rather than `$CAND`, so standalone the gate could flood-test the
+pristine and report PASS for the candidate.
+
+**And the afternoon's other headline is withdrawn.** `rome_bench.sh` measured
+rotating **1.74-1.91** across six runs against **2.59** on 09-05 and **2.60** on
+09-08, and the 09-08 binary itself measured 1.90 today -- so it looked like
+machine state, with the code, the harness, the page cache (dropped by hand,
+sudo), THP, fragmentation, heat, the checkpoint machinery and the expert mapping
+all excluded by measurement. Then this gate, on the same box an hour later,
+reproduced the 09-09 P8 gate **row for row**: 27 tok **3.00/2.75 s** (was
+2.72-2.92), 390 tok **41.13/40.51 s** (was 40.59-40.84), 1 236 tok
+**139.31/139.14 s** (was 139.35-139.51), decode 5.70/5.88/5.87/6.05/4.91/4.64
+(was 5.6/5.8, 5.9/6.1, 4.9/4.7), `majflt=0` throughout. Identical to three
+digits at the largest size. **The machine is not slower.** Whatever moved lives
+inside the `datapoint.py` path specifically -- its cold row is labelled "cache
+evicted before engine load", so that harness evicts the model and re-faults
+182 GiB inside the measurement, which is the obvious next thing to look at -- and
+NOT in the engine, the box, or anything the owner experiences. The reboot that
+was being held for the owner is no longer indicated. §"Decode slowdown
+2026-09-10" in the record carries the full exclusion list so it is not redone.
 
 **Rev 23 (2026-09-10, 08:45): P10 — the checkpoint cache evicts by worth, and
 the same flood that costs 668 s today costs 4.6 s.** The four slots were an LRU,

@@ -163,6 +163,158 @@ static inline int coli_sparse_index_select_range(int *out, const float *queries,
     return 0;
 }
 
+/* G5: same selection, but a pool's mixed key is cached instead of rebuilt on
+ * every call.
+ *
+ * The pooling loop above computes pooled[p] from keys/gates/ape of pool p's
+ * own members only -- never from the query -- so once a pool is COMPLETE
+ * (all `pool` members present and causally behind every future query, which
+ * for an append-only KV cache means "behind the current sequence length")
+ * its mixed key never changes again. The plain function above still redoes
+ * that mix for every pool on every call, which is what makes it O(context)
+ * per decode token and O(context^2) per generation -- ported here from
+ * Qwen's block-key cache (2d3cf7e, qwen38_core.h's q38_attention/IK_pooled),
+ * whose commit message is the derivation: q38_rope() there and the softmax
+ * mix here both use only the block's/pool's own fixed position, so the
+ * result is identical no matter which later token scores it.
+ *
+ * `pool_cache` is a caller-owned buffer sized to hold every pool this layer
+ * will ever have ([pools_cap][dim]); `pool_cache_count` is how many LEADING
+ * pools it already holds a valid mix for. Both live for the life of one
+ * session (GLM's GLayerState, one per DSA layer) and must be reset to count
+ * 0 -- pool_cache itself does not need clearing, only unreachable pools are
+ * ever read -- whenever a session starts fresh or rewinds to a shorter
+ * prefix than it last held: a fresh session_open, or a checkpoint/segment
+ * restore into one. session_open already calloc's GLayerState, which zeroes
+ * the count for the ordinary "new session" case for free; restore sites are
+ * the ones that must do it explicitly, exactly as Q38's four
+ * q38_ik_pool_reset() call sites did for the same reason.
+ *
+ * Passing pool_cache == NULL or pool_cache_count == NULL falls back to the
+ * uncached function above unconditionally -- the two are bit-identical on
+ * every input, this only changes how much repeated work is thrown away. */
+static inline int coli_sparse_index_select_range_cached(int *out, const float *queries,
+                                                 const float *keys, const float *gates,
+                                                 const float *head_w, const float *ape,
+                                                 const unsigned char *valid,
+                                                 int sequence, int heads, int dim,
+                                                 int pool, int topk, int with_tail,
+                                                 int q_from, int q_to,
+                                                 float *pool_cache, int *pool_cache_count) {
+    if (!pool_cache || !pool_cache_count)
+        return coli_sparse_index_select_range(out, queries, keys, gates, head_w, ape,
+                                              valid, sequence, heads, dim, pool, topk,
+                                              with_tail, q_from, q_to);
+    if (!out || !queries || !keys || !gates || !head_w || !ape || !valid ||
+        q_from < 0 || q_to > sequence || q_from > q_to ||
+        sequence < 1 || heads < 1 || dim < 1 || pool < 1 || topk < pool || topk % pool)
+        return -1;
+
+    const int width = coli_sparse_index_width(topk, pool, with_tail);
+    const int pools = (sequence + pool - 1) / pool;
+    const int wanted = topk / pool;
+
+    float *scores = malloc((size_t)pools * sizeof(*scores));
+    unsigned char *complete = calloc((size_t)pools, 1);
+    unsigned char *taken = calloc((size_t)pools, 1);
+    if (!scores || !complete || !taken) {
+        free(taken); free(complete); free(scores);
+        return -1;
+    }
+
+    int first = 0;
+    while (first < sequence && !valid[first]) first++;
+
+    int cached = *pool_cache_count;
+    if (cached > pools) cached = pools;   /* defensive: sequence should only grow */
+    for (int p = 0; p < cached; p++) complete[p] = 1;
+
+    /* Extend the cached prefix by exactly as many pools as are newly
+     * complete and contiguous with what is already cached -- the same
+     * "blocks only grow" invariant Qwen's cache relies on. A pool found
+     * incomplete stops the *count* from advancing past it (so a later call
+     * still recomputes it once it does close) but the loop keeps going so
+     * every complete pool still gets a mix this call, cached or not. */
+    int frontier = cached;
+    for (int p = cached; p < pools; p++) {
+        const int start = first + p * pool;
+        complete[p] = start + pool <= sequence;
+        for (int j = 0; complete[p] && j < pool; j++)
+            if (!valid[start + j]) complete[p] = 0;
+        if (!complete[p]) continue;
+        float *dst = pool_cache + (size_t)p * dim;
+        for (int d = 0; d < dim; d++) {
+            float maximum = -FLT_MAX;
+            for (int j = 0; j < pool; j++) {
+                const float logit = gates[(size_t)(start + j) * dim + d] +
+                                    ape[(size_t)j * dim + d];
+                if (logit > maximum) maximum = logit;
+            }
+            float total = 0.0f;
+            for (int j = 0; j < pool; j++)
+                total += expf(gates[(size_t)(start + j) * dim + d] +
+                              ape[(size_t)j * dim + d] - maximum);
+            float mixed = 0.0f;
+            for (int j = 0; j < pool; j++) {
+                const float weight = expf(gates[(size_t)(start + j) * dim + d] +
+                                          ape[(size_t)j * dim + d] - maximum) / total;
+                mixed += weight * keys[(size_t)(start + j) * dim + d];
+            }
+            dst[d] = mixed;
+        }
+        if (p == frontier) frontier = p + 1;
+    }
+    *pool_cache_count = frontier;
+
+    const float scale = 1.0f / sqrtf((float)dim);
+    for (int q = q_from; q < q_to; q++) {
+        int *row = out + (size_t)(q - q_from) * width;
+        for (int i = 0; i < width; i++) row[i] = -1;
+        if (!valid[q]) continue;
+
+        for (int p = 0; p < pools; p++) {
+            const int last = first + (p + 1) * pool - 1;
+            if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
+            const float *pv = pool_cache + (size_t)p * dim;
+            float score = 0.0f;
+            for (int h = 0; h < heads; h++) {
+                const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
+                float dot = 0.0f;
+                for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
+                if (dot > 0.0f)                                  /* ReLU */
+                    score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+            }
+            scores[p] = score;
+        }
+
+        for (int rank = 0; rank < wanted; rank++) {
+            int best = -1;
+            for (int p = 0; p < pools; p++)
+                if (!taken[p] && scores[p] > -FLT_MAX &&
+                    (best < 0 || scores[p] > scores[best])) best = p;
+            if (best < 0) break;
+            taken[best] = 1;
+            for (int j = 0; j < pool; j++) row[rank * pool + j] = first + best * pool + j;
+        }
+        memset(taken, 0, (size_t)pools);
+
+        if (with_tail) {
+            int visible = 0;
+            for (int i = first; i <= q; i++) if (valid[i]) visible++;
+            const int tail = visible % pool;
+            const int tail_start = first + visible - tail;
+            for (int j = 0; j < tail && j < pool - 1; j++)
+                if (tail_start + j <= q && valid[tail_start + j])
+                    row[topk + j] = tail_start + j;
+        }
+    }
+
+    free(taken);
+    free(complete);
+    free(scores);
+    return 0;
+}
+
 /* Tutte le query, che e' il caso del prefill. */
 static inline int coli_sparse_index_select(int *out, const float *queries,
                                            const float *keys, const float *gates,

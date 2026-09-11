@@ -649,6 +649,14 @@ typedef struct {
                                            * refreshed only by the migration sync */
     float *latent;                        /* [cap][kv_lora]: MLA assorbita */
     float *ikeys, *igates;                /* [cap][dim indexer] */
+    /* G5: pooled DSA block keys, cached -- see coli_sparse_index_select_range_cached
+     * in sparse_index.h for why this is safe (a pool's mix depends only on its own
+     * members, never the query). [pools_cap][dim indexer], pools_cap sized in
+     * session_open; pool_cache_count is how many LEADING pools already have a
+     * cached mix and must go back to 0 whenever this session's positions are
+     * rewritten from outside mla_layer (checkpoint/segment restore) -- a fresh
+     * session_open already zeroes it via calloc. */
+    float *pool_cache; int pool_cache_count;
 } GLayerState;
 
 typedef struct {
@@ -1773,6 +1781,20 @@ static void glm_pool_blocked(float *pooled_all, const float *wT,
     }
 }
 
+/* G5: default ON. GLM53_NO_INDEX_CACHE=1 is the A/B against the pristine,
+ * always-recompute path (coli_sparse_index_select_range) -- named after the
+ * existing GLM53_NO_MMAP / GLM53_NO_CANCEL_POLL disable knobs. The two paths
+ * are bit-identical on every input (see sparse_index.h); this only changes
+ * how much of the pooling loop is redone per call. */
+static int g_index_cache = -1;
+static int index_cache_on(void) {
+    if (g_index_cache < 0) {
+        const char *e = getenv("GLM53_NO_INDEX_CACHE");
+        g_index_cache = (e && atoi(e)) ? 0 : 1;
+    }
+    return g_index_cache;
+}
+
 static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
@@ -1873,9 +1895,15 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     const double _tm1 = optime_on() ? optime_now() : 0.0;
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
-    if (coli_sparse_index_select_range(selected, iq, ik, gates, head_w, l->ikpa, valid,
+    const int index_rc = index_cache_on()
+        ? coli_sparse_index_select_range_cached(selected, iq, ik, gates, head_w, l->ikpa,
+                                       valid, seen, IH, ID, c->index_kpool, c->index_topk,
+                                       c->index_kpool_tail, base, seen,
+                                       st->pool_cache, &st->pool_cache_count)
+        : coli_sparse_index_select_range(selected, iq, ik, gates, head_w, l->ikpa, valid,
                                        seen, IH, ID, c->index_kpool, c->index_topk,
-                                       c->index_kpool_tail, base, seen)) {
+                                       c->index_kpool_tail, base, seen);
+    if (index_rc) {
         fprintf(stderr, "selezione indexer fallita\n"); exit(1);
     }
     /* GLM53_DUMP_INDEX=1 stampa le righe scelte dall'indexer: e' il primo
@@ -3886,7 +3914,20 @@ static GSession *session_open(const GModel *m, int cap, int slot) {
             st->latent = malloc((size_t)cap * c->kv_lora * sizeof(float));
             st->ikeys = malloc((size_t)cap * c->index_hd * sizeof(float));
             st->igates = malloc((size_t)cap * c->index_hd * sizeof(float));
-            if (!st->latent || !st->ikeys || !st->igates) {
+            /* G5: one pool_cache slot per pool the session can ever hold. A real
+             * checkpoint always has index_kpool>=1 (validated at load, line ~323),
+             * but a Model built directly rather than parsed -- a fabricated test
+             * struct -- can leave it 0, and dividing by it would be exactly the
+             * SIGFPE C1 guarded in Qwen's ensure_kv (df8ddc5). Falls back to one
+             * cache slot per token, which is always enough room and is never
+             * actually read: the indexer itself (coli_sparse_index_select_range,
+             * called either way) already refuses pool<1 on its own. */
+            {
+                const int64_t pools_cap = c->index_kpool > 0
+                    ? ((int64_t)cap + c->index_kpool - 1) / c->index_kpool : cap;
+                st->pool_cache = malloc((size_t)pools_cap * (size_t)c->index_hd * sizeof(float));
+            }
+            if (!st->latent || !st->ikeys || !st->igates || !st->pool_cache) {
                 fprintf(stderr, "OOM sulla cache del layer %d\n", i); exit(1);
             }
         } else if (c->kda_proj) {
@@ -3927,7 +3968,7 @@ static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayerState *st = &s->layer[i];
-        free(st->latent); free(st->ikeys); free(st->igates);
+        free(st->latent); free(st->ikeys); free(st->igates); free(st->pool_cache);
         free(st->kda_state); free(st->kda_window);
     }
     free(s->kda_scratch);
@@ -5165,6 +5206,16 @@ static int ckpt_restore(const GModel *m, KVSlot *slot, const int *sequence, int 
         memcpy(spans[i].ptr, g_ckpt[best].blob + at, spans[i].bytes);
         at += spans[i].bytes;
     }
+    /* G5: the checkpoint blob does not carry pool_cache (it is not in
+     * ckpt_spans), so whatever this session cached before restoring is now
+     * describing the WRONG ikeys/igates content. In practice `s` was just
+     * opened fresh by slot_reset+session_open above ckpt_restore's only
+     * caller, so the count is already 0 -- this is the explicit version of
+     * that invariant, the same belt-and-suspenders reset Q38's cache takes
+     * at every place a session's positions are rewritten from outside its
+     * own forward pass. */
+    for (int i = 0; i < m->c.n_layers; i++)
+        if (m->c.is_full[i]) s->layer[i].pool_cache_count = 0;
     s->filled = best_len;
     ckpt_sync_in(m, s);
     slot_remember(slot, sequence, best_len);
@@ -6321,6 +6372,14 @@ static int glm53_segment_session_restore(void *session_impl,
                                    read_user_data, error, error_size))
         return -1;
     glm53_kda_sync_in(session);    /* G12: host -> device after the restore writes */
+    /* G5: glm53_segment_spans does not include pool_cache, so the restored
+     * ikeys/igates content is not reflected in it -- same reasoning as
+     * ckpt_restore above. */
+    {
+        const Cfg *c = &session->engine->model.c;
+        for (uint32_t i = session->engine->layer_begin; i < session->engine->layer_end; i++)
+            if (c->is_full[i]) session->session->layer[i].pool_cache_count = 0;
+    }
     session->position = header.position;
     session->session->filled = (int)header.position;
     return 0;

@@ -2034,21 +2034,35 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
         q38_tm_add_live(m,Q38_TM_ROUTER,router_started);
         q38_prefetch_native_fp8_experts(m,layer,idx,K);
-        double phase_started=now_s();
-        q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
-        for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
-        float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
-        q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+        double phase_started;
 #ifdef Q38_VK_TIER
         int q38vk_cpu_idx[Q38_MAX_TOPK], q38vk_cpu_n=K;
         for(int z=0;z<K;z++) q38vk_cpu_idx[z]=z;
-        if(g_q38vk_ready&&K<=64){
-            static ColiVkTensor *bufG[3][64],*bufU[3][64],*bufD[3][64];
-            static int bufRows[3][64], bufZ[3][64], bufN[3];
-            static float *bufX[3], *bufY[3];
+        /* Q3 (2026-09-11, record §Q3): the routed groups are issued BEFORE the
+         * shared expert, not after. §Q-PROFILE measured 13.0 ms/token of pure
+         * idle in vk-take -- GPU wait left over after the CPU share of the
+         * routed experts is exhausted -- while the shared expert, 7.2 ms/token
+         * of 8-thread CPU work with no dependency on anything the GPUs touch,
+         * sat entirely on the wrong side of the issue. This is §G9's pattern
+         * (GLM's deferred CPU experts moved into the issue->take gap) on this
+         * engine: nothing about the arithmetic moves, only the wall-clock
+         * moment. `bufX` is a copy of `xs` taken in the staging loop and the
+         * shared expert writes only sg/su/sh/shared, so the GPUs read exactly
+         * the row they read before; `ys` is still accumulated CPU share, then
+         * device 0/1/2 in order, then the shared term LAST. Bit-identical.
+         *
+         * The declarations are hoisted here because the block below is now cut
+         * in two by the shared expert. The statics keep function-static
+         * lifetime exactly as before. */
+        static ColiVkTensor *bufG[3][64],*bufU[3][64],*bufD[3][64];
+        static int bufRows[3][64], bufZ[3][64], bufN[3];
+        static float *bufX[3], *bufY[3];
+        int placed_mask[Q38_MAX_TOPK]; for(int z=0;z<K;z++) placed_mask[z]=0;
+        int issued[3]={0,0,0};
+        const int q38vk_on=(g_q38vk_ready&&K<=64);
+        if(q38vk_on){
             if(!bufX[0]) for(int dv=0;dv<3;dv++){ bufX[dv]=falloc(64*(int64_t)H); bufY[dv]=falloc(64*(int64_t)H); }
             bufN[0]=bufN[1]=bufN[2]=0;
-            int placed_mask[Q38_MAX_TOPK]; for(int z=0;z<K;z++) placed_mask[z]=0;
             double vk_started=q38_tm_t0();
             for(int z=0;z<K;z++){
                 int dev=q38vk_expert_ensure(m,layer,idx[z]);
@@ -2065,7 +2079,6 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
              * share below. Measured on 3x RX 7900 XTX (2026-09-04): three
              * sequential sync groups cost 2.37 ms per layer, concurrent
              * issue/take 0.63 ms -- 114 vs 30 ms per token at full residency. */
-            int issued[3]={0,0,0};
             for(int dev=0;dev<3;dev++){
                 if(!bufN[dev]) continue;
                 if(dev==0) issued[0]=coli_vk_expert_group_issue(bufG[0],bufU[0],bufD[0],bufRows[0],bufN[0],bufX[0]);
@@ -2073,11 +2086,29 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
                 else issued[2]=coli_vk_expert_group_issue3(bufG[2],bufU[2],bufD[2],bufRows[2],bufN[2],bufX[2]);
                 if(issued[dev]) for(int n=0;n<bufN[dev];n++) placed_mask[bufZ[dev][n]]=1;
             }
-            /* Placement + staging + the three issues: everything before the CPU
-             * share starts. RP4 measured the equivalent bucket for GLM and found
-             * the GPU made the engine wait 0.07 ms/token -- this is the split
-             * that answers the same question for Qwen. */
+            /* Placement + staging + the three issues: everything before the
+             * shared expert and the CPU share start. RP4 measured the
+             * equivalent bucket for GLM and found the GPU made the engine wait
+             * 0.07 ms/token -- this is the split that answers the same question
+             * for Qwen. */
             q38_tm_add_live(m,Q38_TM_VK_ISSUE,vk_started);
+            /* routed-total is the sum of the routed segments, as before: it
+             * excluded the shared expert when the two were adjacent and it
+             * still excludes it now that the shared expert runs between them. */
+            q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+        }
+#endif
+        /* The shared expert. Since Q3 this runs with the routed groups already
+         * in flight on all three GPUs, so its 7.2 ms/token of 8-thread CPU work
+         * comes out of the GPU's idle wait instead of adding to the token. */
+        phase_started=now_s();
+        q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
+        for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
+        float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
+        q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+#ifdef Q38_VK_TIER
+        if(q38vk_on){
+            phase_started=now_s();
             /* CPU share while the GPUs run: experts no device holds (or whose issue failed) */
             q38vk_cpu_n=0;
             for(int z=0;z<K;z++) if(!placed_mask[z]) q38vk_cpu_idx[q38vk_cpu_n++]=z;

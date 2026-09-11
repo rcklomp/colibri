@@ -204,5 +204,13 @@ int main(int argc,char**argv){
     /* routed experts */
     bench_fp8_experts(2560,640,10,128,0);
     bench_fp8_experts(2560,640,10,128,1);
+    /* The SHARED expert is one expert-shaped FP8 triple per layer through the
+     * same kernel (shared_expert_intermediate_size == moe_intermediate_size ==
+     * 640), so K=1 here IS the shared expert's per-layer cost. Added for Q3
+     * (2026-09-11): the item moves this much CPU work into the GPU gap, and the
+     * x48 column is the isolated prediction for the [OPTIME] shared counter.
+     * Pool is 128 experts = 630 MB, well past the 128 MB L3 and 96 MB
+     * Infinity Cache, so it streams from DRAM like the engine's does. */
+    bench_fp8_experts(2560,640,1,128,0);
     return 0;
 }

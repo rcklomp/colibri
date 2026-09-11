@@ -133,7 +133,12 @@ fi
 case "$ENGINE" in
   qwen38)
     # CPU path: Q38_VULKAN deliberately unset.
-    ENGINE_BIN="${COLIBRI_SRC}/c/qwen38"
+    # ROME_BENCH_ENGINE_BIN: same override the glm53 case has had since G12.
+    # Extended to the qwen targets for Q3 (2026-09-11), where pristine and
+    # candidate have to be INTERLEAVED (run1 A, run1 B, run2 A, run2 B) and
+    # rebuilding the tree between every run would put a build in the middle of
+    # the A/B. The sha256 is printed and the override is announced either way.
+    ENGINE_BIN="${ROME_BENCH_ENGINE_BIN:-${COLIBRI_SRC}/c/qwen38}"
     MODEL_SNAP="${HOME}/models/Qwen3.8-Flash-Next-FP8"
     THREADS=8
     CAP=512
@@ -144,7 +149,7 @@ case "$ENGINE" in
     # dev2/dev3 additionally on COLI_VK_DEV2/3 being SET -- unset means "don't
     # try", not "auto" (:1001). Without these the qwen38-vk binary runs as a
     # plain CPU engine and silently reports CPU numbers.
-    ENGINE_BIN="${COLIBRI_SRC}/c/qwen38-vk"
+    ENGINE_BIN="${ROME_BENCH_ENGINE_BIN:-${COLIBRI_SRC}/c/qwen38-vk}"
     MODEL_SNAP="${HOME}/models/Qwen3.8-Flash-Next-FP8"
     THREADS=8
     CAP=512

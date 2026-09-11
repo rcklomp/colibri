@@ -55,6 +55,25 @@ that silently didn't come up. Both tools now assert their own tier/config
 came up and refuse to report a number if it didn't; neither tool used to
 require that, which is how the 2026-09-10 bad numbers got as far as a commit.
 
+## `rome_bench.sh` freezes GLM's routing history and not Qwen's (2026-09-11)
+
+Found while taking §Q-PROFILE. `glm53` reads `COLI_USAGE_PATH` and the harness
+points it at a per-run **copy**, so a GLM run cannot mutate the histogram the
+next run preloads its tier from (§C0, §RP1 — 23.5 ms/token of apparent gain
+once turned out to be exactly that). `qwen38` reads a **different variable**,
+`COLI_USAGE`, defaults it to `<snap>/.coli_usage`, and **rewrites it at exit**;
+the harness sets nothing for qwen38. So every Qwen row ever recorded mutated
+what the next one preloaded from.
+
+It has not bitten, and §Q-REBASE says why: Qwen's tier is VRAM-limited, not
+history-limited, and stops at `14673 of 21858` in every run regardless. That is
+luck, not design. If you are taking Qwen numbers where the tier composition
+could matter — anything touching expert placement, formats or VRAM — freeze it
+yourself (`COLI_USAGE=/tmp/copy.bin`), the way
+`tools/hot-expert/q_profile_run.sh` does. The harness default is left alone
+deliberately: changing it would make new rows incomparable to every existing
+one for no measured benefit.
+
 Both tools are self-contained: `rome_bench.sh` takes `~/bench/.rig.lock`
 itself and stops/restarts the owner's gateway around the measurement;
 `prefill_snapshot.sh` never touches the gateway at all. Do not call

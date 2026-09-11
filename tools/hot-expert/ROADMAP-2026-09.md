@@ -28,7 +28,7 @@ nobody has to remember them.
 |---|---|---|---|---|
 | C0 | **DONE** 09-04 | `tools/rome_bench.sh`: drops caches, warms **one** model, verifies residency, pins 8 threads, sets the GLM caps, runs `datapoint.py`, appends a row. Asserts the GPU tier is really up and **refuses to record** otherwise — six config defects found writing it, incl. a mislabelled row it retro-corrected (record §C0) | Sonnet | 0.24% between runs, vs 3%: **met** |
 | C1 | **DONE 09-06 — MERGED.** The gate is met and the merge is done. `tests/test_qwen38_prefix` SIGFPEd on every tree since `2d3cf7e`: `ensure_kv` computes `m->max_t / c->idx_ratio` and the ratio is 0 for any Model built directly rather than parsed from a config — SERVE paths and the test's own fabricated Model. Real checkpoints cannot reach it (`Q38_NEED` validates `idx_ratio>0` at load). Guarded to one block when the ratio is absent; for every config with `idx_ratio>0` it computes exactly what it always did. **exit 136 → exit 0**, all four qwen38 C tests pass, all three engines build clean, and `perf/rome-cpu-path` (67 commits) is merged into `hot-expert-tier` as `2c311a0` — verified building and passing from a clean checkout on the rig *before* the push | record §C1 bisected it 3/3 | unblocks the merge | done | Opus | test exit 0: **met**; merge: **done** |
-| C2 | not started | Add `qwen38` to the record's steady-state table for GLM as well (G0 below) so both engines have the same four numbers | Haiku | table filled |
+| C2 | **DONE** 09-06, **re-taken 09-11** | Both engines now have the same four numbers. The 09-06 table is record §C2; it is superseded by **§Q-REBASE** (4.04 / 4.09 rotating, 5.23 / 5.25 warm, 3.45 / 3.37 cold), which also closes the "provisional cold column" flag §C2 left open | Haiku | table filled: **met** |
 
 ## Track G: GLM-5.3 — 2.60–2.75 tok/s rotating (was 1.65 at G0), 8 threads, 3 GPUs
 
@@ -196,73 +196,173 @@ harness/oracle/gate landed, P1 answered (prefix reuse works on a real turn
 done when that script exits 0. Phase Q below stands, but interactive use of
 GLM-5.3 is gated on the prefill track, not on anything here.
 
-## Phase Q: start here (written 2026-09-06, as track G was finalised)
+## Phase Q: start here (rewritten 2026-09-11 from the Q-PROFILE)
 
-**Baseline is established.** `qwen38-vk`, cap 512, max-new 80, 8 threads,
-GPU tier asserted at 14,673 experts: **4.06 / 4.10 rotating, 5.45 / 5.46
-warm-identical, 2.32 / 2.40 cold** (record §C2). The cold column is
-**provisional** — it is 31% below the 09-04 figure and the record says why and
-how to settle it. Do not build a projection on it.
+**Baseline, re-taken 2026-09-11 (record §Q-REBASE).** `qwen38-vk`, cap 512,
+max-new 80, 8 threads, tier asserted at **14 673 of 21 858** (dev0 24.4/25.7 GB),
+binary `24a075ee4116326e`: **4.04 / 4.09 rotating, 5.23 / 5.25 warm-identical,
+3.45 / 3.37 cold**, evicting, i.e. comparable to every historical row here.
+The 09-04 / 09-06 / 09-09 rows are **superseded and historical only**. The
+"provisional cold column" flag on the old §C2 baseline is **closed**: 3.45 /
+3.37 reproduces 09-09's 3.38 / 3.44 and 09-04's 3.47.
 
-**Do this first: a G3-equivalent per-op profile.** Track Q has never had one.
-Every useful thing on track G came from G3's profile and the three re-profiles
-that corrected it; every *wrong* thing came from reasoning about buckets nobody
-had measured. `tools/hot-expert/profile_run.sh` and `profile_parse.py` are the
-procedure — the run list at the bottom is GLM's and needs a qwen38 equivalent,
-but the residency discipline and the parser's accounting checks carry over.
-**Until that profile exists, the Q items below are ordered by guesswork.**
+**Track G's two weeks of shared-file kernel work are measurably neutral here** —
+every column lands inside the harness's own noise — and §Q-REBASE says why in
+code: the P4 tile pipelines require `S>1 && fmt∈{1,4}` and Qwen's experts are
+`fmt=8` at `S=1`, `quant.h`'s changes are purely additive with `matmul_fp8`
+untouched, P6b's KDA VRAM pool is never allocated by this engine, and RP4's
+timestamps are off by default.
+
+**The profile now exists: record §Q-PROFILE.** Decode token **191.2 ms**
+fresh-process, three repeats agreeing to 0.5% on every bucket, accounting
+residual 0.04 ms, and a `perf` flat profile agreeing with the timers to 0.7
+percentage points. `tools/hot-expert/q_profile_run.sh` reproduces it. **Every Q
+item below is re-derived from it; the six items that used to be here were
+ordered by guesswork and two of them turned out to be measuring nothing.**
+
+The two facts that reorganise the track:
+
+1. **55% of the decode token (105.8 ms) is already at the machine's memory
+   ceiling.** The dense BF16 stream is 6.81 GB/token through `dense-matmul` at
+   **75.7 GB/s** plus 1.27 GB of LM head at **80.4 GB/s**, against a measured
+   70.9 GB/s DRAM read at 8 threads. No CPU-side change touches it.
+2. **Only 36.3% of the token is single-threaded** (31.75% libgomp spin × 8/7),
+   against **69%** for GLM-5.3 at §G3. The cheap parallelism wins that took
+   track G from 1.65 to 2.75 tok/s are mostly already taken on this engine;
+   what is left of them is ~26 ms/token, and it is in two places (§Q1, §Q2).
 
 **What transfers from track G, at no cost:**
 
 | lesson | where it came from |
 |---|---|
-| Assert 100% page residency **before every run**, not once per campaign. Every engine run drops the model to ~91.6% and it does not come back | §RP2, §RP3 |
+| Assert 100% page residency **before every run**, not once per campaign. **Qwen's constant is 94.3699%** (GLM's is 91.6347%), reproducible to four decimals | §RP2, §RP3, §Q-PROFILE |
 | A probe can size **throughput** on synthetic data but **never accuracy** — the distribution is what carries the answer | §G14 |
-| The serving gate cannot resolve under ~3–4%; `[OPTIME]` timers hold to ~1%. Say "inconclusive" rather than rounding | §G11 part 1, §G13 |
+| The serving gate cannot resolve under ~3–4%; `[OPTIME]` timers hold to ~1% (here: 0.5%). Say "inconclusive" rather than rounding | §G11 part 1, §G13, §Q-PROFILE |
 | An oracle that runs **one request per process** cannot see session-lifetime state. `tworeq.py` is the check | §G12 stage 2c |
 | A bucket is only "blocked" if what was *declined* is the same kind of thing as what is being *proposed* | item 4f, §G14 |
 | Isolated kernel speedups attenuate ~0.55–0.65× in-engine when the path streams cold weights | §G14 |
-| Freeze the routing histogram per campaign (`COLI_USAGE_PATH` to a copy) or runs mutate what the next one preloads | §C0, §RP1 |
+| Put a **sub-timer in first**: §G3's KDA decomposition missed 1.05 ms/call and only a sub-timer found it. §Q-PROFILE's within-bucket splits are arithmetic from shapes, so this is mandatory for Q1, Q2 and Q3 | §G4 |
+| Freeze the routing histogram per campaign or runs mutate what the next one preloads. **qwen38 reads `COLI_USAGE`, not `COLI_USAGE_PATH`**, and `rome_bench.sh` does **not** freeze it for qwen38 — every Q row so far mutated the next one's preload | §C0, §RP1, §Q-PROFILE |
 
-**What does NOT transfer — check, do not assume:**
+**What does NOT transfer — now checked, not assumed:**
 
-- **Scale.** Qwen's tier holds **14,673 experts**; GLM's holds 4,686. "VRAM-bound"
-  is a GLM finding, not a Qwen one.
-- **§SPEC-PROBE's answer.** It was decisive *for GLM* because the experts missing
-  the tier are the cold ones that never dedup across a block. Qwen3.8 is 173 GiB
-  with a much larger tier, so **Q4 must re-run the chunk probe on qwen38 before
-  anyone spends the 5–8 days** — that warning is already on the Q4 row.
-- **The clamp gap.** `qmatmul_gate_up.comp` computes `silu(gate)*up` with no
-  clamp (§G14/§G13). Whether Qwen's activations exceed its own limit is unknown.
+- **Scale — the old entry here was wrong and the numbers were already in the
+  record.** It said Qwen's tier holds 14 673 experts against GLM's 4 686 and
+  therefore "VRAM-bound is a GLM finding, not a Qwen one". **Qwen's tier is
+  equally VRAM-saturated:** 14 673 × 4.92 MB ≈ 72 GB, which is all three cards,
+  dev0 reports 24.4 of 25.7 GB, and the preload stops with **7 185 candidates
+  left unplaced**. GLM's 4 686 × 14.16 MB + 3.78 GB dense ≈ 70 of 72 GB. The
+  counts differ because a Qwen FP8 expert is **2.9× smaller** than a GLM int4
+  one, not because Qwen has room. Both engines are VRAM-bound; Qwen just places
+  **80.80%** of its routed activations against GLM's ~79%.
+- **The clamp gap — checked, and it does not exist here.**
+  `qmatmul_gate_up.comp` computes `silu(gate)*up` unclamped; Qwen's CPU expert
+  path computes `q38_silu(eg)*eu`, also unclamped; and Qwen's `config.json` has
+  **no `swiglu_limit` key at all** (GLM's is 10.0). The two paths compute the
+  same function, so §G15's by-product — a model whose output depends on which
+  experts happen to be tier-resident — **has no Qwen analogue** beyond ordinary
+  FP accumulation order, which the 09-04 rows already measured at max-abs
+  7.6e-6, cosine 1.0, same argmax.
+- **§SPEC-PROBE's answer — still does not transfer, and now has an
+  instrument.** Its arithmetic rests on the share of expert activations that
+  stream from RAM; Qwen's is 19.2%, not GLM's 21%, so it is not obviously
+  different *today* — but §Q8 would take it to ~0, which fires SPEC-PROBE's own
+  stated reversal condition. The chunk probe is Q9's first step and the
+  `[OPTIME] placement` counters added by §Q-PROFILE are what it reads.
 
-**Known-good state as of this line:** all four qwen38 C tests pass (C1's SIGFPE
-is fixed), `qwen38`, `qwen38-vk` and `glm53` all build clean, and
-`hot-expert-tier` is at `2c311a0` with track G merged and verified from a clean
-checkout.
+## Track Q: Qwen3.8 — 4.04 / 4.09 rotating, 5.23 / 5.25 warm, 3.45 / 3.37 cold (record §Q-REBASE), 191.2 ms/token fresh-process (§Q-PROFILE)
 
-## Track Q: Qwen3.8 (today 5.35 repeated / 3.69 rotating / 3.59 cold, 3 GPUs, 8 threads)
+**Rewritten 2026-09-11 against the profile and the microbenchmark.** The
+previous six rows are superseded: they were written before anything had
+measured this engine, the roadmap said so, and the evidence contradicted three
+of them outright. The items are **renumbered**, because four of them changed
+identity; the old→new map is:
 
-Two families: placement items that finish the branch's work, and the tech
-report's mechanisms that Colibri does not use yet.
+| old | new | what happened |
+|---|---|---|
+| Q0 | — | **DEAD, both halves.** The tier is VRAM-limited, not history-limited |
+| Q1 (fuse gr read/write) | **Q2**, re-scoped | the fusion is not where the time is; the *serial scalar* half is |
+| Q2 (FP8 residual) | — | **DEAD.** The pass it targets is 0.18 ms/token, 0.1% |
+| Q3 (dense off DRAM) | **Q7** | still real, still Fable; the design question changed |
+| Q4 (MTP) | **Q9** | unchanged in substance, now gated behind Q8 |
+| Q5 (4-acc BF16, "S>1 only, TTFT not decode") | **Q4** | **mis-scoped: it is 1.10–1.14× at S=1 too**, measured |
+| Q6 (int8/int4 experts) | **Q8** | re-sized, and it is now the item that unlocks Q9 |
+| — | **Q1, Q3, Q5** | new, straight out of the profile: ports of measured track-G patterns |
 
-| id | item | evidence | expected | effort | tier | gate |
-|---|---|---|---|---|---|---|
-| Q0 | Populate the whole mapping at load (knob, default on when the checkpoint fits RAM) and capture a longer routing history so the preload fills VRAM (14,673 of ~14,700 slots; histogram had 21,858 hot experts) | rotating-prompt CPU number did not move with prefault-at-bind: first-touch cost relocates, it does not vanish | rotating ≈ cold-request gap closes; ~+10% rotating | 1 day | Sonnet | rotating median vs today's 3.69 |
-| Q1 | Fuse the gated-residual read and write into one pass each with the group RMSNorm folded in (tech report §2.2, "traversed once per block in each direction") | `q38_gr_read` makes several passes over the 4×2560 widened stream plus three small matmuls, ×2 per layer ×48 | −10 to −20 ms/token | 1–2 days | Opus | logits within 1e-5 of pristine, greedy text identical |
-| Q2 | FP8 storage for the widened residual stream (tech report §2.2: "halves the bytes moved, almost no loss in quality") | the residual is FP32 today; the report says the gates bound its range | −10 to −15 ms/token of memory traffic; **changes numerics** | 1–2 days | Opus | env-gated; report the logit cosine and the tiny-check result; ship off by default unless within the near-tie tolerance |
-| Q3 | Dense set off DRAM: a BF16 `fmt` in `qmatmul.comp` (numerics-preserving) and a per-layer hybrid where the dense projections run on the GPU and DeltaNet/QSA stay on the CPU | resident BF16 114–137 ms/token at the CPU's 100 GB/s floor; GPU int8 GEMV 132–400 GB/s effective; submit+fence 55 µs; 4 tensors per submit measured | −70 to −90 ms/token → ~5 tok/s rotating | design 1 session + 3–5 days | **Fable** (design: what moves, submit plan per layer, VRAM split with the expert tier) then Opus (implement) | logits within 1e-5 (BF16 fmt) ; rotating median; VRAM accounting in the record |
-| Q4 | **⚠ RE-GATE BEFORE STARTING — see record §SPEC-PROBE.** The same family was measured on GLM-5.3 and capped at ~1.2× *optimistic*, because the experts that miss the GPU tier are the cold ones and adjacent tokens never share them: the CPU expert count was **identical at every block size 1→16**. Qwen3.8 (173 GiB) has the same doesn't-fit-in-VRAM shape, so the estimate in this row is not safe. **Run the chunk probe on qwen38 first — half a day — before spending the 5–8.** Original row: MTP speculative decoding: load the MTP module, draft up to 4 tokens per step reusing the QSA top-k indices, verify in one forward, accept the matching prefix (tech report Table 4: 4.06 mean accepted) | decode is bandwidth-bound: the dense 8.5 GB is read once per verify step, experts ~4×; ≈ 2.4× tokens per second at equal bytes | the largest multiplier; measured only by accepted tokens per second on rotating prompts, never on a repeated prompt | spec 1 session + 5–8 days | **Fable** (spec: tensor contract from the checkpoint, verify semantics for DeltaNet state rollback and QSA index reuse, acceptance metric) then Opus (draft head + verify path) and Sonnet (harness: accepted-length histogram, identity of the accepted text against plain greedy) | accepted text == greedy text for 1k tokens; accepted length ≥ 3.5 on the datapoint prompts; rotating tok/s |
-| Q5 | 4-accumulator BF16 matmul for prefill rows (S>1 only) | 9.0 → 5.1 ms at S=32 in isolation | TTFT, not decode | half day | Sonnet | greedy text identical; TTFT on the 690-token document |
-| Q6 | (later) int8/int4 expert conversion for VRAM density | fp8-emul 1.7× slower than int8 on the GPU; halves VRAM per expert | ~−9 ms/token plus a larger resident tier | 3+ days, second checkpoint on disk | Opus | numerics vs tiny-check; hit rate on rotating |
+Every item's "bucket" column is a **measured** `[OPTIME]` figure from
+§Q-PROFILE. Where the item targets part of a bucket, the split is arithmetic
+from the tensor shapes and is marked *(est.)* — **step 0 of any such item is a
+sub-timer that replaces the estimate with a measurement**, which is what §G4
+had to learn the hard way.
 
-Order: Q0 and Q5 first (cheap, Sonnet), Q1 next (Opus, bit-close), then the
-Fable design session for Q3 and Q4 together (they compete for VRAM and for
-the per-layer submit budget, so they must be designed against each other),
-then Q3 implementation, then Q4. Q2 slots anywhere after Q1 but ships off
-by default until its numerics are recorded.
+| id | item | bucket (measured) | evidence | expected | effort | tier | gate |
+|---|---|---:|---|---|---|---|---|
+| **Q1** | **DeltaNet's serial tail.** Parallelise the `CD=10 240`-channel causal conv (`for d < CD`: one silu and a 3-tap shift each, 36 layers = **368 640 serial iterations/token**), the per-head q/k normalisation, and the per-head output RMSNorm. Only the 48-head recurrence has a `parallel for` today. This is §G4 step 3 + §G8 on a different engine | deltanet **70.5 ms/token (36.9%)**, of which **~15.9 (est.)** is serial scalar and ~55.0 is its own bandwidth-bound projections | §G4 step 3 got **2.7×** on GLM's identical conv-channel loop; §G8 got 2.43× on GLM's per-head loops. Channel slices and head slices are disjoint; no reduction changes order | **−8 to −13 ms/token** (−4 to −7% of the token) | 1–2 days | Sonnet | **bit-identical** greedy text + last-token logits; `[OPTIME] deltanet` ≤ 60 ms/token; rotating median vs 4.04 / 4.09 |
+| **Q2** | **The gated residual's serial tail.** Parallelise `q38_gr_read`'s four `q38_rms0` calls (a `double` accumulator over H=2560) and its `C=4 × H=2560` sigmoid mix — together **≈1M `expf`/token, single-threaded, at 97 sites**. This is §G10's mHC item in a different engine | gr-read **26.7 ms/token (14.0%)**, of which **~9.9 (est.)** is serial scalar and ~16.9 is its two 10240×320 matmuls | §G10 got **4.05×** on GLM's structurally identical `coli_hc_pre`. `perf` puts `step.constprop.0` + `q38_gr_read.constprop.0` + `__expf_fma` at 1.85% of *cycles* against ~5% of *wall* — the signature of serial code | **−5 to −8 ms/token** | 1 day | Sonnet | **bit-identical** (keep each row's own reduction order — and **do not remove the allocations**: §G10's malloc-removal half changed GCC's rounding and was reverted); `[OPTIME] gr-read` ≤ 20 ms/token |
+| **Q3** | **The shared expert into the GPU gap.** The routed-expert group is issued, the CPU share runs in the gap, then the engine waits. The shared expert — pure CPU work — runs **before** the issue, so it is not in the gap. Move the issue above it. §G9 on a different engine | vk-take **13.0 ms/token (6.8%) of pure idle wait**; shared expert **7.2 ms/token** on the wrong side of the issue | §G9 hid GLM's 22 ms/token of GPU wait inside CPU work that was already larger; here the CPU work exists and is simply ordered wrong | **−5 to −7 ms/token** | half a day | Sonnet | **bit-identical** (`ys` accumulation order unchanged — add the shared term last, as today); `[OPTIME] vk-take` ≤ 8 ms/token **and** `moe` down ≥ 5 ms/token |
+| **Q4** | **Four accumulators in the BF16 dense GEMV at S=1** (was Q5, which said "S>1 only, TTFT not decode" — **measurement says otherwise**). Both kernels need it: `q38_matmul_bf16` and the inlined loop in `q38_dense_matmul_multi`, which are 30.49% and 24.91% of user cycles. Breaks the single FMA dependency chain; **changes the summation order**, so it ships behind a knob with the logit diff recorded | `dense-matmul` **90.0** + lm-head **15.8** = **105.8 ms/token (55%)** | `rome_cpubench.c`, 8 threads, pools > L3, this engine's exact shapes: **79.6→90.8, 81.8→90.2, 80.7→87.9, 84.7→92.7 GB/s — 1.10–1.14× at S=1**. In-engine attenuation on *this* path is ~0.95× (LM head: isolated 15.011 ms, in-engine 15.8), **not** §G14's 0.55–0.65×, because these are resident tensors and not cold mmap'd experts | **−8 to −12 ms/token** | 1 day | Opus | knob **off** bit-identical to pristine; knob **on**: greedy text identical over 128 tokens and the last-token logit cosine in the commit body; `[OPTIME] dense-matmul` and `lm-head`; rotating median |
+| **Q5** | **Fuse the CPU expert's three matmuls into one OpenMP region.** `q38_moe_decode`'s CPU share calls `q38_weight_matmul` three times per expert — **3 fork/joins × 92 CPU experts = 276 OMP regions per token**. This is §G11 part 1, which was bit-identical on GLM | cpu-experts **15.4 ms/token (8.1%)** | `rome_cpubench.c`: the same ten experts cost **1.602 ms/token-layer through the engine's loop and 1.387 fused — 1.16×**. Isolated and in-engine already agree to 4% (0.16 vs 0.167 ms/expert), so this is not an attenuation gamble | **−2.1 ms/token** | half a day | Sonnet | **bit-identical** (§G11 part 1 was); `[OPTIME] cpu-experts` ≤ 13.5 ms/token |
+| **Q6** | **The LM head off the CPU** — one tensor, no per-layer submit plan, and the cheapest honest probe of Q7's premise. **Changes numerics** (int8/int4), so it ships behind a knob, off by default, with the logit diff recorded. Note it partly overlaps Q4: measure it **after** Q4 lands, against Q4's number | lm-head **15.8 ms/token (8.2%)**, 1.27 GB at **80.4 GB/s** | 09-04 placement matrix, this exact shape (2560→248 320): CPU 12.3 ms, **GPU int8 1.58 ms (403 GB/s)**, int4 1.36 ms. Today's isolated re-run says 15.0 ms CPU at 8 threads | **−10 to −13 ms/token** *before* Q4, less after | 1–2 days | Opus | greedy text identical over 128 tokens **and** last-token logit cosine reported; knob **off** bit-identical; rotating median |
+| **Q7** | **The dense stream off DRAM** (was Q3). A BF16 `fmt` in `qmatmul.comp` is numerics-preserving; int8 is not. **The design question has changed and is why this still needs Fable:** it is no longer "what moves", it is *"what moves, given that the expert tier is already full and every byte of dense weight on a card evicts an expert"* — Q7 and Q8 now compete for the same 72 GB from opposite directions and must be designed against each other | `dense-matmul` **90.0 ms/token (47.0%)** at **75.7 GB/s** against a 70.9 GB/s 8-thread DRAM ceiling. Split: DeltaNet projections 4.16 GB, QSA 1.24 GB, gated residual 1.28 GB, router 0.13 GB | GPU int8 GEMV 132–403 GB/s effective; submit+fence **53–66 µs**; 4 tensors per submit 0.247 vs 0.378 ms (09-04). CPU int8 is 2.35× per call (0.280 vs 0.658 ms at 2560×10240) and is the cheaper half of the same question. **VRAM is the constraint, not throughput** | **−40 to −70 ms/token** *if the VRAM can be found*; the range is wide because the VRAM split is the unsolved part | design 1 session + 3–5 days | **Fable** (design: what moves, per-layer submit plan, **and the VRAM split against Q8**) then Opus | logits within 1e-5 (BF16 `fmt`) or bit-identical; rotating median; **VRAM accounting and the resulting tier count in the record** |
+| **Q8** | **int4 experts — and what they unlock** (was Q6). A Qwen expert is 4.92 MB in FP8 and **2.46 MB in int4**, so **all 24 576 experts fit in ~60 GB of the 72 GB the three cards have**. That takes the CPU expert path to zero and fires §SPEC-PROBE's own stated reversal condition. **§G15 is the precedent and its procedure is MANDATORY: the numerics probe runs FIRST, simulated on the weights already on disk, before any converter, shader or `fmt` exists** — GLM did not survive int3, and fp8→int4 on a different model is a different question that must be answered before anything is built | cpu-experts **15.4 ms/token (8.1%)** at 29.4 GB/s = 41% of DRAM; tier **14 673 of 21 858, 7 185 unplaced**; placement **80.80%** | fp8-emul is 1.7× slower than int8 on this GPU; int4 halves VRAM per expert again. §G14: a probe sizes throughput on synthetic data but **never** accuracy — use the real activation distribution | **−15.4 ms/token** (CPU expert path → 0) **plus** it unblocks Q9 | probe 1 day, then 3+ days and a second checkpoint on disk | Opus | **the probe's gate comes first**: greedy text identical and the `ref.json` token match unchanged against the fp8 control at the *same* placement. If it fails, the item is dead and no kernel is written |
+| **Q9** | **MTP speculative decoding** (was Q4). **⚠ RE-GATE BEFORE STARTING and now also GATED BEHIND Q8.** Load the MTP module, draft up to 4 tokens per step reusing the QSA top-k indices, verify in one forward, accept the matching prefix (tech report Table 4: 4.06 mean accepted) | — | §SPEC-PROBE capped this family at ~1.2× optimistic **for GLM**, because the experts that miss the tier are cold ones adjacent tokens never share. Qwen's miss share is **19.2%**, close enough to GLM's 21% that the same cap is the null hypothesis — **but after Q8 the miss share is ~0 and SPEC-PROBE's own reversal condition fires** | largest multiplier on the board, **after Q8 and not before** | chunk probe half a day; spec 1 session + 5–8 days | **Fable** (spec) then Opus + Sonnet | **step 1 is the chunk probe on qwen38** (`Q38_PREFILL_BATCH` × the `[OPTIME] placement` counters): report the CPU-expert count at block size 1→16. Then accepted text == greedy text for 1k tokens; accepted length ≥ 3.5; rotating tok/s |
 
-Target for the track: ~5 tok/s rotating from Q0–Q3, then ×2 or better from
-Q4 measured as accepted tokens per second.
+### Deleted, with the measurement that deleted them
+
+- **Q0 (populate-at-load + longer routing history) — DEAD, both halves.**
+  Half 1: `Q38_MMAP_POPULATE` is **already on by default** on this engine, and
+  §G1/§G1b measured the whole-mapping variant on GLM at **122 s of extra load
+  for no measurable gain**, with the first-touch cost relocated rather than
+  removed — the record's own Q row already said the rotating number did not
+  move. Half 2: **measured false.** Seven processes on 2026-09-11 all printed
+  `preloaded 14673 of 21858 ... (dev0 24.4/25.7 GB)`; the histogram already
+  offers 21 858 candidates and the preload stops because the cards are full.
+  **More history cannot add an expert to a full card.** Its purpose — more
+  experts resident — is inherited by **Q8**, which is the only way to get them.
+- **Old Q2 (FP8 widened residual stream) — DEAD.** Its premise was
+  "−10 to −15 ms/token of memory traffic". Measured: the widened residual is
+  4×2560 floats = **40 KB per token**, and `gr-apply`, the pass that writes it,
+  is **0.18 ms/token — 0.1% of the token**. `gr-read`'s cost is its 10240×320
+  weight matrices (§Q2 above), not the residual. There is no 10–15 ms there.
+  If it is ever revived it is a long-context/prefill item, not a decode one.
+- **A pooled-key cache for the indexer (the Qwen twin of §G5) — NOT AN ITEM.**
+  Qwen already has it (`IK_pooled`, commit `2d3cf7e` — the commit §G5 ported
+  *from*), and the indexer measures **0.15 ms/token at ctx≈70 and 0.28 at
+  ctx≈180**. It is not worth a day at any context this box will run.
+
+### Order, and why
+
+**Q1 → Q2 → Q3 → Q5** first: **−20 to −30 ms/token** of the 191 between them,
+**every one of them bit-identical**, every one a port of a track-G pattern that
+is already measured on the other engine (G4 step 3 / G8, G10, G9, G11 part 1).
+Sonnet tier, about three and a half days for all four. Ordered by bucket size,
+with Q5 last only because it is the smallest.
+
+Then **Q4** (four accumulators). It is first among the numerics-changing items
+because it is the only one whose speedup is already measured *at this engine's
+exact shapes with its own kernel*, and because it is one day.
+
+Then **Q6** (the LM head), measured **after** Q4 and against Q4's number — the
+two overlap and sizing Q6 off today's 15.8 ms would double-count.
+
+Then the **Fable design session for Q7 and Q8 together**. They compete for the
+same 72 GB from opposite directions — Q7 wants VRAM for dense weights, Q8 wants
+it for experts — and designing either alone would repeat the mistake the old
+roadmap made in pairing its Q3 with its Q4. **Q8's numerics probe runs first
+and can kill Q8 outright** (§G15 did exactly that to its GLM cousin), and Q8's
+outcome decides whether Q9 exists at all.
+
+Then **Q9**, if and only if Q8 landed.
+
+**Target for the track, rewritten from the evidence.** Q1+Q2+Q3+Q5 take the
+fresh-process token from **191 to ~165 ms with no numerics change at all**;
+Q4 and Q6 take it to roughly **145**, behind knobs, with logit diffs recorded.
+After that **~95–106 ms of what remains is at the DRAM ceiling**, and every
+further gain needs a different device (Q7) or a smaller format (Q8) — there is
+no third option and no cheap one. The old target line ("~5 tok/s rotating from
+Q0–Q3, then ×2 from Q4") rested on a Q0 and a Q2 that are both now dead;
+**Q1–Q6 are worth roughly +25 to +30% on the rotating median, and everything
+beyond that is a VRAM decision that only Fable can take.**
 
 ## Sequencing across both tracks
 
@@ -512,7 +612,10 @@ by guess; where a position is a judgment call rather than a number, it says so.
    run with an unset cap — it is the guard against the incident that put 91 GB
    "in VRAM" and evicted the page cache.
 9. **C1** whenever someone guards the `2d3cf7e` divisor. Blocks nothing else.
-10. **Track Q** is untouched. Q0 and Q5 are a day between them.
+10. **Track Q** has its baseline (§Q-REBASE) and its profile (§Q-PROFILE) as of
+   2026-09-11, and its items are re-derived from them rather than guessed.
+   Q1, Q2 and Q3 are about three Sonnet-days between them and are the whole of
+   the cheap parallelism left on that engine.
 
 ### Keeping the profile honest: a re-measurement cadence, not a one-off
 

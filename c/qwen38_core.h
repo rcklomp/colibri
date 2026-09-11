@@ -1892,68 +1892,122 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
             float *z_row=z+(int64_t)s*V;
             float *b_row=bb+(int64_t)s*VH;
             float *a_row=aa+(int64_t)s*VH;
-            double sub_started=q38_tm_t0();
-            for(int d=0;d<CD;d++) {
-                float value=l->dn_conv[(int64_t)d*CK+CK-1]*qkv_row[d];
-                float *history=ring+(int64_t)d*(CK-1);
-                for(int tap=0;tap<CK-1;tap++)
-                    value+=l->dn_conv[(int64_t)d*CK+tap]*history[tap];
-                conv[d]=q38_silu(value);
-                for(int tap=0;tap<CK-2;tap++)history[tap]=history[tap+1];
-                history[CK-2]=qkv_row[d];
-            }
-            q38_tm_add_live(m,Q38_TM_DN_CONV,sub_started);
-            const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
-            sub_started=q38_tm_t0();
-            for(int h=0;h<VH;h++) {
-                float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
-                memcpy(qh,qi+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
-                memcpy(kh,ki+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
-                double qsum=1e-6,ksum=1e-6;
-                for(int d=0;d<KD;d++) {
-                    qsum+=(double)qh[d]*qh[d];
-                    ksum+=(double)kh[d]*kh[d];
-                }
-                float qscale=1.f/sqrtf((float)qsum)/sqrtf((float)KD);
-                float kscale=1.f/sqrtf((float)ksum);
-                for(int d=0;d<KD;d++){qh[d]*=qscale;kh[d]*=kscale;}
-            }
-            q38_tm_add_live(m,Q38_TM_DN_QKNORM,sub_started);
-            sub_started=q38_tm_t0();
-            #pragma omp parallel for schedule(static)
-            for(int h=0;h<VH;h++) {
-                float *state=rec+(int64_t)h*KD*VD;
-                const float *qh=q+(int64_t)h*KD;
-                const float *kh=k+(int64_t)h*KD;
-                const float *vh=vi+(int64_t)h*VD;
-                float alpha=expf(-expf(l->dn_alog[h])*
-                                 q38_softplus(a_row[h]+l->dn_dtbias[h]));
-                float beta=q38_sigmoid(b_row[h]);
-                float delta[512];
-                int64_t state_cells=(int64_t)KD*VD;
-                for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
-                for(int value=0;value<VD;value++) {
-                    float previous=0.f;
-                    for(int d=0;d<KD;d++)
-                        previous+=kh[d]*state[(int64_t)d*VD+value];
-                    delta[value]=(vh[value]-previous)*beta;
-                }
-                for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
-                    state[(int64_t)d*VD+value]+=kh[d]*delta[value];
-                for(int value=0;value<VD;value++) {
-                    float current=0.f;
-                    for(int d=0;d<KD;d++)
-                        current+=qh[d]*state[(int64_t)d*VD+value];
-                    core[(int64_t)h*VD+value]=current;
-                }
-            }
-            q38_tm_add_live(m,Q38_TM_DN_RECUR,sub_started);
             float *norm_row=norm+(int64_t)s*V;
-            sub_started=q38_tm_t0();
-            for(int h=0;h<VH;h++)
-                q38_rmsg(norm_row+(int64_t)h*VD,core+(int64_t)h*VD,
-                         z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
-            q38_tm_add_live(m,Q38_TM_DN_GNORM,sub_started);
+            /* Q1 (2026-09-12): ONE parallel region for all four per-token
+             * loops instead of a serial conv, a serial q/k norm, a
+             * `parallel for` recurrence and a serial gated RMSNorm.
+             *
+             * Why one region and not four `parallel for`s (which is the
+             * literal §G4 step 3 + §G8 port): the fork/join count per token
+             * stays at 36 instead of going to 144, in an engine where
+             * §Q-PROFILE measured libgomp at 31.75% of user cycles. The
+             * isolated harness (tools/hot-expert/rome_dnbench.c, 8 threads)
+             * measured both arms at these exact shapes over 36 layers:
+             *   serial 3.286 / 3.294 ms-token (L3-hot / >512 MB pool)
+             *   four pragmas 1.755 / 1.584
+             *   one region  1.645 / 1.372
+             * so the four-pragma arm is rejected on measurement, not taste.
+             *
+             * SHARING, which is what §G4's `memory` bug was: every write in
+             * every one of these loops lands in a slice indexed by that
+             * loop's own induction variable, and no slice is written twice.
+             *   conv loop   writes conv[d] and ring[d*(CK-1) .. +CK-2];
+             *               reads l->dn_conv[d*CK..] and qkv_row[d].
+             *   q/k norm    writes q[h*KD..] and k[h*KD..]; reads conv
+             *               (h/rep shares a SOURCE slice, which is a read).
+             *   recurrence  writes rec[h*KD*VD..] and core[h*VD..]; `delta`
+             *               is a stack array inside the loop body, so it is
+             *               per-iteration and not a shared scratch buffer --
+             *               that is exactly the shape §G4's `memory` was not.
+             *   gnorm       writes norm_row[h*VD..]; reads core, z_row.
+             * The three implicit barriers at the end of each `omp for` are
+             * what make conv visible to q/k norm, q/k to the recurrence and
+             * core to the RMSNorm. Nothing else in the region writes.
+             *
+             * BIT-IDENTICAL: every element's arithmetic and every reduction
+             * (qsum/ksum per head, ss inside q38_rmsg) stays inside one
+             * iteration, so no summation order changes. Proved outside the
+             * engine by rome_dnbench.c's oracle (36 layers x 64 consecutive
+             * tokens, conv ring carried, memcmp on conv/q/k/norm and on every
+             * layer's ring) and in the engine by the last-token logits.
+             *
+             * The sub-timers are taken by the master thread between the
+             * barriers; only master calls q38_tm_* inside the region, so the
+             * lazy COLI_TIMERS init is still not racing anything (and it has
+             * already run above, in dn-proj, on the serial path). */
+            #pragma omp parallel
+            {
+                double sub_started=0.0;
+                #pragma omp master
+                sub_started=q38_tm_t0();
+                #pragma omp for schedule(static)
+                for(int d=0;d<CD;d++) {
+                    float value=l->dn_conv[(int64_t)d*CK+CK-1]*qkv_row[d];
+                    float *history=ring+(int64_t)d*(CK-1);
+                    for(int tap=0;tap<CK-1;tap++)
+                        value+=l->dn_conv[(int64_t)d*CK+tap]*history[tap];
+                    conv[d]=q38_silu(value);
+                    for(int tap=0;tap<CK-2;tap++)history[tap]=history[tap+1];
+                    history[CK-2]=qkv_row[d];
+                }
+                #pragma omp master
+                { q38_tm_add_live(m,Q38_TM_DN_CONV,sub_started);
+                  sub_started=q38_tm_t0(); }
+                const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
+                #pragma omp for schedule(static)
+                for(int h=0;h<VH;h++) {
+                    float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
+                    memcpy(qh,qi+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
+                    memcpy(kh,ki+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
+                    double qsum=1e-6,ksum=1e-6;
+                    for(int d=0;d<KD;d++) {
+                        qsum+=(double)qh[d]*qh[d];
+                        ksum+=(double)kh[d]*kh[d];
+                    }
+                    float qscale=1.f/sqrtf((float)qsum)/sqrtf((float)KD);
+                    float kscale=1.f/sqrtf((float)ksum);
+                    for(int d=0;d<KD;d++){qh[d]*=qscale;kh[d]*=kscale;}
+                }
+                #pragma omp master
+                { q38_tm_add_live(m,Q38_TM_DN_QKNORM,sub_started);
+                  sub_started=q38_tm_t0(); }
+                #pragma omp for schedule(static)
+                for(int h=0;h<VH;h++) {
+                    float *state=rec+(int64_t)h*KD*VD;
+                    const float *qh=q+(int64_t)h*KD;
+                    const float *kh=k+(int64_t)h*KD;
+                    const float *vh=vi+(int64_t)h*VD;
+                    float alpha=expf(-expf(l->dn_alog[h])*
+                                     q38_softplus(a_row[h]+l->dn_dtbias[h]));
+                    float beta=q38_sigmoid(b_row[h]);
+                    float delta[512];
+                    int64_t state_cells=(int64_t)KD*VD;
+                    for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
+                    for(int value=0;value<VD;value++) {
+                        float previous=0.f;
+                        for(int d=0;d<KD;d++)
+                            previous+=kh[d]*state[(int64_t)d*VD+value];
+                        delta[value]=(vh[value]-previous)*beta;
+                    }
+                    for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
+                        state[(int64_t)d*VD+value]+=kh[d]*delta[value];
+                    for(int value=0;value<VD;value++) {
+                        float current=0.f;
+                        for(int d=0;d<KD;d++)
+                            current+=qh[d]*state[(int64_t)d*VD+value];
+                        core[(int64_t)h*VD+value]=current;
+                    }
+                }
+                #pragma omp master
+                { q38_tm_add_live(m,Q38_TM_DN_RECUR,sub_started);
+                  sub_started=q38_tm_t0(); }
+                #pragma omp for schedule(static)
+                for(int h=0;h<VH;h++)
+                    q38_rmsg(norm_row+(int64_t)h*VD,core+(int64_t)h*VD,
+                             z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
+                #pragma omp master
+                q38_tm_add_live(m,Q38_TM_DN_GNORM,sub_started);
+            }
         }
         double outproj_started=q38_tm_t0();
         q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,

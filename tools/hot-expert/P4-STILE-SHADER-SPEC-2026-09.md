@@ -63,8 +63,13 @@ per row r:  sum[r] = subgroupAdd(acc[r]);  lane 0 writes y[s0 + r, o] (with the
   and the existing pipeline when `S == 1`. Decode never touches the new
   code — the gate's decode column must read within 1 %.
 - **Formats.** Implement fmt 4 (grouped int4, everything on rome) and fmt 1
-  (int8) first; fmt 5 (int3-g64, G15's future) and fmt 7/8 follow the same
-  pattern and can be added when they exist on this box. The tiled pipeline
+  (int8) first; fmt 7/8 follow the same pattern and can be added when they
+  exist on this box. **fmt 5 (int3-g64) is moot for this engine**: G15
+  (`ROADMAP-2026-09.md` 4h, record §G15) simulated it on GLM-5.3's own int4
+  weights before building any shader and the model does not survive it
+  (`teacher_forcing` diverges, cosine 0.973/0.878) — do not add fmt 5 to the
+  tiled pipeline on GLM-5.3's account; it would only be worth doing again for
+  a different model or a finer-grained int3 variant. The tiled pipeline
   must refuse (return 0 → caller falls back to the per-row pipeline) for a
   format it does not implement.
 - **Push constants.** The existing `struct PC {fmt, S, I, O, rowWords, gs}`

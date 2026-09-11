@@ -82,6 +82,16 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `[MAP] 59 file mappati (st_map_shard_range), esperti mappabili 12096/12096`;
   `majflt` per request stays 0 and `[MAP] … copy=0` — if either moves, the
   mapping is the first suspect.
+- **GLM-5.3's routed-expert GPU kernel skips the swiglu clamp.**
+  `c/shaders/qmatmul_gate_up.comp` computes `silu(gate)*up` with no bound;
+  the CPU path applies `swiglu_limit=10.0`. Noted without a number in §G13,
+  measured while gating G15 (2026-09-11, record §G15): forcing routed
+  experts onto the CPU (`GLM53_EXPERTS_CPU=1`, same int4 weights, placement
+  only) changes 6 of 42 and 8 of 1232 `teacher_forcing` predictions and the
+  long-prompt argmax versus the normal GPU/CPU split. **GLM-5.3's output
+  today depends on which experts happen to be tier-resident**, not only on
+  the weights and the prompt. A correctness gap, not a speed one; not fixed,
+  not this item's scope, next real item on this engine.
 - **One benchmark at a time, across sessions as well as inside one.** The rig
   serialises measurements. Parallel sessions or subagents may edit and build
   concurrently; only one may run an engine. Check `pgrep -x glm53`,

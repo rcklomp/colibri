@@ -99,6 +99,20 @@ typedef enum {
     Q38_TM_EXPERT_CPU,
     Q38_TM_VK_ISSUE,
     Q38_TM_VK_TAKE,
+    /* Q1 (2026-09-12): DeltaNet's own split. §Q-PROFILE could only ESTIMATE
+     * the serial-scalar share of the 70.5 ms/token deltanet bucket, by
+     * subtracting the projections' bandwidth arithmetic (~55.0) from the
+     * measured total, and said so. §G4 is why that is not good enough: G3's
+     * KDA decomposition missed 1.05 ms/call of GPU submits and only a
+     * sub-timer found it, after the item had already been sized against the
+     * estimate. These five NEST inside DELTANET and partition it up to an
+     * allocation/loop remainder, printed as dn-rest. Like the Q-PROFILE
+     * counters they are read only when COLI_TIMERS=1. */
+    Q38_TM_DN_PROJ,
+    Q38_TM_DN_CONV,
+    Q38_TM_DN_QKNORM,
+    Q38_TM_DN_RECUR,
+    Q38_TM_DN_GNORM,
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -1867,8 +1881,10 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         int rows=S-base<rows_capacity?S-base:rows_capacity;
         const float *chunk=x+(int64_t)base*H;
         {
+            double proj_started=q38_tm_t0();
             Q38DenseItem in[4]={{qkv,&l->dn_qkv,CD},{z,&l->dn_z,V},{bb,&l->dn_b,VH},{aa,&l->dn_a,VH}};
             q38_dense_matmul_multi(m,in,4,chunk,rows,H);
+            q38_tm_add_live(m,Q38_TM_DN_PROJ,proj_started);
         }
 
         for(int s=0;s<rows;s++) {
@@ -1876,6 +1892,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
             float *z_row=z+(int64_t)s*V;
             float *b_row=bb+(int64_t)s*VH;
             float *a_row=aa+(int64_t)s*VH;
+            double sub_started=q38_tm_t0();
             for(int d=0;d<CD;d++) {
                 float value=l->dn_conv[(int64_t)d*CK+CK-1]*qkv_row[d];
                 float *history=ring+(int64_t)d*(CK-1);
@@ -1885,7 +1902,9 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 for(int tap=0;tap<CK-2;tap++)history[tap]=history[tap+1];
                 history[CK-2]=qkv_row[d];
             }
+            q38_tm_add_live(m,Q38_TM_DN_CONV,sub_started);
             const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
+            sub_started=q38_tm_t0();
             for(int h=0;h<VH;h++) {
                 float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
                 memcpy(qh,qi+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
@@ -1899,6 +1918,8 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 float kscale=1.f/sqrtf((float)ksum);
                 for(int d=0;d<KD;d++){qh[d]*=qscale;kh[d]*=kscale;}
             }
+            q38_tm_add_live(m,Q38_TM_DN_QKNORM,sub_started);
+            sub_started=q38_tm_t0();
             #pragma omp parallel for schedule(static)
             for(int h=0;h<VH;h++) {
                 float *state=rec+(int64_t)h*KD*VD;
@@ -1926,13 +1947,18 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                     core[(int64_t)h*VD+value]=current;
                 }
             }
+            q38_tm_add_live(m,Q38_TM_DN_RECUR,sub_started);
             float *norm_row=norm+(int64_t)s*V;
+            sub_started=q38_tm_t0();
             for(int h=0;h<VH;h++)
                 q38_rmsg(norm_row+(int64_t)h*VD,core+(int64_t)h*VD,
                          z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
+            q38_tm_add_live(m,Q38_TM_DN_GNORM,sub_started);
         }
+        double outproj_started=q38_tm_t0();
         q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,
                          rows,V,H);
+        q38_tm_add_live(m,Q38_TM_DN_PROJ,outproj_started);
         base+=rows;
     }
     free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);
@@ -2606,7 +2632,8 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
          * q38_tm_report_optime, this bank just lists them. A short
          * initialiser here would leave NULL names for a %s. */
         "step","embed","gr-read","gr-apply","attention","moe",
-        "router","cpu-experts","vk-issue","vk-take"
+        "router","cpu-experts","vk-issue","vk-take",
+        "dn-proj","dn-conv","dn-qknorm","dn-recur","dn-gnorm"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -2664,6 +2691,16 @@ static void q38_tm_report_optime(const Q38Timers *t,const char *scope) {
         {"  cpu-experts",  s[Q38_TM_EXPERT_CPU]},
         {"  vk-take",      s[Q38_TM_VK_TAKE]},
         {"  routed-total", s[Q38_TM_ROUTED_EXPERT]},
+        /* Q1: inside deltanet. dn-rest is the remainder -- the nine
+         * falloc/free pairs per call and the loop scaffolding -- and it is
+         * the row that would have caught §G4's missing 1.05 ms/call. */
+        {"  dn-proj",      s[Q38_TM_DN_PROJ]},
+        {"  dn-conv",      s[Q38_TM_DN_CONV]},
+        {"  dn-qknorm",    s[Q38_TM_DN_QKNORM]},
+        {"  dn-recur",     s[Q38_TM_DN_RECUR]},
+        {"  dn-gnorm",     s[Q38_TM_DN_GNORM]},
+        {"  dn-rest",      s[Q38_TM_DELTANET]-(s[Q38_TM_DN_PROJ]+s[Q38_TM_DN_CONV]+
+                           s[Q38_TM_DN_QKNORM]+s[Q38_TM_DN_RECUR]+s[Q38_TM_DN_GNORM])},
         {"  dense-matmul", s[Q38_TM_DENSE_MATMUL]},
         {"  expert-read",  s[Q38_TM_EXPERT_READ]},
         {"  fp8-expand",   s[Q38_TM_FP8_EXPAND]},

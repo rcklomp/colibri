@@ -79,6 +79,26 @@ typedef enum {
     Q38_TM_QSA_ATTENTION,
     Q38_TM_PLE,
     Q38_TM_LM_HEAD,
+    /* Q-PROFILE (2026-09-11): the ten counters above do not partition a token.
+     * They leave the gated residual, the router and the embedding gather
+     * untimed, and they fold the GPU expert wait into ROUTED_EXPERT together
+     * with the CPU share that runs beside it -- so no G3-style "where does the
+     * token go" table can be built from them, and none ever was. The counters
+     * below close that: STEP is the denominator, EMBED/GR_READ/GR_APPLY/
+     * ATTENTION/MOE/DELTANET/PLE/LM_HEAD partition it, and ROUTER/EXPERT_CPU/
+     * VK_ISSUE/VK_TAKE decompose MOE. They are read only when COLI_TIMERS=1 is
+     * set (q38_tm_live), so the default path pays nothing at all -- not even
+     * the clock_gettime the ten older counters pay unconditionally. */
+    Q38_TM_STEP,
+    Q38_TM_EMBED,
+    Q38_TM_GR_READ,
+    Q38_TM_GR_APPLY,
+    Q38_TM_ATTENTION,
+    Q38_TM_MOE,
+    Q38_TM_ROUTER,
+    Q38_TM_EXPERT_CPU,
+    Q38_TM_VK_ISSUE,
+    Q38_TM_VK_TAKE,
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -161,6 +181,19 @@ typedef struct {
     float *vis_rows;
     int *vis_map, vis_map_len, vis_rows_n;
     Q38Timers timers;
+    /* Snapshot taken right after the prefill forward, so the report can show
+     * the DECODE phase on its own. G3's timers zero themselves after prefill;
+     * here the totals are also wanted (serve mode prints a per-request delta
+     * from them), so the split is a snapshot rather than a reset. */
+    Q38Timers timers_prefill;
+    int timers_split;
+    /* Routed-expert PLACEMENT counts, the Qwen twin of glm53's
+     * g_n_bind_gpu/g_n_bind_cpu. The existing hits/miss pair counts the CPU
+     * slot cache, which says nothing about how many activations the VRAM tier
+     * actually served -- and that share is what sizes every item that wants
+     * more experts resident. One increment per routed expert per layer. */
+    uint64_t expert_placed_gpu, expert_placed_cpu;
+    uint64_t expert_placed_gpu_prefill, expert_placed_cpu_prefill;
 } Model;
 
 static float *g_last_logit;
@@ -174,6 +207,23 @@ static double now_s(void) {
 
 static inline void q38_tm_add(Model *m,Q38Timer timer,double started) {
     m->timers.seconds[timer] += now_s() - started;
+}
+
+/* The profile counters added for the Q-track per-op table are opt-in at
+ * runtime: q38_tm_t0 returns 0 and q38_tm_add_live does nothing unless
+ * COLI_TIMERS=1. Every call site is on the serial path between OpenMP
+ * regions, so the lazy initialisation below is not racing anything. */
+static int g_q38_tm_live = -1;
+static inline int q38_tm_live(void) {
+    if(g_q38_tm_live<0){
+        const char *e=getenv("COLI_TIMERS");
+        g_q38_tm_live=(e&&e[0]=='1'&&e[1]=='\0')?1:0;
+    }
+    return g_q38_tm_live;
+}
+static inline double q38_tm_t0(void) { return q38_tm_live()?now_s():0.0; }
+static inline void q38_tm_add_live(Model *m,Q38Timer timer,double started) {
+    if(q38_tm_live()) m->timers.seconds[timer] += now_s() - started;
 }
 
 static Q38Timers q38_tm_delta(const Q38Timers *after,const Q38Timers *before) {
@@ -1061,6 +1111,7 @@ static void q38vk_preload(Model *m) {
 static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
                         int S,float *mixed,float *inject) {
     const Cfg *c=&m->c;
+    double phase_started=q38_tm_t0();
     int H=c->hidden,W=c->hc_width,C=c->hc_count,R=c->hc_rank;
     if(C<=0||H<=0||W!=C*H){fprintf(stderr,"invalid gated-residual width\n");exit(1);}
     float *norm=falloc((int64_t)S*W),*low=falloc((int64_t)S*R),*mix=falloc((int64_t)S*W);
@@ -1082,14 +1133,22 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
         for(int64_t z=0;z<(int64_t)S*C;z++) inject[z]=2.f*q38_sigmoid(inject[z]/C);
     }
     free(norm);free(low);free(mix);
+    q38_tm_add_live(m,Q38_TM_GR_READ,phase_started);
 }
 
-static void q38_gr_apply(const Cfg *c,float *hyper,const float *block,const float *inject,int S) {
+/* Takes the Model rather than the Cfg only so this write-back can be timed:
+ * it is one of the two halves of the tech report's "traversed once per block
+ * in each direction" and the Q1 roadmap item is about exactly these passes,
+ * so leaving it off the clock left that item sized by guesswork. */
+static void q38_gr_apply(Model *m,float *hyper,const float *block,const float *inject,int S) {
+    const Cfg *c=&m->c;
+    double phase_started=q38_tm_t0();
     int H=c->hidden,C=c->hc_count,W=c->hc_width;
     for(int s=0;s<S;s++)for(int b=0;b<C;b++){
         float a=inject[(int64_t)s*C+b];
         for(int d=0;d<H;d++)hyper[(int64_t)s*W+(int64_t)b*H+d]+=a*block[(int64_t)s*H+d];
     }
+    q38_tm_add_live(m,Q38_TM_GR_APPLY,phase_started);
 }
 
 typedef struct {
@@ -1888,6 +1947,7 @@ static int q38_block_desc(const void *aa,const void *bb){
 }
 
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
+    double attn_started=q38_tm_t0();
     Cfg *c=&m->c;int H=c->hidden,QH=c->q_heads,KVH=c->kv_heads,D=c->head_dim;
     int IQ=c->idx_qheads,ID=c->idx_dim,R=c->idx_ratio,maxsel=c->idx_budget+R-1;
     float *qp=falloc((int64_t)S*QH*2*D),*kp=falloc((int64_t)S*KVH*D),*vp=falloc((int64_t)S*KVH*D);
@@ -1951,6 +2011,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     }
     q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
     free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
+    q38_tm_add_live(m,Q38_TM_ATTENTION,attn_started);
 }
 
 /* The single-row path is intentionally kept separate from prefill.  Decode is
@@ -1962,6 +2023,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
+        double router_started=q38_tm_t0();
         q38_dense_matmul(m,logits,xs,&l->router,1,H,E);float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
         double all=0;for(int e=0;e<E;e++){logits[e]=expf(logits[e]-mx);all+=logits[e];}
         int idx[Q38_MAX_TOPK];float val[Q38_MAX_TOPK];
@@ -1970,6 +2032,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
+        q38_tm_add_live(m,Q38_TM_ROUTER,router_started);
         q38_prefetch_native_fp8_experts(m,layer,idx,K);
         double phase_started=now_s();
         q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
@@ -1986,6 +2049,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             if(!bufX[0]) for(int dv=0;dv<3;dv++){ bufX[dv]=falloc(64*(int64_t)H); bufY[dv]=falloc(64*(int64_t)H); }
             bufN[0]=bufN[1]=bufN[2]=0;
             int placed_mask[Q38_MAX_TOPK]; for(int z=0;z<K;z++) placed_mask[z]=0;
+            double vk_started=q38_tm_t0();
             for(int z=0;z<K;z++){
                 int dev=q38vk_expert_ensure(m,layer,idx[z]);
                 if(dev<0||dev>2) continue;
@@ -2009,9 +2073,17 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
                 else issued[2]=coli_vk_expert_group_issue3(bufG[2],bufU[2],bufD[2],bufRows[2],bufN[2],bufX[2]);
                 if(issued[dev]) for(int n=0;n<bufN[dev];n++) placed_mask[bufZ[dev][n]]=1;
             }
+            /* Placement + staging + the three issues: everything before the CPU
+             * share starts. RP4 measured the equivalent bucket for GLM and found
+             * the GPU made the engine wait 0.07 ms/token -- this is the split
+             * that answers the same question for Qwen. */
+            q38_tm_add_live(m,Q38_TM_VK_ISSUE,vk_started);
             /* CPU share while the GPUs run: experts no device holds (or whose issue failed) */
             q38vk_cpu_n=0;
             for(int z=0;z<K;z++) if(!placed_mask[z]) q38vk_cpu_idx[q38vk_cpu_n++]=z;
+            m->expert_placed_cpu+=(uint64_t)q38vk_cpu_n;
+            m->expert_placed_gpu+=(uint64_t)(K-q38vk_cpu_n);
+            double cpu_started=q38_tm_t0();
             for(int zi=0;zi<q38vk_cpu_n;zi++){
                 int z=q38vk_cpu_idx[zi];
                 Slot *ex=q38_expert_get(m,layer,idx[z]);
@@ -2019,6 +2091,8 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
                 for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
                 for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             }
+            q38_tm_add_live(m,Q38_TM_EXPERT_CPU,cpu_started);
+            double take_started=q38_tm_t0();
             for(int dev=0;dev<3;dev++){
                 if(!issued[dev]) continue;
                 int rc=dev==0?coli_vk_expert_group_take(bufY[0]):dev==1?coli_vk_expert_group_take2(bufY[1]):coli_vk_expert_group_take3(bufY[2]);
@@ -2033,6 +2107,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
                     }
                 }
             }
+            q38_tm_add_live(m,Q38_TM_VK_TAKE,take_started);
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
             q38vk_cpu_n=0;   /* everything is accounted for above */
         }
@@ -2046,6 +2121,8 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+            q38_tm_add_live(m,Q38_TM_EXPERT_CPU,phase_started);
+            m->expert_placed_cpu++;
         }
 #ifdef Q38_VK_TIER
         }
@@ -2137,6 +2214,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
         /* Route the complete chunk with one resident router matmul.  Selection
          * intentionally mirrors q38_moe_decode, including rt_router_pick's
          * deterministic fallback for invalid logits. */
+        double router_started=q38_tm_t0();
         q38_dense_matmul(m,logits,x+(int64_t)base*H,&l->router,rows,H,E);
         for(int s=0;s<rows;s++) {
             float *probabilities=logits+(int64_t)s*E;
@@ -2174,6 +2252,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             }
             rt_route(layer,base+s,selected,gates,K);
         }
+        q38_tm_add_live(m,Q38_TM_ROUTER,router_started);
 
         /* Prefixing by expert makes every group contiguous while the inverse
          * map lets the final reduction recover the original row/rank order. */
@@ -2368,8 +2447,10 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
 }
 
 static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+    double phase_started=q38_tm_t0();
     if(S<=1||!m->prefill_batch)q38_moe_decode(m,l,layer,x,S,out);
     else q38_moe_prefill(m,l,layer,x,S,out);
+    q38_tm_add_live(m,Q38_TM_MOE,phase_started);
 }
 
 static void reset_recurrent(Model *m) {
@@ -2430,10 +2511,10 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
         q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
         if(c->is_attn[i]) q38_attention(m,l,i,mixed,S,pos_base,block);
         else q38_deltanet(m,l,i,mixed,S,block);
-        q38_gr_apply(c,hyper,block,inject,S);
+        q38_gr_apply(m,hyper,block,inject,S);
         q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);
         q38_moe(m,l,i,mixed,S,block);
-        q38_gr_apply(c,hyper,block,inject,S);
+        q38_gr_apply(m,hyper,block,inject,S);
     }
     free(mixed); free(inject); free(block);
 }
@@ -2441,6 +2522,7 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
+    double step_started=q38_tm_t0(),embed_started=step_started;
     float *hyper=falloc((int64_t)S*W);
     /* Le righe PLE partono ADESSO, non al layer 2 dove servono: sono note dagli
      * id dei token soltanto, e i due layer che le precedono danno il tempo di
@@ -2457,6 +2539,7 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
+    q38_tm_add_live(m,Q38_TM_EMBED,embed_started);
     for(int i=0;i<c->layers;i++){
         Layer *l=&m->L[i];
         if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);
@@ -2466,14 +2549,16 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;}
         q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
         if(c->is_attn[i])q38_attention(m,l,i,mixed,S,pos_base,block);else q38_deltanet(m,l,i,mixed,S,block);
-        q38_gr_apply(c,hyper,block,inject,S);
-        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);q38_moe(m,l,i,mixed,S,block);q38_gr_apply(c,hyper,block,inject,S);
+        q38_gr_apply(m,hyper,block,inject,S);
+        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);q38_moe(m,l,i,mixed,S,block);q38_gr_apply(m,hyper,block,inject,S);
     }
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
     float *logit=falloc(c->vocab);double phase_started=now_s();
     q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
-    free(hyper);free(mixed);free(inject);free(block);return logit;
+    free(hyper);free(mixed);free(inject);free(block);
+    q38_tm_add_live(m,Q38_TM_STEP,step_started);
+    return logit;
 }
 
 static int q38_tm_enabled(void) {
@@ -2485,7 +2570,12 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
     if(!q38_tm_enabled())return;
     static const char *names[Q38_TM_COUNT]={
         "expert-read","fp8-expand","routed-expert","shared-expert",
-        "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head"
+        "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head",
+        /* Q-PROFILE counters; the partition they form is printed by
+         * q38_tm_report_optime, this bank just lists them. A short
+         * initialiser here would leave NULL names for a %s. */
+        "step","embed","gr-read","gr-apply","attention","moe",
+        "router","cpu-experts","vk-issue","vk-take"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -2497,8 +2587,80 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
                    "expert-read is disk service and fp8-expand is synchronous miss work\n");
 }
 
+/* The G3-style per-op table (record §G3 for GLM-5.3; §Q-PROFILE for this one).
+ * Two rules make it readable and checkable:
+ *   - the eight buckets under "token" PARTITION the step, so their sum minus
+ *     the measured step time is the accounting residual, printed as
+ *     "unaccounted". G3's equivalent closed to 3 ms in 47 s; anything larger
+ *     here means a phase is missing a timer.
+ *   - everything under "of which" is NESTED inside a bucket above it and must
+ *     not be added to the total. dense-matmul in particular cuts across
+ *     gr-read, attention, deltanet and the router.
+ * ms/token uses `forwards`, so on a decode-only bank it is ms per generated
+ * token; on a bank that includes prefill it is ms per forward and the prefill
+ * forward is one of them. */
+static void q38_tm_report_optime(const Q38Timers *t,const char *scope) {
+    if(!q38_tm_enabled()||!t->forwards)return;
+    double per=1000.0/(double)t->forwards;
+    const double *s=t->seconds;
+    double step=s[Q38_TM_STEP];
+    double top=s[Q38_TM_EMBED]+s[Q38_TM_PLE]+s[Q38_TM_GR_READ]+s[Q38_TM_GR_APPLY]+
+               s[Q38_TM_ATTENTION]+s[Q38_TM_DELTANET]+s[Q38_TM_MOE]+s[Q38_TM_LM_HEAD];
+    double pct=step>0?100.0/step:0.0;
+    fprintf(stderr,"[OPTIME] === %s: %llu forwards, %.3f ms/forward measured ===\n",
+            scope,(unsigned long long)t->forwards,step*per);
+    struct { const char *name; double v; } rows[]={
+        {"embed",        s[Q38_TM_EMBED]},
+        {"ple",          s[Q38_TM_PLE]},
+        {"gr-read",      s[Q38_TM_GR_READ]},
+        {"gr-apply",     s[Q38_TM_GR_APPLY]},
+        {"attention",    s[Q38_TM_ATTENTION]},
+        {"deltanet",     s[Q38_TM_DELTANET]},
+        {"moe",          s[Q38_TM_MOE]},
+        {"lm-head",      s[Q38_TM_LM_HEAD]},
+    };
+    for(unsigned i=0;i<sizeof rows/sizeof rows[0];i++)
+        fprintf(stderr,"[OPTIME] %-14s %9.3f ms/token  %5.1f%%\n",
+                rows[i].name,rows[i].v*per,rows[i].v*pct);
+    fprintf(stderr,"[OPTIME] %-14s %9.3f ms/token  %5.1f%%  (sum %.3f vs step %.3f)\n",
+            "unaccounted",(step-top)*per,(step-top)*pct,top*per,step*per);
+    struct { const char *name; double v; } nested[]={
+        {"  qsa-index",    s[Q38_TM_QSA_INDEX]},
+        {"  qsa-attn",     s[Q38_TM_QSA_ATTENTION]},
+        {"  router",       s[Q38_TM_ROUTER]},
+        {"  shared",       s[Q38_TM_SHARED_EXPERT]},
+        {"  vk-issue",     s[Q38_TM_VK_ISSUE]},
+        {"  cpu-experts",  s[Q38_TM_EXPERT_CPU]},
+        {"  vk-take",      s[Q38_TM_VK_TAKE]},
+        {"  routed-total", s[Q38_TM_ROUTED_EXPERT]},
+        {"  dense-matmul", s[Q38_TM_DENSE_MATMUL]},
+        {"  expert-read",  s[Q38_TM_EXPERT_READ]},
+        {"  fp8-expand",   s[Q38_TM_FP8_EXPAND]},
+    };
+    for(unsigned i=0;i<sizeof nested/sizeof nested[0];i++)
+        fprintf(stderr,"[OPTIME] %-14s %9.3f ms/token  %5.1f%%  (of which, nested)\n",
+                nested[i].name,nested[i].v*per,nested[i].v*pct);
+}
+
+static void q38_tm_report_placement(const Model *m) {
+    if(!q38_tm_enabled())return;
+    uint64_t g=m->expert_placed_gpu,cp=m->expert_placed_cpu,t=g+cp;
+    uint64_t dg=g-m->expert_placed_gpu_prefill,dc=cp-m->expert_placed_cpu_prefill,dt=dg+dc;
+    fprintf(stderr,"[OPTIME] placement   total: gpu=%llu cpu=%llu (%.2f%% on the tier)\n",
+            (unsigned long long)g,(unsigned long long)cp,t?100.0*(double)g/(double)t:0.0);
+    if(m->timers_split)
+        fprintf(stderr,"[OPTIME] placement  decode: gpu=%llu cpu=%llu (%.2f%% on the tier)\n",
+                (unsigned long long)dg,(unsigned long long)dc,dt?100.0*(double)dg/(double)dt:0.0);
+}
+
 static void tm_report(const Model *m) {
     q38_tm_report_bank(&m->timers,"total");
+    if(m->timers_split){
+        Q38Timers decode=q38_tm_delta(&m->timers,&m->timers_prefill);
+        q38_tm_report_optime(&decode,"decode only");
+    }
+    q38_tm_report_optime(&m->timers,"whole run (prefill + decode)");
+    q38_tm_report_placement(m);
     if(q38_tm_enabled())
         fprintf(stderr,"[qwen38 expert I/O] weight-ranges=%llu scale-ranges=%llu "
                        "coalesced-gate-up=%llu prefetched=%llu parallel-batches=%llu "

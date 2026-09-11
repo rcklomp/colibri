@@ -984,6 +984,14 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     q38_ik_pool_reset(m);
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
+    /* Snapshot after the prefill forward so tm_report can print the decode
+     * phase on its own: a per-op table that mixes a 40-token prefill into 80
+     * decode tokens is not the table any decode item is gated on (record §G3
+     * zeroes GLM's timers at the same point, for the same reason). */
+    m->timers_prefill = m->timers;
+    m->expert_placed_gpu_prefill = m->expert_placed_gpu;
+    m->expert_placed_cpu_prefill = m->expert_placed_cpu;
+    m->timers_split = 1;
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];

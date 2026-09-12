@@ -4,8 +4,9 @@
 // fmt: 1=int8, 2=int4 (packed 2/byte, nibble-8), 5=int3-g64 (per 64-input group:
 // 24 bytes = 16B low plane [2 bits/val] + 8B high plane [1 bit/val], values v+4 in
 // [-4,3], ONE f32 scale PER GROUP — scale[] holds O*ceil(I/64) entries and the
-// per-row multiply at the end does not apply). Weights are a byte buffer exposed
-// as uint32 words; bytes/nibbles/planes are extracted manually.
+// per-row multiply at the end does not apply), 9=BF16 (2 values/word, no scale).
+// Weights are a byte buffer exposed as uint32 words; bytes/nibbles/planes are
+// extracted manually.
 //
 // Optimized decode (S=1) GEMV, techniques adapted from llama.cpp's mul_mat_vec
 // (MIT) to colibri's per-row int4/int8 layout:
@@ -59,6 +60,17 @@ float mx4(uint word, int lane) {
 // matches quant.h's matmul_fp8/e4m3x8_to_f32x8 bit-for-bit (see that file's
 // derivation and its exhaustive 256-code validation record). sign(1) exp(4,
 // bias=7) mant(3); subnormal at exp==0 -> mant/512; NaN only at byte&0x7F==0x7F.
+// fmt=9: BF16 (Qwen3.8 dense projections, roadmap Q7). Two values per uint32
+// word, LOW half = even column -- which is exactly what a little-endian host's
+// `uint16_t W[]` row already is, so upload_tensor memcpys the row unchanged.
+// Dequant is a shift: a bf16 occupies the top 16 bits of its f32, so widening is
+// `bits << 16` for the even lane and `bits & 0xffff0000` for the odd one. That
+// is bit-for-bit quant.h's `bf16_to_f32`; rome_vkbench's BF16 case proves it
+// against the engine's own q38_matmul_bf16 rather than arguing it. NO per-row
+// scale (see the fmt list at the store below).
+float bflo(uint word) { return uintBitsToFloat(word << 16); }
+float bfhi(uint word) { return uintBitsToFloat(word & 0xffff0000u); }
+
 float e4m3(uint word, int lane) {
     uint b = (word >> (uint(lane) * 8u)) & 0xffu;
     uint sign = (b & 0x80u) << 24;
@@ -156,6 +168,40 @@ void main() {
                     }
                 }
             }
+        } else if (p.fmt == 9) { // BF16 (Qwen3.8 dense projections)
+            // Four words per lane per step: four coalesced 256 B subgroup loads in
+            // flight at once, summed into four independent accumulators. A single
+            // accumulator chain is latency-bound long before this kernel is
+            // bandwidth-bound -- the same argument Q4 made for the CPU GEMV, and
+            // the reason this is not the naive one-word loop. The unrolled body is
+            // entered only while wi < words - 3*sgsize, so the one word that can
+            // hold half a column (the last, when I is odd) always falls to the
+            // tail loop, where the guard is.
+            int words = (p.I + 1) / 2;
+            int lim = words - 3 * sgsize;
+            float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+            int wi = lane;
+            for (; wi < lim; wi += 4 * sgsize) {
+                uint q0 = w[rowBase + uint(wi)];
+                uint q1 = w[rowBase + uint(wi + sgsize)];
+                uint q2 = w[rowBase + uint(wi + 2 * sgsize)];
+                uint q3 = w[rowBase + uint(wi + 3 * sgsize)];
+                int j0 = wi * 2, j1 = j0 + sgsize * 2, j2 = j1 + sgsize * 2, j3 = j2 + sgsize * 2;
+                b0 += (staged ? xsh[j0]     : x[xoff + j0])     * bflo(q0)
+                    + (staged ? xsh[j0 + 1] : x[xoff + j0 + 1]) * bfhi(q0);
+                b1 += (staged ? xsh[j1]     : x[xoff + j1])     * bflo(q1)
+                    + (staged ? xsh[j1 + 1] : x[xoff + j1 + 1]) * bfhi(q1);
+                b2 += (staged ? xsh[j2]     : x[xoff + j2])     * bflo(q2)
+                    + (staged ? xsh[j2 + 1] : x[xoff + j2 + 1]) * bfhi(q2);
+                b3 += (staged ? xsh[j3]     : x[xoff + j3])     * bflo(q3)
+                    + (staged ? xsh[j3 + 1] : x[xoff + j3 + 1]) * bfhi(q3);
+            }
+            for (; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i = wi * 2;
+                b0 += (staged ? xsh[i] : x[xoff + i]) * bflo(pk);
+                if (i + 1 < p.I) b0 += (staged ? xsh[i + 1] : x[xoff + i + 1]) * bfhi(pk);
+            }
+            sum = (b0 + b1) + (b2 + b3);
         } else { // int4
             int words = (p.I + 7) / 8;
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
@@ -167,6 +213,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8) ? tot : tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8 || p.fmt == 9) ? tot : tot * scale[o];
     }
 }

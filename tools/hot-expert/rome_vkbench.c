@@ -16,13 +16,378 @@
 #include "backend_vulkan.h"
 
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
-static size_t rowbytes(int fmt,int I){return fmt==2?(size_t)(I+1)/2:(size_t)I;}   /* 1,8: 1 B/elem; 2: nibble */
-static size_t nscales(int fmt,int I,int O){return fmt==8?(size_t)((O+127)/128)*((I+127)/128):(size_t)O;}
+static size_t rowbytes(int fmt,int I){return fmt==2?(size_t)(I+1)/2:fmt==9?(size_t)I*2:(size_t)I;} /* 1,8: 1 B/elem; 2: nibble; 9: bf16 */
+static size_t nscales(int fmt,int I,int O){return fmt==8?(size_t)((O+127)/128)*((I+127)/128):fmt==9?(size_t)1:(size_t)O;}
 static uint8_t rnd8(void){uint8_t v=rand()&0xff;return (v&0x7f)>=0x7e?0x38:v;}      /* no e4m3 NaN codes */
 static float *randx(int n){float *x=malloc((size_t)n*4);for(int i=0;i<n;i++)x[i]=(rand()%200-100)/100.0f;return x;}
 static uint8_t *randw(size_t n){uint8_t *w=malloc(n);for(size_t i=0;i<n;i++)w[i]=rnd8();return w;}
 static float *consts(size_t n,float v){float *s=malloc(n*4);for(size_t i=0;i<n;i++)s[i]=v;return s;}
-static const char *fname(int fmt){return fmt==1?"int8":fmt==2?"int4":fmt==8?"fp8-emul":"?";}
+static const char *fname(int fmt){return fmt==1?"int8":fmt==2?"int4":fmt==8?"fp8-emul":fmt==9?"bf16":"?";}
+
+/* ===================== Q7 step 0: the BF16 fmt=9 dense path =====================
+ * Roadmap Q7 / tools/hot-expert/Q7-DENSE-GPU-SPEC-2026-09-12.md. Two jobs:
+ *   (a) prove the GPU BF16 GEMV computes what the engine's q38_matmul_bf16
+ *       computes -- exhaustively on the dequant itself, bit-exactly on data
+ *       whose sums are order-independent, and to relL2 on random data;
+ *   (b) time ONE SUBMIT at the five shapes the item dispatches, from pools
+ *       larger than the 96 MB Infinity Cache, so the per-set ms/token the spec
+ *       gates on is measured before a line of engine code is written.
+ * Nothing here runs the model; this is the isolated harness. */
+
+static inline float bf16_to_f32x(uint16_t h){uint32_t u=(uint32_t)h<<16;float f;memcpy(&f,&u,4);return f;}
+
+/* THREE references, because "is the GPU right?" and "is the GPU as accurate as
+ * what it replaces?" are different questions and only the second one matters.
+ *
+ *   ref_f64     the truth: the same products accumulated in double.
+ *   ref_engine  what qwen38 computes TODAY, copied verbatim from
+ *               qwen38_core.h's q38_matmul_bf16 default arm (8-wide AVX2
+ *               accumulator + left-to-right horizontal sum). Q4's acc4 arm is
+ *               deliberately not the reference: this item is measured against
+ *               the knob-off engine.
+ *   ref_scalar  a plain sequential f32 sum.
+ *
+ * An absolute relL2 bar against ref_scalar is the wrong gate and the first run
+ * showed why: over I = 6144 random terms a SEQUENTIAL f32 sum carries ~sqrt(I)
+ * roundings of its own, so it differs from the GPU's subgroup tree by ~1.4e-6
+ * with the tree being the MORE accurate of the two. The gate that means what the
+ * spec means -- "summation order only, not a precision loss" -- is: the GPU is
+ * no further from the f64 truth than the CPU kernel it replaces. */
+static void ref_f64(float *y,const float *x,const uint16_t *W,int I,int O){
+    for(int o=0;o<O;o++){
+        const uint16_t *w=W+(int64_t)o*I;
+        double a=0.0;for(int i=0;i<I;i++)a+=(double)x[i]*(double)bf16_to_f32x(w[i]);
+        y[o]=(float)a;
+    }
+}
+static void ref_scalar(float *y,const float *x,const uint16_t *W,int I,int O){
+    for(int o=0;o<O;o++){
+        const uint16_t *w=W+(int64_t)o*I;
+        float a=0.f;for(int i=0;i<I;i++)a+=x[i]*bf16_to_f32x(w[i]);
+        y[o]=a;
+    }
+}
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+static inline __m256 bf16x8(__m128i h){__m256i w=_mm256_cvtepu16_epi32(h);return _mm256_castsi256_ps(_mm256_slli_epi32(w,16));}
+static void ref_engine(float *y,const float *x,const uint16_t *W,int I,int O){
+    for(int o=0;o<O;o++){
+        const uint16_t *w=W+(int64_t)o*I;
+        __m256 vacc=_mm256_setzero_ps();int i=0;
+        for(;i+8<=I;i+=8)
+            vacc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i),bf16x8(_mm_loadu_si128((const __m128i*)(w+i))),vacc);
+        float buf[8];_mm256_storeu_ps(buf,vacc);
+        float a=buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+        for(;i<I;i++)a+=x[i]*bf16_to_f32x(w[i]);
+        y[o]=a;
+    }
+}
+#else
+#define ref_engine ref_scalar
+#endif
+static double rel_l2(const float *a,const float *ref,int n){
+    double num=0,den=0;
+    for(int i=0;i<n;i++){double d=(double)a[i]-ref[i];num+=d*d;den+=(double)ref[i]*ref[i];}
+    return den>0?sqrt(num/den):0.0;
+}
+
+static uint16_t *bf16_rand(size_t n){
+    uint16_t *w=malloc(n*2);
+    for(size_t i=0;i<n;i++){                 /* finite, O(1) magnitude, no NaN/Inf/denormal */
+        int e=120+(rand()%9);                /* exponents 2^-7 .. 2^1 */
+        w[i]=(uint16_t)(((rand()&1)<<15)|(e<<7)|(rand()&0x7f));
+    }
+    return w;
+}
+/* Integers in [-8,8]: every product and every partial sum over I<=10240 is exact
+ * in f32 (|sum| <= 8*8*10240 = 655360 < 2^24), so ANY summation order gives the
+ * SAME bits. A relL2 bar would hide a transposed or half-shifted column here; a
+ * bit compare cannot. */
+static uint16_t *bf16_smallint(size_t n){
+    uint16_t *w=malloc(n*2);
+    for(size_t i=0;i<n;i++){float v=(float)(rand()%17-8);uint32_t u;memcpy(&u,&v,4);w[i]=(uint16_t)(u>>16);}
+    return w;
+}
+static float *smallint_x(int n){float *x=malloc((size_t)n*4);for(int i=0;i<n;i++)x[i]=(float)(rand()%17-8);return x;}
+static float one_f=1.0f;
+
+/* (a1) EXHAUSTIVE: every finite bf16 code, both lane parities, through the real
+ * shader. I=2 so one word holds the pair; x picks the lane. This is the check
+ * the spec asks for instead of the argument that "a shift is a shift".
+ *
+ * The expectation is the ENGINE'S OWN DOT PRODUCT over the same two-element row,
+ * not the raw bf16_to_f32 of the code -- and that distinction is not pedantry:
+ * compared against the raw dequant, code 0x8000 (negative zero) "disagreed",
+ * because a sum that starts at +0.0 turns -0.0 into +0.0 by IEEE 754. The CPU
+ * kernel does exactly the same thing. Comparing dot against dot asks the
+ * question the item is actually about. */
+static int bf16_dequant_exhaustive(void){
+    const int O=65536,I=2;int bad=0,denorm=0,other=0;
+    uint16_t *W=calloc((size_t)O*I,2);
+    float *y=malloc((size_t)O*4),*yref=malloc((size_t)O*4);
+    for(int parity=0;parity<2;parity++){
+        for(int c=0;c<O;c++){W[(size_t)c*I+0]=0;W[(size_t)c*I+1]=0;W[(size_t)c*I+parity]=(uint16_t)c;}
+        float x[2]={parity==0?1.f:0.f,parity==0?0.f:1.f};
+        ColiVkTensor *t=NULL;
+        if(!coli_vk_matmul(&t,y,x,W,&one_f,9,1,I,O,0)){printf("BF16 exhaustive: dispatch failed\n");return 1;}
+        ref_engine(yref,x,W,I,O);
+        for(int c=0;c<O;c++){
+            if(((c>>7)&0xff)==0xff) continue;          /* Inf/NaN: no weight is one */
+            float want=yref[c];
+            uint32_t a,b;memcpy(&a,&y[c],4);memcpy(&b,&want,4);
+            if(a==b) continue;
+            bad++;
+            /* A bf16 with exponent field 0 and a nonzero mantissa is an f32
+             * DENORMAL (< 2^-126 ~ 1.2e-38). RADV runs compute with fp32
+             * denormals flushed to zero, so these come back as +-0. Classified,
+             * not counted: it is the only class this kernel is allowed to
+             * disagree on, and the engine-side scan says whether the real
+             * weights contain any (Q38_DENSE_GPU_SCAN=1). */
+            if(((c>>7)&0xff)==0 && (c&0x7f)!=0) denorm++;
+            else { if(other<5)printf("  bf16 code 0x%04x parity %d: gpu %.9g (0x%08x) want %.9g (0x%08x)\n",
+                                     c,parity,y[c],a,want,b); other++; }
+        }
+        coli_vk_tensor_free(t);
+    }
+    printf("BF16 DEQUANT exhaustive: %d/131072 finite codes x parities disagree "
+           "(%d denormal flush-to-zero, %d OTHER) -- %s\n",
+           bad,denorm,other,
+           other?"FAIL":"PASS (bit-identical on every normal code; denormals flushed)");
+    free(W);free(y);free(yref);return other;
+}
+
+/* (a2) per shape, two legs:
+ *   LAYOUT   bit-exact against the engine kernel on order-independent integer
+ *            data. This is the leg that catches a transposed row, a wrong
+ *            rowWords or a swapped column parity, and no tolerance can hide it.
+ *   ACCURACY on random data, relL2 of the GPU and of the CPU kernel it replaces,
+ *            both against an f64 accumulation of the same products. The gate is
+ *            gpu <= engine: no less accurate than what ships today. */
+static int bf16_check_shape(int I,int O){
+    uint16_t *We=bf16_smallint((size_t)I*O);float *xe=smallint_x(I);
+    float *yg=malloc((size_t)O*4),*ye=malloc((size_t)O*4),*yd=malloc((size_t)O*4),*ys=malloc((size_t)O*4);
+    ColiVkTensor *t=NULL;int bad=0;
+    if(!coli_vk_matmul(&t,yg,xe,We,&one_f,9,1,I,O,0)){printf("BF16 check %dx%d: dispatch failed\n",I,O);return 1;}
+    ref_engine(ye,xe,We,I,O);
+    for(int o=0;o<O;o++){uint32_t a,b;memcpy(&a,&yg[o],4);memcpy(&b,&ye[o],4);if(a!=b)bad++;}
+    coli_vk_tensor_free(t);t=NULL;
+    uint16_t *Wr=bf16_rand((size_t)I*O);float *xr=randx(I);
+    if(!coli_vk_matmul(&t,yg,xr,Wr,&one_f,9,1,I,O,0)){printf("BF16 check %dx%d: dispatch failed\n",I,O);return 1;}
+    ref_f64(yd,xr,Wr,I,O); ref_engine(ye,xr,Wr,I,O); ref_scalar(ys,xr,Wr,I,O);
+    double rg=rel_l2(yg,yd,O),re=rel_l2(ye,yd,O),rs=rel_l2(ys,yd,O);
+    double mx=0;for(int o=0;o<O;o++){double d=fabs((double)yg[o]-ye[o]);if(d>mx)mx=d;}
+    int fail=bad||rg>re;
+    printf("BF16 CHECK  I=%5d O=%6d: layout %d/%d rows differ (%s) | vs f64 truth: "
+           "gpu %.3e  engine %.3e  scalar %.3e -> gpu is %.2fx the engine's error (%s) | "
+           "gpu-vs-engine max-abs %.3e\n",
+           I,O,bad,O,bad?"FAIL":"PASS",rg,re,rs,re>0?rg/re:0.0,rg<=re?"PASS":"FAIL",mx);
+    coli_vk_tensor_free(t);
+    free(We);free(xe);free(Wr);free(xr);free(yg);free(ye);free(yd);free(ys);
+    return fail;
+}
+
+static int dcmp(const void*a,const void*b){double x=*(const double*)a,y=*(const double*)b;return x<y?-1:x>y?1:0;}
+
+/* (b) ONE SUBMIT at a Q7 shape, `reps` repeats, MEDIAN. `copies` distinct tensor
+ * sets rotate so the weights stream from VRAM and not from Infinity Cache; the
+ * pool size is printed so the >96 MB claim is checkable and not assumed.
+ * chain<0: all items independent (DeltaNet/QSA A, `out`, the head).
+ * chain>=0: item[chain] reads item 0's device-side output (the gr pair). */
+static void bench_q7(const char *name,int I,const int *Os,int n,int chain,int copies,int reps,double per_token){
+    ColiVkTensor **t=calloc((size_t)copies*n,sizeof(*t));
+    float *x=randx(I);
+    uint16_t **w=malloc(n*sizeof(*w));float **y=malloc(n*sizeof(*y));
+    size_t bytes=0;
+    for(int j=0;j<n;j++){
+        int Ij=(j==chain)?Os[0]:I;
+        w[j]=bf16_rand((size_t)Ij*Os[j]);y[j]=malloc((size_t)Os[j]*4);
+        bytes+=(size_t)Ij*Os[j]*2;
+    }
+    ColiVkMM items[VK_MM_MAX];
+    #define Q7_FILL(c) for(int j=0;j<n;j++) items[j]=(ColiVkMM){&t[(size_t)(c)*n+j],w[j],&one_f,9,Os[j],0, \
+        (j==0&&chain>0)?NULL:y[j], (j==chain)?Os[0]:I, (j==chain)?0:-1};
+    for(int c=0;c<copies;c++){Q7_FILL(c) if(!coli_vk_matmul_multi(items,n,x,I)){printf("Q7 %s: dispatch failed\n",name);return;}}
+    double *s=malloc((size_t)reps*sizeof(double));
+    for(int r=0;r<reps;r++){
+        int c=r%copies;Q7_FILL(c)
+        double t0=now();coli_vk_matmul_multi(items,n,x,I);s[r]=(now()-t0)*1e3;
+    }
+    qsort(s,(size_t)reps,sizeof(double),dcmp);
+    double med=s[reps/2];
+    printf("Q7 %-13s %d tensor(s) I=%-5d %8.3f MB/submit  median %7.4f ms  (min %7.4f max %7.4f)  %6.1f GB/s  pool %.0f MB  -> x%.0f = %7.3f ms/token\n",
+           name,n,I,bytes/1e6,med,s[0],s[reps-1],bytes/med/1e6,(double)copies*bytes/1e6,per_token,med*per_token);
+    #undef Q7_FILL
+    for(int c=0;c<copies*n;c++)coli_vk_tensor_free(t[c]);
+    free(t);free(x);for(int j=0;j<n;j++){free(w[j]);free(y[j]);}free(w);free(y);free(s);
+}
+
+/* Q7 step 1 diagnosis: the SAME two DeltaNet submits, but with the engine's own
+ * CPU gap between them.
+ *
+ * Step 0 predicted dn-proj at 19.6 ms/token from back-to-back submits; in the
+ * engine the identical dispatches cost 26.96. The difference has to be either
+ * the kernel (it is not -- same code, same shapes, same VRAM) or the DUTY CYCLE:
+ * in the engine, submit A is followed by ~0.26 ms of CPU recurrence
+ * (dn-recur 9.28 ms/token over 36 layers) and submit B by the rest of the layer,
+ * so dev0 is idle in sub-millisecond bursts 72 times a token and never reaches
+ * the clocks a back-to-back loop holds it at. This case reproduces that shape
+ * with a busy-wait of the measured length and nothing else changed. If the
+ * per-submit time rises to the in-engine figure, the attenuation is the duty
+ * cycle and NOT something a wider load in the shader can fix. */
+static void spin_ms(double ms){double t0=now();while((now()-t0)*1e3<ms){}}
+
+/* Generalised over the set, because Q7's arbitration (Fable, 2026-09-12) made
+ * this replay the REQUIRED form of a step-0 GPU prediction, not a step-1
+ * diagnosis: "a step-0 microbenchmark that predicts an in-engine bucket for a
+ * GPU dispatch must replay the engine's inter-submit gaps, not run
+ * back-to-back", with >= 5 repeats (the two repeats at 0.26/1.50 spanned 7.2
+ * ms/token, so two are not a prediction).
+ *
+ * `nB == 0` is the one-submit form, which is the LM head: A, then the whole gap.
+ * `outer` whole-configuration repeats, each an independent median of `reps`, and
+ * the median-of-medians and the span across them are both printed -- the span is
+ * the number that says how much to trust the prediction. */
+static void bench_q7_layer(const char *name,
+                           int I1,const int *OsA,int nA,
+                           int I2,int OsB,int nB,
+                           double gap_ab,double gap_ba,
+                           int copies,int reps,int outer,double per_token,
+                           double engine_measured){
+    ColiVkTensor **ta=calloc((size_t)copies*nA,sizeof(*ta)),**tb=nB?calloc(copies,sizeof(*tb)):NULL;
+    float *x1=randx(I1),*x2=nB?randx(I2):NULL;
+    uint16_t *wa[VK_MM_MAX],*wb=NULL;float *ya[VK_MM_MAX],*yb=nB?malloc((size_t)OsB*4):NULL;
+    for(int j=0;j<nA;j++){wa[j]=bf16_rand((size_t)I1*OsA[j]);ya[j]=malloc((size_t)OsA[j]*4);}
+    if(nB)wb=bf16_rand((size_t)I2*OsB);
+    ColiVkMM it[VK_MM_MAX];
+    #define FILL_A(c) for(int j=0;j<nA;j++) it[j]=(ColiVkMM){&ta[(size_t)(c)*nA+j],wa[j],&one_f,9,OsA[j],0,ya[j],I1,-1};
+    #define FILL_B(c) it[0]=(ColiVkMM){&tb[c],wb,&one_f,9,OsB,0,yb,I2,-1};
+    for(int c=0;c<copies;c++){
+        FILL_A(c) if(!coli_vk_matmul_multi(it,nA,x1,I1)){printf("Q7 replay %s: A failed\n",name);return;}
+        if(nB){FILL_B(c) if(!coli_vk_matmul_multi(it,1,x2,I2)){printf("Q7 replay %s: B failed\n",name);return;}}
+    }
+    double *s=malloc((size_t)reps*sizeof(double)),*meds=malloc((size_t)outer*sizeof(double));
+    for(int o=0;o<outer;o++){
+        for(int r=0;r<reps;r++){
+            int c=r%copies;double acc=0,t0;
+            FILL_A(c) t0=now(); coli_vk_matmul_multi(it,nA,x1,I1); acc+=now()-t0;
+            spin_ms(gap_ab);
+            if(nB){FILL_B(c) t0=now(); coli_vk_matmul_multi(it,1,x2,I2); acc+=now()-t0;}
+            spin_ms(gap_ba);
+            s[r]=acc*1e3;
+        }
+        qsort(s,(size_t)reps,sizeof(double),dcmp);
+        meds[o]=s[reps/2];
+    }
+    double lo=meds[0],hi=meds[0];
+    for(int o=1;o<outer;o++){if(meds[o]<lo)lo=meds[o];if(meds[o]>hi)hi=meds[o];}
+    double *sorted=malloc((size_t)outer*sizeof(double));
+    memcpy(sorted,meds,(size_t)outer*sizeof(double));
+    qsort(sorted,(size_t)outer,sizeof(double),dcmp);
+    printf("Q7 replay %-10s gap A->B %5.2f  after %5.2f ms: med-of-%d %7.4f ms/site "
+           "(span %7.4f..%7.4f) -> x%.0f = %7.3f ms/token  (span %7.3f..%7.3f)",
+           name,gap_ab,gap_ba,outer,sorted[outer/2],lo,hi,per_token,
+           sorted[outer/2]*per_token,lo*per_token,hi*per_token);
+    if(engine_measured>0)printf("   [engine %.2f]",engine_measured);
+    printf("\n    per-repeat:");
+    for(int o=0;o<outer;o++)printf(" %.3f",meds[o]*per_token);
+    printf("\n");
+    #undef FILL_A
+    #undef FILL_B
+    for(int c=0;c<copies*nA;c++)coli_vk_tensor_free(ta[c]);
+    if(nB)for(int c=0;c<copies;c++)coli_vk_tensor_free(tb[c]);
+    free(ta);free(tb);free(x1);free(x2);free(yb);free(wb);
+    for(int j=0;j<nA;j++){free(wa[j]);free(ya[j]);}
+    free(s);free(meds);free(sorted);
+}
+
+static void q7_replay_dn(void);
+static void q7_step0(void){
+    printf("\n===== Q7 step 0: fmt=9 BF16 on dev0 (spec Q7-DENSE-GPU-SPEC-2026-09-12) =====\n");
+    int bad=bf16_dequant_exhaustive();
+    bad|=bf16_check_shape(2560,10240);      /* DeltaNet qkv          */
+    bad|=bf16_check_shape(6144,2560);       /* DeltaNet/QSA out      */
+    bad|=bf16_check_shape(2560,12288);      /* QSA q                 */
+    bad|=bf16_check_shape(10240,320);       /* gr down (UNSTAGED: I > 6144) */
+    bad|=bf16_check_shape(320,10240);       /* gr up                 */
+    bad|=bf16_check_shape(2560,48);         /* DeltaNet b/a          */
+    bad|=bf16_check_shape(2561,777);        /* odd I, odd O: the tail guard  */
+    printf("BF16 CORRECTNESS: %s\n",bad?"*** FAIL -- do not time this ***":"ALL PASS");
+    if(bad)return;
+    printf("\n-- one submit per site, median of 10, pools > 96 MB Infinity Cache --\n");
+    { int Os[4]={10240,6144,48,48};   bench_q7("deltanet-A",2560,Os,4,-1,4,10,36); }
+    { int Os[1]={2560};               bench_q7("deltanet-B",6144,Os,1,-1,8,10,36); }
+    { int Os[4]={12288,512,512,640};  bench_q7("qsa-A",     2560,Os,4,-1,4,10,12); }
+    { int Os[1]={2560};               bench_q7("qsa-B",     6144,Os,1,-1,8,10,12); }
+    { int Os[1]={248320};             bench_q7("lm-head",   2560,Os,1,-1,2,10, 1); }
+    /* the gated-residual pair as ONE submit: down (-1, intermediate), inject (-1),
+     * up (chained on down). No `act` flag yet -- that push constant is step 4; what
+     * this times is the bytes and the single round trip, which is what the step-4
+     * go/no-go (<= 9.2 ms/token) is about. */
+    { int Os[3]={320,4,10240};        bench_q7("gr-pair",  10240,Os,3, 2,16,10,97); }
+    /* Step 1's attenuation, isolated. 0.00 is the back-to-back control; 0.26 is
+     * the engine's measured CPU recurrence between A and B (dn-recur 9.28
+     * ms/token / 36); 1.5 is roughly the rest of a layer (the token is 139.7 ms
+     * over 48 layers, minus the DeltaNet work itself). */
+    printf("\n-- step 1 diagnosis: the same two submits with the engine's CPU gap between them --\n");
+    q7_replay_dn();
+}
+
+/* Step 1's four DeltaNet configurations, now through the general replay so the
+ * >= 5 repeats the arbitration requires apply to them too. */
+static void q7_replay_dn(void){
+    int OsA[4]={10240,6144,48,48};
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.00,0.00,4,20,5,36,26.98);
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.26,0.00,4,20,5,36,26.98);
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.26,1.50,4,20,5,36,26.98);
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.26,3.00,4,20,5,36,26.98);
+}
+
+/* ---- Steps 2 and 3: their OWN step 0, by the corrected rule ------------------
+ *
+ * Fable's arbitration of step 1 (record §Q7 `### Arbitration`) made the
+ * gap-replay the required form of a step-0 GPU prediction. Steps 2 and 3 are
+ * therefore predicted here, at the engine's own inter-submit timing, and NOT
+ * from the back-to-back medians in the step-0 table (6.83-7.44 and 2.74-2.85),
+ * which are now known to understate the engine by ~1.37x on the two-submit
+ * shape.
+ *
+ * QSA's gaps, from step 1's own [OPTIME] table with Q38_DENSE_GPU=1:
+ *   A -> B   the CPU index + attention stages, qsa-attn 3.46 + qsa-index 0.13
+ *            over 12 layers = 0.30 ms.
+ *   B -> A   the rest of a QSA layer: the two gated-residual sites and the MoE
+ *            site. The token is 139.74 ms over 48 layers = 2.91 ms/layer, of
+ *            which the two QSA submits are ~0.7 -- so ~1.5-2.2, bracketed here
+ *            by 1.00 / 1.50 / 3.00 with the back-to-back control at 0.00.
+ *
+ * The LM head is ONE submit per token. Its "gap" is everything between the last
+ * layer's last submit and it (the final gated residual, and on the way back a
+ * whole token of CPU work before the next one), so it is swept wide: the head is
+ * 2.7 ms of solid work that ramps the clocks itself, and the question this
+ * answers is how much of that 2.7 survives being issued once per 130 ms.
+ *
+ * NOTE the replay's gap is IDLE, where the engine's is partly dev0 running
+ * expert groups for the MoE site. So this is the pessimistic end and step 1
+ * confirmed that reading: the engine measured 26.98 BELOW the 1.50 ms replay. */
+static void q7_step0_s23(void){
+    printf("\n===== Q7 steps 2-3 step 0: the gap replay (Fable's corrected rule) =====\n");
+    int bad=bf16_check_shape(2560,248320);   /* the head: never shape-checked, only timed */
+    printf("BF16 CORRECTNESS (lm-head shape): %s\n",bad?"*** FAIL ***":"PASS");
+    if(bad)return;
+    printf("\n-- QSA: 4-tensor A (71.4 MB) + `o` B (31.5 MB), x12 layers --\n");
+    int OsQ[4]={12288,512,512,640};
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.00,0.00,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,0.00,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,1.00,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,1.50,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,3.00,4,20,5,12,0);
+    printf("\n-- LM head: one 1.27 GB submit, x1 per token --\n");
+    int OsH[1]={248320};
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,0.00,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,1.50,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,3.00,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,10.00,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,30.00,2,10,5,1,0);
+}
 
 static void bench_dense(int fmt,int I,int O,int copies,int iters){
     size_t rb=rowbytes(fmt,I),ns=nscales(fmt,I,O);
@@ -118,6 +483,15 @@ int main(int argc,char**argv){
     if(!coli_vk_init(spv)){printf("vk init failed\n");return 1;}
     srand(7);
     double used,budget;if(coli_vk_mem_budget(&used,&budget))printf("dev0 budget %.1f GB used %.1f GB\n",budget,used);
+    /* `vkbench <spv> q7` runs only Q7 step 0 -- the placement matrix below is
+     * already in the record and re-running it costs minutes of rig time. */
+    if(argc>2&&!strcmp(argv[2],"q7")){q7_step0();coli_vk_shutdown();return 0;}
+    /* `vkbench <spv> q7s23` is steps 2-3's own step 0: the head's shape check
+     * and the QSA / LM-head gap replays. Step 0's correctness legs and step 1's
+     * replay are in the record already and cost rig time to repeat. */
+    if(argc>2&&!strcmp(argv[2],"q7s23")){q7_step0_s23();coli_vk_shutdown();return 0;}
+    if(argc>2&&!strcmp(argv[2],"q7dn")){q7_replay_dn();coli_vk_shutdown();return 0;}
+    q7_step0();
     /* 1. round trip: tiny matmul, per-call cost is ~all overhead */
     bench_dense(1,512,512,1,400);
     bench_dense(1,256,64,1,400);

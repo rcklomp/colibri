@@ -73,6 +73,13 @@ typedef struct {
     int8_t *sim_q;
     float  *sim_s;
     int     sim_gs;
+    /* Q7 (roadmap Track Q): the dev0-resident BF16 copy of this weight, uploaded
+     * as fmt=9 before the expert preload when Q38_DENSE_GPU selects its set.
+     * `ColiVkTensor *`, void here so the CPU-only qwen38 build needs no Vulkan
+     * header. NULL = this weight is not on the device and the CPU kernel runs,
+     * which is every shipped configuration. The host BF16 copy is KEPT: the
+     * knob-off path, prefill (S > 1) and any dispatch failure all read it. */
+    void *vk;
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -141,6 +148,20 @@ typedef enum {
     Q38_TM_GR_UP,
     Q38_TM_GR_MIX,
     Q38_TM_GR_INJECT,
+    /* Q7 step 0 (2026-09-12): the QSA projections, which were the one set in
+     * §Q-PROFILE's bandwidth table with no sub-timer at all -- its ~16.4
+     * ms/token is an ESTIMATE, and the spec's step-2 gate ("half its step-0
+     * figure") cannot be stated against an estimate. §Q1 and §Q2 both found the
+     * subtraction estimate wrong by 2x in their own buckets, which is why this
+     * counter is added BEFORE the tensors move and not after. NESTS inside
+     * ATTENTION alongside qsa-index and qsa-attn; read only when COLI_TIMERS=1. */
+    Q38_TM_QSA_PROJ,
+    /* Q7: time spent inside a dev0 dense submit. It is ALSO added to
+     * DENSE_MATMUL, so that counter keeps meaning "the dense stream, wherever it
+     * runs" and the dn-proj, qsa-proj, gr-down/gr-up and lm-head wrappers keep
+     * working unchanged. This one says how much of it is on the device.
+     * Nested; never added to the total. */
+    Q38_TM_VK_DENSE,
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -388,6 +409,33 @@ static inline __m256 q38_bf16x8_to_f32x8(__m128i h) {
  * path with the knob on as well as with it off. */
 static int g_q38_bf16_acc4 = 0;    /* Q38_BF16_ACC4=1; resolved in model_init_range */
 
+/* Q7 (roadmap Track Q; spec tools/hot-expert/Q7-DENSE-GPU-SPEC-2026-09-12.md):
+ * the dense BF16 stream on dev0 as fmt=9. A BITMASK, off by default, so each set
+ * is its own A/B and the record can carry a per-set sub-timer:
+ *
+ *   1  DeltaNet projections   (36 layers x {qkv,z,b,a} + out)
+ *   2  QSA projections        (12 layers x {q,k,v,idx_qk} + o)
+ *   4  the LM head
+ *   8  the gated-residual pair (97 sites, ONE submit: down -> up, inject beside)
+ *
+ * Unset or 0 is today's binary, bit-identical. DECODE ONLY (S == 1): prefill
+ * keeps the CPU kernels, so TTFT is untouched by this item and a conversation
+ * prefills on the CPU and decodes on dev0 -- which is what the oracle is about.
+ * The numerics are summation order only: the same bf16-times-f32 products, in
+ * the order a subgroup reduction produces instead of the order an AVX2 lane
+ * does. No transcendental and no state on the device in sets 1|2|4. */
+#define Q38_DG_DN    1
+#define Q38_DG_QSA   2
+#define Q38_DG_HEAD  4
+#define Q38_DG_GR    8
+static int g_q38_dense_gpu = 0;    /* Q38_DENSE_GPU=<mask>; resolved in model_init_range */
+#ifdef Q38_VK_TIER
+/* fmt=9 carries no scale; upload_tensor still copies one float into the tensor's
+ * sbuf so binding 2 stays a real buffer. One shared constant, never read by the
+ * shader (9 is in its no-scale list). */
+static float g_q38_vk_noscale = 1.0f;
+#endif
+
 #if defined(__AVX2__) && defined(__FMA__)
 static inline float q38_dot_bf16_acc4(const float *xs,const uint16_t *w,int I) {
     __m256 a0=_mm256_setzero_ps(),a1=a0,a2=a0,a3=a0;int i=0;
@@ -581,6 +629,59 @@ static void q38_dense_matmul_multi(Model *m,Q38DenseItem *items,int n,const floa
 #endif
     for(int j=0;j<n;j++)q38_dense_matmul(m,items[j].y,x,items[j].w,S,I,items[j].O);
 }
+
+#ifdef Q38_VK_TIER
+/* Q7: n resident BF16 projections of the same input, ONE submit on dev0.
+ *
+ * Returns 0 and touches NOTHING if this set is not selected, if the row is not a
+ * decode row, or if any weight is not device-resident -- so every caller keeps
+ * its CPU path verbatim below the call and a dispatch failure is a slowdown, not
+ * a wrong answer. The tensors were uploaded once before the expert preload
+ * (q38vk_dense_reserve), so coli_vk_matmul_multi's own upload_tensor call is an
+ * early return here and `weights`/`scales` are passed only to satisfy it.
+ *
+ * The elapsed time is added to vk-dense (which says how much of the token is in
+ * a dev0 dense submit) and, when `charge_dense` is set, to dense-matmul as well
+ * -- which therefore keeps meaning "the dense stream, wherever it runs" and
+ * keeps dn-proj / qsa-proj / gr-* comparable across the knob. One clock read for
+ * both; two q38_tm_add calls would charge two different elapsed times for one
+ * submit.
+ *
+ * `charge_dense` is 0 for exactly one caller, the LM head (step 3), because the
+ * head's CPU path is q38_weight_matmul and has NEVER been inside dense-matmul
+ * (89.7 = dn-proj 52.9 + qsa-proj 15.8 + the four gr buckets + router; the head
+ * is its own 15.8 next to it). Charging the submit there would make the bucket
+ * mean one thing with the knob off and another with it on, which is the one
+ * property the A/B depends on. `lm-head` itself wraps the call either way. */
+static int q38vk_dense_multi_ex(Model *m,Q38DenseItem *items,int n,const float *x,
+                                int S,int I,int set,int charge_dense) {
+    if(!g_q38vk_ready||!(g_q38_dense_gpu&set)||S!=1||n<1||n>VK_MM_MAX)return 0;
+    ColiVkMM mm[VK_MM_MAX];
+    for(int j=0;j<n;j++){
+        Q38Weight *w=(Q38Weight*)items[j].w;
+        if(!w||!w->vk||w->kind!=Q38_WEIGHT_BF16||w->sim_q||
+           w->cols!=I||w->rows!=items[j].O)return 0;
+        mm[j]=(ColiVkMM){(ColiVkTensor**)&w->vk,w->data,&g_q38_vk_noscale,
+                         9,items[j].O,0,items[j].y,I,-1};
+    }
+    double started=now_s();
+    if(!coli_vk_matmul_multi(mm,n,x,I))return 0;
+    double elapsed=now_s()-started;
+    if(charge_dense) m->timers.seconds[Q38_TM_DENSE_MATMUL]+=elapsed;
+    m->timers.seconds[Q38_TM_VK_DENSE]+=elapsed;
+    return 1;
+}
+#define q38vk_dense_multi(m,items,n,x,S,I,set) \
+    q38vk_dense_multi_ex((m),(items),(n),(x),(S),(I),(set),1)
+#else
+/* CPU-only qwen38: always "could not dispatch", so every call site falls through
+ * to the kernel it already had. The casts keep the arguments USED, or the item
+ * arrays the call sites build would draw -Wunused-variable in this build only. */
+#define q38vk_dense_multi_ex(m,items,n,x,S,I,set,cd) \
+    ((void)(m),(void)(items),(void)(n),(void)(x),(void)(S),(void)(I),(void)(set),(void)(cd),0)
+#define q38vk_dense_multi(m,items,n,x,S,I,set) \
+    q38vk_dense_multi_ex((m),(items),(n),(x),(S),(I),(set),1)
+#endif
 
 static inline float q38_sigmoid(float x) {
     if (x >= 0.f) { float z=expf(-x); return 1.f/(1.f+z); }
@@ -1201,6 +1302,30 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
         fprintf(stderr,"[q38] Q4: BF16 dense GEMV with 4 accumulators "
                        "(Q38_BF16_ACC4=1) -- summation order differs from the "
                        "default, see record §Q4\n");
+    /* Q7: same reason as Q4's -- read from inside the decode path, resolved once
+     * here. Refused outright next to QP's simulations: those attach an int8
+     * `sim_q` to the SAME Q38Weight the device copy would be made from, and a
+     * sim-carrying weight must never reach the device path. Refusing is louder
+     * than silently preferring one, and neither combination has ever been
+     * measured. */
+    {
+        const char *e=getenv("Q38_DENSE_GPU");
+        g_q38_dense_gpu=e?atoi(e):0;
+        if(g_q38_dense_gpu<0)g_q38_dense_gpu=0;
+        if(g_q38_dense_gpu&&(g_q38_i8_dense>0||g_q38_i8_head>0)){
+            fprintf(stderr,"[q38] Q7: Q38_DENSE_GPU=%d together with Q38_I8_DENSE/"
+                           "Q38_I8_HEAD is REFUSED -- the int8 simulation attaches to "
+                           "the same weights the device copy is made from\n",g_q38_dense_gpu);
+            exit(1);
+        }
+#ifndef Q38_VK_TIER
+        if(g_q38_dense_gpu){
+            fprintf(stderr,"[q38] Q7: Q38_DENSE_GPU needs the Vulkan build "
+                           "(qwen38-vk); the knob is IGNORED, not half-applied\n");
+            g_q38_dense_gpu=0;
+        }
+#endif
+    }
     m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
@@ -1275,6 +1400,90 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
                    m->resident_weight_bytes/1073741824.0);
 }
 
+#ifdef Q38_VK_TIER
+/* Q7: upload the selected dense sets to dev0 as fmt=9 BF16, once, before the
+ * expert preload. Priority 1.0 against the default 0.75 every other qwen38
+ * allocation uses, so an oversubscribed heap gives up an expert and never a
+ * dense tensor. (The spec says "the tier fills at 0.4"; that is colibri.c's
+ * convention -- qwen38 never calls coli_vk_alloc_priority at all and so fills
+ * its tier at the 0.75 default. 1.0 still ranks above it, which is what the
+ * requirement means, and the discrepancy is recorded rather than assumed.)
+ *
+ * A failed upload is NOT fatal and not silent: the weight keeps vk == NULL, the
+ * dispatch helper refuses that item, and its whole submit falls back to the CPU
+ * kernel with the right answer. The printed line is what the record copies. */
+typedef struct { Q38Weight *w; int set; } Q38VkDenseEntry;
+/* Q7: the ONE numeric difference the exhaustive shader check found is that RADV
+ * runs compute with fp32 denormals flushed to zero, so a bf16 whose exponent
+ * field is 0 and whose mantissa is not (|v| < 2^-126 ~ 1.2e-38) reads as +-0 on
+ * the device and as itself on the CPU. Whether that is reachable at all is a
+ * property of the checkpoint, not an argument: Q38_DENSE_GPU_SCAN=1 counts them
+ * in exactly the tensors this item uploads. A denormal weight contributes less
+ * than 1e-38 to a dot product whose terms are O(1), i.e. ~30 orders of magnitude
+ * below the f32 ULP of the sum -- so a nonzero count would still be harmless,
+ * but it would have to be in the record rather than assumed away. */
+static uint64_t g_q38_vk_denorm=0, g_q38_vk_scanned=0;
+static void q38vk_scan_denormals(const Q38Weight *w) {
+    const uint16_t *p=(const uint16_t*)w->data;
+    int64_t n=(int64_t)w->rows*w->cols;
+    uint64_t d=0;
+    #pragma omp parallel for schedule(static) reduction(+:d)
+    for(int64_t i=0;i<n;i++) if(((p[i]>>7)&0xff)==0 && (p[i]&0x7f)!=0) d++;
+    g_q38_vk_denorm+=d; g_q38_vk_scanned+=(uint64_t)n;
+}
+static int q38vk_dense_one(Q38VkDenseEntry e,double *gb,int *nt,int *failed) {
+    Q38Weight *w=e.w;
+    if(!(g_q38_dense_gpu&e.set)||!w||w->kind!=Q38_WEIGHT_BF16||!w->data||w->vk)return 0;
+    if(q38_env_bool("Q38_DENSE_GPU_SCAN",0)) q38vk_scan_denormals(w);
+    if(!coli_vk_tensor_ensure((ColiVkTensor**)&w->vk,w->data,&g_q38_vk_noscale,
+                              9,w->cols,w->rows,0)){w->vk=NULL;(*failed)++;return 0;}
+    int b=e.set==Q38_DG_DN?0:e.set==Q38_DG_QSA?1:e.set==Q38_DG_HEAD?2:3;
+    gb[b]+=(double)w->rows*w->cols*2.0/1e9; nt[b]++;
+    return 1;
+}
+static void q38vk_dense_reserve(Model *m) {
+    Cfg *c=&m->c;
+    Q38VkDenseEntry q[16];
+    double gb[4]={0,0,0,0}; int nt[4]={0,0,0,0}, failed=0;
+    coli_vk_alloc_priority(1.0f);
+    for(int i=m->range_begin;i<m->range_end;i++){
+        Layer *l=&m->L[i];
+        int n=0;
+        if(c->is_attn[i]){
+            q[n++]=(Q38VkDenseEntry){&l->q,Q38_DG_QSA};       q[n++]=(Q38VkDenseEntry){&l->k,Q38_DG_QSA};
+            q[n++]=(Q38VkDenseEntry){&l->v,Q38_DG_QSA};       q[n++]=(Q38VkDenseEntry){&l->idx_qk,Q38_DG_QSA};
+            q[n++]=(Q38VkDenseEntry){&l->o,Q38_DG_QSA};
+        } else {
+            q[n++]=(Q38VkDenseEntry){&l->dn_qkv,Q38_DG_DN};   q[n++]=(Q38VkDenseEntry){&l->dn_z,Q38_DG_DN};
+            q[n++]=(Q38VkDenseEntry){&l->dn_b,Q38_DG_DN};     q[n++]=(Q38VkDenseEntry){&l->dn_a,Q38_DG_DN};
+            q[n++]=(Q38VkDenseEntry){&l->dn_out,Q38_DG_DN};
+        }
+        q[n++]=(Q38VkDenseEntry){&l->attn_gr.down,Q38_DG_GR}; q[n++]=(Q38VkDenseEntry){&l->attn_gr.up,Q38_DG_GR};
+        q[n++]=(Q38VkDenseEntry){&l->attn_gr.inject,Q38_DG_GR};
+        q[n++]=(Q38VkDenseEntry){&l->mlp_gr.down,Q38_DG_GR};  q[n++]=(Q38VkDenseEntry){&l->mlp_gr.up,Q38_DG_GR};
+        q[n++]=(Q38VkDenseEntry){&l->mlp_gr.inject,Q38_DG_GR};
+        for(int j=0;j<n;j++) q38vk_dense_one(q[j],gb,nt,&failed);
+    }
+    /* The final gated residual (site 97) and the LM head. */
+    q38vk_dense_one((Q38VkDenseEntry){&m->final_gr.down,Q38_DG_GR},gb,nt,&failed);
+    q38vk_dense_one((Q38VkDenseEntry){&m->final_gr.up,Q38_DG_GR},gb,nt,&failed);
+    q38vk_dense_one((Q38VkDenseEntry){&m->final_gr.inject,Q38_DG_GR},gb,nt,&failed);
+    q38vk_dense_one((Q38VkDenseEntry){&m->lm_head,Q38_DG_HEAD},gb,nt,&failed);
+    coli_vk_alloc_priority(0.75f);   /* back to this engine's default class */
+    fprintf(stderr,"[qwen38] Q7 dense on dev0: %d tensors, %.2f GB "
+                   "(deltanet %.2f, qsa %.2f, head %.2f, gr %.2f), mask=%d%s\n",
+            nt[0]+nt[1]+nt[2]+nt[3],gb[0]+gb[1]+gb[2]+gb[3],
+            gb[0],gb[1],gb[2],gb[3],g_q38_dense_gpu,
+            failed?" -- WARNING: some uploads FAILED, those tensors stay on the CPU":"");
+    if(g_q38_vk_scanned)
+        fprintf(stderr,"[qwen38] Q7 denormal scan: %llu of %llu bf16 values are "
+                       "denormal (%.3e) -- these read as 0 on the device (RADV "
+                       "flushes fp32 denormals) and as themselves on the CPU\n",
+                (unsigned long long)g_q38_vk_denorm,(unsigned long long)g_q38_vk_scanned,
+                g_q38_vk_scanned?(double)g_q38_vk_denorm/(double)g_q38_vk_scanned:0.0);
+}
+#endif
+
 static void model_init(Model *m,const char *snap,int cap,int bits) {
     model_init_range(m,snap,cap,bits,0,0,1,1);
 #ifdef Q38_VK_TIER
@@ -1312,6 +1521,14 @@ static void model_init(Model *m,const char *snap,int cap,int bits) {
              * dev0 and drops its coldest experts by itself. */
             if (g_q38vk_ready && g_q38_vk_ballast_gb > 0)
                 coli_vk_ballast_gb(g_q38_vk_ballast_gb);
+            /* Q7: the dense reservation goes at the SAME point and for the same
+             * reason QP(d)'s ballast does -- after the devices exist and before
+             * q38vk_preload, so the existing hottest-first fill simply sees a
+             * smaller dev0 and drops its coldest experts by itself. No placement
+             * code, and the preload line is the check: §QP(d) measured 13 586
+             * experts at a 5.4 GB reservation, and step 2 must reproduce that
+             * with real tensors instead of ballast. */
+            if (g_q38vk_ready && g_q38_dense_gpu) q38vk_dense_reserve(m);
         }
     }
 #endif
@@ -2169,7 +2386,13 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         {
             double proj_started=q38_tm_t0();
             Q38DenseItem in[4]={{qkv,&l->dn_qkv,CD},{z,&l->dn_z,V},{bb,&l->dn_b,VH},{aa,&l->dn_a,VH}};
-            q38_dense_matmul_multi(m,in,4,chunk,rows,H);
+            /* Q7 submit A: the four projections of `chunk`, all src = -1, one
+             * submit. Submit B is the out projection at the bottom of this loop;
+             * between them sits the CPU recurrence, whose input is A's output and
+             * whose output is B's input -- which is why this is two submits per
+             * layer and not one (the spec's per-layer submit plan). */
+            if(!q38vk_dense_multi(m,in,4,chunk,rows,H,Q38_DG_DN))
+                q38_dense_matmul_multi(m,in,4,chunk,rows,H);
             q38_tm_add_live(m,Q38_TM_DN_PROJ,proj_started);
         }
 
@@ -2298,8 +2521,13 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
             }
         }
         double outproj_started=q38_tm_t0();
-        q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,
-                         rows,V,H);
+        {   /* Q7 submit B: one item, reading the gated-RMSNormed recurrence
+             * output. Same bucket (dn-proj) as submit A, so the gate reads one
+             * number for the set. */
+            Q38DenseItem ob[1]={{out+(int64_t)base*H,&l->dn_out,H}};
+            if(!q38vk_dense_multi(m,ob,1,norm,rows,V,Q38_DG_DN))
+                q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,rows,V,H);
+        }
         q38_tm_add_live(m,Q38_TM_DN_PROJ,outproj_started);
         base+=rows;
     }
@@ -2321,8 +2549,21 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     float *qp=falloc((int64_t)S*QH*2*D),*kp=falloc((int64_t)S*KVH*D),*vp=falloc((int64_t)S*KVH*D);
     float *ip=falloc((int64_t)S*(IQ+c->idx_kheads)*ID);
     {
+        /* Q7 step 0: qsa-proj covers BOTH projection calls -- this fused A group
+         * and the `o` matmul at the end of the function -- because they are the
+         * one set the item moves to dev0 as submits A and B. Taken on the serial
+         * path between OpenMP regions, exactly like Q1's dn-proj, so COLI_TIMERS
+         * unset still pays nothing (q38_tm_t0/q38_tm_add_live). */
+        double proj_started=q38_tm_t0();
         Q38DenseItem in[4]={{qp,&l->q,QH*2*D},{kp,&l->k,KVH*D},{vp,&l->v,KVH*D},{ip,&l->idx_qk,(IQ+c->idx_kheads)*ID}};
-        q38_dense_matmul_multi(m,in,4,x,S,H);
+        /* Q7 step 2, submit A: the four projections of `x`, all src = -1, one
+         * submit on dev0. Submit B is the `o` matmul at the bottom of this
+         * function; between them sit the CPU index and attention stages, whose
+         * input is A's output and whose output is B's input -- the same
+         * two-submits-per-layer shape as DeltaNet, and for the same reason. */
+        if(!q38vk_dense_multi(m,in,4,x,S,H,Q38_DG_QSA))
+            q38_dense_matmul_multi(m,in,4,x,S,H);
+        q38_tm_add_live(m,Q38_TM_QSA_PROJ,proj_started);
     }
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
@@ -2377,7 +2618,15 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         }
         q38_tm_add(m,Q38_TM_QSA_ATTENTION,phase_started);
     }
-    q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
+    double oproj_started=q38_tm_t0();
+    {   /* Q7 step 2, submit B: one item, reading the per-head attention output.
+         * Same bucket (qsa-proj) as submit A, so the gate reads one number for
+         * the set. */
+        Q38DenseItem ob[1]={{out,&l->o,H}};
+        if(!q38vk_dense_multi(m,ob,1,heads,S,QH*D,Q38_DG_QSA))
+            q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
+    }
+    q38_tm_add_live(m,Q38_TM_QSA_PROJ,oproj_started);
     free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
     q38_tm_add_live(m,Q38_TM_ATTENTION,attn_started);
 }
@@ -3022,7 +3271,18 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
      * the timed lm-head below so the per-op table is unaffected either way. */
     if(g_q38_tf&&!g_q38_tf_done&&S>1){q38_tf_emit(m,mixed,S,c->hidden);g_q38_tf_done=1;}
     float *logit=falloc(c->vocab);double phase_started=now_s();
-    q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
+    {   /* Q7 step 3: the LM head, ONE submit, O = 248 320 -- the largest single
+         * tensor this item moves (1.27 GB) and the only one whose reassociation
+         * lands directly on the logits the oracle reads. Note the argument is
+         * `1` rows, not S: the head is applied to the LAST position only, so
+         * this is a decode-shaped call even during prefill -- but
+         * q38vk_dense_multi still refuses when S != 1, because prefill's OWN
+         * head call (q38_tf_emit, 64 rows) must stay on the CPU and TTFT is
+         * out of this item's scope. */
+        Q38DenseItem hd[1]={{logit,&m->lm_head,c->vocab}};
+        if(!q38vk_dense_multi_ex(m,hd,1,mixed+(int64_t)(S-1)*H,S,H,Q38_DG_HEAD,0))
+            q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
+    }
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     free(hyper);free(mixed);free(inject);free(block);
     q38_tm_add_live(m,Q38_TM_STEP,step_started);
@@ -3045,7 +3305,8 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
         "step","embed","gr-read","gr-apply","attention","moe",
         "router","cpu-experts","vk-issue","vk-take",
         "dn-proj","dn-conv","dn-qknorm","dn-recur","dn-gnorm",
-        "gr-rms","gr-down","gr-lowsilu","gr-up","gr-mix","gr-inject"
+        "gr-rms","gr-down","gr-lowsilu","gr-up","gr-mix","gr-inject",
+        "qsa-proj","vk-dense"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -3095,8 +3356,15 @@ static void q38_tm_report_optime(const Q38Timers *t,const char *scope) {
     fprintf(stderr,"[OPTIME] %-14s %9.3f ms/token  %5.1f%%  (sum %.3f vs step %.3f)\n",
             "unaccounted",(step-top)*per,(step-top)*pct,top*per,step*per);
     struct { const char *name; double v; } nested[]={
+        /* Q7 step 0: qsa-proj/qsa-index/qsa-attn nest inside `attention`;
+         * qsa-rest is the remainder (the falloc/free pairs, the rope/rms on
+         * k, the KV writes), so the three named rows can be read as a split
+         * rather than as three numbers next to a larger one. */
+        {"  qsa-proj",     s[Q38_TM_QSA_PROJ]},
         {"  qsa-index",    s[Q38_TM_QSA_INDEX]},
         {"  qsa-attn",     s[Q38_TM_QSA_ATTENTION]},
+        {"  qsa-rest",     s[Q38_TM_ATTENTION]-(s[Q38_TM_QSA_PROJ]+s[Q38_TM_QSA_INDEX]+
+                           s[Q38_TM_QSA_ATTENTION])},
         {"  router",       s[Q38_TM_ROUTER]},
         {"  shared",       s[Q38_TM_SHARED_EXPERT]},
         {"  vk-issue",     s[Q38_TM_VK_ISSUE]},
@@ -3127,6 +3395,7 @@ static void q38_tm_report_optime(const Q38Timers *t,const char *scope) {
                            s[Q38_TM_GR_LOWSILU]+s[Q38_TM_GR_UP]+s[Q38_TM_GR_MIX]+
                            s[Q38_TM_GR_INJECT])},
         {"  dense-matmul", s[Q38_TM_DENSE_MATMUL]},
+        {"  vk-dense",     s[Q38_TM_VK_DENSE]},
         {"  expert-read",  s[Q38_TM_EXPERT_READ]},
         {"  fp8-expand",   s[Q38_TM_FP8_EXPAND]},
     };

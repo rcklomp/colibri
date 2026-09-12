@@ -2544,7 +2544,13 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
          * unset still pays nothing (q38_tm_t0/q38_tm_add_live). */
         double proj_started=q38_tm_t0();
         Q38DenseItem in[4]={{qp,&l->q,QH*2*D},{kp,&l->k,KVH*D},{vp,&l->v,KVH*D},{ip,&l->idx_qk,(IQ+c->idx_kheads)*ID}};
-        q38_dense_matmul_multi(m,in,4,x,S,H);
+        /* Q7 step 2, submit A: the four projections of `x`, all src = -1, one
+         * submit on dev0. Submit B is the `o` matmul at the bottom of this
+         * function; between them sit the CPU index and attention stages, whose
+         * input is A's output and whose output is B's input -- the same
+         * two-submits-per-layer shape as DeltaNet, and for the same reason. */
+        if(!q38vk_dense_multi(m,in,4,x,S,H,Q38_DG_QSA))
+            q38_dense_matmul_multi(m,in,4,x,S,H);
         q38_tm_add_live(m,Q38_TM_QSA_PROJ,proj_started);
     }
     for(int s=0;s<S;s++){
@@ -2601,7 +2607,13 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         q38_tm_add(m,Q38_TM_QSA_ATTENTION,phase_started);
     }
     double oproj_started=q38_tm_t0();
-    q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
+    {   /* Q7 step 2, submit B: one item, reading the per-head attention output.
+         * Same bucket (qsa-proj) as submit A, so the gate reads one number for
+         * the set. */
+        Q38DenseItem ob[1]={{out,&l->o,H}};
+        if(!q38vk_dense_multi(m,ob,1,heads,S,QH*D,Q38_DG_QSA))
+            q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
+    }
     q38_tm_add_live(m,Q38_TM_QSA_PROJ,oproj_started);
     free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
     q38_tm_add_live(m,Q38_TM_ATTENTION,attn_started);

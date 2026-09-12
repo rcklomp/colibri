@@ -1599,8 +1599,22 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
      * 174.76 (serial), i.e. zero within the spread. A change with no measured
      * token delta that triples a neighbouring bucket does not ship, so the
      * pragma was deleted rather than kept as a knob (record §Q2, "the rms half,
-     * rejected"). It becomes worth doing once q38_gr_apply is parallel too --
-     * logged as its own roadmap item. */
+     * rejected").
+     *
+     * Q11 (2026-09-12) then tested §Q2's "it becomes worth doing once
+     * q38_gr_apply is parallel too" and MEASURED IT FALSE, which is why that
+     * sentence is no longer here. Five arms in one campaign (record §Q11):
+     * parallelising the write-back alone takes `gr-apply` 0.18 -> 0.90; both
+     * loops parallel in their own regions -- the shape Q11's roadmap row asks
+     * for -- lands the pair at 1.71 against 1.24 today; the best shape that
+     * exists (both `omp for`s inside ONE region, both split over b so thread b
+     * reads back the 10 KB it just wrote) reaches 1.14, i.e. -0.10 ms/token on
+     * a token whose run-to-run spread is 0.6. The reason is arithmetic and
+     * final: one OpenMP region costs 4.5 us on this box and a second `omp for`
+     * inside it costs 4.2 us more, so ANY parallel shape pays >= 0.85 ms/token
+     * of synchronisation over these 96 sites, against 1.24 ms/token of work.
+     * Both loops stay serial, and `gr-apply <= 0.10` is unreachable by any
+     * pragma. Do not re-open this without a shape that adds NO barrier. */
     for(int s=0;s<S;s++) for(int b=0;b<C;b++)
         q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,g->norm+(int64_t)b*H,H,c->eps);
     q38_tm_add_live(m,Q38_TM_GR_RMS,sub_started);

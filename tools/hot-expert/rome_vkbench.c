@@ -221,6 +221,56 @@ static void bench_q7(const char *name,int I,const int *Os,int n,int chain,int co
     free(t);free(x);for(int j=0;j<n;j++){free(w[j]);free(y[j]);}free(w);free(y);free(s);
 }
 
+/* Q7 step 1 diagnosis: the SAME two DeltaNet submits, but with the engine's own
+ * CPU gap between them.
+ *
+ * Step 0 predicted dn-proj at 19.6 ms/token from back-to-back submits; in the
+ * engine the identical dispatches cost 26.96. The difference has to be either
+ * the kernel (it is not -- same code, same shapes, same VRAM) or the DUTY CYCLE:
+ * in the engine, submit A is followed by ~0.26 ms of CPU recurrence
+ * (dn-recur 9.28 ms/token over 36 layers) and submit B by the rest of the layer,
+ * so dev0 is idle in sub-millisecond bursts 72 times a token and never reaches
+ * the clocks a back-to-back loop holds it at. This case reproduces that shape
+ * with a busy-wait of the measured length and nothing else changed. If the
+ * per-submit time rises to the in-engine figure, the attenuation is the duty
+ * cycle and NOT something a wider load in the shader can fix. */
+static void spin_ms(double ms){double t0=now();while((now()-t0)*1e3<ms){}}
+static void bench_q7_dutycycle(double gap_ab,double gap_ba,int copies,int reps){
+    const int I1=2560,I2=6144;
+    int OsA[4]={10240,6144,48,48},OsB=2560;
+    ColiVkTensor **ta=calloc((size_t)copies*4,sizeof(*ta)),**tb=calloc(copies,sizeof(*tb));
+    float *x1=randx(I1),*x2=randx(I2);
+    uint16_t *wa[4],*wb;float *ya[4],*yb=malloc((size_t)OsB*4);
+    size_t bytes=0;
+    for(int j=0;j<4;j++){wa[j]=bf16_rand((size_t)I1*OsA[j]);ya[j]=malloc((size_t)OsA[j]*4);bytes+=(size_t)I1*OsA[j]*2;}
+    wb=bf16_rand((size_t)I2*OsB);bytes+=(size_t)I2*OsB*2;
+    ColiVkMM it[4];
+    #define FILL_A(c) for(int j=0;j<4;j++) it[j]=(ColiVkMM){&ta[(size_t)(c)*4+j],wa[j],&one_f,9,OsA[j],0,ya[j],I1,-1};
+    #define FILL_B(c) it[0]=(ColiVkMM){&tb[c],wb,&one_f,9,OsB,0,yb,I2,-1};
+    for(int c=0;c<copies;c++){FILL_A(c) if(!coli_vk_matmul_multi(it,4,x1,I1)){printf("dutycycle: A failed\n");return;}
+                              FILL_B(c) if(!coli_vk_matmul_multi(it,1,x2,I2)){printf("dutycycle: B failed\n");return;}}
+    double *s=malloc((size_t)reps*sizeof(double));
+    for(int r=0;r<reps;r++){
+        int c=r%copies;double acc=0,t0;
+        FILL_A(c) t0=now(); coli_vk_matmul_multi(it,4,x1,I1); acc+=now()-t0;
+        spin_ms(gap_ab);
+        FILL_B(c) t0=now(); coli_vk_matmul_multi(it,1,x2,I2); acc+=now()-t0;
+        spin_ms(gap_ba);
+        s[r]=acc*1e3;
+    }
+    qsort(s,(size_t)reps,sizeof(double),dcmp);
+    printf("Q7 dn-layer   gap A->B %.2f ms, B->A %.2f ms: median %7.4f ms/layer  "
+           "(min %7.4f max %7.4f)  -> x36 = %7.3f ms/token   [engine measured 26.98]\n",
+           gap_ab,gap_ba,s[reps/2],s[0],s[reps-1],s[reps/2]*36);
+    #undef FILL_A
+    #undef FILL_B
+    for(int c=0;c<copies*4;c++)coli_vk_tensor_free(ta[c]);
+    for(int c=0;c<copies;c++)coli_vk_tensor_free(tb[c]);
+    free(ta);free(tb);free(x1);free(x2);free(yb);free(wb);
+    for(int j=0;j<4;j++){free(wa[j]);free(ya[j]);}
+    free(s);
+}
+
 static void q7_step0(void){
     printf("\n===== Q7 step 0: fmt=9 BF16 on dev0 (spec Q7-DENSE-GPU-SPEC-2026-09-12) =====\n");
     int bad=bf16_dequant_exhaustive();
@@ -244,6 +294,15 @@ static void q7_step0(void){
      * this times is the bytes and the single round trip, which is what the step-4
      * go/no-go (<= 9.2 ms/token) is about. */
     { int Os[3]={320,4,10240};        bench_q7("gr-pair",  10240,Os,3, 2,16,10,97); }
+    /* Step 1's attenuation, isolated. 0.00 is the back-to-back control; 0.26 is
+     * the engine's measured CPU recurrence between A and B (dn-recur 9.28
+     * ms/token / 36); 1.5 is roughly the rest of a layer (the token is 139.7 ms
+     * over 48 layers, minus the DeltaNet work itself). */
+    printf("\n-- step 1 diagnosis: the same two submits with the engine's CPU gap between them --\n");
+    bench_q7_dutycycle(0.00,0.00,4,20);
+    bench_q7_dutycycle(0.26,0.00,4,20);
+    bench_q7_dutycycle(0.26,1.50,4,20);
+    bench_q7_dutycycle(0.26,3.00,4,20);
 }
 
 static void bench_dense(int fmt,int I,int O,int copies,int iters){

@@ -2936,10 +2936,21 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
  *
  * The head is applied in 64-row chunks so a 1 200-token prompt costs 63 MB of
  * logits rather than 1.2 GB, and it goes through q38_weight_matmul so that an
- * attached int8 head (QP(c)) is exercised by the oracle too. */
+ * attached int8 head (QP(c)) is exercised by the oracle too.
+ *
+ * Q4 arbitration (record §Q4 `### Arbitration`, 2026-09-12): telling a
+ * near-tie flip from a cascade needs the pristine's top-1/top-2 margin and
+ * the runner-up id at every position, not only the argmax -- `Q38_TF_DUMP`
+ * used to write the last row only. Two more lines, `tf_margin` (top1-top2,
+ * "%.6f" per position) and `tf_top2` (the runner-up token id): a second scan
+ * of the row this function already holds in `lg`, no extra forward. Printed
+ * whenever `teacher_forcing` is (Q38_TF=1); `step` and the default (Q38_TF
+ * unset) path are untouched either way. */
 static void q38_tf_emit(Model *m,const float *mixed,int S,int H) {
     const int V=m->c.vocab,CH=64;
     float *lg=falloc((int64_t)CH*V),*last=NULL;
+    float *margin=(float*)malloc((size_t)S*sizeof(float));
+    int *top2=(int*)malloc((size_t)S*sizeof(int));
     printf("teacher_forcing");
     for(int b=0;b<S;b+=CH){
         int n=S-b<CH?S-b:CH;
@@ -2948,6 +2959,10 @@ static void q38_tf_emit(Model *m,const float *mixed,int S,int H) {
             const float *row=lg+(int64_t)r*V;
             int best=0;float bv=row[0];
             for(int v=1;v<V;v++)if(row[v]>bv){bv=row[v];best=v;}
+            int best2=-1;float bv2=-INFINITY;
+            for(int v=0;v<V;v++){if(v==best)continue;if(row[v]>bv2){bv2=row[v];best2=v;}}
+            if(margin)margin[b+r]=bv-bv2;
+            if(top2)top2[b+r]=best2;
             printf(" %d",best);
         }
         if(b+n>=S){
@@ -2955,7 +2970,11 @@ static void q38_tf_emit(Model *m,const float *mixed,int S,int H) {
             if(last)memcpy(last,lg+(int64_t)(n-1)*V,(size_t)V*sizeof(float));
         }
     }
-    printf("\n");fflush(stdout);
+    printf("\n");
+    if(margin){printf("tf_margin");for(int s=0;s<S;s++)printf(" %.6f",margin[s]);printf("\n");}
+    if(top2){printf("tf_top2");for(int s=0;s<S;s++)printf(" %d",top2[s]);printf("\n");}
+    fflush(stdout);
+    free(margin);free(top2);
     if(last&&g_q38_tf_dump&&*g_q38_tf_dump){
         FILE *f=fopen(g_q38_tf_dump,"wb");
         if(f){fwrite(last,sizeof(float),(size_t)V,f);fclose(f);

@@ -980,9 +980,69 @@ by guess; where a position is a judgment call rather than a number, it says so.
    bit-identical to pristine. One new item out of it: **Q12**, which subset of
    the 676 dense tensors does take int8 — the same per-tensor perturbation is
    fine on one tensor (logit relL2 7.7e−3) and fatal across 48 layers (0.198),
-   so the failure is depth, not precision.** Then Q5, then the Fable session
-   (Q7-gpu's BF16 spec, the QP(c) call, whether Q12 runs first), then the build
-   order in §Q-ARB point 3 — whose decision table has resolved to its last row.
+   so the failure is depth, not precision.**
+   **Q4 — DONE 2026-09-12, merged `313f1f5`: −10.02 ms/token on the bucket,
+   knob `Q38_BF16_ACC4` OFF by default (confirmed to stay off after a
+   dedicated Fable-specified verification: 2 of 4 flip conditions failed —
+   two long-prompt `teacher_forcing` flips had margins above the near-tie
+   bar, and expert-routing itself differed on 1077 of 57 600 traced rows,
+   record §Q4 `### Arbitration executed`).**
+   **Q7-gpu — DONE 2026-09-12, full arm merged (`fb8d3cd`, `0c23577`):
+   DeltaNet + QSA projections + the LM head moved to a BF16 dispatch on
+   dev0. Arm total `dn-proj`+`qsa-proj`+`lm-head` **38.88 ms/token against
+   the 42.2 floor** (record §Q7 `### Arbitration`); fresh-process token
+   **170.86 → 127.74 (−43.12, −25.2%)**, warm-identical **−39.31 ms/token**.
+   Step 4 (the gated-residual pair, GPU) was refused per the spec's own
+   pre-authorised rule — measured slower than the CPU arm before its VRAM
+   cost. Bit-identical or explained at every step; `tworeq.py` parametrised
+   for qwen38 along the way. Two new items out of the merge: **Q13** (dev0's
+   idle clocks between submits) and **Q14** (a CPU-side twin, ~7 ms/token of
+   the arm's gain returns in `gr-read`/`shared`, tracks fence-wait not
+   eviction).**
+   **Q10 — DONE 2026-09-12, merged `a934285`: −8.5 ms/token on the token,
+   −7.19 on `dn-recur` (4.6×), oracle 0 of 1 811 939 328 state elements
+   differ. Neither of the item's own proposed mechanisms was right — not
+   traffic (folding the decay pass measured at zero), not "unvectorised"
+   (gcc had already vectorised it) — the real one was dependency-chain
+   length, found only because step 0 tested the two foldings separately
+   (record §Q10).**
+   **Q13 — step 0 DONE 2026-09-12, CONFIRMED CLOCKS on a paired same-binary
+   A/B (record §Q13 step 0, `### The narrow variant`): forcing dev0 to
+   `high` DPM buys −8.281 ms/token on the arm (bit-identical, 6/6 oracle),
+   but costs +69 W of continuous idle draw on the card that also drives
+   this box's console, to speed an engine (qwen38) that is not the one
+   served (glm53). The cheaper hypothesis — lock only the memory clock —
+   was tested and REFUTED: it captures ≤12% of the gain for 93% of the
+   power cost; the real carrier is the core/shader clock, not memory
+   bandwidth. **Neither DPM variant ships.** The only lever that costs no
+   ongoing power is a keepalive dispatch (holds the core busy only during
+   real idle gaps) — not built, this is where a future session picks up if
+   the ~8 ms/token is worth a day of Opus-tier work. dev0 confirmed left at
+   `auto` after every leg.**
+   **Q11 was REJECTED 2026-09-12** (§Q2's rms-pragma fix does not make it
+   free; `gr-apply ≤ 0.10` is unreachable at ~4.5 µs/region on 96 sites,
+   record §Q11) — merged as a documentation-only no-op, `759f441`.
+   **edge0 evaluation — CLOSED 2026-09-12, REJECT (record §EDGE0):** the
+   prerouter-as-correctness-fix idea (item #1) is refuted by its own
+   falsification arm — holding the swiglu clamp constant makes two wildly
+   different expert-residency configs produce bit-identical output
+   (relL2 exactly 0), so pinning experts by predicted routing cannot help;
+   the actual bug is the missing clamp in `qmatmul_gate_up.comp`, a
+   separate Track G item (see below). Items #2–#5 were screened out
+   (#2/#3 already exist under different names, #4/#5 don't apply or are
+   refactor-only).
+   **NEXT, as of 2026-09-12: Q12 and Q14 are both unblocked** (they were
+   sequenced behind Q13's step 0, which is now answered) and are the two
+   smallest remaining items on this track. Q5 remains open but is
+   near-zero value (§Q3 already showed the gap it targets is mostly spent).
+   The Fable session for Q7-gpu's spec already happened (§Q7 arbitration
+   and `Q7-DENSE-GPU-SPEC-2026-09-12.md`) and the arm is built — nothing
+   further from that clause is owed. Separately, and not part of this
+   track: the missing swiglu clamp in the routed-expert GPU shader
+   (§G13/§G15's finding, GLM-5.3 only) is a substantial, multi-item Track G
+   fix — it touches every routed-expert computation since G2 and needs
+   G4/G7/G8/G9/G10/G12's numbers re-validated — queued as its own future
+   item, not started.
 
 ### Keeping the profile honest: a re-measurement cadence, not a one-off
 

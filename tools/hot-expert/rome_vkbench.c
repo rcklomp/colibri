@@ -235,42 +235,72 @@ static void bench_q7(const char *name,int I,const int *Os,int n,int chain,int co
  * per-submit time rises to the in-engine figure, the attenuation is the duty
  * cycle and NOT something a wider load in the shader can fix. */
 static void spin_ms(double ms){double t0=now();while((now()-t0)*1e3<ms){}}
-static void bench_q7_dutycycle(double gap_ab,double gap_ba,int copies,int reps){
-    const int I1=2560,I2=6144;
-    int OsA[4]={10240,6144,48,48},OsB=2560;
-    ColiVkTensor **ta=calloc((size_t)copies*4,sizeof(*ta)),**tb=calloc(copies,sizeof(*tb));
-    float *x1=randx(I1),*x2=randx(I2);
-    uint16_t *wa[4],*wb;float *ya[4],*yb=malloc((size_t)OsB*4);
-    size_t bytes=0;
-    for(int j=0;j<4;j++){wa[j]=bf16_rand((size_t)I1*OsA[j]);ya[j]=malloc((size_t)OsA[j]*4);bytes+=(size_t)I1*OsA[j]*2;}
-    wb=bf16_rand((size_t)I2*OsB);bytes+=(size_t)I2*OsB*2;
-    ColiVkMM it[4];
-    #define FILL_A(c) for(int j=0;j<4;j++) it[j]=(ColiVkMM){&ta[(size_t)(c)*4+j],wa[j],&one_f,9,OsA[j],0,ya[j],I1,-1};
+
+/* Generalised over the set, because Q7's arbitration (Fable, 2026-09-12) made
+ * this replay the REQUIRED form of a step-0 GPU prediction, not a step-1
+ * diagnosis: "a step-0 microbenchmark that predicts an in-engine bucket for a
+ * GPU dispatch must replay the engine's inter-submit gaps, not run
+ * back-to-back", with >= 5 repeats (the two repeats at 0.26/1.50 spanned 7.2
+ * ms/token, so two are not a prediction).
+ *
+ * `nB == 0` is the one-submit form, which is the LM head: A, then the whole gap.
+ * `outer` whole-configuration repeats, each an independent median of `reps`, and
+ * the median-of-medians and the span across them are both printed -- the span is
+ * the number that says how much to trust the prediction. */
+static void bench_q7_layer(const char *name,
+                           int I1,const int *OsA,int nA,
+                           int I2,int OsB,int nB,
+                           double gap_ab,double gap_ba,
+                           int copies,int reps,int outer,double per_token,
+                           double engine_measured){
+    ColiVkTensor **ta=calloc((size_t)copies*nA,sizeof(*ta)),**tb=nB?calloc(copies,sizeof(*tb)):NULL;
+    float *x1=randx(I1),*x2=nB?randx(I2):NULL;
+    uint16_t *wa[VK_MM_MAX],*wb=NULL;float *ya[VK_MM_MAX],*yb=nB?malloc((size_t)OsB*4):NULL;
+    for(int j=0;j<nA;j++){wa[j]=bf16_rand((size_t)I1*OsA[j]);ya[j]=malloc((size_t)OsA[j]*4);}
+    if(nB)wb=bf16_rand((size_t)I2*OsB);
+    ColiVkMM it[VK_MM_MAX];
+    #define FILL_A(c) for(int j=0;j<nA;j++) it[j]=(ColiVkMM){&ta[(size_t)(c)*nA+j],wa[j],&one_f,9,OsA[j],0,ya[j],I1,-1};
     #define FILL_B(c) it[0]=(ColiVkMM){&tb[c],wb,&one_f,9,OsB,0,yb,I2,-1};
-    for(int c=0;c<copies;c++){FILL_A(c) if(!coli_vk_matmul_multi(it,4,x1,I1)){printf("dutycycle: A failed\n");return;}
-                              FILL_B(c) if(!coli_vk_matmul_multi(it,1,x2,I2)){printf("dutycycle: B failed\n");return;}}
-    double *s=malloc((size_t)reps*sizeof(double));
-    for(int r=0;r<reps;r++){
-        int c=r%copies;double acc=0,t0;
-        FILL_A(c) t0=now(); coli_vk_matmul_multi(it,4,x1,I1); acc+=now()-t0;
-        spin_ms(gap_ab);
-        FILL_B(c) t0=now(); coli_vk_matmul_multi(it,1,x2,I2); acc+=now()-t0;
-        spin_ms(gap_ba);
-        s[r]=acc*1e3;
+    for(int c=0;c<copies;c++){
+        FILL_A(c) if(!coli_vk_matmul_multi(it,nA,x1,I1)){printf("Q7 replay %s: A failed\n",name);return;}
+        if(nB){FILL_B(c) if(!coli_vk_matmul_multi(it,1,x2,I2)){printf("Q7 replay %s: B failed\n",name);return;}}
     }
-    qsort(s,(size_t)reps,sizeof(double),dcmp);
-    printf("Q7 dn-layer   gap A->B %.2f ms, B->A %.2f ms: median %7.4f ms/layer  "
-           "(min %7.4f max %7.4f)  -> x36 = %7.3f ms/token   [engine measured 26.98]\n",
-           gap_ab,gap_ba,s[reps/2],s[0],s[reps-1],s[reps/2]*36);
+    double *s=malloc((size_t)reps*sizeof(double)),*meds=malloc((size_t)outer*sizeof(double));
+    for(int o=0;o<outer;o++){
+        for(int r=0;r<reps;r++){
+            int c=r%copies;double acc=0,t0;
+            FILL_A(c) t0=now(); coli_vk_matmul_multi(it,nA,x1,I1); acc+=now()-t0;
+            spin_ms(gap_ab);
+            if(nB){FILL_B(c) t0=now(); coli_vk_matmul_multi(it,1,x2,I2); acc+=now()-t0;}
+            spin_ms(gap_ba);
+            s[r]=acc*1e3;
+        }
+        qsort(s,(size_t)reps,sizeof(double),dcmp);
+        meds[o]=s[reps/2];
+    }
+    double lo=meds[0],hi=meds[0];
+    for(int o=1;o<outer;o++){if(meds[o]<lo)lo=meds[o];if(meds[o]>hi)hi=meds[o];}
+    double *sorted=malloc((size_t)outer*sizeof(double));
+    memcpy(sorted,meds,(size_t)outer*sizeof(double));
+    qsort(sorted,(size_t)outer,sizeof(double),dcmp);
+    printf("Q7 replay %-10s gap A->B %5.2f  after %5.2f ms: med-of-%d %7.4f ms/site "
+           "(span %7.4f..%7.4f) -> x%.0f = %7.3f ms/token  (span %7.3f..%7.3f)",
+           name,gap_ab,gap_ba,outer,sorted[outer/2],lo,hi,per_token,
+           sorted[outer/2]*per_token,lo*per_token,hi*per_token);
+    if(engine_measured>0)printf("   [engine %.2f]",engine_measured);
+    printf("\n    per-repeat:");
+    for(int o=0;o<outer;o++)printf(" %.3f",meds[o]*per_token);
+    printf("\n");
     #undef FILL_A
     #undef FILL_B
-    for(int c=0;c<copies*4;c++)coli_vk_tensor_free(ta[c]);
-    for(int c=0;c<copies;c++)coli_vk_tensor_free(tb[c]);
+    for(int c=0;c<copies*nA;c++)coli_vk_tensor_free(ta[c]);
+    if(nB)for(int c=0;c<copies;c++)coli_vk_tensor_free(tb[c]);
     free(ta);free(tb);free(x1);free(x2);free(yb);free(wb);
-    for(int j=0;j<4;j++){free(wa[j]);free(ya[j]);}
-    free(s);
+    for(int j=0;j<nA;j++){free(wa[j]);free(ya[j]);}
+    free(s);free(meds);free(sorted);
 }
 
+static void q7_replay_dn(void);
 static void q7_step0(void){
     printf("\n===== Q7 step 0: fmt=9 BF16 on dev0 (spec Q7-DENSE-GPU-SPEC-2026-09-12) =====\n");
     int bad=bf16_dequant_exhaustive();
@@ -299,10 +329,64 @@ static void q7_step0(void){
      * ms/token / 36); 1.5 is roughly the rest of a layer (the token is 139.7 ms
      * over 48 layers, minus the DeltaNet work itself). */
     printf("\n-- step 1 diagnosis: the same two submits with the engine's CPU gap between them --\n");
-    bench_q7_dutycycle(0.00,0.00,4,20);
-    bench_q7_dutycycle(0.26,0.00,4,20);
-    bench_q7_dutycycle(0.26,1.50,4,20);
-    bench_q7_dutycycle(0.26,3.00,4,20);
+    q7_replay_dn();
+}
+
+/* Step 1's four DeltaNet configurations, now through the general replay so the
+ * >= 5 repeats the arbitration requires apply to them too. */
+static void q7_replay_dn(void){
+    int OsA[4]={10240,6144,48,48};
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.00,0.00,4,20,5,36,26.98);
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.26,0.00,4,20,5,36,26.98);
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.26,1.50,4,20,5,36,26.98);
+    bench_q7_layer("dn-layer",2560,OsA,4,6144,2560,1,0.26,3.00,4,20,5,36,26.98);
+}
+
+/* ---- Steps 2 and 3: their OWN step 0, by the corrected rule ------------------
+ *
+ * Fable's arbitration of step 1 (record §Q7 `### Arbitration`) made the
+ * gap-replay the required form of a step-0 GPU prediction. Steps 2 and 3 are
+ * therefore predicted here, at the engine's own inter-submit timing, and NOT
+ * from the back-to-back medians in the step-0 table (6.83-7.44 and 2.74-2.85),
+ * which are now known to understate the engine by ~1.37x on the two-submit
+ * shape.
+ *
+ * QSA's gaps, from step 1's own [OPTIME] table with Q38_DENSE_GPU=1:
+ *   A -> B   the CPU index + attention stages, qsa-attn 3.46 + qsa-index 0.13
+ *            over 12 layers = 0.30 ms.
+ *   B -> A   the rest of a QSA layer: the two gated-residual sites and the MoE
+ *            site. The token is 139.74 ms over 48 layers = 2.91 ms/layer, of
+ *            which the two QSA submits are ~0.7 -- so ~1.5-2.2, bracketed here
+ *            by 1.00 / 1.50 / 3.00 with the back-to-back control at 0.00.
+ *
+ * The LM head is ONE submit per token. Its "gap" is everything between the last
+ * layer's last submit and it (the final gated residual, and on the way back a
+ * whole token of CPU work before the next one), so it is swept wide: the head is
+ * 2.7 ms of solid work that ramps the clocks itself, and the question this
+ * answers is how much of that 2.7 survives being issued once per 130 ms.
+ *
+ * NOTE the replay's gap is IDLE, where the engine's is partly dev0 running
+ * expert groups for the MoE site. So this is the pessimistic end and step 1
+ * confirmed that reading: the engine measured 26.98 BELOW the 1.50 ms replay. */
+static void q7_step0_s23(void){
+    printf("\n===== Q7 steps 2-3 step 0: the gap replay (Fable's corrected rule) =====\n");
+    int bad=bf16_check_shape(2560,248320);   /* the head: never shape-checked, only timed */
+    printf("BF16 CORRECTNESS (lm-head shape): %s\n",bad?"*** FAIL ***":"PASS");
+    if(bad)return;
+    printf("\n-- QSA: 4-tensor A (71.4 MB) + `o` B (31.5 MB), x12 layers --\n");
+    int OsQ[4]={12288,512,512,640};
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.00,0.00,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,0.00,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,1.00,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,1.50,4,20,5,12,0);
+    bench_q7_layer("qsa-layer",2560,OsQ,4,6144,2560,1,0.30,3.00,4,20,5,12,0);
+    printf("\n-- LM head: one 1.27 GB submit, x1 per token --\n");
+    int OsH[1]={248320};
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,0.00,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,1.50,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,3.00,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,10.00,2,10,5,1,0);
+    bench_q7_layer("lm-head",2560,OsH,1,0,0,0,0.00,30.00,2,10,5,1,0);
 }
 
 static void bench_dense(int fmt,int I,int O,int copies,int iters){
@@ -402,6 +486,11 @@ int main(int argc,char**argv){
     /* `vkbench <spv> q7` runs only Q7 step 0 -- the placement matrix below is
      * already in the record and re-running it costs minutes of rig time. */
     if(argc>2&&!strcmp(argv[2],"q7")){q7_step0();coli_vk_shutdown();return 0;}
+    /* `vkbench <spv> q7s23` is steps 2-3's own step 0: the head's shape check
+     * and the QSA / LM-head gap replays. Step 0's correctness legs and step 1's
+     * replay are in the record already and cost rig time to repeat. */
+    if(argc>2&&!strcmp(argv[2],"q7s23")){q7_step0_s23();coli_vk_shutdown();return 0;}
+    if(argc>2&&!strcmp(argv[2],"q7dn")){q7_replay_dn();coli_vk_shutdown();return 0;}
     q7_step0();
     /* 1. round trip: tiny matmul, per-call cost is ~all overhead */
     bench_dense(1,512,512,1,400);

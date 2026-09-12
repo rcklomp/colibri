@@ -418,16 +418,41 @@ static void rec_ab_off(float *state,const float *qh,const float *kh,
                        const float *vh,float *core_h,float alpha,float beta){
     REC_AB_BODY(fmaf)
 }
+/* CONTROL: (b)'s loop order WITHOUT (a) -- the decay pass is kept, so the
+ * traffic is 5 units instead of (a)+(b)'s 3.  This is the row that separates
+ * "traffic removed" from "loop order fixed": (a) alone gives the traffic and
+ * not the order, this gives the order and not the traffic. */
+static void rec_b_off(float *state,const float *qh,const float *kh,
+                      const float *vh,float *core_h,float alpha,float beta){
+    float prev[VD],delta[VD],cur[VD];
+    int64_t state_cells=(int64_t)KD*VD;
+    for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
+    for(int value=0;value<VD;value++) prev[value]=0.f;
+    for(int d=0;d<KD;d++){
+        float kd=kh[d]; const float *sr=state+(int64_t)d*VD;
+        for(int value=0;value<VD;value++) prev[value]+=kd*sr[value];
+    }
+    for(int value=0;value<VD;value++) delta[value]=(vh[value]-prev[value])*beta;
+    for(int value=0;value<VD;value++) cur[value]=0.f;
+    for(int d=0;d<KD;d++){
+        float kd=kh[d],qd=qh[d]; float *sr=state+(int64_t)d*VD;
+        for(int value=0;value<VD;value++){
+            float s=fmaf(kd,delta[value],sr[value]);
+            sr[value]=s; cur[value]+=qd*s;
+        }
+    }
+    for(int value=0;value<VD;value++) core_h[value]=cur[value];
+}
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
 #endif
 
 typedef enum { R_BASE, R_A, R_A_F, R_AB, R_AB_F,
-               R_BPREV, R_BCUR, R_AB_OFF, R_NVAR } RVariant;
+               R_BPREV, R_BCUR, R_AB_OFF, R_B_OFF, R_NVAR } RVariant;
 static const char *rvname[R_NVAR]={
     "base (4 passes)","(a) plain +","(a) fmaf()","(a)+(b) plain +",
     "(a)+(b) fmaf()","diag (b) prev only","diag (b) cur only",
-    "(a)+(b) contract-off"};
+    "(a)+(b) contract-off","(b) only, decay kept"};
 
 /* one layer of the recurrence, parallel over heads exactly as the engine is */
 static void rec_layer(RVariant v,RecLayer *L,const float *q,const float *k,
@@ -450,6 +475,7 @@ static void rec_layer(RVariant v,RecLayer *L,const float *q,const float *k,
         case R_AB_F: rec_ab_f(state,qh,kh,vh,core_h,alpha,beta); break;
         case R_BPREV:rec_b_prev(state,qh,kh,vh,core_h,alpha,beta); break;
         case R_BCUR: rec_b_cur (state,qh,kh,vh,core_h,alpha,beta); break;
+        case R_B_OFF:rec_b_off (state,qh,kh,vh,core_h,alpha,beta); break;
         default:     rec_ab_off(state,qh,kh,vh,core_h,alpha,beta); break;
         }
     }

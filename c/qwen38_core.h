@@ -2407,6 +2407,14 @@ static int q38_bounded_prefill_rows(int requested,uint64_t fixed,
  * process on a fixed input and falls back to the base on any difference.
  * Q38_DN_RECUR_FOLD=0 forces the base path for an A/B.
  * ========================================================================== */
+/* noinline, and it matters for correctness rather than for speed: the
+ * self-check is only sound if it compares the SAME machine code the engine
+ * runs, and an inlined copy inside the `omp for` could be vectorised
+ * differently from the out-of-line one the check calls.  One body, both call
+ * sites.  Cost: 1 728 calls/token, a few microseconds. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
 static void q38_dn_recur_base(float *state,const float *qh,const float *kh,
                               const float *vh,float *core_h,int KD,int VD,
                               float alpha,float beta) {
@@ -2433,6 +2441,7 @@ static void q38_dn_recur_base(float *state,const float *qh,const float *kh,
 #define Q38_DN_FOLD_BUILT 1
 #pragma GCC push_options
 #pragma GCC optimize ("fp-contract=off")
+__attribute__((noinline))
 static void q38_dn_recur_fold(float *state,const float *qh,const float *kh,
                               const float *vh,float *core_h,int KD,int VD,
                               float alpha,float beta) {

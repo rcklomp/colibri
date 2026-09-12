@@ -1,8 +1,20 @@
 /* rome_dnbench.c -- the isolated microbenchmark for roadmap item Q1
  * (DeltaNet's serial tail), plus its bit-identity oracle.
  *
+ * EXTENDED 2026-09-12 for roadmap item Q10 (the DeltaNet recurrence's state
+ * traffic).  Part 2 at the bottom of main() adds the 48-head recurrence itself
+ * -- the loop Q1 measured at 9.19 ms/token and did not touch -- with its own
+ * oracle (memcmp on the FULL 3.146 MB/layer state, not just the output, over
+ * 36 layers x 64 consecutive tokens, because the state persists across tokens
+ * and a single-token check cannot see a wrong reassociation) and three cache
+ * regimes chosen to separate the bandwidth reading from the latency one.
+ * Run `rome_dnbench q1` or `rome_dnbench recur` for one part only.
+ *
  * Build:
  *   gcc -O3 -march=native -fopenmp -o /tmp/rome_dnbench rome_dnbench.c -lm
+ *   (the engine's own flags: c/Makefile's Linux x86-64 block is
+ *    -O3 -march=native -fopenmp -pthread, no -std=, so -ffp-contract=fast is
+ *    in force in BOTH and the contraction the oracle sees is the engine's.)
  * Run (8 threads, rig lock held, no engine up -- like every other row this
  * family of harnesses has produced):
  *   OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close /tmp/rome_dnbench
@@ -197,6 +209,205 @@ static void dn_fused(const DNLayer *L,const float *qkv_row,float *conv,
     }
 }
 
+/* ==========================================================================
+ * PART 2 -- roadmap item Q10: the 48-head DeltaNet recurrence.
+ *
+ * Verbatim from c/qwen38_core.h's `#pragma omp for` over h<VH inside
+ * q38_deltanet (the [OPTIME] dn-recur bucket, 9.19 ms/token per Q1 step 0).
+ * Per head and token it makes FOUR traversals of a KD*VD = 128*128 f32 state
+ * (64 KB):
+ *   1. decay        state[cell] *= alpha              (read + write)
+ *   2. k.state      previous = sum_d kh[d]*state[d,v] (read, d-inner, stride
+ *                                                      VD*4 = 512 B)
+ *   3. rank-1       state[d,v] += kh[d]*delta[v]      (read + write)
+ *   4. q.state      current  = sum_d qh[d]*state[d,v] (read, d-inner, 512 B)
+ * = 6 traffic units (4 reads + 2 writes) of 64 KB per head.
+ *
+ * THE TWO FOLDINGS UNDER TEST, and exactly what each claims.
+ *
+ * (a) REC_A -- drop the decay pass.  fl(s*alpha) is recomputed on the fly
+ *     inside pass 2 and again inside pass 3.  Both are the same single float
+ *     multiply of the same two floats, so they round to the same bits; the
+ *     only thing that can break it is FMA CONTRACTION, and only in pass 3,
+ *     where `s*alpha + kh[d]*delta[v]` has TWO multiplies feeding ONE add and
+ *     the compiler picks one to fuse.  The base's pass 3 is
+ *     `state[c] += kh[d]*delta[v]` with state[c] already holding fl(s*alpha),
+ *     i.e. one multiply feeding one add -- under -ffp-contract=fast that is
+ *     fma(kh[d], delta[v], fl(s*alpha)).  So the candidate is bit-identical
+ *     iff it fuses the SAME multiply.  This harness does not assume that: it
+ *     builds BOTH spellings --
+ *        REC_A / REC_AB      : plain `s*alpha + kd*delta[v]`, compiler's pick
+ *        REC_A_F / REC_AB_F  : explicit fmaf(kd, delta[v], s*alpha)
+ *     -- and lets the memcmp oracle say which one (or both) holds.  Pass 2's
+ *     `previous += kh[d]*(s*alpha)` is not at risk: the inner `s*alpha` feeds
+ *     a multiply, not an add, so it is never a contraction candidate.
+ *     Traffic: 6 -> 4 units.
+ *
+ * (b) REC_AB -- additionally fold q.state into the rank-1 pass with `d` OUTER
+ *     and `value` INNER, so every current[value] still accumulates in
+ *     ascending d (same summation order, same addends, same rounding), and
+ *     do the same to the `previous` reduction, which costs nothing extra and
+ *     preserves its d-order for the same reason.  Traffic: 4 -> 3 units, and
+ *     BOTH d-inner strided reductions become unit-stride and vectorisable
+ *     across `value` -- which is the change that matters if the loop is
+ *     latency-bound rather than bandwidth-bound.
+ *
+ * Note both foldings recompute fl(s*alpha), so the state is READ twice and
+ * WRITTEN once per head per token in (b): 3 units against the base's 6.
+ * ========================================================================== */
+
+typedef struct {                /* one DeltaNet layer's recurrent state */
+    float *state;               /* VH*KD*VD floats = 3.146 MB */
+    float *alog;                /* VH */
+    float *dtbias;              /* VH */
+} RecLayer;
+
+/* verbatim from c/qwen38_core.h */
+static inline float q38_softplus(float x){ return x>20.f?x:log1pf(expf(x)); }
+
+/* ---- per-head kernels ----------------------------------------------------- */
+/* BASE: copied character for character out of q38_deltanet's h-loop body. */
+static void rec_base(float *state,const float *qh,const float *kh,
+                     const float *vh,float *core_h,float alpha,float beta){
+    float delta[512];
+    int64_t state_cells=(int64_t)KD*VD;
+    for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
+    for(int value=0;value<VD;value++) {
+        float previous=0.f;
+        for(int d=0;d<KD;d++)
+            previous+=kh[d]*state[(int64_t)d*VD+value];
+        delta[value]=(vh[value]-previous)*beta;
+    }
+    for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
+        state[(int64_t)d*VD+value]+=kh[d]*delta[value];
+    for(int value=0;value<VD;value++) {
+        float current=0.f;
+        for(int d=0;d<KD;d++)
+            current+=qh[d]*state[(int64_t)d*VD+value];
+        core_h[value]=current;
+    }
+}
+
+/* (a) only: decay folded away, both reductions still d-inner/strided. */
+#define REC_A_BODY(FUSE)                                                      \
+    float delta[512];                                                         \
+    for(int value=0;value<VD;value++) {                                       \
+        float previous=0.f;                                                   \
+        for(int d=0;d<KD;d++)                                                 \
+            previous+=kh[d]*(state[(int64_t)d*VD+value]*alpha);               \
+        delta[value]=(vh[value]-previous)*beta;                               \
+    }                                                                         \
+    for(int d=0;d<KD;d++)for(int value=0;value<VD;value++){                   \
+        int64_t c=(int64_t)d*VD+value;                                        \
+        state[c]=FUSE(kh[d],delta[value],state[c]*alpha);                     \
+    }                                                                         \
+    for(int value=0;value<VD;value++) {                                       \
+        float current=0.f;                                                    \
+        for(int d=0;d<KD;d++)                                                 \
+            current+=qh[d]*state[(int64_t)d*VD+value];                        \
+        core_h[value]=current;                                                \
+    }
+#define PLAIN_FMA(a,b,c) ((c)+(a)*(b))
+static void rec_a(float *state,const float *qh,const float *kh,
+                  const float *vh,float *core_h,float alpha,float beta){
+    REC_A_BODY(PLAIN_FMA)
+}
+static void rec_a_f(float *state,const float *qh,const float *kh,
+                    const float *vh,float *core_h,float alpha,float beta){
+    REC_A_BODY(fmaf)
+}
+
+/* (a)+(b): every pass d-outer / value-inner.  prev[] and cur[] accumulate in
+ * ascending d exactly as `previous` and `current` do in the base. */
+#define REC_AB_BODY(FUSE)                                                     \
+    float prev[VD],delta[VD],cur[VD];                                         \
+    for(int value=0;value<VD;value++) prev[value]=0.f;                        \
+    for(int d=0;d<KD;d++){                                                    \
+        float kd=kh[d]; const float *sr=state+(int64_t)d*VD;                  \
+        for(int value=0;value<VD;value++)                                     \
+            prev[value]+=kd*(sr[value]*alpha);                                \
+    }                                                                         \
+    for(int value=0;value<VD;value++)                                         \
+        delta[value]=(vh[value]-prev[value])*beta;                            \
+    for(int value=0;value<VD;value++) cur[value]=0.f;                         \
+    for(int d=0;d<KD;d++){                                                    \
+        float kd=kh[d],qd=qh[d]; float *sr=state+(int64_t)d*VD;               \
+        for(int value=0;value<VD;value++){                                    \
+            float s=FUSE(kd,delta[value],sr[value]*alpha);                    \
+            sr[value]=s;                                                      \
+            cur[value]+=qd*s;                                                 \
+        }                                                                     \
+    }                                                                         \
+    for(int value=0;value<VD;value++) core_h[value]=cur[value];
+static void rec_ab(float *state,const float *qh,const float *kh,
+                   const float *vh,float *core_h,float alpha,float beta){
+    REC_AB_BODY(PLAIN_FMA)
+}
+static void rec_ab_f(float *state,const float *qh,const float *kh,
+                     const float *vh,float *core_h,float alpha,float beta){
+    REC_AB_BODY(fmaf)
+}
+
+typedef enum { R_BASE, R_A, R_A_F, R_AB, R_AB_F, R_NVAR } RVariant;
+static const char *rvname[R_NVAR]={
+    "base (4 passes)","(a) plain +","(a) fmaf()","(a)+(b) plain +","(a)+(b) fmaf()"};
+
+/* one layer of the recurrence, parallel over heads exactly as the engine is */
+static void rec_layer(RVariant v,RecLayer *L,const float *q,const float *k,
+                      const float *vi,const float *a_row,const float *b_row,
+                      float *core){
+    #pragma omp parallel for schedule(static)
+    for(int h=0;h<VH;h++){
+        float *state=L->state+(int64_t)h*KD*VD;
+        const float *qh=q+(int64_t)h*KD;
+        const float *kh=k+(int64_t)h*KD;
+        const float *vh=vi+(int64_t)h*VD;
+        float alpha=expf(-expf(L->alog[h])*q38_softplus(a_row[h]+L->dtbias[h]));
+        float beta=q38_sigmoid(b_row[h]);
+        float *core_h=core+(int64_t)h*VD;
+        switch(v){
+        case R_BASE: rec_base(state,qh,kh,vh,core_h,alpha,beta); break;
+        case R_A:    rec_a   (state,qh,kh,vh,core_h,alpha,beta); break;
+        case R_A_F:  rec_a_f (state,qh,kh,vh,core_h,alpha,beta); break;
+        case R_AB:   rec_ab  (state,qh,kh,vh,core_h,alpha,beta); break;
+        default:     rec_ab_f(state,qh,kh,vh,core_h,alpha,beta); break;
+        }
+    }
+}
+
+#define REC_BYTES ((size_t)VH*KD*VD*sizeof(float))
+static RecLayer *make_rec(int n,uint64_t *seed){
+    RecLayer *L=calloc((size_t)n,sizeof(RecLayer));
+    for(int i=0;i<n;i++){
+        L[i].state =aligned_alloc(64,REC_BYTES);
+        L[i].alog  =aligned_alloc(64,(size_t)VH*sizeof(float));
+        L[i].dtbias=aligned_alloc(64,(size_t)VH*sizeof(float));
+        for(size_t j=0;j<REC_BYTES/4;j++) L[i].state[j]=frand(seed)*0.1f;
+        for(int j=0;j<VH;j++){ L[i].alog[j]=frand(seed)*0.5f-1.f;
+                               L[i].dtbias[j]=frand(seed)*0.5f; }
+    }
+    return L;
+}
+static void free_rec(RecLayer *L,int n){
+    for(int i=0;i<n;i++){free(L[i].state);free(L[i].alog);free(L[i].dtbias);}
+    free(L);
+}
+static RecLayer *clone_rec(const RecLayer *src,int n){
+    RecLayer *L=calloc((size_t)n,sizeof(RecLayer));
+    for(int i=0;i<n;i++){
+        L[i].alog=src[i].alog; L[i].dtbias=src[i].dtbias;   /* shared, read-only */
+        L[i].state=aligned_alloc(64,REC_BYTES);
+        memcpy(L[i].state,src[i].state,REC_BYTES);
+    }
+    return L;
+}
+static void free_clone(RecLayer *L,int n){
+    for(int i=0;i<n;i++) free(L[i].state);
+    free(L);
+}
+
+static int part_recur(uint64_t *seed);
+
 /* -------------------------------------------------------------------------- */
 static DNLayer *make_layers(int n,uint64_t *seed){
     DNLayer *L=calloc((size_t)n,sizeof(DNLayer));
@@ -248,14 +459,21 @@ static void token(Variant v,DNLayer *L,int layers,const float *qkv,const float *
     }
 }
 
-int main(void){
+int main(int argc,char **argv){
     uint64_t seed=0x51ed270bULL;
     int threads=1;
+    int do_q1=1, do_rec=1;
+    if(argc>1){
+        if(!strcmp(argv[1],"q1"))         { do_rec=0; }
+        else if(!strcmp(argv[1],"recur")) { do_q1=0;  }
+        else { fprintf(stderr,"usage: %s [q1|recur]\n",argv[0]); return 2; }
+    }
 #ifdef _OPENMP
     threads=omp_get_max_threads();
 #endif
     printf("rome_dnbench: %d threads, CD=%d VH=%d KD=%d VD=%d CK=%d, 36 DeltaNet layers\n",
            threads,CD,VH,KD,VD,CK);
+    if(!do_q1) goto part2;
 
     float *qkv=aligned_alloc(64,(size_t)8*CD*sizeof(float));
     float *z  =aligned_alloc(64,(size_t)V*sizeof(float));
@@ -338,5 +556,112 @@ int main(void){
         free(L);
     }
     (void)copy_rings;
+part2:
+    if(do_rec) return part_recur(&seed);
+    return 0;
+}
+
+/* ==========================================================================
+ * PART 2 -- Q10 step 0: the recurrence's oracle and its three cache regimes.
+ *
+ * THE ORACLE is deliberately stricter than the rest of this track's harness
+ * oracles, because the recurrent state PERSISTS ACROSS TOKENS: a reassociation
+ * that is invisible in one token's `core` output would drift the state and
+ * show up dozens of tokens later.  So every variant is run from an identical
+ * cloned state for 36 layers x 64 consecutive tokens and, at EVERY token,
+ * memcmp'd against the base on (i) the `core` output and (ii) all 36 layers'
+ * FULL 3.146 MB state -- 4.08 GB of memcmp per variant.
+ *
+ * THE THREE REGIMES separate the two competing readings of the 9.19 ms/token:
+ *   l2   1 layer's state (3.146 MB; 8 threads x 6 heads x 64 KB = 384 KB per
+ *        core, inside this part's 512 KB L2) re-used every token.
+ *   l3   36 layers (110.6 MB) -- what the engine holds; fits the 128 MB L3 but
+ *        not any L2, so every token's first traversal of a head comes from L3.
+ *   dram 288 layers (884 MB) -- past L3, so the first traversal is a DRAM read
+ *        and the write-back is a DRAM write.  The engine pushes 6.81 GB/token
+ *        of dense weights through L3 between DeltaNet layers, so this row is
+ *        the closer model of the engine even though the engine's own state is
+ *        110.6 MB.
+ * If the loop is BANDWIDTH-bound the three rows separate sharply.  If it is
+ * LATENCY-bound (128 dependent adds per output, 512 B apart, unvectorised)
+ * they are close, and the fix is (b)'s loop order rather than (a)'s traffic.
+ * ========================================================================== */
+static int part_recur(uint64_t *seed){
+    const int LAY=36, TOK=64;
+    printf("\n================ Q10: the 48-head recurrence ================\n");
+    printf("state %d heads x %dx%d f32 = %.3f MB/layer, %.1f MB over %d layers\n",
+           VH,KD,VD,(double)REC_BYTES/1048576.0,
+           (double)REC_BYTES*LAY/1048576.0,LAY);
+
+    /* per-token inputs; 8 rotating sets so the arithmetic is not degenerate */
+    float *q=aligned_alloc(64,(size_t)8*VH*KD*sizeof(float));
+    float *k=aligned_alloc(64,(size_t)8*VH*KD*sizeof(float));
+    float *vv=aligned_alloc(64,(size_t)8*V*sizeof(float));
+    float *ar=aligned_alloc(64,(size_t)8*VH*sizeof(float));
+    float *br=aligned_alloc(64,(size_t)8*VH*sizeof(float));
+    for(size_t i=0;i<(size_t)8*VH*KD;i++){ q[i]=frand(seed)*0.1f; k[i]=frand(seed)*0.1f; }
+    for(size_t i=0;i<(size_t)8*V;i++)  vv[i]=frand(seed);
+    for(size_t i=0;i<(size_t)8*VH;i++){ ar[i]=frand(seed); br[i]=frand(seed); }
+    float *core_a=aligned_alloc(64,(size_t)V*sizeof(float));
+    float *core_b=aligned_alloc(64,(size_t)V*sizeof(float));
+
+    /* ---- ORACLE ---------------------------------------------------------- */
+    RecLayer *base=make_rec(LAY,seed);
+    int ok_var[R_NVAR]; ok_var[R_BASE]=1;
+    for(int vi=1;vi<R_NVAR;vi++){
+        RecLayer *A=clone_rec(base,LAY), *B=clone_rec(base,LAY);
+        int ok=1,first=-1; const char *what="";
+        for(int t=0;t<TOK && ok;t++){
+            int s=t%8;
+            for(int i=0;i<LAY;i++){
+                rec_layer(R_BASE,&A[i],q+(int64_t)s*VH*KD,k+(int64_t)s*VH*KD,
+                          vv+(int64_t)s*V,ar+(int64_t)s*VH,br+(int64_t)s*VH,core_a);
+                rec_layer((RVariant)vi,&B[i],q+(int64_t)s*VH*KD,k+(int64_t)s*VH*KD,
+                          vv+(int64_t)s*V,ar+(int64_t)s*VH,br+(int64_t)s*VH,core_b);
+            }
+            if(memcmp(core_a,core_b,(size_t)V*4)){ok=0;what="core";}
+            else for(int i=0;i<LAY;i++)
+                if(memcmp(A[i].state,B[i].state,REC_BYTES)){ok=0;what="state";break;}
+            if(!ok) first=t;
+        }
+        printf("ORACLE  %-16s vs base, %d layers x %d tokens, core+FULL state: %s%s",
+               rvname[vi],LAY,TOK,ok?"BIT-IDENTICAL":"DIFFER on ",ok?"":what);
+        if(!ok) printf(" at token %d",first);
+        printf("\n");
+        ok_var[vi]=ok;
+        free_clone(A,LAY); free_clone(B,LAY);
+    }
+    free_rec(base,LAY);
+
+    /* ---- TIMING ---------------------------------------------------------- */
+    struct { const char *tag; int layers; int reps; } regs[]={
+        {"l2   (1 layer, 3.1 MB -- 384 KB/core)", 1,   400},
+        {"l3   (36 layers, 110.6 MB)",            LAY, 40 },
+        {"dram (288 layers, 884.7 MB)",           LAY*8, 5 },
+    };
+    for(unsigned ri=0;ri<sizeof regs/sizeof regs[0];ri++){
+        int nl=regs[ri].layers, reps=regs[ri].reps;
+        RecLayer *L=make_rec(nl,seed);
+        printf("--- %s\n",regs[ri].tag);
+        for(int vi=0;vi<R_NVAR;vi++){
+            if(vi && !ok_var[vi]) { printf("    %-16s (skipped: not bit-identical)\n",rvname[vi]); continue; }
+            for(int w=0;w<2;w++)
+                for(int i=0;i<nl;i++)
+                    rec_layer((RVariant)vi,&L[i],q,k,vv,ar,br,core_a);
+            double t0=now();
+            for(int r=0;r<reps;r++){
+                int s=r%8;
+                for(int i=0;i<nl;i++)
+                    rec_layer((RVariant)vi,&L[i],q+(int64_t)s*VH*KD,k+(int64_t)s*VH*KD,
+                              vv+(int64_t)s*V,ar+(int64_t)s*VH,br+(int64_t)s*VH,core_a);
+            }
+            double dt=now()-t0;
+            double layers_done=(double)reps*(double)nl;
+            printf("    %-16s %8.3f ms/token (36 layers)   %7.3f us/layer\n",
+                   rvname[vi],dt/layers_done*LAY*1000.0,dt/layers_done*1e6);
+        }
+        free_rec(L,nl);
+    }
+    free(q);free(k);free(vv);free(ar);free(br);free(core_a);free(core_b);
     return 0;
 }

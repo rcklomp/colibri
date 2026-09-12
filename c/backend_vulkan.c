@@ -231,6 +231,54 @@ static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void 
     return alloc_hostvis_mt(bytes, buf, mem, ptr, G.memtype);
 }
 
+/* ---- roadmap item QP(d): idle VRAM ballast on dev0 ------------------------
+ * Allocates `gb` GB from the SAME memory type the weight arena uses, in 256 MB
+ * chunks, and never touches or frees it. Returns the GB actually taken.
+ *
+ * WHY THIS EXISTS AND WHAT IT IS NOT. QP(d) has to price the VRAM a future
+ * dense-on-dev0 arm (Q7-gpu) would cost, and the only honest way to do that
+ * before the arm exists is to take the VRAM away and let the engine's OWN
+ * preload react. q38vk_expert_ensure already places hottest-first with a 1.5 GB
+ * reserve per device and already spills dev0 -> dev2 -> dev3 and then declines;
+ * with less budget on dev0 the coldest experts simply fall off the end. So this
+ * knob writes NO placement logic -- it is the measurement's independent
+ * variable and nothing else, which is why the resulting rotating median is a
+ * number about VRAM rather than about a kernel nobody has written.
+ *
+ * The allocation stays IDLE on purpose: it is never bound to a buffer and never
+ * referenced by a submit, so it does not enter the per-submit BO cost the
+ * arena comment above measures (~0.35 ms/submit at ~5.7k referenced
+ * allocations). It still counts in VK_EXT_memory_budget's heapUsage, which is
+ * exactly what q38vk_expert_ensure's reserve check reads.
+ *
+ * Called only from qwen38's tier init and only when Q38_VK_BALLAST_GB is set;
+ * glm53 never calls it. */
+double coli_vk_ballast_gb(double gb) {
+    if (!G.ready || gb <= 0) return 0;
+    const size_t CHUNK = (size_t)256 << 20;
+    size_t want = (size_t)(gb * 1e9), got = 0;
+    int n = 0;
+    while (got < want) {
+        size_t take = want - got < CHUNK ? want - got : CHUNK;
+        if (take < (size_t)1 << 20) break;
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = take, .memoryTypeIndex = G.memtype};
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        if (vkAllocateMemory(G.dev, &ai, NULL, &mem) != VK_SUCCESS) break;
+        got += take; n++;      /* deliberately leaked: it must outlive the process's tier */
+    }
+    double used = 0, budget = 0;
+    if (coli_vk_mem_budget(&used, &budget))
+        fprintf(stderr, "[VK] QP(d) ballast: %.2f GB in %d idle allocations on dev0 "
+                        "(heap now %.1f used / %.1f budget GB)\n", got / 1e9, n, used, budget);
+    else
+        fprintf(stderr, "[VK] QP(d) ballast: %.2f GB in %d idle allocations on dev0 "
+                        "(no memory_budget extension: the tier's reserve check is count-based "
+                        "and this ballast will NOT reduce placement -- the row is invalid)\n",
+                got / 1e9, n);
+    return got / 1e9;
+}
+
 static int scratch_reserve_mtu(Scratch *s, size_t bytes, uint32_t memtype, VkBufferUsageFlags usage) {
     if (s->cap >= bytes) return 1;
     if (s->buf) { vkDestroyBuffer(G.dev, s->buf, NULL); vkFreeMemory(G.dev, s->mem, NULL); }

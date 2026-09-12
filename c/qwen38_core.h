@@ -1150,13 +1150,19 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
      * OpenMP regions exactly like Q1's dn-* counters, so COLI_TIMERS unset
      * still pays nothing. */
     double sub_started=q38_tm_t0();
-    /* Q2 (2026-09-12): the four q38_rms0 calls run in parallel over the
-     * hyper-columns -- four ways at decode (S=1, C=4), S*C ways in prefill.
-     * Each call keeps its OWN serial `double` accumulation over H=2560, so no
-     * summation order changes and the result is bit-identical; only which
-     * thread runs which column changes. Writes: norm[s*W+b*H .. +H), disjoint
-     * per (s,b). Reads: hyper (same layout, read only) and g->norm. */
-    #pragma omp parallel for collapse(2) schedule(static)
+    /* Q2 (2026-09-12): this loop STAYS SERIAL, and that is a measurement, not
+     * an omission. Parallelising it over (s,b) -- the item's own text, four
+     * ways at decode -- takes gr-rms 1.07 -> 0.82 ms/token and puts 0.35 back
+     * into `gr-apply`, which rises 0.18 -> 0.53 reproducibly (three repeats,
+     * two campaigns, +-0.01): the four threads pull all 40 KB of `hyper` into
+     * four private L2s, and q38_gr_apply then writes the whole of it from one
+     * thread, which on this 4-CCX part pays cross-CCX invalidation for what it
+     * used to find in its own cache. Net on the token: 174.65 (parallel) vs
+     * 174.76 (serial), i.e. zero within the spread. A change with no measured
+     * token delta that triples a neighbouring bucket does not ship, so the
+     * pragma was deleted rather than kept as a knob (record §Q2, "the rms half,
+     * rejected"). It becomes worth doing once q38_gr_apply is parallel too --
+     * logged as its own roadmap item. */
     for(int s=0;s<S;s++) for(int b=0;b<C;b++)
         q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,g->norm+(int64_t)b*H,H,c->eps);
     q38_tm_add_live(m,Q38_TM_GR_RMS,sub_started);

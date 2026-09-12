@@ -539,19 +539,45 @@ logged as **Q11** together with the `q38_gr_apply` parallelisation that makes it
 free. **Q11 is half a day and −0.4 to −0.5**; it is placed with Q10, after QP
 rather than before it, because both are now small next to what QP decides.
 
-Then **QP**, in the first Opus slot: three format simulations and the ballast
-eviction rows, one to two days, no tok/s claimed. It is the highest
-information-per-day item on the track — it decides whether Q8 exists, which
-arm Q7 takes, where Q4 ranks, and what Q7-gpu's VRAM costs — and nothing after
-it can be specified honestly without it.
+**QP: DONE 2026-09-12 (record §QP), and it did what it was placed here to do —
+it deleted more work than it created.** The four answers, in the order the rest
+of this section depends on them:
+
+- **(a) int4-g64 experts: DEAD.** 3 of 30 short-prompt `teacher_forcing`
+  changes, 319 of 1200 long-prompt, cos 0.926429. **Q8 is dead**, and with it
+  its converter, its second 64–68 GB checkpoint, its `fmt=4` tier port, and its
+  −56 ms rotating target. Q9's SPEC-PROBE reversal never fires.
+- **(b) int8 dense: DEAD, both groupings** (per-row cos 0.980191, g64 0.982097 —
+  both below §G14's own rejected 0.98964), **and this was the weights-only,
+  f32-activation, same-summation-order best case**, so the `maddubs` kernel
+  Q7-cpu was built around is worse than what failed. **Q7-cpu is dead and
+  Q7-gpu's `int8 fmt` with it. Q7 is a BF16 arm or nothing, and Q4 goes first.**
+- **(c) int8 LM head: fails the gate as written on both arms, marginally**, and
+  is the one thing QP hands to Fable as a decision rather than an answer
+  (§QP (c) prices both branches).
+- **(d) the eviction curve: measured**, and it validated §Q-ARB's ledger
+  arithmetic to within 0.2% (predicted 13 570 experts placed at 5.4 GB of dense
+  reservation, measured 13 586).
+
+**What QP cost and what it saved: one day, against the 3+ days of Q8's build,
+the 1–2 of Q7-cpu, and a Fable spec session that would have had to choose
+between two ledgers.** §G15's precedent held exactly. Everything below this
+paragraph is written against these answers.
 
 Then **Q5** (half a day, Sonnet), placed here because its counter tells the
 design session how much CPU-side slack the gap has, and re-scoped to say that
 the token may not move.
 
-Then the **Fable session**: the Q7 spec against QP's answers, Q8's build spec
-if it is alive, and Q4's placement. Then the build order from the table in
-§Q-ARB point 3. Then **Q9**, if and only if Q8 landed.
+Then the **Fable session**, whose agenda QP has shortened to three items: the
+**Q7-gpu BF16 spec** (there is no arm to choose between any more — §Q-ARB's
+decision table resolved to its last row), the **QP(c) call** on whether the int8
+head's g64 arm is allowed past a short-prompt leg that rejected it on 1 of 30
+while the 1200-position leg passed it, and whether **Q12** (which subset of the
+676 dense tensors does take int8 — the depth finding in §QP (b)) is worth a
+Sonnet knob plus a few probe sweeps before Q7-gpu is written, since a surviving
+subset would revive Q7-cpu for exactly those tensors. Q8's build spec is not on
+the agenda: there is no Q8. **Q9** is no longer gated behind it — its chunk
+probe stands alone and is half a day to refuse.
 
 **The numerics bar, stated once so the back half does not ship for nothing.**
 After Q1/Q2/Q3/Q5, **every remaining item changes numerics** — Q4 and a BF16
@@ -562,7 +588,17 @@ confirm or veto once: **default-on** at §G12's evidence class — `teacher_forc
 identical over ≥ 1k positions, greedy identity over 128 tokens, last-token
 cosine ≥ 0.9999; **opt-in** down to §G14's rejection line (cosine ≥ 0.99, greedy
 text identical); **dead** below it. Summation-order changes should land in the
-first class; QP says which of the formats do.
+first class; QP says which of the formats do — **and the answer is none of
+them.** Measured 2026-09-12 against this exact bar: int4-g64 experts cos
+**0.9264** and int8 dense cos **0.9802 / 0.9821** are all **below the dead
+line**; the int8 LM head is cos **0.999970 / 0.999987**, i.e. **inside the
+default-on class on the cosine leg**, and it is the greedy/short-TF legs that
+reject it — which is precisely why §QP (c) hands it to the owner-and-Fable bar
+above rather than deciding it. **The only remaining numerics change on the
+track is therefore summation order** (Q4, and a BF16 `fmt` in Q7-gpu), which is
+the class this bar already puts default-on, so the "knob that is off delivers
+nothing to the gateway" problem has largely dissolved: there is no weight
+format left to ship behind one.
 
 **Target for the track, per column, because the columns are different tokens.**
 In ms of the 191-ms fresh-process token: Q3+Q1+Q2+Q5 take it to **~163–173
@@ -573,17 +609,26 @@ place of its estimated −5 to −8 as well, record §Q2 — all three bit-ident
 items are now measured and the no-numerics floor of this track is
 **~174 ms/token fresh-process, 4.41 tok/s rotating, 5.66 warm-identical**, with
 Q5 (0 to −2, counter only) and Q11 (−0.4 to −0.5) the only bit-identical rows
-left); then the int8 branch (Q7-cpu) to **~103–123**, or
-the BF16 branch (Q4) to **~150–165**; then Q7-gpu to **~85–110** on the int8
-branch or **~110–135** on the BF16 branch. Converted to the **rotating
+left); then **the BF16 branch, which QP(b) made the only branch** (Q4) to
+**~150–165**; then Q7-gpu at BF16 to **~110–135**. Converted to the **rotating
 median, cumulative against today's 247 ms**: the bit-identical four
-**+9–13%**; then **+40–55%** (int8 branch) or **+13–19%** (BF16 branch); then
-**+50–78%** or **+31–50%** with Q7-gpu. Warm-identical sees the same savings
-over 191 ms, so about a third more in percentage terms. **The 56 ms of miss
-service is untouched by all of it until Q8**, which is the item that closes
-the two columns toward each other. The draft's "+25 to +30% from Q1–Q6"
-straddled the two columns and two branches; stated per column and per branch
-it is honest, and the rotating figure is the one the owner sees.
+**+9–13%**; then **+13–19%** (Q4); then **+31–50%** with Q7-gpu.
+Warm-identical sees the same savings over 191 ms, so about a third more in
+percentage terms.
+
+**The int8 branch's column is struck out, not deferred** (QP(b), 2026-09-12):
+the "~103–123 then ~85–110, +40–55% then +50–78%" cells were Q7-cpu's, and
+Q7-cpu is dead. **This roughly halves the ceiling this track can claim** — from
++50–78% to +31–50% on the rotating median — and the honest statement of the new
+ceiling is the point of writing it down rather than quietly dropping the row.
+**The 56 ms of miss service is now untouched by everything on the track**, not
+just "until Q8": Q8 was the only item that acted on it and there is no Q8. The
+two columns (rotating and warm-identical) therefore stay 56 ms apart, and
+closing them would need a new item nobody has written — the first place to look
+is not a weight format but **Q12**, and after that the miss *service* path
+rather than the miss *rate*. The draft's "+25 to +30% from Q1–Q6" straddled the
+two columns and two branches; stated per column with one branch left it is
+honest, and the rotating figure is the one the owner sees.
 
 ## Sequencing across both tracks
 

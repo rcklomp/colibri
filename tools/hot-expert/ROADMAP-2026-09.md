@@ -908,10 +908,19 @@ by guess; where a position is a judgment call rather than a number, it says so.
    engine is ~174 ms/token fresh-process.** Then **Q10** (the recurrence's
    state traffic, out of Q1's sub-timers; step 0 decides whether it is a
    bandwidth or a latency item) and **Q11** (half a day, −0.4 to −0.5). Then
-   **QP** (the probe day: three format simulations and the ballast
-   eviction rows — it decides whether Q8 exists, which arm Q7 takes and
-   where Q4 ranks), then Q5, then the Fable session for the Q7 spec against
-   QP's answers, then the build order in §Q-ARB point 3.
+   **QP — DONE 2026-09-12 (record §QP), and it answered all four: int4-g64
+   experts DEAD (cos 0.9264, 319 of 1200 teacher-forced predictions changed) so
+   **Q8 is dead**; int8 dense DEAD in both groupings (cos 0.980/0.982, below
+   §G14's own rejected 0.98964) so **Q7-cpu is dead, Q7 is a BF16 arm, and Q4
+   goes first**; the int8 LM head fails the gate as written on both arms by one
+   leg each and is handed to Fable rather than rounded; the ballast curve
+   measured and §Q-ARB's ledger arithmetic confirmed to 0.2%. Knobs off are
+   bit-identical to pristine. One new item out of it: **Q12**, which subset of
+   the 676 dense tensors does take int8 — the same per-tensor perturbation is
+   fine on one tensor (logit relL2 7.7e−3) and fatal across 48 layers (0.198),
+   so the failure is depth, not precision.** Then Q5, then the Fable session
+   (Q7-gpu's BF16 spec, the QP(c) call, whether Q12 runs first), then the build
+   order in §Q-ARB point 3 — whose decision table has resolved to its last row.
 
 ### Keeping the profile honest: a re-measurement cadence, not a one-off
 

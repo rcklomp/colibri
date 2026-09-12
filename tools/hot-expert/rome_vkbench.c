@@ -112,21 +112,28 @@ static float *smallint_x(int n){float *x=malloc((size_t)n*4);for(int i=0;i<n;i++
 static float one_f=1.0f;
 
 /* (a1) EXHAUSTIVE: every finite bf16 code, both lane parities, through the real
- * shader, compared bit-for-bit against bf16_to_f32. I=2 so one word holds the
- * pair; x picks the lane. This is the check the spec asks for instead of the
- * argument that "a shift is a shift". */
+ * shader. I=2 so one word holds the pair; x picks the lane. This is the check
+ * the spec asks for instead of the argument that "a shift is a shift".
+ *
+ * The expectation is the ENGINE'S OWN DOT PRODUCT over the same two-element row,
+ * not the raw bf16_to_f32 of the code -- and that distinction is not pedantry:
+ * compared against the raw dequant, code 0x8000 (negative zero) "disagreed",
+ * because a sum that starts at +0.0 turns -0.0 into +0.0 by IEEE 754. The CPU
+ * kernel does exactly the same thing. Comparing dot against dot asks the
+ * question the item is actually about. */
 static int bf16_dequant_exhaustive(void){
     const int O=65536,I=2;int bad=0,denorm=0,other=0;
     uint16_t *W=calloc((size_t)O*I,2);
-    float *y=malloc((size_t)O*4);
+    float *y=malloc((size_t)O*4),*yref=malloc((size_t)O*4);
     for(int parity=0;parity<2;parity++){
         for(int c=0;c<O;c++){W[(size_t)c*I+0]=0;W[(size_t)c*I+1]=0;W[(size_t)c*I+parity]=(uint16_t)c;}
         float x[2]={parity==0?1.f:0.f,parity==0?0.f:1.f};
         ColiVkTensor *t=NULL;
         if(!coli_vk_matmul(&t,y,x,W,&one_f,9,1,I,O,0)){printf("BF16 exhaustive: dispatch failed\n");return 1;}
+        ref_engine(yref,x,W,I,O);
         for(int c=0;c<O;c++){
             if(((c>>7)&0xff)==0xff) continue;          /* Inf/NaN: no weight is one */
-            float want=bf16_to_f32x((uint16_t)c);
+            float want=yref[c];
             uint32_t a,b;memcpy(&a,&y[c],4);memcpy(&b,&want,4);
             if(a==b) continue;
             bad++;
@@ -146,7 +153,7 @@ static int bf16_dequant_exhaustive(void){
            "(%d denormal flush-to-zero, %d OTHER) -- %s\n",
            bad,denorm,other,
            other?"FAIL":"PASS (bit-identical on every normal code; denormals flushed)");
-    free(W);free(y);return other;
+    free(W);free(y);free(yref);return other;
 }
 
 /* (a2) per shape, two legs:

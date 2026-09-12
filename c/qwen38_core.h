@@ -640,13 +640,21 @@ static void q38_dense_matmul_multi(Model *m,Q38DenseItem *items,int n,const floa
  * (q38vk_dense_reserve), so coli_vk_matmul_multi's own upload_tensor call is an
  * early return here and `weights`/`scales` are passed only to satisfy it.
  *
- * The elapsed time is added to BOTH dense-matmul (which therefore keeps meaning
- * "the dense stream, wherever it runs", and keeps dn-proj / qsa-proj / lm-head /
- * gr-* comparable across the knob) and vk-dense (which says how much of it is on
- * the device). One clock read for both -- two q38_tm_add calls would charge two
- * different elapsed times for one submit. */
-static int q38vk_dense_multi(Model *m,Q38DenseItem *items,int n,const float *x,
-                             int S,int I,int set) {
+ * The elapsed time is added to vk-dense (which says how much of the token is in
+ * a dev0 dense submit) and, when `charge_dense` is set, to dense-matmul as well
+ * -- which therefore keeps meaning "the dense stream, wherever it runs" and
+ * keeps dn-proj / qsa-proj / gr-* comparable across the knob. One clock read for
+ * both; two q38_tm_add calls would charge two different elapsed times for one
+ * submit.
+ *
+ * `charge_dense` is 0 for exactly one caller, the LM head (step 3), because the
+ * head's CPU path is q38_weight_matmul and has NEVER been inside dense-matmul
+ * (89.7 = dn-proj 52.9 + qsa-proj 15.8 + the four gr buckets + router; the head
+ * is its own 15.8 next to it). Charging the submit there would make the bucket
+ * mean one thing with the knob off and another with it on, which is the one
+ * property the A/B depends on. `lm-head` itself wraps the call either way. */
+static int q38vk_dense_multi_ex(Model *m,Q38DenseItem *items,int n,const float *x,
+                                int S,int I,int set,int charge_dense) {
     if(!g_q38vk_ready||!(g_q38_dense_gpu&set)||S!=1||n<1||n>VK_MM_MAX)return 0;
     ColiVkMM mm[VK_MM_MAX];
     for(int j=0;j<n;j++){
@@ -659,16 +667,20 @@ static int q38vk_dense_multi(Model *m,Q38DenseItem *items,int n,const float *x,
     double started=now_s();
     if(!coli_vk_matmul_multi(mm,n,x,I))return 0;
     double elapsed=now_s()-started;
-    m->timers.seconds[Q38_TM_DENSE_MATMUL]+=elapsed;
+    if(charge_dense) m->timers.seconds[Q38_TM_DENSE_MATMUL]+=elapsed;
     m->timers.seconds[Q38_TM_VK_DENSE]+=elapsed;
     return 1;
 }
+#define q38vk_dense_multi(m,items,n,x,S,I,set) \
+    q38vk_dense_multi_ex((m),(items),(n),(x),(S),(I),(set),1)
 #else
 /* CPU-only qwen38: always "could not dispatch", so every call site falls through
  * to the kernel it already had. The casts keep the arguments USED, or the item
  * arrays the call sites build would draw -Wunused-variable in this build only. */
+#define q38vk_dense_multi_ex(m,items,n,x,S,I,set,cd) \
+    ((void)(m),(void)(items),(void)(n),(void)(x),(void)(S),(void)(I),(void)(set),(void)(cd),0)
 #define q38vk_dense_multi(m,items,n,x,S,I,set) \
-    ((void)(m),(void)(items),(void)(n),(void)(x),(void)(S),(void)(I),(void)(set),0)
+    q38vk_dense_multi_ex((m),(items),(n),(x),(S),(I),(set),1)
 #endif
 
 static inline float q38_sigmoid(float x) {
@@ -3259,7 +3271,18 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
      * the timed lm-head below so the per-op table is unaffected either way. */
     if(g_q38_tf&&!g_q38_tf_done&&S>1){q38_tf_emit(m,mixed,S,c->hidden);g_q38_tf_done=1;}
     float *logit=falloc(c->vocab);double phase_started=now_s();
-    q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
+    {   /* Q7 step 3: the LM head, ONE submit, O = 248 320 -- the largest single
+         * tensor this item moves (1.27 GB) and the only one whose reassociation
+         * lands directly on the logits the oracle reads. Note the argument is
+         * `1` rows, not S: the head is applied to the LAST position only, so
+         * this is a decode-shaped call even during prefill -- but
+         * q38vk_dense_multi still refuses when S != 1, because prefill's OWN
+         * head call (q38_tf_emit, 64 rows) must stay on the CPU and TTFT is
+         * out of this item's scope. */
+        Q38DenseItem hd[1]={{logit,&m->lm_head,c->vocab}};
+        if(!q38vk_dense_multi_ex(m,hd,1,mixed+(int64_t)(S-1)*H,S,H,Q38_DG_HEAD,0))
+            q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
+    }
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     free(hyper);free(mixed);free(inject);free(block);
     q38_tm_add_live(m,Q38_TM_STEP,step_started);

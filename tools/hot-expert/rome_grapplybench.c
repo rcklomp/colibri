@@ -152,13 +152,6 @@ static void gr_apply_par_bd(float *hyper,const float *block,const float *inj){
     for(int b=0;b<C;b++) for(int d=0;d<H;d++)
         hyper[(int64_t)b*H+d]+=inj[b]*block[d];
 }
-static void gr_apply_par_b(float *hyper,const float *block,const float *inj){
-    #pragma omp parallel for schedule(static)
-    for(int b=0;b<C;b++){
-        float a=inj[b];
-        for(int d=0;d<H;d++) hyper[(int64_t)b*H+d]+=a*block[d];
-    }
-}
 /* the fused arm: ONE region, the write-back's `omp for` then the rms's.
  * split==0: both over b (four ways, identical static schedules, so thread b
  *           reads back in the rms the 10 KB it just wrote in the apply);

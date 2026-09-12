@@ -31,10 +31,19 @@ restart_gateway() {
   echo "gateway did not answer /v1/models within 10 min"; return 1
 }
 stop_gateway() {
-  # never cut a user's turn: wait until the last POST has its [req] line
+  # never cut a user's turn: wait until the last POST has its [req] line.
+  #
+  # `grep -c` PRINTS 0 and EXITS 1 when it matches nothing, so the old
+  # `$(grep -c ... || echo 0)` produced the two-line string "0\n0" and every
+  # comparison below died with "[: 0 0: integer expected" — the loop then never
+  # broke and this function spun for its full 360 x 10 s before doing anything.
+  # It fires exactly when the log has NO requests in it yet, i.e. on a freshly
+  # restarted gateway, which is the normal state at the end of a chain. Found
+  # 2026-09-12 at QP's acceptance step (record §QP); the `|| echo 0` is simply
+  # wrong here and `grep -c` alone is already the right answer.
   for i in $(seq 1 360); do
-    posts=$(grep -c "POST /v1/chat/completions\|POST /v1/completions" "$LOG" 2>/dev/null || echo 0)
-    reqs=$(grep -c "\[req\] " "$LOG" 2>/dev/null || echo 0)
+    posts=$(grep -c "POST /v1/chat/completions\|POST /v1/completions" "$LOG" 2>/dev/null); posts=${posts:-0}
+    reqs=$(grep -c "\[req\] " "$LOG" 2>/dev/null); reqs=${reqs:-0}
     [ "$posts" -le "$reqs" ] && break; sleep 10
   done
   pkill -f "openai_[s]erver.py"; sleep 3; pkill -9 -x glm53 2>/dev/null

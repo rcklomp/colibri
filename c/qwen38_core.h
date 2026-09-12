@@ -1401,9 +1401,28 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
  * dispatch helper refuses that item, and its whole submit falls back to the CPU
  * kernel with the right answer. The printed line is what the record copies. */
 typedef struct { Q38Weight *w; int set; } Q38VkDenseEntry;
+/* Q7: the ONE numeric difference the exhaustive shader check found is that RADV
+ * runs compute with fp32 denormals flushed to zero, so a bf16 whose exponent
+ * field is 0 and whose mantissa is not (|v| < 2^-126 ~ 1.2e-38) reads as +-0 on
+ * the device and as itself on the CPU. Whether that is reachable at all is a
+ * property of the checkpoint, not an argument: Q38_DENSE_GPU_SCAN=1 counts them
+ * in exactly the tensors this item uploads. A denormal weight contributes less
+ * than 1e-38 to a dot product whose terms are O(1), i.e. ~30 orders of magnitude
+ * below the f32 ULP of the sum -- so a nonzero count would still be harmless,
+ * but it would have to be in the record rather than assumed away. */
+static uint64_t g_q38_vk_denorm=0, g_q38_vk_scanned=0;
+static void q38vk_scan_denormals(const Q38Weight *w) {
+    const uint16_t *p=(const uint16_t*)w->data;
+    int64_t n=(int64_t)w->rows*w->cols;
+    uint64_t d=0;
+    #pragma omp parallel for schedule(static) reduction(+:d)
+    for(int64_t i=0;i<n;i++) if(((p[i]>>7)&0xff)==0 && (p[i]&0x7f)!=0) d++;
+    g_q38_vk_denorm+=d; g_q38_vk_scanned+=(uint64_t)n;
+}
 static int q38vk_dense_one(Q38VkDenseEntry e,double *gb,int *nt,int *failed) {
     Q38Weight *w=e.w;
     if(!(g_q38_dense_gpu&e.set)||!w||w->kind!=Q38_WEIGHT_BF16||!w->data||w->vk)return 0;
+    if(q38_env_bool("Q38_DENSE_GPU_SCAN",0)) q38vk_scan_denormals(w);
     if(!coli_vk_tensor_ensure((ColiVkTensor**)&w->vk,w->data,&g_q38_vk_noscale,
                               9,w->cols,w->rows,0)){w->vk=NULL;(*failed)++;return 0;}
     int b=e.set==Q38_DG_DN?0:e.set==Q38_DG_QSA?1:e.set==Q38_DG_HEAD?2:3;
@@ -1444,6 +1463,12 @@ static void q38vk_dense_reserve(Model *m) {
             nt[0]+nt[1]+nt[2]+nt[3],gb[0]+gb[1]+gb[2]+gb[3],
             gb[0],gb[1],gb[2],gb[3],g_q38_dense_gpu,
             failed?" -- WARNING: some uploads FAILED, those tensors stay on the CPU":"");
+    if(g_q38_vk_scanned)
+        fprintf(stderr,"[qwen38] Q7 denormal scan: %llu of %llu bf16 values are "
+                       "denormal (%.3e) -- these read as 0 on the device (RADV "
+                       "flushes fp32 denormals) and as themselves on the CPU\n",
+                (unsigned long long)g_q38_vk_denorm,(unsigned long long)g_q38_vk_scanned,
+                g_q38_vk_scanned?(double)g_q38_vk_denorm/(double)g_q38_vk_scanned:0.0);
 }
 #endif
 

@@ -76,6 +76,11 @@ static int   g_q38_experts_cpu = 0;
 static int   g_q38_i8_dense    = 0;
 static int   g_q38_i8_head     = 0;
 static double g_q38_vk_ballast_gb = 0.0;
+/* The teacher_forcing oracle's state. Declared here with the other knobs
+ * because model_init_range resolves it and `step` uses it, and those sit on
+ * opposite sides of qwen38_core.h. */
+static int g_q38_tf = 0, g_q38_tf_done = 0;
+static const char *g_q38_tf_dump = NULL;
 /* One NaN fp8 byte (0x7F/0xFF) would make a group's absmax and every level in
  * it undefined. quant.h's fmt=8 NaN POLICY is "propagate and let the sampler's
  * existing net catch it", which an integer format cannot do, so the simulation
@@ -97,6 +102,8 @@ static void q38_sim_init_knobs(void) {
     g_q38_experts_cpu = q38_sim_env_int("Q38_EXPERTS_CPU");
     g_q38_i8_dense    = q38_sim_env_int("Q38_I8_DENSE");
     g_q38_i8_head     = q38_sim_env_int("Q38_I8_HEAD");
+    g_q38_tf          = q38_sim_env_int("Q38_TF");
+    g_q38_tf_dump     = getenv("Q38_TF_DUMP");
     {
         const char *b = getenv("Q38_VK_BALLAST_GB");
         g_q38_vk_ballast_gb = (b && *b) ? atof(b) : 0.0;

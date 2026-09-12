@@ -1102,8 +1102,6 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int allocate_state) {
     (void)bits; memset(m,0,sizeof(*m)); double t0=now_s();
     q38_sim_init_knobs();        /* QP: before any omp region, see q38_sim.h */
-    g_q38_tf=q38_sim_env_int("Q38_TF");
-    g_q38_tf_dump=getenv("Q38_TF_DUMP");
     m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
@@ -2840,8 +2838,6 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
  * The head is applied in 64-row chunks so a 1 200-token prompt costs 63 MB of
  * logits rather than 1.2 GB, and it goes through q38_weight_matmul so that an
  * attached int8 head (QP(c)) is exercised by the oracle too. */
-static int g_q38_tf = 0, g_q38_tf_done = 0;
-static const char *g_q38_tf_dump = NULL;
 static void q38_tf_emit(Model *m,const float *mixed,int S,int H) {
     const int V=m->c.vocab,CH=64;
     float *lg=falloc((int64_t)CH*V),*last=NULL;

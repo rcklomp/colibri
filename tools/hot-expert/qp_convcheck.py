@@ -76,7 +76,10 @@ sim8 = rd("qp_i8row_levels_i8.bin", np.int8).reshape(O, I).astype(np.int32)
 sim8s = rd("qp_i8row_scales_f32.bin", np.float32).reshape(O, 1)
 
 q8, s8 = conv.quant_int8(wf, 8)
-q8 = np.asarray(q8).reshape(O, I).astype(np.int32)
+# quant_int8 returns its int8 levels VIEWED AS uint8 (that is the on-disk byte
+# order for fmt=1); view them back before comparing, or every negative level
+# reads as 256+level and about half the array "differs" for no reason.
+q8 = np.asarray(q8).view(np.int8).reshape(O, I).astype(np.int32)
 s8 = np.asarray(s8, dtype=np.float32).reshape(O, 1)
 bad8 = int((q8 != sim8).sum())
 bad8s = int((s8.view(np.uint32) != sim8s.view(np.uint32)).sum())

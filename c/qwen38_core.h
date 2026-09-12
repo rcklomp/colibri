@@ -2519,9 +2519,13 @@ static void q38_dn_fold_init(int KD,int VD) {
     const char *e=getenv("Q38_DN_RECUR_FOLD");
     if(e&&*e&&!atoi(e)) { q38_dn_fold=0; return; }
     q38_dn_fold=q38_dn_fold_ok(KD,VD);
-    if(!q38_dn_fold&&getenv("Q38_VERBOSE"))
-        fprintf(stderr,"[DN] recurrence folding OFF: the self-check found a "
-                       "difference (compiler contraction), using the base loop\n");
+    /* Printed both ways on purpose: a log that only says something when the
+     * path is OFF cannot prove that the measured run was ON. */
+    if(getenv("Q38_VERBOSE"))
+        fprintf(stderr,q38_dn_fold?
+            "[DN] recurrence folding ON (self-check bit-identical, KD=%d VD=%d)\n":
+            "[DN] recurrence folding OFF: the self-check found a difference "
+            "(compiler contraction), using the base loop (KD=%d VD=%d)\n",KD,VD);
 }
 
 /* Batch the four resident DeltaNet input projections and the output projection

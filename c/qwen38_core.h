@@ -1902,11 +1902,13 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
              * stays at 36 instead of going to 144, in an engine where
              * §Q-PROFILE measured libgomp at 31.75% of user cycles. The
              * isolated harness (tools/hot-expert/rome_dnbench.c, 8 threads)
-             * measured both arms at these exact shapes over 36 layers:
-             *   serial 3.286 / 3.294 ms-token (L3-hot / >512 MB pool)
-             *   four pragmas 1.755 / 1.584
-             *   one region  1.645 / 1.372
-             * so the four-pragma arm is rejected on measurement, not taste.
+             * measured both arms at these exact shapes over 36 layers, twice,
+             * as ms/token for the three loops (L3-hot / >512 MB pool):
+             *   serial        3.286 / 3.294   and  3.248 / 3.307
+             *   four pragmas  1.755 / 1.584   and  1.846 / 1.626
+             *   one region    1.645 / 1.372   and  1.813 / 1.446
+             * so the four-pragma arm is rejected on measurement, not taste
+             * (and it is deleted, not left in the tree as a knob).
              *
              * SHARING, which is what §G4's `memory` bug was: every write in
              * every one of these loops lands in a slice indexed by that

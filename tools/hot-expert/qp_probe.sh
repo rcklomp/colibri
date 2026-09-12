@@ -126,7 +126,7 @@ LONG=/tmp/qp_prompt_long.txt
 cat > "$SHORT" <<'EOF'
 Explain how a database transaction can deadlock, give a concrete example with two transactions and two rows, and compare two practical prevention strategies in detail.
 EOF
-: > "$LONG"; for _ in $(seq 1 30); do cat "$SHORT" >> "$LONG"; done
+: > "$LONG"; for _ in $(seq 1 40); do cat "$SHORT" >> "$LONG"; done   # 40 x 30 tokens = ~1200 positions, >= the item's 1000
 log "prompt bytes: short=$(wc -c < "$SHORT") long=$(wc -c < "$LONG")"
 
 # ---- page cache: GLM out, Qwen in, asserted ----------------------------------

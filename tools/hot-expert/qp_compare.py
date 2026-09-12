@@ -96,11 +96,22 @@ def pair(ctrl, cand, label="", long_prompt=False):
         gr = "MISSING"
     else:
         gr = "identical" if ga == gb else "DIFFERS"
+    # Byte equality first: for the knobs-off row the gate is IDENTICAL, and a
+    # cosine of 1.000000000 is not the same claim as "the same bytes".
+    pa = os.path.join(D, f"{ctrl}.last.f32")
+    pb = os.path.join(D, f"{cand}.last.f32")
+    if os.path.exists(pa) and os.path.exists(pb):
+        same = open(pa, "rb").read() == open(pb, "rb").read()
+        byteeq = f"last-generated logits {'BIT-IDENTICAL' if same else 'differ'} " \
+                 f"({os.path.getsize(pa)} bytes)"
+    else:
+        byteeq = "last-generated logits MISSING"
     lg = cmp_logits(logits(cand, "tf"), logits(ctrl, "tf"))
     lgl = cmp_logits(logits(cand, "last"), logits(ctrl, "last"))
     print(f"\n=== {cand} vs {ctrl}  {label}")
     print(f"  teacher_forcing : {tf}")
     print(f"  greedy 128      : {gr}")
+    print(f"  bytes           : {byteeq}")
     for name, r in (("last prompt pos", lg), ("last generated ", lgl)):
         if isinstance(r, str):
             print(f"  {name} : {r}")

@@ -1,6 +1,14 @@
 #!/bin/bash
 # q11_chain.sh -- Q11: the gated residual's WRITE-BACK (qwen38-vk).
 #
+# Q11 was REJECTED on the numbers this script took (record §Q11), and the
+# Q38_GR_PAR knob its CAND_ARMS drive was deleted from the engine with the
+# rejection. To re-run the campaign, point BRANCH at the commit that still has
+# the five arms -- `perf/q11-gr-apply-writeback` @ 5a3bf65, kept reachable for
+# exactly this reason. Against any later tree the arms are no-ops and every
+# column will read as the pristine, which is itself a check that the knob is
+# really gone.
+#
 # Same shape as q3_chain.sh (which is a copy of q_profile_chain.sh, the pattern
 # for this engine): builds the pristine (branch point) and the candidate,
 # proves the candidate BIT-IDENTICAL (last-token logits by cmp, greedy text by

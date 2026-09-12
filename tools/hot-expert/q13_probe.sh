@@ -220,9 +220,14 @@ else
 fi
 
 # ---- the table ---------------------------------------------------------------
-python3 - "$OUT" <<'PY'
+# Q13_CMP: which levels the table and the oracle compare, first one is the
+# reference. Defaults to the two the item started with; "auto manual" is the
+# narrower mclk-only variant, whose runs land in the same output directory and
+# are read against the same auto leg.
+CMP=${Q13_CMP:-"auto high"}
+python3 - "$OUT" $CMP <<'PY'
 import sys, os, glob, statistics
-D = sys.argv[1]
+D = sys.argv[1]; LEVELS = sys.argv[2:] or ["auto", "high"]
 def bank(p):
     out, on = {}, False
     for line in open(p, errors="replace"):
@@ -243,30 +248,34 @@ def group(pat):
 rows = ["token", "dn-proj", "qsa-proj", "lm-head", "vk-dense", "vk-take", "vk-issue",
         "dense-matmul", "deltanet", "attention", "moe", "cpu-experts", "gr-read", "shared", "dn-recur"]
 for mask in ("m1", "m7"):
-    tags = [f"auto-{mask}-*", f"high-{mask}-*"]
-    data = [group(t) for t in tags]
-    print(f"\n=== Q38_DENSE_GPU={'1' if mask=='m1' else '7'}   ({data[0][1]} auto repeats, {data[1][1]} high repeats)")
+    data = [group(f"{l}-{mask}-*") for l in LEVELS]
+    print(f"\n=== Q38_DENSE_GPU={'1' if mask=='m1' else '7'}   " +
+          ", ".join(f"{d[1]} {l} repeats" for l, d in zip(LEVELS, data)))
     w = max(len(r) for r in rows) + 2
-    print("bucket".ljust(w) + "auto".rjust(12) + "high".rjust(12) + "delta".rjust(12))
+    print("bucket".ljust(w) + "".join(l.rjust(12) for l in LEVELS) +
+          "".join(("d:" + l).rjust(12) for l in LEVELS[1:]))
     for r in rows:
-        a, h = data[0][0].get(r), data[1][0].get(r)
-        line = r.ljust(w)
-        line += (f"{a:12.3f}" if a is not None else "".rjust(12))
-        line += (f"{h:12.3f}" if h is not None else "".rjust(12))
-        line += (f"{h-a:+12.3f}" if (a is not None and h is not None) else "".rjust(12))
+        vals = [d[0].get(r) for d in data]
+        line = r.ljust(w) + "".join((f"{v:12.3f}" if v is not None else "".rjust(12)) for v in vals)
+        for v in vals[1:]:
+            line += (f"{v-vals[0]:+12.3f}" if (v is not None and vals[0] is not None) else "".rjust(12))
         print(line)
 PY
 
 # ---- the oracle: a DPM level changes no arithmetic ---------------------------
-log "--- oracle: teacher-forcing and last-token dumps, auto vs high"
-for mask in m1 m7; do
-  for r in 1 2 3; do
-    a=$(sha256sum "$OUT/auto-$mask-$r.tf.f32" 2>/dev/null | cut -c1-16)
-    h=$(sha256sum "$OUT/high-$mask-$r.tf.f32" 2>/dev/null | cut -c1-16)
-    al=$(sha256sum "$OUT/auto-$mask-$r.last.f32" 2>/dev/null | cut -c1-16)
-    hl=$(sha256sum "$OUT/high-$mask-$r.last.f32" 2>/dev/null | cut -c1-16)
-    [ "$a" = "$h" ] && [ "$al" = "$hl" ] && v=IDENTICAL || v="DIFFERS  tf $a/$h  last $al/$hl"
-    echo "  $mask r$r: $v"
+set -- $CMP; REF=$1; shift
+log "--- oracle: teacher-forcing and last-token dumps, $REF vs $*"
+for lvl in "$@"; do
+  for mask in m1 m7; do
+    for r in 1 2 3; do
+      a=$(sha256sum "$OUT/$REF-$mask-$r.tf.f32" 2>/dev/null | cut -c1-16)
+      h=$(sha256sum "$OUT/$lvl-$mask-$r.tf.f32" 2>/dev/null | cut -c1-16)
+      al=$(sha256sum "$OUT/$REF-$mask-$r.last.f32" 2>/dev/null | cut -c1-16)
+      hl=$(sha256sum "$OUT/$lvl-$mask-$r.last.f32" 2>/dev/null | cut -c1-16)
+      [ -n "$a" ] && [ -n "$h" ] && [ "$a" = "$h" ] && [ "$al" = "$hl" ] \
+        && v=IDENTICAL || v="DIFFERS  tf $a/$h  last $al/$hl"
+      echo "  $lvl $mask r$r: $v"
+    done
   done
 done
 log "q13 step 0 done; logs in $OUT"

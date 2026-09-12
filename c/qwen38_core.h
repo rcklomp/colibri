@@ -1574,8 +1574,35 @@ static void q38vk_preload(Model *m) {
 }
 #endif
 
-static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
-                        int S,float *mixed,float *inject) {
+/* Q11 (2026-09-12) -- the arm selector, used ONLY while the arms are measured.
+ * §Q11 step 0 predicts, from the rho this record has measured twice, that the
+ * roadmap's shape (a pragma on each of the two loops) REGRESSES by +0.60
+ * ms/token, and that the only shape that can win fuses both loops into one
+ * OpenMP region. This knob exists so the four shapes are one campaign rather
+ * than four builds; the winner ships unconditionally and the knob goes.
+ *   0 both loops serial (today)        3 both, two regions (the roadmap's shape)
+ *   1 write-back parallel, own region  4 FUSED one region, both split over b
+ *   2 rms parallel, own region (§Q2)   5 FUSED one region, write-back over (b,d)
+ * Default 0: the probe binary's default path is today's path. */
+static int g_q38_gr_par = -1;
+static inline int q38_gr_par(void){
+    if(g_q38_gr_par<0){const char *e=getenv("Q38_GR_PAR");g_q38_gr_par=(e&&*e)?atoi(e):0;}
+    return g_q38_gr_par;
+}
+static inline int q38_gr_fused(void){ return q38_gr_par()>=4; }
+
+/* In the fused arms this function performs the PENDING write-back (the
+ * previous op's block, through the previous read's inject) inside its own
+ * leading OpenMP region, immediately before the rms that reads the very bytes
+ * the write-back has just produced. pend_block and pend_inject are NULL
+ * whenever there is nothing pending -- layer 0's first read, every read in the
+ * non-fused arms, and the edge adapter's head-only call in c/qwen38.c, which
+ * is why `hyper` keeps its const qualifier and the write-back aliases it
+ * locally: this function writes `hyper` only when it is handed a write-back to
+ * perform, and that caller never hands it one. */
+static void q38_gr_read_apply(Model *m,const GatedResidual *g,const float *hyper,
+                              int S,float *mixed,float *inject,
+                              const float *pend_block,const float *pend_inject) {
     const Cfg *c=&m->c;
     double phase_started=q38_tm_t0();
     int H=c->hidden,W=c->hc_width,C=c->hc_count,R=c->hc_rank;
@@ -1588,6 +1615,66 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
      * OpenMP regions exactly like Q1's dn-* counters, so COLI_TIMERS unset
      * still pays nothing. */
     double sub_started=q38_tm_t0();
+    int arm=q38_gr_par();
+    int fused=(arm>=4)&&pend_block&&pend_inject;
+    if(fused){
+        /* Q11: ONE region for the write-back and the rms. Two things follow.
+         * (i) rho is paid once instead of twice -- at 5.3 us/region and 96
+         * sites that is 0.51 ms/token, which is larger than everything the two
+         * loops can give back, so it is the difference between this item and a
+         * regression. (ii) with arm 4 both `omp for`s are split over b with the
+         * same static schedule, so thread b reads back in the rms exactly the
+         * 10 KB it has just written in the write-back -- out of its own L1
+         * rather than out of DRAM, and with no line it wrote being probed by
+         * anyone else. That is the direct test of §Q2's stated mechanism.
+         * Numerics: every hyper element is written exactly once (no reduction),
+         * and each q38_rms0 keeps its own serial double accumulation, so this
+         * is bit-identical to the serial pair by construction. */
+        double t_ap=0;
+        float *hw=(float*)hyper;   /* see the note on the signature */
+        #pragma omp parallel
+        {
+            if(arm>=5){
+                #pragma omp for collapse(3) schedule(static)
+                for(int s=0;s<S;s++) for(int b=0;b<C;b++) for(int d=0;d<H;d++)
+                    hw[(int64_t)s*W+(int64_t)b*H+d]+=
+                        pend_inject[(int64_t)s*C+b]*pend_block[(int64_t)s*H+d];
+            } else {
+                #pragma omp for collapse(2) schedule(static)
+                for(int s=0;s<S;s++) for(int b=0;b<C;b++){
+                    float a=pend_inject[(int64_t)s*C+b];
+                    for(int d=0;d<H;d++)
+                        hw[(int64_t)s*W+(int64_t)b*H+d]+=a*pend_block[(int64_t)s*H+d];
+                }
+            }
+            /* the master's clock after the write-back's implicit barrier is the
+             * split point between the two sub-timers -- the same instrument
+             * §Q2's gr-* counters use, and it puts the region's ENTRY cost in
+             * `gr-apply` and its final barrier in `gr-rms`. Reported, not
+             * chosen to flatter either leg of the gate. */
+            #pragma omp master
+            { if(q38_tm_live()) t_ap=now_s(); }
+            #pragma omp for collapse(2) schedule(static)
+            for(int s=0;s<S;s++) for(int b=0;b<C;b++)
+                q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,
+                         g->norm+(int64_t)b*H,H,c->eps);
+        }
+        if(q38_tm_live()){
+            double t_end=now_s();
+            m->timers.seconds[Q38_TM_GR_APPLY]+=t_ap-sub_started;
+            m->timers.seconds[Q38_TM_GR_RMS] +=t_end-t_ap;
+            /* the write-back is not this bucket's work: keep `gr-read`
+             * comparable with the pristine's by discounting it */
+            phase_started+=t_ap-sub_started;
+        }
+    } else if(arm&2){
+        /* §Q2's rejected arm, revived as an arm only: four ways at decode, in
+         * its own region. */
+        #pragma omp parallel for collapse(2) schedule(static)
+        for(int s=0;s<S;s++) for(int b=0;b<C;b++)
+            q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,g->norm+(int64_t)b*H,H,c->eps);
+        q38_tm_add_live(m,Q38_TM_GR_RMS,sub_started);
+    } else {
     /* Q2 (2026-09-12): this loop STAYS SERIAL, and that is a measurement, not
      * an omission. Parallelising it over (s,b) -- the item's own text, four
      * ways at decode -- takes gr-rms 1.07 -> 0.82 ms/token and puts 0.35 back
@@ -1604,6 +1691,7 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
     for(int s=0;s<S;s++) for(int b=0;b<C;b++)
         q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,g->norm+(int64_t)b*H,H,c->eps);
     q38_tm_add_live(m,Q38_TM_GR_RMS,sub_started);
+    }
     sub_started=q38_tm_t0();
     q38_dense_matmul(m,low,norm,&g->down,S,W,R);
     q38_tm_add_live(m,Q38_TM_GR_DOWN,sub_started);
@@ -1646,6 +1734,13 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
     q38_tm_add_live(m,Q38_TM_GR_READ,phase_started);
 }
 
+/* The six-argument form every caller outside this file uses (the edge
+ * adapter's head-only call in c/qwen38.c): a read with nothing pending. */
+static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
+                        int S,float *mixed,float *inject) {
+    q38_gr_read_apply(m,g,hyper,S,mixed,inject,NULL,NULL);
+}
+
 /* Takes the Model rather than the Cfg only so this write-back can be timed:
  * it is one of the two halves of the tech report's "traversed once per block
  * in each direction" and the Q1 roadmap item is about exactly these passes,
@@ -1654,9 +1749,19 @@ static void q38_gr_apply(Model *m,float *hyper,const float *block,const float *i
     const Cfg *c=&m->c;
     double phase_started=q38_tm_t0();
     int H=c->hidden,C=c->hc_count,W=c->hc_width;
-    for(int s=0;s<S;s++)for(int b=0;b<C;b++){
-        float a=inject[(int64_t)s*C+b];
-        for(int d=0;d<H;d++)hyper[(int64_t)s*W+(int64_t)b*H+d]+=a*block[(int64_t)s*H+d];
+    if(q38_gr_par()&1){
+        /* Q11 arm 1/3/5: eight ways at decode over the flattened (b,d). Each
+         * hyper element is written exactly once by exactly one (s,b,d), so no
+         * accumulation crosses iterations and the split is bit-identical. */
+        #pragma omp parallel for collapse(3) schedule(static)
+        for(int s=0;s<S;s++)for(int b=0;b<C;b++)for(int d=0;d<H;d++)
+            hyper[(int64_t)s*W+(int64_t)b*H+d]+=
+                inject[(int64_t)s*C+b]*block[(int64_t)s*H+d];
+    } else {
+        for(int s=0;s<S;s++)for(int b=0;b<C;b++){
+            float a=inject[(int64_t)s*C+b];
+            for(int d=0;d<H;d++)hyper[(int64_t)s*W+(int64_t)b*H+d]+=a*block[(int64_t)s*H+d];
+        }
     }
     q38_tm_add_live(m,Q38_TM_GR_APPLY,phase_started);
 }
@@ -3149,21 +3254,33 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
                                      int layer_end) {
     Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
+    /* Q11: in the fused arms the write-back is carried to the read that
+     * follows it and performed inside that read's region. `pend` says one is
+     * outstanding; it is flushed by hand before the PLE add (which touches
+     * hyper, and re-ordering the two `+=` would change the rounding) and
+     * before this function returns, because a segment caller reads `hyper`
+     * as the boundary state. */
+    int fuse=q38_gr_fused(), pend=0;
     for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
         if(i==c->ple_layer){
+            if(pend){q38_gr_apply(m,hyper,block,inject,S);pend=0;}
             float *ple=falloc((int64_t)S*W); q38_ple(m,ids,S,hyper,ple);
             for(int64_t z=0;z<(int64_t)S*W;z++) hyper[z]+=ple[z];
             free(ple);
         }
-        q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
+        if(pend&&!fuse){q38_gr_apply(m,hyper,block,inject,S);pend=0;}
+        q38_gr_read_apply(m,&l->attn_gr,hyper,S,mixed,inject,
+                    pend?block:NULL,pend?inject:NULL); pend=0;
         if(c->is_attn[i]) q38_attention(m,l,i,mixed,S,pos_base,block);
         else q38_deltanet(m,l,i,mixed,S,block);
-        q38_gr_apply(m,hyper,block,inject,S);
-        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);
+        if(fuse) pend=1; else q38_gr_apply(m,hyper,block,inject,S);
+        q38_gr_read_apply(m,&l->mlp_gr,hyper,S,mixed,inject,
+                    pend?block:NULL,pend?inject:NULL); pend=0;
         q38_moe(m,l,i,mixed,S,block);
-        q38_gr_apply(m,hyper,block,inject,S);
+        if(fuse) pend=1; else q38_gr_apply(m,hyper,block,inject,S);
     }
+    if(pend) q38_gr_apply(m,hyper,block,inject,S);
     free(mixed); free(inject); free(block);
 }
 
@@ -3254,19 +3371,28 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     q38_tm_add_live(m,Q38_TM_EMBED,embed_started);
+    /* Q11: see q38_layers_forward_range -- the write-back rides into the read
+     * that follows it in the fused arms, and is flushed by hand before the PLE
+     * add. Every one of the 96 write-backs has a read immediately after it,
+     * which is what makes the fusion available at all. */
+    int fuse=q38_gr_fused(), pend=0;
     for(int i=0;i<c->layers;i++){
         Layer *l=&m->L[i];
-        if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);
+        if(i==c->ple_layer){if(pend){q38_gr_apply(m,hyper,block,inject,S);pend=0;}
+            float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);
             /* consumate: il chunk successivo ha altri token, e riusare queste
              * righe darebbe gli embedding del chunk precedente combaciando in
              * silenzio invece di dare errore. */
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;}
-        q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
+        if(pend&&!fuse){q38_gr_apply(m,hyper,block,inject,S);pend=0;}
+        q38_gr_read_apply(m,&l->attn_gr,hyper,S,mixed,inject,pend?block:NULL,pend?inject:NULL);pend=0;
         if(c->is_attn[i])q38_attention(m,l,i,mixed,S,pos_base,block);else q38_deltanet(m,l,i,mixed,S,block);
-        q38_gr_apply(m,hyper,block,inject,S);
-        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);q38_moe(m,l,i,mixed,S,block);q38_gr_apply(m,hyper,block,inject,S);
+        if(fuse)pend=1;else q38_gr_apply(m,hyper,block,inject,S);
+        q38_gr_read_apply(m,&l->mlp_gr,hyper,S,mixed,inject,pend?block:NULL,pend?inject:NULL);pend=0;
+        q38_moe(m,l,i,mixed,S,block);
+        if(fuse)pend=1;else q38_gr_apply(m,hyper,block,inject,S);
     }
-    q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
+    q38_gr_read_apply(m,&m->final_gr,hyper,S,mixed,NULL,pend?block:NULL,pend?inject:NULL);m->kv_len=pos_base+S;
     /* QP oracle, off unless Q38_TF=1: the prefill's per-position argmax. Before
      * the timed lm-head below so the per-op table is unaffected either way. */
     if(g_q38_tf&&!g_q38_tf_done&&S>1){q38_tf_emit(m,mixed,S,c->hidden);g_q38_tf_done=1;}

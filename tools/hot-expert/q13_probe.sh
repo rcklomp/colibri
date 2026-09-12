@@ -199,11 +199,25 @@ wait_for_level(){  # $1 = wanted value
 
 log "dev0=$DEV0_PCI level=$(cat $DPM)  dev2=$DEV2_PCI level=$(cat /sys/bus/pci/devices/$DEV2_PCI/power_dpm_force_performance_level)  dev3=$DEV3_PCI level=$(cat /sys/bus/pci/devices/$DEV3_PCI/power_dpm_force_performance_level)"
 
-wait_for_level auto || exit 3
-level_phase auto
-wait_for_level high || exit 3
-level_phase high
-wait_for_level auto || log "WARNING: dev0 NOT back at auto -- tell the owner"
+# Q13_ORDER: the levels to measure, in order. Default is the natural one, but on
+# 2026-09-12 the owner had already set `high` before the run started, so the run
+# was taken as "high auto" -- which also means the LAST thing the script waits
+# for is the revert, and the card is back at its default before the gateway
+# comes up. The order is recorded with the numbers; it is a confound like any
+# other and three fresh-process repeats a side is what bounds it.
+ORDER=${Q13_ORDER:-"auto high"}
+for lvl in $ORDER; do
+  wait_for_level "$lvl" || exit 3
+  level_phase "$lvl"
+done
+# Q13_FINAL_AUTO=0 when the two legs are run as two invocations (gateway up in
+# between, so the owner's service is not down while a human is being waited on):
+# the revert is then chased outside the script, with nothing stopped.
+if [ "${Q13_FINAL_AUTO:-1}" = 1 ]; then
+  [ "$(cat $DPM)" = auto ] || wait_for_level auto || log "WARNING: dev0 NOT back at auto -- TELL THE OWNER"
+else
+  [ "$(cat $DPM)" = auto ] || log "NOTE: dev0 is at '$(cat $DPM)', NOT auto -- the revert is owed"
+fi
 
 # ---- the table ---------------------------------------------------------------
 python3 - "$OUT" <<'PY'

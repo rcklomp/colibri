@@ -113,6 +113,20 @@ typedef enum {
     Q38_TM_DN_QKNORM,
     Q38_TM_DN_RECUR,
     Q38_TM_DN_GNORM,
+    /* Q2 (2026-09-12) step 0: the gated residual's own split, for the same
+     * reason Q1 needed DeltaNet's. §Q-PROFILE's "~9.9 of the 26.7 ms/token
+     * gr-read bucket is serial scalar" is the SAME arithmetic subtraction
+     * (26.7 minus the two 10240x320 matmuls' bandwidth estimate of ~16.9)
+     * that put Q1's serial share at ~15.9 when a sub-timer measured 7.98.
+     * These six NEST inside GR_READ and partition it up to an
+     * allocation remainder, printed as gr-rest. Read only when
+     * COLI_TIMERS=1. */
+    Q38_TM_GR_RMS,
+    Q38_TM_GR_DOWN,
+    Q38_TM_GR_LOWSILU,
+    Q38_TM_GR_UP,
+    Q38_TM_GR_MIX,
+    Q38_TM_GR_INJECT,
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -1132,19 +1146,63 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
     /* Makes the initialized-input invariant visible to aggressive interprocedural
      * warning analysis; every element is overwritten by q38_rms0 below. */
     memset(norm,0,(size_t)S*W*sizeof(float));
+    /* Q2 step 0 (2026-09-12): six sub-timers, taken on the serial path between
+     * OpenMP regions exactly like Q1's dn-* counters, so COLI_TIMERS unset
+     * still pays nothing. */
+    double sub_started=q38_tm_t0();
+    /* Q2 (2026-09-12): this loop STAYS SERIAL, and that is a measurement, not
+     * an omission. Parallelising it over (s,b) -- the item's own text, four
+     * ways at decode -- takes gr-rms 1.07 -> 0.82 ms/token and puts 0.35 back
+     * into `gr-apply`, which rises 0.18 -> 0.53 reproducibly (three repeats,
+     * two campaigns, +-0.01): the four threads pull all 40 KB of `hyper` into
+     * four private L2s, and q38_gr_apply then writes the whole of it from one
+     * thread, which on this 4-CCX part pays cross-CCX invalidation for what it
+     * used to find in its own cache. Net on the token: 174.65 (parallel) vs
+     * 174.76 (serial), i.e. zero within the spread. A change with no measured
+     * token delta that triples a neighbouring bucket does not ship, so the
+     * pragma was deleted rather than kept as a knob (record §Q2, "the rms half,
+     * rejected"). It becomes worth doing once q38_gr_apply is parallel too --
+     * logged as its own roadmap item. */
     for(int s=0;s<S;s++) for(int b=0;b<C;b++)
         q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,g->norm+(int64_t)b*H,H,c->eps);
+    q38_tm_add_live(m,Q38_TM_GR_RMS,sub_started);
+    sub_started=q38_tm_t0();
     q38_dense_matmul(m,low,norm,&g->down,S,W,R);
+    q38_tm_add_live(m,Q38_TM_GR_DOWN,sub_started);
+    sub_started=q38_tm_t0();
     for(int64_t z=0;z<(int64_t)S*R;z++) low[z]=q38_silu(low[z]/C);
+    q38_tm_add_live(m,Q38_TM_GR_LOWSILU,sub_started);
+    sub_started=q38_tm_t0();
     q38_dense_matmul(m,mix,low,&g->up,S,R,W);
+    q38_tm_add_live(m,Q38_TM_GR_UP,sub_started);
+    sub_started=q38_tm_t0();
+    /* Q2: the sigmoid mix runs in parallel over d (2560 ways at decode, S*H in
+     * prefill). The inner `for b<C` sum stays SERIAL inside one iteration, so
+     * every mixed[d] accumulates its four terms in exactly today's order and
+     * the result is bit-identical. This loop is the item's main target: 10 240
+     * sigmoids per site, ~994k expf per token over 97 sites, single-threaded
+     * until now. Writes: mixed[s*H+d], disjoint per (s,d). Reads: mix, norm --
+     * neither is written here, and the matmul above has already published mix.
+     *
+     * Two regions rather than Q1's single one, and the reason is structural,
+     * not a preference: the two loops Q2 names are separated by the two
+     * 10240x320 matmuls (norm -> low -> mix), each of which is its own
+     * `omp parallel for` inside q38_dense_matmul. An enclosing region would
+     * make those nested, and OMP_NESTED is off by default, which would run
+     * them on one thread. The isolated harness therefore measured this shape
+     * WITH both fork/joins included (tools/hot-expert/rome_grbench.c). */
+    #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int d=0;d<H;d++){
         float v=0.f;
         for(int b=0;b<C;b++) v+=q38_sigmoid(mix[(int64_t)s*W+(int64_t)b*H+d])*norm[(int64_t)s*W+(int64_t)b*H+d];
         mixed[(int64_t)s*H+d]=v/C;
     }
+    q38_tm_add_live(m,Q38_TM_GR_MIX,sub_started);
     if(inject){
+        sub_started=q38_tm_t0();
         q38_dense_matmul(m,inject,norm,&g->inject,S,W,C);
         for(int64_t z=0;z<(int64_t)S*C;z++) inject[z]=2.f*q38_sigmoid(inject[z]/C);
+        q38_tm_add_live(m,Q38_TM_GR_INJECT,sub_started);
     }
     free(norm);free(low);free(mix);
     q38_tm_add_live(m,Q38_TM_GR_READ,phase_started);
@@ -2689,7 +2747,8 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
          * initialiser here would leave NULL names for a %s. */
         "step","embed","gr-read","gr-apply","attention","moe",
         "router","cpu-experts","vk-issue","vk-take",
-        "dn-proj","dn-conv","dn-qknorm","dn-recur","dn-gnorm"
+        "dn-proj","dn-conv","dn-qknorm","dn-recur","dn-gnorm",
+        "gr-rms","gr-down","gr-lowsilu","gr-up","gr-mix","gr-inject"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -2757,6 +2816,19 @@ static void q38_tm_report_optime(const Q38Timers *t,const char *scope) {
         {"  dn-gnorm",     s[Q38_TM_DN_GNORM]},
         {"  dn-rest",      s[Q38_TM_DELTANET]-(s[Q38_TM_DN_PROJ]+s[Q38_TM_DN_CONV]+
                            s[Q38_TM_DN_QKNORM]+s[Q38_TM_DN_RECUR]+s[Q38_TM_DN_GNORM])},
+        /* Q2: inside gr-read. gr-rms and gr-mix are the two loops the item
+         * names; gr-down/gr-up are the two 10240x320 matmuls it does not
+         * touch; gr-rest is the remainder (three falloc/free pairs and the
+         * memset). */
+        {"  gr-rms",       s[Q38_TM_GR_RMS]},
+        {"  gr-down",      s[Q38_TM_GR_DOWN]},
+        {"  gr-lowsilu",   s[Q38_TM_GR_LOWSILU]},
+        {"  gr-up",        s[Q38_TM_GR_UP]},
+        {"  gr-mix",       s[Q38_TM_GR_MIX]},
+        {"  gr-inject",    s[Q38_TM_GR_INJECT]},
+        {"  gr-rest",      s[Q38_TM_GR_READ]-(s[Q38_TM_GR_RMS]+s[Q38_TM_GR_DOWN]+
+                           s[Q38_TM_GR_LOWSILU]+s[Q38_TM_GR_UP]+s[Q38_TM_GR_MIX]+
+                           s[Q38_TM_GR_INJECT])},
         {"  dense-matmul", s[Q38_TM_DENSE_MATMUL]},
         {"  expert-read",  s[Q38_TM_EXPERT_READ]},
         {"  fp8-expand",   s[Q38_TM_FP8_EXPAND]},

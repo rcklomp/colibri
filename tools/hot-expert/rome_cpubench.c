@@ -192,6 +192,17 @@ int main(int argc,char**argv){
     bench_bf16("acc4",          6144,2560,1,12,matmul_bf16_acc4);
     bench_bf16("engine (1 acc)",2560,640,1,128,matmul_bf16_engine);    /* shared expert / small */
     bench_bf16("acc4",          2560,640,1,128,matmul_bf16_acc4);
+    /* Q4 (2026-09-12): the gated residual's two shapes, 1.28 of the 6.81 GB the
+     * `dense-matmul` counter streams (§Q-PROFILE's byte table) and the only
+     * ones in the set with a SHORT inner dimension -- I=320 is ten iterations
+     * of the 32-wide body, so if four accumulators do not pay there the
+     * prediction for the bucket is not the prediction for 2560x10240. 6.55 MB
+     * per matrix, 32 copies = 210 MB, past the 128 MB L3 and the 96 MB
+     * Infinity Cache like every other row here. */
+    bench_bf16("engine (1 acc)",10240,320,1,32,matmul_bf16_engine);    /* gated residual down */
+    bench_bf16("acc4",          10240,320,1,32,matmul_bf16_acc4);
+    bench_bf16("engine (1 acc)",320,10240,1,32,matmul_bf16_engine);    /* gated residual up */
+    bench_bf16("acc4",          320,10240,1,32,matmul_bf16_acc4);
     bench_bf16("engine (1 acc)",2560,248320,1,2,matmul_bf16_engine);   /* LM head 1.27 GB */
     bench_bf16("acc4",          2560,248320,1,2,matmul_bf16_acc4);
     /* prefill S=32 */

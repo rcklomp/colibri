@@ -360,9 +360,70 @@ static inline __m256 q38_bf16x8_to_f32x8(__m128i h) {
 }
 #endif
 
+/* Q4 (roadmap Track Q; record §Q4): the four-accumulator arm of this engine's
+ * two BF16 dense GEMVs, `Q38_BF16_ACC4=1`, OFF by default.
+ *
+ * The default loop carries ONE `vfmadd231ps` accumulator. On Zen 2 that
+ * instruction has 5-cycle latency and 2/cycle throughput, so a single chain
+ * retires one FMA every 5 cycles per thread and the loop is latency-bound
+ * before it is load-bound -- which is why §Q-PROFILE measured this kernel at
+ * 75.7-84.7 GB/s against the box's 70.9 GB/s 8-thread DRAM figure but could
+ * still make it faster. Four independent chains cover the latency.
+ *
+ * NUMERICS: the products are the same products of the same operands in the same
+ * lanes. Only the ORDER in which the partial sums are added changes -- a0 takes
+ * i=0..7,32..39,..., a1 takes 8..15,40..47,... -- so this is float
+ * REASSOCIATION, not a precision loss. Reassociation is still not bit-identity,
+ * which is why it is a knob and not a rewrite: §G14's `GLM53_I4_FAST` is the
+ * precedent for this exact class on this fork (same idea, other engine, other
+ * tensor; it shipped opt-in with `last_logits` relL2 3.0e-6 and identical
+ * greedy text). The knob-on logit cosine is in the commit body and in §Q4.
+ *
+ * The 32-wide body, the 8-wide tail into a0, the `(a0+a1)+(a2+a3)` fold and the
+ * left-to-right horizontal sum below are VERBATIM
+ * tools/hot-expert/rome_cpubench.c's `matmul_bf16_acc4` -- the harness that
+ * sized this item at 1.10-1.14x -- so the kernel in the engine is the kernel
+ * that was benchmarked and not a retyping of it. Both GEMVs call this one
+ * function, so §Q1's fused multi-region stays bit-identical to the per-matrix
+ * path with the knob on as well as with it off. */
+static int g_q38_bf16_acc4 = 0;    /* Q38_BF16_ACC4=1; resolved in model_init_range */
+
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float q38_dot_bf16_acc4(const float *xs,const uint16_t *w,int I) {
+    __m256 a0=_mm256_setzero_ps(),a1=a0,a2=a0,a3=a0;int i=0;
+    for(;i+32<=I;i+=32){
+        a0=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),
+                           q38_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(w+i))),a0);
+        a1=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8),
+                           q38_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(w+i+8))),a1);
+        a2=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+16),
+                           q38_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(w+i+16))),a2);
+        a3=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+24),
+                           q38_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(w+i+24))),a3);
+    }
+    for(;i+8<=I;i+=8)
+        a0=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),
+                           q38_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(w+i))),a0);
+    a0=_mm256_add_ps(_mm256_add_ps(a0,a1),_mm256_add_ps(a2,a3));
+    float buf[8];_mm256_storeu_ps(buf,a0);
+    float a=buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+    for(;i<I;i++)a+=xs[i]*bf16_to_f32(w[i]);
+    return a;
+}
+#endif
+
 static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
                             int S,int I,int O) {
 #if defined(__AVX2__) && defined(__FMA__)
+    if(g_q38_bf16_acc4){
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++){
+            const uint16_t *w=W+(int64_t)o*I;
+            for(int s=0;s<S;s++)
+                y[(int64_t)s*O+o]=q38_dot_bf16_acc4(x+(int64_t)s*I,w,I);
+        }
+        return;
+    }
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint16_t *w=W+(int64_t)o*I;
@@ -446,7 +507,11 @@ static void q38_dense_matmul(Model *m,float *y,const float *x,const Q38Weight *w
  * threads had nothing to split. Rows of every matrix are computed exactly as
  * q38_matmul_bf16 computes them (same loads, same FMA order), so outputs are
  * bit-identical; only the scheduling changes. Non-BF16 members (the expanded
- * F32 A/B mode) fall back to the per-matrix path. */
+ * F32 A/B mode) fall back to the per-matrix path. Q4 keeps this invariant: when
+ * Q38_BF16_ACC4 is on, both this region and q38_matmul_bf16 call the same
+ * q38_dot_bf16_acc4, so the fused and per-matrix paths still agree bit for bit
+ * with each other -- what changes against the PRISTINE is the summation order,
+ * in both of them at once. */
 #define Q38_MM_MULTI_MAX 4
 typedef struct { float *y; const Q38Weight *w; int O; } Q38DenseItem;
 static void q38_dense_matmul_multi(Model *m,Q38DenseItem *items,int n,const float *x,int S,int I) {
@@ -471,6 +536,24 @@ static void q38_dense_matmul_multi(Model *m,Q38DenseItem *items,int n,const floa
         int prefix[Q38_MM_MULTI_MAX+1];prefix[0]=0;
         for(int j=0;j<n;j++)prefix[j+1]=prefix[j]+items[j].O;
         int total=prefix[n];
+        /* Q4: the same four-accumulator dot as q38_matmul_bf16's, one function
+         * for both, so the "rows are computed exactly as q38_matmul_bf16
+         * computes them" invariant above holds with the knob on as well. Only
+         * the dot changes; the fused scheduling this region exists for does
+         * not. */
+        if(g_q38_bf16_acc4){
+            #pragma omp parallel for schedule(static)
+            for(int r=0;r<total;r++){
+                int j=0;while(j+1<n&&r>=prefix[j+1])j++;
+                int o=r-prefix[j];
+                const uint16_t *w=(const uint16_t*)items[j].w->data+(int64_t)o*I;
+                float *y=items[j].y;int O=items[j].O;
+                for(int s=0;s<S;s++)
+                    y[(int64_t)s*O+o]=q38_dot_bf16_acc4(x+(int64_t)s*I,w,I);
+            }
+            q38_tm_add(m,Q38_TM_DENSE_MATMUL,started);
+            return;
+        }
         #pragma omp parallel for schedule(static)
         for(int r=0;r<total;r++){
             int j=0;while(j+1<n&&r>=prefix[j+1])j++;
@@ -1102,6 +1185,22 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int allocate_state) {
     (void)bits; memset(m,0,sizeof(*m)); double t0=now_s();
     q38_sim_init_knobs();        /* QP: before any omp region, see q38_sim.h */
+    /* Q4: resolved here for the same reason -- both BF16 GEMVs read it from
+     * inside `#pragma omp parallel for`, and a lazily-initialised static inside
+     * a kernel called from a parallel region is a data race (q38_sim.h's
+     * comment; quant.h's E4M3_LUT makes the same point). */
+    g_q38_bf16_acc4=q38_env_bool("Q38_BF16_ACC4",0);
+#if !(defined(__AVX2__) && defined(__FMA__))
+    if(g_q38_bf16_acc4){
+        fprintf(stderr,"[q38] Q4: Q38_BF16_ACC4 needs AVX2+FMA and this build has "
+                       "neither; the knob is IGNORED, not silently half-applied\n");
+        g_q38_bf16_acc4=0;
+    }
+#endif
+    if(g_q38_bf16_acc4)
+        fprintf(stderr,"[q38] Q4: BF16 dense GEMV with 4 accumulators "
+                       "(Q38_BF16_ACC4=1) -- summation order differs from the "
+                       "default, see record §Q4\n");
     m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);

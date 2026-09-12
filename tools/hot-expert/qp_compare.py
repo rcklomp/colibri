@@ -41,14 +41,31 @@ def tf_line(tag):
 
 
 def greedy_text(tag):
+    """The WHOLE generated block, not the first line of it.
+
+    print_decoded writes the 128 tokens as they decode, and this model emits
+    newlines inside them: the continuation spans a dozen log lines and the
+    `Text      :` line is only its first. Comparing that one line is a much
+    weaker oracle than it looks -- it reported "identical" for two runs whose
+    continuations diverged four lines down, which is exactly the sort of
+    silently-weak check §G15's note about ambiguous greedy text warns about. So
+    take everything between `Generated (N new tokens):` and the `TTFT:` line
+    that follows it.
+    """
     p = os.path.join(D, f"{tag}.log")
     if not os.path.exists(p):
         return None
-    got = None
+    block, on = [], False
     for line in open(p, errors="replace"):
-        if line.startswith("Text      :") or line.startswith("Ids       :"):
-            got = line.rstrip("\n")
-    return got
+        if line.startswith("Generated (") and "new tokens" in line:
+            block, on = [], True
+            continue
+        if on and line.startswith("TTFT:"):
+            on = False
+            continue
+        if on:
+            block.append(line)
+    return "".join(block) if block else None
 
 
 def logits(tag, which="tf"):

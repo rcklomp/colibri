@@ -141,6 +141,14 @@ typedef enum {
     Q38_TM_GR_UP,
     Q38_TM_GR_MIX,
     Q38_TM_GR_INJECT,
+    /* Q7 step 0 (2026-09-12): the QSA projections, which were the one set in
+     * §Q-PROFILE's bandwidth table with no sub-timer at all -- its ~16.4
+     * ms/token is an ESTIMATE, and the spec's step-2 gate ("half its step-0
+     * figure") cannot be stated against an estimate. §Q1 and §Q2 both found the
+     * subtraction estimate wrong by 2x in their own buckets, which is why this
+     * counter is added BEFORE the tensors move and not after. NESTS inside
+     * ATTENTION alongside qsa-index and qsa-attn; read only when COLI_TIMERS=1. */
+    Q38_TM_QSA_PROJ,
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -2321,8 +2329,15 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     float *qp=falloc((int64_t)S*QH*2*D),*kp=falloc((int64_t)S*KVH*D),*vp=falloc((int64_t)S*KVH*D);
     float *ip=falloc((int64_t)S*(IQ+c->idx_kheads)*ID);
     {
+        /* Q7 step 0: qsa-proj covers BOTH projection calls -- this fused A group
+         * and the `o` matmul at the end of the function -- because they are the
+         * one set the item moves to dev0 as submits A and B. Taken on the serial
+         * path between OpenMP regions, exactly like Q1's dn-proj, so COLI_TIMERS
+         * unset still pays nothing (q38_tm_t0/q38_tm_add_live). */
+        double proj_started=q38_tm_t0();
         Q38DenseItem in[4]={{qp,&l->q,QH*2*D},{kp,&l->k,KVH*D},{vp,&l->v,KVH*D},{ip,&l->idx_qk,(IQ+c->idx_kheads)*ID}};
         q38_dense_matmul_multi(m,in,4,x,S,H);
+        q38_tm_add_live(m,Q38_TM_QSA_PROJ,proj_started);
     }
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
@@ -2377,7 +2392,9 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         }
         q38_tm_add(m,Q38_TM_QSA_ATTENTION,phase_started);
     }
+    double oproj_started=q38_tm_t0();
     q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
+    q38_tm_add_live(m,Q38_TM_QSA_PROJ,oproj_started);
     free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
     q38_tm_add_live(m,Q38_TM_ATTENTION,attn_started);
 }
@@ -3026,7 +3043,8 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
         "step","embed","gr-read","gr-apply","attention","moe",
         "router","cpu-experts","vk-issue","vk-take",
         "dn-proj","dn-conv","dn-qknorm","dn-recur","dn-gnorm",
-        "gr-rms","gr-down","gr-lowsilu","gr-up","gr-mix","gr-inject"
+        "gr-rms","gr-down","gr-lowsilu","gr-up","gr-mix","gr-inject",
+        "qsa-proj"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -3076,8 +3094,15 @@ static void q38_tm_report_optime(const Q38Timers *t,const char *scope) {
     fprintf(stderr,"[OPTIME] %-14s %9.3f ms/token  %5.1f%%  (sum %.3f vs step %.3f)\n",
             "unaccounted",(step-top)*per,(step-top)*pct,top*per,step*per);
     struct { const char *name; double v; } nested[]={
+        /* Q7 step 0: qsa-proj/qsa-index/qsa-attn nest inside `attention`;
+         * qsa-rest is the remainder (the falloc/free pairs, the rope/rms on
+         * k, the KV writes), so the three named rows can be read as a split
+         * rather than as three numbers next to a larger one. */
+        {"  qsa-proj",     s[Q38_TM_QSA_PROJ]},
         {"  qsa-index",    s[Q38_TM_QSA_INDEX]},
         {"  qsa-attn",     s[Q38_TM_QSA_ATTENTION]},
+        {"  qsa-rest",     s[Q38_TM_ATTENTION]-(s[Q38_TM_QSA_PROJ]+s[Q38_TM_QSA_INDEX]+
+                           s[Q38_TM_QSA_ATTENTION])},
         {"  router",       s[Q38_TM_ROUTER]},
         {"  shared",       s[Q38_TM_SHARED_EXPERT]},
         {"  vk-issue",     s[Q38_TM_VK_ISSUE]},

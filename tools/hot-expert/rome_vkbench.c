@@ -16,13 +16,166 @@
 #include "backend_vulkan.h"
 
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
-static size_t rowbytes(int fmt,int I){return fmt==2?(size_t)(I+1)/2:(size_t)I;}   /* 1,8: 1 B/elem; 2: nibble */
-static size_t nscales(int fmt,int I,int O){return fmt==8?(size_t)((O+127)/128)*((I+127)/128):(size_t)O;}
+static size_t rowbytes(int fmt,int I){return fmt==2?(size_t)(I+1)/2:fmt==9?(size_t)I*2:(size_t)I;} /* 1,8: 1 B/elem; 2: nibble; 9: bf16 */
+static size_t nscales(int fmt,int I,int O){return fmt==8?(size_t)((O+127)/128)*((I+127)/128):fmt==9?(size_t)1:(size_t)O;}
 static uint8_t rnd8(void){uint8_t v=rand()&0xff;return (v&0x7f)>=0x7e?0x38:v;}      /* no e4m3 NaN codes */
 static float *randx(int n){float *x=malloc((size_t)n*4);for(int i=0;i<n;i++)x[i]=(rand()%200-100)/100.0f;return x;}
 static uint8_t *randw(size_t n){uint8_t *w=malloc(n);for(size_t i=0;i<n;i++)w[i]=rnd8();return w;}
 static float *consts(size_t n,float v){float *s=malloc(n*4);for(size_t i=0;i<n;i++)s[i]=v;return s;}
-static const char *fname(int fmt){return fmt==1?"int8":fmt==2?"int4":fmt==8?"fp8-emul":"?";}
+static const char *fname(int fmt){return fmt==1?"int8":fmt==2?"int4":fmt==8?"fp8-emul":fmt==9?"bf16":"?";}
+
+/* ===================== Q7 step 0: the BF16 fmt=9 dense path =====================
+ * Roadmap Q7 / tools/hot-expert/Q7-DENSE-GPU-SPEC-2026-09-12.md. Two jobs:
+ *   (a) prove the GPU BF16 GEMV computes what the engine's q38_matmul_bf16
+ *       computes -- exhaustively on the dequant itself, bit-exactly on data
+ *       whose sums are order-independent, and to relL2 on random data;
+ *   (b) time ONE SUBMIT at the five shapes the item dispatches, from pools
+ *       larger than the 96 MB Infinity Cache, so the per-set ms/token the spec
+ *       gates on is measured before a line of engine code is written.
+ * Nothing here runs the model; this is the isolated harness. */
+
+static inline float bf16_to_f32x(uint16_t h){uint32_t u=(uint32_t)h<<16;float f;memcpy(&f,&u,4);return f;}
+
+/* The engine's default (knob-off) BF16 GEMV, copied verbatim from
+ * qwen38_core.h's q38_matmul_bf16 -- scalar here, because the reference only has
+ * to be the same PRODUCTS in a defined order, and a scalar loop is the one form
+ * nobody has to audit for lane tricks. Q4's acc4 arm is deliberately not the
+ * reference: this item is measured against the knob-off engine. */
+static void ref_matmul_bf16(float *y,const float *x,const uint16_t *W,int I,int O){
+    for(int o=0;o<O;o++){
+        const uint16_t *w=W+(int64_t)o*I;
+        float a=0.f;for(int i=0;i<I;i++)a+=x[i]*bf16_to_f32x(w[i]);
+        y[o]=a;
+    }
+}
+
+static uint16_t *bf16_rand(size_t n){
+    uint16_t *w=malloc(n*2);
+    for(size_t i=0;i<n;i++){                 /* finite, O(1) magnitude, no NaN/Inf/denormal */
+        int e=120+(rand()%9);                /* exponents 2^-7 .. 2^1 */
+        w[i]=(uint16_t)(((rand()&1)<<15)|(e<<7)|(rand()&0x7f));
+    }
+    return w;
+}
+/* Integers in [-8,8]: every product and every partial sum over I<=10240 is exact
+ * in f32 (|sum| <= 8*8*10240 = 655360 < 2^24), so ANY summation order gives the
+ * SAME bits. A relL2 bar would hide a transposed or half-shifted column here; a
+ * bit compare cannot. */
+static uint16_t *bf16_smallint(size_t n){
+    uint16_t *w=malloc(n*2);
+    for(size_t i=0;i<n;i++){float v=(float)(rand()%17-8);uint32_t u;memcpy(&u,&v,4);w[i]=(uint16_t)(u>>16);}
+    return w;
+}
+static float *smallint_x(int n){float *x=malloc((size_t)n*4);for(int i=0;i<n;i++)x[i]=(float)(rand()%17-8);return x;}
+static float one_f=1.0f;
+
+/* (a1) EXHAUSTIVE: every finite bf16 code, both lane parities, through the real
+ * shader, compared bit-for-bit against bf16_to_f32. I=2 so one word holds the
+ * pair; x picks the lane. This is the check the spec asks for instead of the
+ * argument that "a shift is a shift". */
+static int bf16_dequant_exhaustive(void){
+    const int O=65536,I=2;int bad=0;
+    uint16_t *W=calloc((size_t)O*I,2);
+    float *y=malloc((size_t)O*4);
+    for(int parity=0;parity<2;parity++){
+        for(int c=0;c<O;c++){W[(size_t)c*I+0]=0;W[(size_t)c*I+1]=0;W[(size_t)c*I+parity]=(uint16_t)c;}
+        float x[2]={parity==0?1.f:0.f,parity==0?0.f:1.f};
+        ColiVkTensor *t=NULL;
+        if(!coli_vk_matmul(&t,y,x,W,&one_f,9,1,I,O,0)){printf("BF16 exhaustive: dispatch failed\n");return 1;}
+        for(int c=0;c<O;c++){
+            if(((c>>7)&0xff)==0xff) continue;          /* Inf/NaN: no weight is one */
+            float want=bf16_to_f32x((uint16_t)c);
+            uint32_t a,b;memcpy(&a,&y[c],4);memcpy(&b,&want,4);
+            if(a!=b){if(bad<5)printf("  bf16 code 0x%04x parity %d: gpu %.9g (0x%08x) want %.9g (0x%08x)\n",c,parity,y[c],a,want,b);bad++;}
+        }
+        coli_vk_tensor_free(t);
+    }
+    printf("BF16 DEQUANT exhaustive: %d/131072 finite codes x parities DISAGREE -- %s\n",
+           bad,bad?"FAIL":"PASS (bit-identical to bf16_to_f32)");
+    free(W);free(y);return bad;
+}
+
+/* (a2) per shape: bit-exact on order-independent data, relL2 on random data. */
+static int bf16_check_shape(int I,int O){
+    uint16_t *We=bf16_smallint((size_t)I*O);float *xe=smallint_x(I);
+    float *yg=malloc((size_t)O*4),*yr=malloc((size_t)O*4);
+    ColiVkTensor *t=NULL;int bad=0;
+    if(!coli_vk_matmul(&t,yg,xe,We,&one_f,9,1,I,O,0)){printf("BF16 check %dx%d: dispatch failed\n",I,O);return 1;}
+    ref_matmul_bf16(yr,xe,We,I,O);
+    for(int o=0;o<O;o++){uint32_t a,b;memcpy(&a,&yg[o],4);memcpy(&b,&yr[o],4);if(a!=b)bad++;}
+    coli_vk_tensor_free(t);t=NULL;
+    uint16_t *Wr=bf16_rand((size_t)I*O);float *xr=randx(I);
+    if(!coli_vk_matmul(&t,yg,xr,Wr,&one_f,9,1,I,O,0)){printf("BF16 check %dx%d: dispatch failed\n",I,O);return 1;}
+    ref_matmul_bf16(yr,xr,Wr,I,O);
+    double num=0,den=0,mx=0;
+    for(int o=0;o<O;o++){double d=(double)yg[o]-yr[o];num+=d*d;den+=(double)yr[o]*yr[o];if(fabs(d)>mx)mx=fabs(d);}
+    double rel=den>0?sqrt(num/den):0;
+    printf("BF16 CHECK  I=%5d O=%6d: exact-data %d/%d rows differ (%s)   random-data relL2 %.3e max-abs %.3e (%s)\n",
+           I,O,bad,O,bad?"FAIL":"PASS",rel,mx,rel<=1e-6?"PASS":"FAIL");
+    coli_vk_tensor_free(t);
+    free(We);free(xe);free(Wr);free(xr);free(yg);free(yr);
+    return bad||rel>1e-6;
+}
+
+static int dcmp(const void*a,const void*b){double x=*(const double*)a,y=*(const double*)b;return x<y?-1:x>y?1:0;}
+
+/* (b) ONE SUBMIT at a Q7 shape, `reps` repeats, MEDIAN. `copies` distinct tensor
+ * sets rotate so the weights stream from VRAM and not from Infinity Cache; the
+ * pool size is printed so the >96 MB claim is checkable and not assumed.
+ * chain<0: all items independent (DeltaNet/QSA A, `out`, the head).
+ * chain>=0: item[chain] reads item 0's device-side output (the gr pair). */
+static void bench_q7(const char *name,int I,const int *Os,int n,int chain,int copies,int reps,double per_token){
+    ColiVkTensor **t=calloc((size_t)copies*n,sizeof(*t));
+    float *x=randx(I);
+    uint16_t **w=malloc(n*sizeof(*w));float **y=malloc(n*sizeof(*y));
+    size_t bytes=0;
+    for(int j=0;j<n;j++){
+        int Ij=(j==chain)?Os[0]:I;
+        w[j]=bf16_rand((size_t)Ij*Os[j]);y[j]=malloc((size_t)Os[j]*4);
+        bytes+=(size_t)Ij*Os[j]*2;
+    }
+    ColiVkMM items[VK_MM_MAX];
+    #define Q7_FILL(c) for(int j=0;j<n;j++) items[j]=(ColiVkMM){&t[(size_t)(c)*n+j],w[j],&one_f,9,Os[j],0, \
+        (j==0&&chain>0)?NULL:y[j], (j==chain)?Os[0]:I, (j==chain)?0:-1};
+    for(int c=0;c<copies;c++){Q7_FILL(c) if(!coli_vk_matmul_multi(items,n,x,I)){printf("Q7 %s: dispatch failed\n",name);return;}}
+    double *s=malloc((size_t)reps*sizeof(double));
+    for(int r=0;r<reps;r++){
+        int c=r%copies;Q7_FILL(c)
+        double t0=now();coli_vk_matmul_multi(items,n,x,I);s[r]=(now()-t0)*1e3;
+    }
+    qsort(s,(size_t)reps,sizeof(double),dcmp);
+    double med=s[reps/2];
+    printf("Q7 %-13s %d tensor(s) I=%-5d %8.3f MB/submit  median %7.4f ms  (min %7.4f max %7.4f)  %6.1f GB/s  pool %.0f MB  -> x%.0f = %7.3f ms/token\n",
+           name,n,I,bytes/1e6,med,s[0],s[reps-1],bytes/med/1e6,(double)copies*bytes/1e6,per_token,med*per_token);
+    #undef Q7_FILL
+    for(int c=0;c<copies*n;c++)coli_vk_tensor_free(t[c]);
+    free(t);free(x);for(int j=0;j<n;j++){free(w[j]);free(y[j]);}free(w);free(y);free(s);
+}
+
+static void q7_step0(void){
+    printf("\n===== Q7 step 0: fmt=9 BF16 on dev0 (spec Q7-DENSE-GPU-SPEC-2026-09-12) =====\n");
+    int bad=bf16_dequant_exhaustive();
+    bad|=bf16_check_shape(2560,10240);      /* DeltaNet qkv          */
+    bad|=bf16_check_shape(6144,2560);       /* DeltaNet/QSA out      */
+    bad|=bf16_check_shape(2560,12288);      /* QSA q                 */
+    bad|=bf16_check_shape(10240,320);       /* gr down (UNSTAGED: I > 6144) */
+    bad|=bf16_check_shape(320,10240);       /* gr up                 */
+    bad|=bf16_check_shape(2560,48);         /* DeltaNet b/a          */
+    bad|=bf16_check_shape(2561,777);        /* odd I, odd O: the tail guard  */
+    printf("BF16 CORRECTNESS: %s\n",bad?"*** FAIL -- do not time this ***":"ALL PASS");
+    if(bad)return;
+    printf("\n-- one submit per site, median of 10, pools > 96 MB Infinity Cache --\n");
+    { int Os[4]={10240,6144,48,48};   bench_q7("deltanet-A",2560,Os,4,-1,4,10,36); }
+    { int Os[1]={2560};               bench_q7("deltanet-B",6144,Os,1,-1,8,10,36); }
+    { int Os[4]={12288,512,512,640};  bench_q7("qsa-A",     2560,Os,4,-1,4,10,12); }
+    { int Os[1]={2560};               bench_q7("qsa-B",     6144,Os,1,-1,8,10,12); }
+    { int Os[1]={248320};             bench_q7("lm-head",   2560,Os,1,-1,2,10, 1); }
+    /* the gated-residual pair as ONE submit: down (-1, intermediate), inject (-1),
+     * up (chained on down). No `act` flag yet -- that push constant is step 4; what
+     * this times is the bytes and the single round trip, which is what the step-4
+     * go/no-go (<= 9.2 ms/token) is about. */
+    { int Os[3]={320,4,10240};        bench_q7("gr-pair",  10240,Os,3, 2,16,10,97); }
+}
 
 static void bench_dense(int fmt,int I,int O,int copies,int iters){
     size_t rb=rowbytes(fmt,I),ns=nscales(fmt,I,O);
@@ -118,6 +271,10 @@ int main(int argc,char**argv){
     if(!coli_vk_init(spv)){printf("vk init failed\n");return 1;}
     srand(7);
     double used,budget;if(coli_vk_mem_budget(&used,&budget))printf("dev0 budget %.1f GB used %.1f GB\n",budget,used);
+    /* `vkbench <spv> q7` runs only Q7 step 0 -- the placement matrix below is
+     * already in the record and re-running it costs minutes of rig time. */
+    if(argc>2&&!strcmp(argv[2],"q7")){q7_step0();coli_vk_shutdown();return 0;}
+    q7_step0();
     /* 1. round trip: tiny matmul, per-call cost is ~all overhead */
     bench_dense(1,512,512,1,400);
     bench_dense(1,256,64,1,400);

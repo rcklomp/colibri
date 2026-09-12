@@ -141,6 +141,17 @@ log "shader sha: $(sha256sum "$SHADERS"/qmatmul.spv | cut -c1-16) vs worktree $(
 # O=320), 1.28 of the 6.81 GB the dense-matmul counter streams; every pool is
 # past the 128 MB L3 and the 96 MB Infinity Cache, so every row is DRAM.
 phase_micro(){
+  # The transform oracle first (§G15's rule): prove the candidate kernel sums
+  # the SAME products as the pristine one before believing any timing from it.
+  if gcc -O3 -march=native -fopenmp -o /tmp/rome_q4acc \
+        "$WT/tools/hot-expert/rome_q4acc.c" -lm > "$OUT/q4acc-build.log" 2>&1; then
+    log "--- rome_q4acc (transform oracle)"
+    OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close /tmp/rome_q4acc 2>&1 \
+      | tee "$OUT/q4acc.log"
+    log "  rome_q4acc rc=${PIPESTATUS[0]}"
+  else
+    log "REFUSED: rome_q4acc did not build"; tail -5 "$OUT/q4acc-build.log"; exit 1
+  fi
   if gcc -O3 -march=native -fopenmp -I"$WT/c" -o /tmp/q4_cpubench \
         "$WT/tools/hot-expert/rome_cpubench.c" -lm > "$OUT/cpubench-build.log" 2>&1; then
     for r in 1 2; do
@@ -196,7 +207,14 @@ cat > "$SHORT" <<'EOF'
 Explain how a database transaction can deadlock, give a concrete example with two transactions and two rows, and compare two practical prevention strategies in detail.
 EOF
 : > "$LONG"; for _ in $(seq 1 40); do cat "$SHORT" >> "$LONG"; done
-log "prompt bytes: short=$(wc -c < "$SHORT") long=$(wc -c < "$LONG")"
+# The [OPTIME] table uses §Q-PROFILE's OWN prompt, not QP's, so the pristine
+# column can be read against the record's 90.0 / 15.8 rather than only against
+# the candidate column next to it. §Q1/§Q2/§Q3 all used this file.
+PROF=/tmp/q_profile_prompt.txt
+cat > "$PROF" <<'EOF'
+Explain how a database transaction can deadlock, give a concrete example, and compare two practical prevention strategies in detail.
+EOF
+log "prompt bytes: short=$(wc -c < "$SHORT") long=$(wc -c < "$LONG") prof=$(wc -c < "$PROF")"
 
 # run <bin> <tag> <prompt> <n_new> <timers 0|1> [KEY=VAL ...]
 # Every run gets a FRESH copy of the same routing history: qwen38 REWRITES
@@ -241,11 +259,11 @@ phase_oracle(){
 phase_profile(){
   log "===== PROFILE ====="
   for i in $(seq 1 "$REPS"); do
-    run "$PRIS" prof-pristine-$i "$SHORT" 80 1
+    run "$PRIS" prof-pristine-$i "$PROF" 80 1
     grep -E "^\[OPTIME\]" "$OUT/prof-pristine-$i.log" | head -40
-    run "$CAND" prof-candoff-$i "$SHORT" 80 1
+    run "$CAND" prof-candoff-$i "$PROF" 80 1
     grep -E "^\[OPTIME\]" "$OUT/prof-candoff-$i.log" | head -40
-    run "$CAND" prof-candon-$i "$SHORT" 80 1 Q38_BF16_ACC4=1
+    run "$CAND" prof-candon-$i "$PROF" 80 1 Q38_BF16_ACC4=1
     grep -E "^\[OPTIME\]" "$OUT/prof-candon-$i.log" | head -40
   done
   log "===== SUMMARY ====="

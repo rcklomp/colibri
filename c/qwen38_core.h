@@ -1426,7 +1426,7 @@ static int q38vk_dense_one(Q38VkDenseEntry e,double *gb,int *nt,int *failed) {
     if(!coli_vk_tensor_ensure((ColiVkTensor**)&w->vk,w->data,&g_q38_vk_noscale,
                               9,w->cols,w->rows,0)){w->vk=NULL;(*failed)++;return 0;}
     int b=e.set==Q38_DG_DN?0:e.set==Q38_DG_QSA?1:e.set==Q38_DG_HEAD?2:3;
-    gb[b]+=(double)w->rows*w->cols*2.0/1073741824.0; nt[b]++;
+    gb[b]+=(double)w->rows*w->cols*2.0/1e9; nt[b]++;
     return 1;
 }
 static void q38vk_dense_reserve(Model *m) {

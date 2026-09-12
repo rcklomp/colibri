@@ -57,6 +57,12 @@ any_engine_up(){ pgrep -x qwen38 >/dev/null || pgrep -x qwen38-vk >/dev/null || 
 if any_engine_up; then log "REFUSED: a qwen engine is already running"; exit 1; fi
 stop_gateway || exit 1
 
+# Rebuild the candidate BEFORE measuring it. The first run of this script
+# measured a binary two commits old, because the step-0 chain had rebuilt only
+# qmatmul.spv and `make` on a fresh worktree will not rebuild a .spv whose mtime
+# ties its .comp. A chain rebuilds everything it is about to measure.
+q7_build_engines || { log "REFUSED: build failed"; exit 1; }
+
 [ -x "$PRIS" ] || { log "REFUSED: no pristine at $PRIS"; exit 1; }
 [ -x "$CAND" ] || { log "REFUSED: no candidate at $CAND"; exit 1; }
 log "pristine  $(sha256sum "$PRIS" | cut -c1-16)  shaders $(sha256sum "$PRIS_SH/qmatmul.spv" | cut -c1-16)"

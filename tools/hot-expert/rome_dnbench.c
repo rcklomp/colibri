@@ -348,9 +348,86 @@ static void rec_ab_f(float *state,const float *qh,const float *kh,
     REC_AB_BODY(fmaf)
 }
 
-typedef enum { R_BASE, R_A, R_A_F, R_AB, R_AB_F, R_NVAR } RVariant;
+/* --- WHY THE TWO SPELLINGS ABOVE ARE NOT ENOUGH, from the base's own asm ---
+ * gcc 15.2 -O3 -march=native (the engine's flags) compiles the BASE's two
+ * reductions by OUTER-LOOP vectorisation -- 8 `value`s at a time with `d`
+ * inner and a 512 B stride -- and it emits them as vmulps + vaddps, i.e. it
+ * does NOT contract them:
+ *      .L4:  vbroadcastss (%rdx),%ymm0
+ *            vmulps  -512(%rax),%ymm0,%ymm0
+ *            vaddps  %ymm0,%ymm2,%ymm2
+ * while it DOES contract the rank-1 update (vfmadd213ps at .L10).  So the
+ * roadmap's premise that these reductions are "unvectorised across value" is
+ * wrong -- they are vectorised -- and the bit-identity requirement is the
+ * exact opposite of what the item assumes: the rank-1 addend must be FUSED
+ * (hence fmaf) and the two reductions must NOT be.  Writing (b)'s reductions
+ * as a plain `acc[v] += x*y` in a d-outer/value-inner loop is a textbook
+ * vectorisable statement and gcc contracts it, which is why both (a)+(b)
+ * spellings above fail the oracle.  The fix is to spell the contraction
+ * explicitly in both directions: fmaf() where the base fuses, and
+ * `#pragma GCC optimize ("fp-contract=off")` around the function where it
+ * does not.  The two diagnostics below localise the failure statement by
+ * statement, and REC_AB_OFF is the corrected form. */
+
+/* diagnostic: (a)+fmaf, with (b) applied to the `previous` reduction ONLY */
+static void rec_b_prev(float *state,const float *qh,const float *kh,
+                       const float *vh,float *core_h,float alpha,float beta){
+    float prev[VD],delta[VD];
+    for(int value=0;value<VD;value++) prev[value]=0.f;
+    for(int d=0;d<KD;d++){
+        float kd=kh[d]; const float *sr=state+(int64_t)d*VD;
+        for(int value=0;value<VD;value++) prev[value]+=kd*(sr[value]*alpha);
+    }
+    for(int value=0;value<VD;value++) delta[value]=(vh[value]-prev[value])*beta;
+    for(int d=0;d<KD;d++)for(int value=0;value<VD;value++){
+        int64_t c=(int64_t)d*VD+value;
+        state[c]=fmaf(kh[d],delta[value],state[c]*alpha);
+    }
+    for(int value=0;value<VD;value++) {
+        float current=0.f;
+        for(int d=0;d<KD;d++) current+=qh[d]*state[(int64_t)d*VD+value];
+        core_h[value]=current;
+    }
+}
+/* diagnostic: (a)+fmaf, with (b) applied to the `current` reduction ONLY */
+static void rec_b_cur(float *state,const float *qh,const float *kh,
+                      const float *vh,float *core_h,float alpha,float beta){
+    float delta[512],cur[VD];
+    for(int value=0;value<VD;value++) {
+        float previous=0.f;
+        for(int d=0;d<KD;d++) previous+=kh[d]*(state[(int64_t)d*VD+value]*alpha);
+        delta[value]=(vh[value]-previous)*beta;
+    }
+    for(int value=0;value<VD;value++) cur[value]=0.f;
+    for(int d=0;d<KD;d++){
+        float kd=kh[d],qd=qh[d]; float *sr=state+(int64_t)d*VD;
+        for(int value=0;value<VD;value++){
+            float s=fmaf(kd,delta[value],sr[value]*alpha);
+            sr[value]=s; cur[value]+=qd*s;
+        }
+    }
+    for(int value=0;value<VD;value++) core_h[value]=cur[value];
+}
+
+/* THE CORRECTED (a)+(b): contraction spelled out in both directions. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=off")
+#endif
+static void rec_ab_off(float *state,const float *qh,const float *kh,
+                       const float *vh,float *core_h,float alpha,float beta){
+    REC_AB_BODY(fmaf)
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
+
+typedef enum { R_BASE, R_A, R_A_F, R_AB, R_AB_F,
+               R_BPREV, R_BCUR, R_AB_OFF, R_NVAR } RVariant;
 static const char *rvname[R_NVAR]={
-    "base (4 passes)","(a) plain +","(a) fmaf()","(a)+(b) plain +","(a)+(b) fmaf()"};
+    "base (4 passes)","(a) plain +","(a) fmaf()","(a)+(b) plain +",
+    "(a)+(b) fmaf()","diag (b) prev only","diag (b) cur only",
+    "(a)+(b) contract-off"};
 
 /* one layer of the recurrence, parallel over heads exactly as the engine is */
 static void rec_layer(RVariant v,RecLayer *L,const float *q,const float *k,
@@ -370,7 +447,10 @@ static void rec_layer(RVariant v,RecLayer *L,const float *q,const float *k,
         case R_A:    rec_a   (state,qh,kh,vh,core_h,alpha,beta); break;
         case R_A_F:  rec_a_f (state,qh,kh,vh,core_h,alpha,beta); break;
         case R_AB:   rec_ab  (state,qh,kh,vh,core_h,alpha,beta); break;
-        default:     rec_ab_f(state,qh,kh,vh,core_h,alpha,beta); break;
+        case R_AB_F: rec_ab_f(state,qh,kh,vh,core_h,alpha,beta); break;
+        case R_BPREV:rec_b_prev(state,qh,kh,vh,core_h,alpha,beta); break;
+        case R_BCUR: rec_b_cur (state,qh,kh,vh,core_h,alpha,beta); break;
+        default:     rec_ab_off(state,qh,kh,vh,core_h,alpha,beta); break;
         }
     }
 }
@@ -610,8 +690,8 @@ static int part_recur(uint64_t *seed){
     int ok_var[R_NVAR]; ok_var[R_BASE]=1;
     for(int vi=1;vi<R_NVAR;vi++){
         RecLayer *A=clone_rec(base,LAY), *B=clone_rec(base,LAY);
-        int ok=1,first=-1; const char *what="";
-        for(int t=0;t<TOK && ok;t++){
+        int ok=1,first=-1; long dcore=0,dstate=0; double maxabs=0.0;
+        for(int t=0;t<TOK;t++){
             int s=t%8;
             for(int i=0;i<LAY;i++){
                 rec_layer(R_BASE,&A[i],q+(int64_t)s*VH*KD,k+(int64_t)s*VH*KD,
@@ -619,14 +699,29 @@ static int part_recur(uint64_t *seed){
                 rec_layer((RVariant)vi,&B[i],q+(int64_t)s*VH*KD,k+(int64_t)s*VH*KD,
                           vv+(int64_t)s*V,ar+(int64_t)s*VH,br+(int64_t)s*VH,core_b);
             }
-            if(memcmp(core_a,core_b,(size_t)V*4)){ok=0;what="core";}
-            else for(int i=0;i<LAY;i++)
-                if(memcmp(A[i].state,B[i].state,REC_BYTES)){ok=0;what="state";break;}
-            if(!ok) first=t;
+            int bad=0;
+            if(memcmp(core_a,core_b,(size_t)V*4)){
+                bad=1;
+                for(int j=0;j<V;j++) if(core_a[j]!=core_b[j]){ dcore++;
+                    double e=fabs((double)core_a[j]-(double)core_b[j]);
+                    if(e>maxabs)maxabs=e; }
+            }
+            for(int i=0;i<LAY;i++)
+                if(memcmp(A[i].state,B[i].state,REC_BYTES)){
+                    bad=1;
+                    for(size_t j=0;j<REC_BYTES/4;j++)
+                        if(A[i].state[j]!=B[i].state[j]) dstate++;
+                }
+            if(bad && ok){ ok=0; first=t; }
+            /* keep both sides on the BASE's state so later tokens still compare
+             * the transformation and not the accumulated drift */
+            if(bad) for(int i=0;i<LAY;i++) memcpy(B[i].state,A[i].state,REC_BYTES);
         }
-        printf("ORACLE  %-16s vs base, %d layers x %d tokens, core+FULL state: %s%s",
-               rvname[vi],LAY,TOK,ok?"BIT-IDENTICAL":"DIFFER on ",ok?"":what);
-        if(!ok) printf(" at token %d",first);
+        printf("ORACLE  %-20s vs base, %d layers x %d tokens, core+FULL state: %s",
+               rvname[vi],LAY,TOK,ok?"BIT-IDENTICAL":"DIFFER");
+        if(!ok) printf(" from token %d: %ld/%d core elems, %ld/%lld state elems, max|d| %.3e",
+                       first,dcore,V*TOK,dstate,
+                       (long long)(REC_BYTES/4)*LAY*TOK,maxabs);
         printf("\n");
         ok_var[vi]=ok;
         free_clone(A,LAY); free_clone(B,LAY);
@@ -643,8 +738,11 @@ static int part_recur(uint64_t *seed){
         int nl=regs[ri].layers, reps=regs[ri].reps;
         RecLayer *L=make_rec(nl,seed);
         printf("--- %s\n",regs[ri].tag);
+        double res[R_NVAR][2];
+        for(int pass=0;pass<2;pass++)
         for(int vi=0;vi<R_NVAR;vi++){
-            if(vi && !ok_var[vi]) { printf("    %-16s (skipped: not bit-identical)\n",rvname[vi]); continue; }
+            res[vi][pass]=-1.0;
+            if(vi && !ok_var[vi]) continue;
             for(int w=0;w<2;w++)
                 for(int i=0;i<nl;i++)
                     rec_layer((RVariant)vi,&L[i],q,k,vv,ar,br,core_a);
@@ -656,9 +754,16 @@ static int part_recur(uint64_t *seed){
                               vv+(int64_t)s*V,ar+(int64_t)s*VH,br+(int64_t)s*VH,core_a);
             }
             double dt=now()-t0;
-            double layers_done=(double)reps*(double)nl;
-            printf("    %-16s %8.3f ms/token (36 layers)   %7.3f us/layer\n",
-                   rvname[vi],dt/layers_done*LAY*1000.0,dt/layers_done*1e6);
+            res[vi][pass]=dt/((double)reps*(double)nl)*LAY*1000.0;
+        }
+        for(int vi=0;vi<R_NVAR;vi++){
+            if(vi && !ok_var[vi]){
+                printf("    %-20s (not bit-identical -- not timed)\n",rvname[vi]);
+                continue;
+            }
+            printf("    %-20s %8.3f / %8.3f ms/token (36 layers)   %+7.3f vs base\n",
+                   rvname[vi],res[vi][0],res[vi][1],
+                   (res[vi][0]+res[vi][1])/2.0-(res[0][0]+res[0][1])/2.0);
         }
         free_rec(L,nl);
     }

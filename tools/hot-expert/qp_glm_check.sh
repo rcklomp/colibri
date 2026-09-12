@@ -120,11 +120,30 @@ glmrun glm_cand "$HOME/bench/glm53.qpcand"
 echo
 echo "=== glm53 oracle: the shared-file change must be invisible ==="
 for what in teacher_forcing last_logits greedy; do
-  a=$(grep -m1 "^$what" "$OUT/glm_base.out" | md5sum | cut -c1-16)
-  b=$(grep -m1 "^$what" "$OUT/glm_cand.out" | md5sum | cut -c1-16)
-  [ -n "$a" ] || { echo "  $what: MISSING in base"; continue; }
+  # Check the LINE exists before hashing it. Hashing the empty output of a failed
+  # grep gives d41d8cd98f00b204 on both sides and prints "IDENTICAL" for a line
+  # neither run produced -- glm53 emits the `greedy` prefix only when it has NO
+  # tokenizer, so that is not hypothetical. A check that passes on nothing is
+  # worse than no check.
+  la=$(grep -m1 "^$what" "$OUT/glm_base.out")
+  lb=$(grep -m1 "^$what" "$OUT/glm_cand.out")
+  if [ -z "$la" ] && [ -z "$lb" ]; then
+    echo "  $what: ABSENT in both runs -- this oracle did not run, see the whole-stdout diff below"
+    continue
+  fi
+  [ -n "$la" ] || { echo "  $what: MISSING in base but present in candidate"; continue; }
+  a=$(printf '%s' "$la" | md5sum | cut -c1-16)
+  b=$(printf '%s' "$lb" | md5sum | cut -c1-16)
   [ "$a" = "$b" ] && echo "  $what: IDENTICAL ($a)" || echo "  $what: DIFFERS ($a vs $b)"
 done
+# The continuation is only comparable through the whole stdout, because the text
+# carries no prefix. Strip the one line that is a wall-clock measurement.
+if diff -q <(grep -v "^decode " "$OUT/glm_base.out") <(grep -v "^decode " "$OUT/glm_cand.out") >/dev/null; then
+  echo "  STDOUT MINUS THE TIMING LINE: IDENTICAL (this is the greedy-continuation oracle)"
+else
+  echo "  STDOUT MINUS THE TIMING LINE: DIFFERS"
+  diff <(grep -v "^decode " "$OUT/glm_base.out") <(grep -v "^decode " "$OUT/glm_cand.out") | head -10
+fi
 if cmp -s "$OUT/glm_base.out" "$OUT/glm_cand.out"; then
   echo "  WHOLE STDOUT: BYTE-IDENTICAL ($(stat -c%s "$OUT/glm_base.out") bytes)"
 else

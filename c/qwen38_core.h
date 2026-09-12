@@ -1150,6 +1150,13 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
      * OpenMP regions exactly like Q1's dn-* counters, so COLI_TIMERS unset
      * still pays nothing. */
     double sub_started=q38_tm_t0();
+    /* Q2 (2026-09-12): the four q38_rms0 calls run in parallel over the
+     * hyper-columns -- four ways at decode (S=1, C=4), S*C ways in prefill.
+     * Each call keeps its OWN serial `double` accumulation over H=2560, so no
+     * summation order changes and the result is bit-identical; only which
+     * thread runs which column changes. Writes: norm[s*W+b*H .. +H), disjoint
+     * per (s,b). Reads: hyper (same layout, read only) and g->norm. */
+    #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int b=0;b<C;b++)
         q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,g->norm+(int64_t)b*H,H,c->eps);
     q38_tm_add_live(m,Q38_TM_GR_RMS,sub_started);
@@ -1163,6 +1170,22 @@ static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
     q38_dense_matmul(m,mix,low,&g->up,S,R,W);
     q38_tm_add_live(m,Q38_TM_GR_UP,sub_started);
     sub_started=q38_tm_t0();
+    /* Q2: the sigmoid mix runs in parallel over d (2560 ways at decode, S*H in
+     * prefill). The inner `for b<C` sum stays SERIAL inside one iteration, so
+     * every mixed[d] accumulates its four terms in exactly today's order and
+     * the result is bit-identical. This loop is the item's main target: 10 240
+     * sigmoids per site, ~994k expf per token over 97 sites, single-threaded
+     * until now. Writes: mixed[s*H+d], disjoint per (s,d). Reads: mix, norm --
+     * neither is written here, and the matmul above has already published mix.
+     *
+     * Two regions rather than Q1's single one, and the reason is structural,
+     * not a preference: the two loops Q2 names are separated by the two
+     * 10240x320 matmuls (norm -> low -> mix), each of which is its own
+     * `omp parallel for` inside q38_dense_matmul. An enclosing region would
+     * make those nested, and OMP_NESTED is off by default, which would run
+     * them on one thread. The isolated harness therefore measured this shape
+     * WITH both fork/joins included (tools/hot-expert/rome_grbench.c). */
+    #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int d=0;d<H;d++){
         float v=0.f;
         for(int b=0;b<C;b++) v+=q38_sigmoid(mix[(int64_t)s*W+(int64_t)b*H+d])*norm[(int64_t)s*W+(int64_t)b*H+d];

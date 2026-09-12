@@ -2363,6 +2363,185 @@ static int q38_bounded_prefill_rows(int requested,uint64_t fixed,
     return 1;
 }
 
+/* ==========================================================================
+ * Q10 (2026-09-12): the DeltaNet recurrence's loop order.
+ *
+ * The base form below is the recurrence exactly as it stood after Q1, moved
+ * out of q38_deltanet's `omp for` into a function so the self-check further
+ * down can compare the SAME code the engine runs.  Per head and token it
+ * traverses the KD*VD f32 state (64 KB at 128x128) four times: decay,
+ * `k.state`, the rank-1 update, `q.state` -- 6 traffic units.
+ *
+ * The folded form does two things, both order-preserving per element:
+ *   (a) it drops the decay pass and recomputes fl(s*alpha) on the fly, once
+ *       in the `k.state` read and once as the rank-1 update's FMA addend;
+ *   (b) it runs `d` OUTER and `value` INNER in both reductions, so every
+ *       previous[value] and current[value] still accumulates in ascending d
+ *       -- same addends, same order -- while the loads become unit-stride
+ *       and each of the 16 vector lanes carries its own accumulator.
+ * Traffic goes 6 -> 3 units.
+ *
+ * WHAT STEP 0 MEASURED, because it is not what this item was sized on
+ * (tools/hot-expert/rome_dnbench.c, `recur`; record section Q10 step 0):
+ *   - The traffic is NOT the cost.  (a) on its own -- a full third of the
+ *     traffic removed -- is worth -0.09 ms/token L2-resident, +0.19 L3 and
+ *     +0.39 past L3: zero, in every cache regime.
+ *   - The loop ORDER is the whole cost.  (b) is worth -4.20 / -4.40 / -3.94
+ *     in the same three regimes, and a control with (b)'s order but the
+ *     decay pass KEPT (5 traffic units, not 3) measures the same.  The
+ *     saving is the same whether the state is in L2, in L3 or in DRAM,
+ *     which is what a latency bound looks like and is not what a bandwidth
+ *     bound looks like.
+ *
+ * NUMERICS, and why this is spelled the way it is rather than the obvious
+ * way.  gcc 15.2 at the engine's own flags (-O3 -march=native, no -std, so
+ * -ffp-contract=fast) compiles the BASE's two reductions by outer-loop
+ * vectorisation -- 8 `value`s at a time with `d` inner and a 512 B stride --
+ * and emits them as vmulps + vaddps, i.e. it does NOT contract them, while
+ * it DOES contract the rank-1 update into vfmadd213ps.  So bit-identity
+ * requires the opposite of the item's assumption in both places:
+ *   - the rank-1 addend must be FUSED, and writing it as
+ *     `s*alpha + kh[d]*delta[v]` lets the compiler fuse the OTHER multiply
+ *     (measured: 480 790 578 of 1 811 939 328 state elements differ), so it
+ *     is spelled fmaf(kh[d], delta[v], s*alpha);
+ *   - the two reductions must NOT be fused, and a d-outer/value-inner
+ *     `acc[v] += x*y` is a textbook vectorisable statement that gcc does
+ *     fuse (measured: 208 336 749 state elements differ), so the whole
+ *     function is compiled under -ffp-contract=off, where fmaf() still
+ *     emits a vectorised vfmadd.
+ * Both spellings were run against the base over 36 layers x 64 consecutive
+ * tokens with memcmp on the full 3.146 MB/layer state at every token --
+ * 1.81e9 state elements -- and the form below is BIT-IDENTICAL there.
+ *
+ * WHY THERE IS STILL A SELF-CHECK.  That contraction pattern is a property
+ * of this compiler at these flags, not of the C.  A compiler that contracts
+ * the base's reductions, or one that ignores the pragma, would make this
+ * path silently non-identical -- the failure class of the record's G4
+ * `memory` bug.  q38_dn_fold_ok() therefore runs both forms once per
+ * process on a fixed input and falls back to the base on any difference.
+ * Q38_DN_RECUR_FOLD=0 forces the base path for an A/B.
+ * ========================================================================== */
+/* noinline, and it matters for correctness rather than for speed: the
+ * self-check is only sound if it compares the SAME machine code the engine
+ * runs, and an inlined copy inside the `omp for` could be vectorised
+ * differently from the out-of-line one the check calls.  One body, both call
+ * sites.  Cost: 1 728 calls/token, a few microseconds. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void q38_dn_recur_base(float *state,const float *qh,const float *kh,
+                              const float *vh,float *core_h,int KD,int VD,
+                              float alpha,float beta) {
+    float delta[512];
+    int64_t state_cells=(int64_t)KD*VD;
+    for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
+    for(int value=0;value<VD;value++) {
+        float previous=0.f;
+        for(int d=0;d<KD;d++)
+            previous+=kh[d]*state[(int64_t)d*VD+value];
+        delta[value]=(vh[value]-previous)*beta;
+    }
+    for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
+        state[(int64_t)d*VD+value]+=kh[d]*delta[value];
+    for(int value=0;value<VD;value++) {
+        float current=0.f;
+        for(int d=0;d<KD;d++)
+            current+=qh[d]*state[(int64_t)d*VD+value];
+        core_h[value]=current;
+    }
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#define Q38_DN_FOLD_BUILT 1
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=off")
+__attribute__((noinline))
+static void q38_dn_recur_fold(float *state,const float *qh,const float *kh,
+                              const float *vh,float *core_h,int KD,int VD,
+                              float alpha,float beta) {
+    float prev[512],delta[512],cur[512];
+    for(int value=0;value<VD;value++) prev[value]=0.f;
+    for(int d=0;d<KD;d++) {
+        float kd=kh[d];
+        const float *sr=state+(int64_t)d*VD;
+        for(int value=0;value<VD;value++)
+            prev[value]+=kd*(sr[value]*alpha);          /* NOT contracted */
+    }
+    for(int value=0;value<VD;value++)
+        delta[value]=(vh[value]-prev[value])*beta;
+    for(int value=0;value<VD;value++) cur[value]=0.f;
+    for(int d=0;d<KD;d++) {
+        float kd=kh[d],qd=qh[d];
+        float *sr=state+(int64_t)d*VD;
+        for(int value=0;value<VD;value++) {
+            float s=fmaf(kd,delta[value],sr[value]*alpha); /* contracted */
+            sr[value]=s;
+            cur[value]+=qd*s;                             /* NOT contracted */
+        }
+    }
+    for(int value=0;value<VD;value++) core_h[value]=cur[value];
+}
+#pragma GCC pop_options
+#endif
+
+/* Both forms on one head of fixed pseudo-random state, four (alpha,beta)
+ * pairs, memcmp on the whole state and on the output.  A few hundred KB and
+ * a few microseconds, once per process. */
+static int q38_dn_fold_ok(int KD,int VD) {
+#ifndef Q38_DN_FOLD_BUILT
+    (void)KD;(void)VD;return 0;
+#else
+    if(KD>512||VD>512||KD<1||VD<1) return 0;
+    int64_t cells=(int64_t)KD*VD;
+    float *sa=(float*)malloc((size_t)cells*sizeof(float));
+    float *sb=(float*)malloc((size_t)cells*sizeof(float));
+    float *s0=(float*)malloc((size_t)cells*sizeof(float));
+    float *qh=(float*)malloc((size_t)KD*sizeof(float));
+    float *kh=(float*)malloc((size_t)KD*sizeof(float));
+    float *vh=(float*)malloc((size_t)VD*sizeof(float));
+    float *ca=(float*)malloc((size_t)VD*sizeof(float));
+    float *cb=(float*)malloc((size_t)VD*sizeof(float));
+    int ok=0;
+    if(sa&&sb&&s0&&qh&&kh&&vh&&ca&&cb) {
+        uint64_t r=0x9e3779b97f4a7c15ull;
+        #define Q38_DNR (r=r*6364136223846793005ull+1442695040888963407ull, \
+                         (float)((int32_t)(r>>33))/(float)(1u<<30))
+        for(int64_t i=0;i<cells;i++) s0[i]=Q38_DNR*0.1f;
+        for(int i=0;i<KD;i++){ qh[i]=Q38_DNR*0.1f; kh[i]=Q38_DNR*0.1f; }
+        for(int i=0;i<VD;i++) vh[i]=Q38_DNR;
+        #undef Q38_DNR
+        static const float ab[4][2]={{0.97f,0.31f},{0.5f,0.99f},
+                                     {0.999f,0.01f},{0.13f,0.77f}};
+        ok=1;
+        for(int t=0;t<4&&ok;t++) {
+            memcpy(sa,s0,(size_t)cells*sizeof(float));
+            memcpy(sb,s0,(size_t)cells*sizeof(float));
+            q38_dn_recur_base(sa,qh,kh,vh,ca,KD,VD,ab[t][0],ab[t][1]);
+            q38_dn_recur_fold(sb,qh,kh,vh,cb,KD,VD,ab[t][0],ab[t][1]);
+            if(memcmp(sa,sb,(size_t)cells*sizeof(float))||
+               memcmp(ca,cb,(size_t)VD*sizeof(float))) ok=0;
+        }
+    }
+    free(sa);free(sb);free(s0);free(qh);free(kh);free(vh);free(ca);free(cb);
+    return ok;
+#endif
+}
+
+static int q38_dn_fold=-1;
+static void q38_dn_fold_init(int KD,int VD) {
+    if(q38_dn_fold>=0) return;
+    const char *e=getenv("Q38_DN_RECUR_FOLD");
+    if(e&&*e&&!atoi(e)) { q38_dn_fold=0; return; }
+    q38_dn_fold=q38_dn_fold_ok(KD,VD);
+    /* Printed both ways on purpose: a log that only says something when the
+     * path is OFF cannot prove that the measured run was ON. */
+    if(getenv("Q38_VERBOSE"))
+        fprintf(stderr,q38_dn_fold?
+            "[DN] recurrence folding ON (self-check bit-identical, KD=%d VD=%d)\n":
+            "[DN] recurrence folding OFF: the self-check found a difference "
+            "(compiler contraction), using the base loop (KD=%d VD=%d)\n",KD,VD);
+}
+
 /* Batch the four resident DeltaNet input projections and the output projection
  * in bounded chunks.  The convolution and recurrent update remain strictly
  * token-causal inside each chunk, so chunk boundaries cannot change state or
@@ -2393,6 +2572,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
     float *q=falloc((int64_t)VH*KD),*k=falloc((int64_t)VH*KD);
     float *core=falloc(V);
     float *rec=m->DN_rec[layer],*ring=m->DN_conv[layer];
+    q38_dn_fold_init(KD,VD);   /* serial, once per process: getenv + self-check */
 
     for(int base=0;base<S;) {
         int rows=S-base<rows_capacity?S-base:rows_capacity;
@@ -2496,6 +2676,10 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 #pragma omp master
                 { q38_tm_add_live(m,Q38_TM_DN_QKNORM,sub_started);
                   sub_started=q38_tm_t0(); }
+                /* Q10: same head slices, same `delta` per iteration, same
+                 * sharing argument as above -- only the per-head kernel's
+                 * loop order changed, and q38_dn_fold was decided serially
+                 * before this region (no getenv and no malloc in here). */
                 #pragma omp for schedule(static)
                 for(int h=0;h<VH;h++) {
                     float *state=rec+(int64_t)h*KD*VD;
@@ -2505,23 +2689,13 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                     float alpha=expf(-expf(l->dn_alog[h])*
                                      q38_softplus(a_row[h]+l->dn_dtbias[h]));
                     float beta=q38_sigmoid(b_row[h]);
-                    float delta[512];
-                    int64_t state_cells=(int64_t)KD*VD;
-                    for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
-                    for(int value=0;value<VD;value++) {
-                        float previous=0.f;
-                        for(int d=0;d<KD;d++)
-                            previous+=kh[d]*state[(int64_t)d*VD+value];
-                        delta[value]=(vh[value]-previous)*beta;
-                    }
-                    for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
-                        state[(int64_t)d*VD+value]+=kh[d]*delta[value];
-                    for(int value=0;value<VD;value++) {
-                        float current=0.f;
-                        for(int d=0;d<KD;d++)
-                            current+=qh[d]*state[(int64_t)d*VD+value];
-                        core[(int64_t)h*VD+value]=current;
-                    }
+                    float *core_h=core+(int64_t)h*VD;
+#ifdef Q38_DN_FOLD_BUILT
+                    if(q38_dn_fold)
+                        q38_dn_recur_fold(state,qh,kh,vh,core_h,KD,VD,alpha,beta);
+                    else
+#endif
+                        q38_dn_recur_base(state,qh,kh,vh,core_h,KD,VD,alpha,beta);
                 }
                 #pragma omp master
                 { q38_tm_add_live(m,Q38_TM_DN_RECUR,sub_started);

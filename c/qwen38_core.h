@@ -16,6 +16,12 @@
 #define Q38_PREFILL_BATCH_ROWS 32
 #define Q38_PREFILL_WORKSPACE_BYTES (64u << 20)
 
+/* Roadmap item QP: the int4-expert / int8-dense / int8-head format simulations
+ * and the two instruments they need. Every knob in here is OFF by default and
+ * the engine with all of them unset is bit-identical to the tree before this
+ * include existed (record §QP). */
+#include "q38_sim.h"
+
 /* Persistent GPU expert cache (fmt=8 e4m3), opt-in via Q38_VULKAN=1. Off by
  * default: g_q38vk_ready stays 0 and every check below short-circuits to the
  * unmodified CPU path. See the module comment in patch_qwen38_gputier.py for
@@ -59,6 +65,14 @@ typedef struct {
     int64_t elements, scale_count;
     Q38WeightKind kind;
     unsigned owns_data:1, owns_scales:1;
+    /* QP(b)/(c): the int8 SIMULATION of this weight, built once at load from the
+     * BF16 bytes and used instead of them while Q38_I8_DENSE / Q38_I8_HEAD is
+     * on. NULL in every shipped configuration. The BF16 original is kept, not
+     * replaced, so the knob is reversible and `kind` still describes the
+     * checkpoint. `sim_gs` <= 0 means one scale per output row. */
+    int8_t *sim_q;
+    float  *sim_s;
+    int     sim_gs;
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -295,6 +309,7 @@ static void q38_weight_free(Q38Weight *weight) {
     if(!weight)return;
     if(weight->owns_data)free(weight->data);
     if(weight->owns_scales)free(weight->scales);
+    free(weight->sim_q);free(weight->sim_s);      /* QP: NULL unless a sim knob is on */
     memset(weight,0,sizeof(*weight));
 }
 
@@ -386,12 +401,21 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                 weight?weight->rows:0,weight?weight->cols:0,
                 weight?(int)weight->kind:0,O,I);exit(1);
     }
-    if(weight->kind==Q38_WEIGHT_F32)
+    /* QP(b)/(c): an attached int8 simulation replaces the BF16 read. Checked
+     * first and only ever non-NULL when Q38_I8_DENSE / Q38_I8_HEAD asked for
+     * it, so the default dispatch below is untouched. */
+    if(weight->sim_q&&weight->sim_s)
+        q38_matmul_i8sim(y,x,weight->sim_q,weight->sim_s,S,I,O,weight->sim_gs);
+    else if(weight->kind==Q38_WEIGHT_F32)
         q38_matmul(y,x,(const float*)weight->data,S,I,O);
     else if(weight->kind==Q38_WEIGHT_BF16)
         q38_matmul_bf16(y,x,(const uint16_t*)weight->data,S,I,O);
     else if(weight->kind==Q38_WEIGHT_FP8&&weight->scales)
-        matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+        /* QP(a): Q38_I4_SIM=1 computes the routed experts as int4-g64. The
+         * routed experts are the only FP8 weights this engine has, so this
+         * predicate is the scope the item asks for and nothing wider. */
+        (g_q38_i4_sim?q38_matmul_fp8_sim_i4:matmul_fp8)
+            (y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
     else {fprintf(stderr,"unsupported matmul weight kind %d\n",(int)weight->kind);exit(1);}
 }
 
@@ -433,7 +457,11 @@ static void q38_dense_matmul_multi(Model *m,Q38DenseItem *items,int n,const floa
             fprintf(stderr,"invalid multi matmul weight %d: have [%d,%d] kind=%d, need [%d,%d]\n",
                     j,w?w->rows:0,w?w->cols:0,w?(int)w->kind:0,items[j].O,I);exit(1);
         }
-        if(w->kind!=Q38_WEIGHT_BF16)all_bf16=0;
+        /* QP(b): a weight carrying an int8 simulation leaves the fused BF16
+         * region for the per-matrix path, which dispatches to the sim. The
+         * fallback is bit-identical to this loop by construction (see the
+         * comment above), so nothing moves when no sim is attached. */
+        if(w->kind!=Q38_WEIGHT_BF16||w->sim_q)all_bf16=0;
     }
 #if defined(__AVX2__) && defined(__FMA__)
     static int fused=-1;   /* Q38_DENSE_MULTI=0 restores one region per matrix for A/B */
@@ -987,10 +1015,95 @@ static void q38_vision_detach(Model *m) {
     m->vis_rows=NULL; m->vis_map=NULL; m->vis_map_len=0; m->vis_rows_n=0;
 }
 
+/* ---- QP(b)/(c): attach the int8 simulation to the resident BF16 tensors ----
+ *
+ * `mode` is the knob's value: 1 = one scale per output row (quantize_rows'
+ * encoding), 2 = one scale per 64 inputs. A tensor that is not BF16 is skipped
+ * and SAID SO rather than silently left alone: a probe that quietly simulated
+ * half the set would give a verdict nobody can use.
+ *
+ * The BF16 original is kept. int8 is half its size, so the whole dense set
+ * costs +50 % of itself in RSS rather than +100 %, and the knob stays a knob. */
+static uint64_t g_q38_sim_i8_bytes = 0, g_q38_sim_i8_tensors = 0, g_q38_sim_i8_skipped = 0;
+static void q38_sim_attach_one(Q38Weight *w,int mode,const char *what) {
+    if(!w||!w->data||mode<=0)return;
+    if(w->sim_q)return;                                   /* already attached */
+    if(w->kind!=Q38_WEIGHT_BF16){
+        g_q38_sim_i8_skipped++;
+        fprintf(stderr,"[q38sim] %s is kind=%d, not BF16 -- NOT simulated\n",what,(int)w->kind);
+        return;
+    }
+    const int gs=(mode>=2)?Q38_I4_GS:0;
+    const int ng=q38_i8sim_groups(w->cols,gs);
+    int8_t *q=(int8_t*)malloc((size_t)w->rows*(size_t)w->cols);
+    float *s=(float*)malloc((size_t)w->rows*(size_t)ng*sizeof(float));
+    if(!q||!s){fprintf(stderr,"OOM attaching the int8 simulation to %s\n",what);exit(1);}
+    q38_i8sim_pack_bf16((const uint16_t*)w->data,w->rows,w->cols,gs,q,s);
+    w->sim_q=q;w->sim_s=s;w->sim_gs=gs;
+    g_q38_sim_i8_bytes+=(uint64_t)w->rows*(uint64_t)w->cols+
+                        (uint64_t)w->rows*(uint64_t)ng*sizeof(float);
+    g_q38_sim_i8_tensors++;
+}
+/* The Q7 set: everything the `dense-matmul` and `shared-expert` buckets read.
+ * THE ROUTER IS DELIBERATELY EXCLUDED -- §Q-ARB's Q7 says the router never
+ * moves ("48 submits cost more than it does"), so quantising it would measure a
+ * configuration nobody would ship and would put a discrete top-k reordering
+ * into a number meant to price a format. Q38_I8_ROUTER=1 adds it, for anyone who
+ * wants that question answered separately. The embedding is excluded too: it is
+ * read a row at a time by q38_weight_row, never multiplied. */
+static void q38_sim_attach_dense(Model *m,int layer_begin,int layer_end) {
+    const int mode=g_q38_i8_dense;
+    if(mode<=0)return;
+    const int with_router=q38_sim_env_int("Q38_I8_ROUTER");
+    for(int i=layer_begin;i<layer_end;i++){
+        Layer *l=&m->L[i];
+        GatedResidual *gr[2]={&l->attn_gr,&l->mlp_gr};
+        for(int g=0;g<2;g++){
+            q38_sim_attach_one(&gr[g]->down,mode,"gr.down");
+            q38_sim_attach_one(&gr[g]->up,mode,"gr.up");
+            q38_sim_attach_one(&gr[g]->inject,mode,"gr.inject");
+        }
+        q38_sim_attach_one(&l->sh_g,mode,"shared.gate_proj");
+        q38_sim_attach_one(&l->sh_u,mode,"shared.up_proj");
+        q38_sim_attach_one(&l->sh_d,mode,"shared.down_proj");
+        if(with_router) q38_sim_attach_one(&l->router,mode,"mlp.gate (router)");
+        q38_sim_attach_one(&l->q,mode,"q_proj");
+        q38_sim_attach_one(&l->k,mode,"k_proj");
+        q38_sim_attach_one(&l->v,mode,"v_proj");
+        q38_sim_attach_one(&l->o,mode,"o_proj");
+        q38_sim_attach_one(&l->idx_qk,mode,"indexer.index_qk_proj");
+        q38_sim_attach_one(&l->dn_qkv,mode,"linear_attn.in_proj_qkv");
+        q38_sim_attach_one(&l->dn_z,mode,"linear_attn.in_proj_z");
+        q38_sim_attach_one(&l->dn_b,mode,"linear_attn.in_proj_b");
+        q38_sim_attach_one(&l->dn_a,mode,"linear_attn.in_proj_a");
+        q38_sim_attach_one(&l->dn_out,mode,"linear_attn.out_proj");
+        q38_sim_attach_one(&l->ple_key,mode,"ple_key");
+        q38_sim_attach_one(&l->ple_value,mode,"ple_value");
+    }
+    q38_sim_attach_one(&m->final_gr.down,mode,"final_gr.down");
+    q38_sim_attach_one(&m->final_gr.up,mode,"final_gr.up");
+    q38_sim_attach_one(&m->final_gr.inject,mode,"final_gr.inject");
+    fprintf(stderr,"[q38sim] QP(b): int8 %s on %llu dense tensors (+%.2f GiB), "
+                   "%llu skipped, router %s\n",
+            mode>=2?"g64":"per-row",(unsigned long long)g_q38_sim_i8_tensors,
+            g_q38_sim_i8_bytes/1073741824.0,
+            (unsigned long long)g_q38_sim_i8_skipped,with_router?"INCLUDED":"excluded");
+}
+static void q38_sim_attach_head(Model *m) {
+    if(g_q38_i8_head<=0)return;
+    const uint64_t before=g_q38_sim_i8_bytes;
+    q38_sim_attach_one(&m->lm_head,g_q38_i8_head,"lm_head");
+    fprintf(stderr,"[q38sim] QP(c): int8 %s on the LM head (+%.2f GiB)\n",
+            g_q38_i8_head>=2?"g64":"per-row",(g_q38_sim_i8_bytes-before)/1073741824.0);
+}
+
 static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int layer_begin,int layer_end,int load_boundaries,
                              int allocate_state) {
     (void)bits; memset(m,0,sizeof(*m)); double t0=now_s();
+    q38_sim_init_knobs();        /* QP: before any omp region, see q38_sim.h */
+    g_q38_tf=q38_sim_env_int("Q38_TF");
+    g_q38_tf_dump=getenv("Q38_TF_DUMP");
     m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
@@ -1048,6 +1161,11 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
         if(!lc->slots||!lc->by_expert){fprintf(stderr,"OOM expert cache\n");exit(1);} for(int e=0;e<c->experts;e++)lc->by_expert[e]=-1;
     }
     if(c->ple_layer>=layer_begin&&c->ple_layer<layer_end) q38_load_ple(m,&m->L[c->ple_layer]);
+    /* QP(b)/(c): quantise the resident BF16 dense set / the head to int8 once,
+     * here, after every tensor exists and before any forward. No-ops unless
+     * Q38_I8_DENSE / Q38_I8_HEAD is set. */
+    q38_sim_attach_dense(m,layer_begin,layer_end);
+    if(load_boundaries) q38_sim_attach_head(m);
     /* La torre solo quando il motore possiede la sequenza intera: uno shard che
      * ospita solo alcuni layer non ha da fare niente con le immagini, e
      * caricarla la' sarebbe mezzo giga per nulla. */
@@ -1091,6 +1209,12 @@ static void model_init(Model *m,const char *snap,int cap,int bits) {
                 g_q38vk_dev3_ready = coli_vk_init_dev3(spv, didx);
                 if (g_q38vk_dev3_ready) fprintf(stderr, "[qwen38] Vulkan dev3 ready (expert cache)\n");
             }
+            /* QP(d): the ballast goes in HERE -- after the devices exist and
+             * before q38vk_preload runs from qwen38.c, which is the only
+             * ordering in which the existing hottest-first fill sees a smaller
+             * dev0 and drops its coldest experts by itself. */
+            if (g_q38vk_ready && g_q38_vk_ballast_gb > 0)
+                coli_vk_ballast_gb(g_q38_vk_ballast_gb);
         }
     }
 #endif
@@ -1610,6 +1734,13 @@ static ColiVkTensor **q38vk_reg_at(int layer, int eid) {
  * encoding) it landed on, or -1 if all available devices are full. Already
  * resident: returns coli_vk_tensor_dev(reg[0]) immediately, no re-check. */
 static int q38vk_expert_ensure(Model *m, int layer, int eid) {
+    /* QP(a) control knob: Q38_EXPERTS_CPU=1 makes the tier decline EVERY routed
+     * expert, so the CPU path serves all of them and Q38_I4_SIM cannot be
+     * masked by the ~80 % the GPU normally serves from unmodified fp8 (§G15).
+     * This is the earliest possible point: the preload asks the same question,
+     * so no VRAM is spent either. Placement only -- the CPU share already
+     * exists and already accumulates ys in the same order. */
+    if (g_q38_experts_cpu) return -1;
     ColiVkTensor **reg = q38vk_reg_at(layer, eid);
     if (reg[0]) return coli_vk_tensor_dev(reg[0]);
     Slot *s = q38_expert_get(m, layer, eid);
@@ -2690,6 +2821,55 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
     free(mixed); free(inject); free(block);
 }
 
+/* ---- QP: the teacher_forcing oracle, GLM-5.3's contract on this engine -----
+ *
+ * glm53 prints `teacher_forcing <argmax per prompt position>` after its prefill
+ * and CLAUDE.md names that line the oracle for that engine, because it is what
+ * separates "0 predictions differ" from "16 differ" where greedy text alone is
+ * ambiguous (§G15's own methodological note: on a chaotic prompt pure float
+ * reassociation already changes the 128-token continuation). qwen38 had no
+ * equivalent -- `step` applies the LM head to the LAST position only, and the
+ * ref.json mode's "Matching tokens" is a FREE-RUNNING greedy comparison, which
+ * is a different and much weaker thing. So QP adds the same line here.
+ *
+ * Q38_TF=1 emits it once, from the first multi-token forward (the prefill);
+ * Q38_TF_DUMP=<path> also writes that position's full logit row as raw f32 for
+ * the cosine/max-abs/argmax comparison. Both unset: this function is never
+ * called and `step` is the function it always was.
+ *
+ * The head is applied in 64-row chunks so a 1 200-token prompt costs 63 MB of
+ * logits rather than 1.2 GB, and it goes through q38_weight_matmul so that an
+ * attached int8 head (QP(c)) is exercised by the oracle too. */
+static int g_q38_tf = 0, g_q38_tf_done = 0;
+static const char *g_q38_tf_dump = NULL;
+static void q38_tf_emit(Model *m,const float *mixed,int S,int H) {
+    const int V=m->c.vocab,CH=64;
+    float *lg=falloc((int64_t)CH*V),*last=NULL;
+    printf("teacher_forcing");
+    for(int b=0;b<S;b+=CH){
+        int n=S-b<CH?S-b:CH;
+        q38_weight_matmul(lg,mixed+(int64_t)b*H,&m->lm_head,n,H,V);
+        for(int r=0;r<n;r++){
+            const float *row=lg+(int64_t)r*V;
+            int best=0;float bv=row[0];
+            for(int v=1;v<V;v++)if(row[v]>bv){bv=row[v];best=v;}
+            printf(" %d",best);
+        }
+        if(b+n>=S){
+            last=(float*)malloc((size_t)V*sizeof(float));
+            if(last)memcpy(last,lg+(int64_t)(n-1)*V,(size_t)V*sizeof(float));
+        }
+    }
+    printf("\n");fflush(stdout);
+    if(last&&g_q38_tf_dump&&*g_q38_tf_dump){
+        FILE *f=fopen(g_q38_tf_dump,"wb");
+        if(f){fwrite(last,sizeof(float),(size_t)V,f);fclose(f);
+              fprintf(stderr,"[q38tf] %d last-prompt-position logits -> %s\n",V,g_q38_tf_dump);}
+        else fprintf(stderr,"[q38tf] cannot open %s\n",g_q38_tf_dump);
+    }
+    free(last);free(lg);
+}
+
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
@@ -2724,6 +2904,9 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
         q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);q38_moe(m,l,i,mixed,S,block);q38_gr_apply(m,hyper,block,inject,S);
     }
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
+    /* QP oracle, off unless Q38_TF=1: the prefill's per-position argmax. Before
+     * the timed lm-head below so the per-op table is unaffected either way. */
+    if(g_q38_tf&&!g_q38_tf_done&&S>1){q38_tf_emit(m,mixed,S,c->hidden);g_q38_tf_done=1;}
     float *logit=falloc(c->vocab);double phase_started=now_s();
     q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);

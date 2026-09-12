@@ -30,6 +30,11 @@ void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
  * returns 0 if unavailable. */
 void coli_vk_alloc_priority(float p);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
+/* Roadmap item QP(d): take `gb` GB of dev0 VRAM out of circulation in idle
+ * allocations, before an expert preload, and return what was taken. The
+ * measurement instrument for "what does a dense set on dev0 cost the tier?";
+ * qwen38 calls it when Q38_VK_BALLAST_GB is set, nothing else calls it. */
+double coli_vk_ballast_gb(double gb);
 
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)

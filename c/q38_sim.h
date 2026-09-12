@@ -137,7 +137,9 @@ static void q38_sim_init_knobs(void) {
  * (MULTIPLY). Both halves are checked against their originals rather than
  * restated: rome_q4sim.c compares the levels this produces, byte for byte,
  * against the converter's own quant_int4_grouped(gs=64) run through numpy on
- * the same dequantised floats.
+ * the same dequantised floats: 0 of 655 360 levels and 0 of 10 240 scales
+ * differ, and the level map is checked exhaustively over all 256 fp8 bytes x
+ * 256 group-absmax bytes x 4 block scales (record §QP step 0).
  *
  * The group's fp8 block scale is looked up ONCE because a 64-group cannot
  * straddle two 128-blocks (see Q38_I4_GS). */
@@ -184,7 +186,9 @@ static void q38_i4sim_row(const uint8_t *w, const float *scl, int I,
  * cvtepi32_ps(sub(cvtepu8_epi32(unpacklo(lo,hi)), 8)), which is elements
  * i..i+7 then i+8..i+15 in order -- exactly what loadu_ps(lev+i) gives here.
  * So this is bit-identical to packing the row and calling the shipping kernel,
- * and rome_q4sim.c test C measures that it is (float reassociation only).
+ * and rome_q4sim.c test C MEASURED exactly that at Qwen's two expert shapes:
+ * levels 0 of 1 638 400 differ, group scales 0 of 25 600 differ, output
+ * relL2 0.000e+00 -- not reassociation-close, the same bits (record §QP).
  *
  * Quantisation is per WEIGHT ROW, not per (row, activation row): the levels are
  * computed once and reused across all S, which is both cheaper and the only
@@ -240,7 +244,8 @@ static inline int q38_i8sim_groups(int I, int gs) { return gs > 0 ? (I + gs - 1)
  * quantize_rows(w, q, s, O, I, 8) from quant.h element for element (qmax=127,
  * step = max(amax/127, 1e-8), level = clamp(lrintf(w/step), -128, 127)), and
  * rome_q4sim.c test D checks that against quantize_rows itself rather than
- * against a restatement. gs=64 is the same arithmetic per 64-input group, i.e.
+ * against a restatement -- 0 of 5 242 880 levels and 0 of 2048 row scales
+ * differ, and 0 of 655 360 against the converter's own quant_int8(8). gs=64 is the same arithmetic per 64-input group, i.e.
  * quant_int4_grouped's grouping with int8's qmax.
  *
  * The source is read with bf16_to_f32, so the quantiser sees exactly the values

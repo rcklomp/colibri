@@ -685,10 +685,17 @@ static int part_recur(uint64_t *seed){
     float *core_a=aligned_alloc(64,(size_t)V*sizeof(float));
     float *core_b=aligned_alloc(64,(size_t)V*sizeof(float));
 
+    /* Q10_ONLY / Q10_REG / Q10_NOORACLE: one variant in one regime with no
+     * oracle, so `perf stat` can bracket exactly one kernel's cycles and
+     * bytes.  Everything else is unchanged; the default run is the full one. */
+    const char *e_only=getenv("Q10_ONLY"), *e_reg=getenv("Q10_REG");
+    int only=e_only?atoi(e_only):-1, onereg=e_reg?atoi(e_reg):-1;
+    int no_oracle=getenv("Q10_NOORACLE")!=NULL;
+
     /* ---- ORACLE ---------------------------------------------------------- */
     RecLayer *base=make_rec(LAY,seed);
-    int ok_var[R_NVAR]; ok_var[R_BASE]=1;
-    for(int vi=1;vi<R_NVAR;vi++){
+    int ok_var[R_NVAR]; for(int i=0;i<R_NVAR;i++) ok_var[i]=1;
+    for(int vi=1;vi<R_NVAR && !no_oracle;vi++){
         RecLayer *A=clone_rec(base,LAY), *B=clone_rec(base,LAY);
         int ok=1,first=-1; long dcore=0,dstate=0; double maxabs=0.0;
         for(int t=0;t<TOK;t++){
@@ -735,6 +742,7 @@ static int part_recur(uint64_t *seed){
         {"dram (288 layers, 884.7 MB)",           LAY*8, 5 },
     };
     for(unsigned ri=0;ri<sizeof regs/sizeof regs[0];ri++){
+        if(onereg>=0 && (int)ri!=onereg) continue;
         int nl=regs[ri].layers, reps=regs[ri].reps;
         RecLayer *L=make_rec(nl,seed);
         printf("--- %s\n",regs[ri].tag);
@@ -743,6 +751,7 @@ static int part_recur(uint64_t *seed){
         for(int vi=0;vi<R_NVAR;vi++){
             res[vi][pass]=-1.0;
             if(vi && !ok_var[vi]) continue;
+            if(only>=0 && vi!=only) continue;
             for(int w=0;w<2;w++)
                 for(int i=0;i<nl;i++)
                     rec_layer((RVariant)vi,&L[i],q,k,vv,ar,br,core_a);
@@ -757,6 +766,7 @@ static int part_recur(uint64_t *seed){
             res[vi][pass]=dt/((double)reps*(double)nl)*LAY*1000.0;
         }
         for(int vi=0;vi<R_NVAR;vi++){
+            if(only>=0 && vi!=only) continue;
             if(vi && !ok_var[vi]){
                 printf("    %-20s (not bit-identical -- not timed)\n",rvname[vi]);
                 continue;

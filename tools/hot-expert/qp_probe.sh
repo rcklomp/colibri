@@ -57,6 +57,14 @@ log(){ echo "[$(date -Is)] $*"; }
 
 wait_no_engine(){ for _ in $(seq 1 240); do pgrep -x "$1" >/dev/null || return 0; sleep 1; done
   echo "REFUSED: $1 still running"; return 1; }
+# The pristine is a COPY under a different name (~/bench/qwen38-vk.qppristine),
+# so `pgrep -x qwen38-vk` does not see it and neither does `pkill -9 -x`. Match
+# the bench copies by path, in the bracket form CLAUDE.md requires -- `pkill -f`
+# with an unbracketed pattern matches the ssh command line that carries it and
+# kills the session.
+kill_bench_engines(){ pkill -9 -f "bench/qwen38-[v]k\." 2>/dev/null; pkill -9 -f "bench/qwen3[8]\." 2>/dev/null; true; }
+any_engine_up(){ pgrep -x qwen38 >/dev/null || pgrep -x qwen38-vk >/dev/null || \
+                 pgrep -f "bench/qwen38-[v]k\." >/dev/null || pgrep -f "bench/qwen3[8]\." >/dev/null; }
 
 start_gateway(){
   log "restarting the gateway (warms GLM first -- minutes)"
@@ -80,7 +88,7 @@ start_gateway(){
 on_exit(){
   rc=$?
   log "=== qp_probe exiting rc=$rc"
-  pkill -9 -x qwen38-vk 2>/dev/null; pkill -9 -x qwen38 2>/dev/null
+  pkill -9 -x qwen38-vk 2>/dev/null; pkill -9 -x qwen38 2>/dev/null; kill_bench_engines
   wait_no_engine qwen38-vk; wait_no_engine qwen38
   if [ "${KEEP_QWEN:-0}" = 1 ]; then
     log "KEEP_QWEN=1: leaving Qwen resident and the gateway DOWN"
@@ -101,9 +109,7 @@ trap on_exit EXIT INT TERM HUP
 
 rig_lock_take "qp-probe" || { echo "rig busy"; exit 3; }
 
-for e in qwen38 qwen38-vk; do
-  pgrep -x "$e" >/dev/null && { log "REFUSED: $e already running"; exit 1; }
-done
+if any_engine_up; then log "REFUSED: a qwen engine is already running"; pgrep -af qwen38 | head -3; exit 1; fi
 if pgrep -x glm53 >/dev/null; then
   log "stopping the owner's gateway"
   pkill -f "openai_[s]erver.py"; sleep 3; pkill -9 -x glm53

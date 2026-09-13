@@ -2719,11 +2719,44 @@ def ledger_tools_sig(tools, tool_choice):
 
 
 def ledger_tool_call_sig(message):
+    """Canonical signature of the assistant's tool_calls array.
+
+    A tool call's `function.arguments` field is, per the API schema, a
+    JSON-encoded STRING, not a nested object -- so hashing the raw array
+    with `sort_keys=True` only sorts the OUTER keys and treats `arguments`
+    as an opaque byte string. A client that reconstructs tool_calls from
+    its own richer internal representation on every request, rather than
+    replaying the exact bytes it was originally sent, makes no promise
+    that string comes out byte-identical each time (key order, spacing).
+    Found 2026-09-13 (incident: a conversation's ledger diverging on every
+    turn that carried a tool call, ~64 minutes of unwanted re-prefill each
+    time): Open WebUI's `convert_output_to_messages` is exactly such a
+    reconstruction. Parse each call's `arguments` and let the outer
+    sort_keys dump normalise it too, so two calls that differ only in the
+    JSON formatting of otherwise-identical arguments produce the same
+    signature. A call whose arguments do not parse as JSON is left as the
+    raw string -- unusual, and not this function's place to repair.
+    """
     calls = message.get("tool_calls") if isinstance(message, dict) else None
     if not calls:
         return ""
     try:
-        return json.dumps(calls, sort_keys=True, default=str)
+        normalised = []
+        for call in calls:
+            if not isinstance(call, dict):
+                normalised.append(call)
+                continue
+            call = dict(call)
+            fn = call.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                fn = dict(fn)
+                try:
+                    fn["arguments"] = json.loads(fn["arguments"])
+                except (TypeError, ValueError):
+                    pass  # not JSON -- leave the raw string, not this function's job to repair
+                call["function"] = fn
+            normalised.append(call)
+        return json.dumps(normalised, sort_keys=True, default=str)
     except (TypeError, ValueError):
         return repr(calls)
 
@@ -2908,6 +2941,25 @@ def _ledger_render(messages, enable_thinking, reasoning_effort, tools, tool_choi
             if state == "diverged":
                 ledger_log(f"[ledger] key={key[:8]} ledger=reset reason=diverged "
                            f"at={matched + 1}")
+                # TEMPORARY DIAGNOSTIC (2026-09-13, incident: 8d8c1390 diverging
+                # every turn at a fixed ~8370-token boundary). Dumps the exact
+                # mismatched turn key on both sides, truncated, to stderr under
+                # COLI_REQ_LOG -- purely additive, no behaviour change. Remove
+                # once the root cause is found and fixed.
+                def _dsig(k):
+                    if not isinstance(k, tuple) or len(k) != 3:
+                        return repr(k)[:200]
+                    role, text, tcs = k
+                    return (f"role={role!r} text[:120]={text[:120]!r} "
+                            f"text_len={len(text)} tool_sig[:200]={tcs[:200]!r} "
+                            f"tool_sig_len={len(tcs)}")
+                rec_side = ([t["id"] for t in entry["turns"]][matched]
+                            if matched < len(entry["turns"]) else "<none, client is longer>")
+                cli_side = client_keys[matched] if matched < len(client_keys) else "<none>"
+                ledger_log(f"[ledger-diag] key={key[:8]} matched={matched} "
+                           f"RECORDED: {_dsig(rec_side)}", force=True)
+                ledger_log(f"[ledger-diag] key={key[:8]} matched={matched} "
+                           f"CLIENT:   {_dsig(cli_side)}", force=True)
                 entry["turns"] = []
                 entry["prompt"] = entry["generated"] = ""
                 entry["prompt_tokens"] = None

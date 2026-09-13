@@ -333,6 +333,27 @@ def _unclosed_tail(reply, tools):
     return inner if inner.strip() in declared else None
 
 
+def _deterministic_call_id(prefix, index, name, arguments):
+    """A tool call's id, derived from its own content instead of drawn at random.
+
+    Found 2026-09-13 (incident: a live conversation's ledger diverging on
+    every turn that carried a tool call): the raw text of one generation is
+    re-parsed for tool calls at multiple independent points in this file
+    (the actual API response, P8's reply-pin cache, P9's ledger record), and
+    a `uuid.uuid4()` id would come out different at each of those parses --
+    not just between requests, WITHIN one. That is fine as long as nothing
+    ever compares two parses of the same text for equality; the ledger does
+    exactly that. Hashing (index, name, arguments) instead makes every
+    independent parse of the same raw text agree on the same ids, in the
+    same order, so the id the client actually receives, the id P8 pins, and
+    the id P9 records are always the same string -- without needing every
+    call site that parses tool calls to share one cache.
+    """
+    digest = hashlib.sha1(
+        f"{index}:{name}:{arguments}".encode("utf-8", "replace")).hexdigest()
+    return f"{prefix}_{digest[:24]}"
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
@@ -368,8 +389,10 @@ def parse_tool_calls(reply, tools=None):
                     pass
                 args = {key: payload}
                 salvaged.append(name)
-        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        arguments = json.dumps(args, ensure_ascii=False)
+        calls.append({"id": _deterministic_call_id("call", len(calls), name, arguments),
+                      "type": "function",
+                      "function": {"name": name, "arguments": arguments}})
     if tools and not calls and re.search(r"</?tool_call>|</?arg_key>|</?arg_value>", reply):
         # Diagnosi per la #401: il client ha dichiarato i tools e il modello ha PROVATO la
         # sintassi, ma il parse rigoroso non ha agganciato nulla (tipico output int4 storpiato).
@@ -500,6 +523,7 @@ def parse_k3_tool_calls(reply, tools=None):
     for block in blocks:
         for m in _K3_CALL_RE.finditer(block):
             name = _k3_unescape_attr(m.group(1))
+            k3_index = m.group(2)
             inner = m.group(3)
             jm = _K3_JSON_RE.search(inner)
             if jm is not None:
@@ -517,7 +541,8 @@ def parse_k3_tool_calls(reply, tools=None):
                         except (json.JSONDecodeError, ValueError):
                             args[key] = val
                 arguments = json.dumps(args, ensure_ascii=False)
-            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+            calls.append({"id": _deterministic_call_id("call", k3_index, name, arguments),
+                          "type": "function",
                           "function": {"name": name, "arguments": arguments}})
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
@@ -1313,11 +1338,12 @@ def parse_qwen38_tool_calls(reply, tools=None):
                     args[key] = json.loads(raw)
                 except (TypeError, ValueError):
                     args[key] = raw
+        qwen38_arguments = json.dumps(args, ensure_ascii=False)
         calls.append({
-            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "id": _deterministic_call_id("call", len(calls), name, qwen38_arguments),
             "type": "function",
             "function": {"name": name,
-                         "arguments": json.dumps(args, ensure_ascii=False)},
+                         "arguments": qwen38_arguments},
         })
     text = QWEN38_CALL_RE.sub("", reply or "")
     if not calls and tools and "<tool_call>" in (reply or ""):
@@ -2494,17 +2520,29 @@ def conversation_pin_key(messages, normalise=False):
 
 
 def reply_pin_visible(raw, enable_thinking, tools=None, tool_reply=None):
-    """The part of a raw generation the client keeps -- what the gateway sent back."""
+    """The part of a raw generation the client keeps -- what the gateway sent back.
+
+    Returns `(text, tool_calls)`. `tool_calls` is `[]` when the reply carried
+    none, and is returned (not discarded) so a caller that needs to know
+    what the client will see as this turn's `tool_calls` field -- P9's
+    ledger, since 2026-09-13's incident -- doesn't have to re-parse `raw`
+    itself and risk a second, differently-shaped parse. `_deterministic_
+    call_id` is what makes re-parsing the same `raw` safe at all: every
+    parse of the same text agrees on the same ids, so even a caller that
+    DOES re-parse independently still lands on the same tool_calls this
+    function would have returned.
+    """
     if ARCH == "inkling":
         text, _reasoning = split_inkling(raw)
     else:
         _reasoning, text = split_thinking_reply(raw, enable_thinking)
+    calls = []
     if tools:
         try:
-            text, _calls = parse_arch_tool_calls(text, tools, tool_reply)
+            text, calls = parse_arch_tool_calls(text, tools, tool_reply)
         except Exception:
-            return None            # no longer a byte comparison: do not remember it
-    return text
+            return None, []         # no longer a byte comparison: do not remember it
+    return text, calls
 
 
 def reply_pin_norm(text):
@@ -2719,11 +2757,44 @@ def ledger_tools_sig(tools, tool_choice):
 
 
 def ledger_tool_call_sig(message):
+    """Canonical signature of the assistant's tool_calls array.
+
+    A tool call's `function.arguments` field is, per the API schema, a
+    JSON-encoded STRING, not a nested object -- so hashing the raw array
+    with `sort_keys=True` only sorts the OUTER keys and treats `arguments`
+    as an opaque byte string. A client that reconstructs tool_calls from
+    its own richer internal representation on every request, rather than
+    replaying the exact bytes it was originally sent, makes no promise
+    that string comes out byte-identical each time (key order, spacing).
+    Found 2026-09-13 (incident: a conversation's ledger diverging on every
+    turn that carried a tool call, ~64 minutes of unwanted re-prefill each
+    time): Open WebUI's `convert_output_to_messages` is exactly such a
+    reconstruction. Parse each call's `arguments` and let the outer
+    sort_keys dump normalise it too, so two calls that differ only in the
+    JSON formatting of otherwise-identical arguments produce the same
+    signature. A call whose arguments do not parse as JSON is left as the
+    raw string -- unusual, and not this function's place to repair.
+    """
     calls = message.get("tool_calls") if isinstance(message, dict) else None
     if not calls:
         return ""
     try:
-        return json.dumps(calls, sort_keys=True, default=str)
+        normalised = []
+        for call in calls:
+            if not isinstance(call, dict):
+                normalised.append(call)
+                continue
+            call = dict(call)
+            fn = call.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                fn = dict(fn)
+                try:
+                    fn["arguments"] = json.loads(fn["arguments"])
+                except (TypeError, ValueError):
+                    pass  # not JSON -- leave the raw string, not this function's job to repair
+                call["function"] = fn
+            normalised.append(call)
+        return json.dumps(normalised, sort_keys=True, default=str)
     except (TypeError, ValueError):
         return repr(calls)
 
@@ -2908,6 +2979,25 @@ def _ledger_render(messages, enable_thinking, reasoning_effort, tools, tool_choi
             if state == "diverged":
                 ledger_log(f"[ledger] key={key[:8]} ledger=reset reason=diverged "
                            f"at={matched + 1}")
+                # TEMPORARY DIAGNOSTIC (2026-09-13, incident: 8d8c1390 diverging
+                # every turn at a fixed ~8370-token boundary). Dumps the exact
+                # mismatched turn key on both sides, truncated, to stderr under
+                # COLI_REQ_LOG -- purely additive, no behaviour change. Remove
+                # once the root cause is found and fixed.
+                def _dsig(k):
+                    if not isinstance(k, tuple) or len(k) != 3:
+                        return repr(k)[:200]
+                    role, text, tcs = k
+                    return (f"role={role!r} text[:120]={text[:120]!r} "
+                            f"text_len={len(text)} tool_sig[:200]={tcs[:200]!r} "
+                            f"tool_sig_len={len(tcs)}")
+                rec_side = ([t["id"] for t in entry["turns"]][matched]
+                            if matched < len(entry["turns"]) else "<none, client is longer>")
+                cli_side = client_keys[matched] if matched < len(client_keys) else "<none>"
+                ledger_log(f"[ledger-diag] key={key[:8]} matched={matched} "
+                           f"RECORDED: {_dsig(rec_side)}", force=True)
+                ledger_log(f"[ledger-diag] key={key[:8]} matched={matched} "
+                           f"CLIENT:   {_dsig(cli_side)}", force=True)
                 entry["turns"] = []
                 entry["prompt"] = entry["generated"] = ""
                 entry["prompt_tokens"] = None
@@ -2995,19 +3085,20 @@ def _ledger_render(messages, enable_thinking, reasoning_effort, tools, tool_choi
     return prompt, plan
 
 
-def ledger_record(plan, raw, visible, stats, cancelled=False):
+def ledger_record(plan, raw, visible, stats, cancelled=False, tool_calls=None):
     """(§3.4) On DONE, keep what the engine now holds: the pieces of the prompt
     it just ground plus the raw text it generated.
 
     The assistant turn appended here is the gateway's own record of what it
     caused, NOT a message injected into anybody's transcript: it is used on a
     later turn only if the client sends an assistant turn whose visible content
-    matches it, at that position.
+    AND tool_calls (2026-09-13 fix; previously silently dropped, see
+    _ledger_record) match it, at that position.
     """
     if plan is None or not ledger_enabled():
         return
     try:
-        _ledger_record(plan, raw, visible, stats, cancelled)
+        _ledger_record(plan, raw, visible, stats, cancelled, tool_calls)
     except Exception as exc:        # pragma: no cover - the fail-safe itself
         ledger_log(f"[ledger] record error={type(exc).__name__}:{str(exc)[:120]!r}",
                    force=True)
@@ -3015,7 +3106,7 @@ def ledger_record(plan, raw, visible, stats, cancelled=False):
             _ledger_cache.pop(plan.key, None)
 
 
-def _ledger_record(plan, raw, visible, stats, cancelled):
+def _ledger_record(plan, raw, visible, stats, cancelled, tool_calls=None):
     parts = plan.parts or []
     head, turns = ledger_split_head(plan.messages)
     head_count = len(head)
@@ -3036,8 +3127,17 @@ def _ledger_record(plan, raw, visible, stats, cancelled):
     ids = [ledger_turn_key(m) for m in turns]
     records = [{"id": i, "rendered": p} for i, p in zip(ids, body_pieces)]
     if raw and not cancelled:
+        # 2026-09-13 fix: this used to hardcode "" for the tool-call slot of
+        # the id tuple, no matter what the model actually called -- so an
+        # assistant turn that used a tool could NEVER match on replay (a
+        # client resending its own stored history sends the tool_calls back
+        # too, and ("assistant", text, "<real sig>") != ("assistant", text,
+        # "")), forcing a full re-prefill on every following turn, forever.
+        # `ledger_tool_call_sig` is the same canonicalizer a CLIENT-sent
+        # turn's key goes through in `ledger_turn_key`, so the two sides are
+        # finally comparing like with like.
         records.append({"id": ("assistant", reply_pin_norm(visible or ""),
-                               ""),
+                               ledger_tool_call_sig({"tool_calls": tool_calls}) if tool_calls else ""),
                         "rendered": tail + raw})
 
     with _ledger_lock:
@@ -4567,17 +4667,24 @@ class APIHandler(BaseHTTPRequestHandler):
             conversation = pin_messages if pin_messages is not None else body.get("messages")
             if not isinstance(conversation, list):
                 return
-            remember_reply(conversation, raw_text,
-                           reply_pin_visible(raw_text, enable_thinking, tools, tool_reply))
+            visible, _calls = reply_pin_visible(raw_text, enable_thinking, tools, tool_reply)
+            remember_reply(conversation, raw_text, visible)
 
         def record_ledger(raw_text, stats, tool_reply=None, cancelled=False):
             """P9: what the engine now holds, kept for the next turn of this
-            conversation -- the renderer's own pieces plus the raw generation."""
+            conversation -- the renderer's own pieces plus the raw generation.
+
+            `tool_calls` (2026-09-13 fix) is what makes a turn that called a
+            tool comparable on a later turn at all: before this, the ledger's
+            own record of an assistant turn never carried what it called,
+            so any conversation the client resent WITH that turn's tool_calls
+            attached -- which is what a client replaying its own stored
+            history does -- could never match, and diverged forever."""
             if not chat or ledger is None:
                 return
-            ledger_record(ledger, raw_text,
-                          reply_pin_visible(raw_text, enable_thinking, tools, tool_reply),
-                          stats, cancelled=cancelled)
+            visible, calls = reply_pin_visible(raw_text, enable_thinking, tools, tool_reply)
+            ledger_record(ledger, raw_text, visible, stats, cancelled=cancelled,
+                         tool_calls=calls)
             ledger_report(ledger, stats)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and

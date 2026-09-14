@@ -6,13 +6,17 @@
 # 380-second new chat himself. So this gate always measures the request after the one under
 # test, on Open WebUI's own backend (saved chat + session + memory = what the browser sends).
 #
-#   accept_live.sh            all four checks (exit 1 on any miss)
-#   accept_live.sh --canary   checks 1-2 only: keeps the tool-block checkpoint current when
-#                             Open WebUI's tool list drifts (cron, daily); exit 1 on a miss
+#   accept_live.sh            all checks (exit 1 on any miss)
+#   accept_live.sh --canary   checks 1-2, 5 and the ledger alarm: keeps the tool-block
+#                             checkpoint current when Open WebUI's tool list drifts, and
+#                             catches a server cap that truncates real answers (cron,
+#                             daily); exit 1 on a miss
 #
 # Checks (bounds are the measured values of 2026-09-09 with headroom, not aspirations):
 #  1. UI-shaped new chat A            -> may be cold (a changed tool block is captured here)
 #  2. UI-shaped new chat B (other Q)  -> reused >= prompt-256 and ttft <= 60 s  (the P7b case)
+#  5. a reply with NO max_tokens      -> finish_reason=stop, never length (the server cap must
+#                                        not truncate real answers; in the canary too)
 #  2b. the ledger's own alarm         -> zero MISMATCH and zero `ledger=broken` in the
 #                                        requests this run drove (P9). In the canary too:
 #                                        every prefix regression this week was invisible
@@ -74,6 +78,25 @@ ledger_check() {          # ledger_check <since> [strict]
   fi
 }
 ledger_check "$L0" || FAIL=1
+# 5. a reply must be ALLOWED TO FINISH (2026-09-13). Every other check here pins its own
+# max_tokens (16, 24, 32, 8), so not one of them can see a reply cut off by the SERVER cap --
+# and that is how `--max-tokens 256` sat in ~/start_glm53.sh from the first day of Open WebUI
+# service while this gate passed daily. openai_server.py clamps every request DOWN to that cap
+# and Open WebUI sends no max_tokens, so 256 was the ceiling on every real answer; a tool-calling
+# turn spent it opening a <tool_call> box it could never close and the owner's chat showed
+# nothing at all. So: send NO max_tokens (exactly as Open WebUI does), ask for an answer that
+# cannot fit in a few hundred tokens, and require finish_reason=stop. A `length` here means the
+# operator's cap is truncating real answers, whatever the latency numbers above say.
+FIN=$(curl -s -m 1800 -H "Authorization: Bearer $K" -H "Content-Type: application/json" $URL/v1/chat/completions \
+  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"List the days of the week, and for each one write two full sentences about what people typically do on that day."}]}' \
+  | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); c=d["choices"][0]
+    print(c.get("finish_reason"), d.get("usage",{}).get("completion_tokens"))
+except Exception: print("error 0")')
+fr=$(echo "$FIN" | awk '{print $1}'); ct=$(echo "$FIN" | awk '{print $2}')
+if [ "$fr" = "stop" ]; then say "5. a reply may finish (no max_tokens)" "PASS finish=$fr gen=$ct";
+else say "5. a reply may finish (no max_tokens)" "FAIL finish=$fr gen=$ct -- the server --max-tokens cap is truncating real answers"; FAIL=1; fi
 [ "$MODE" = "--canary" ] && { echo "=== accept_live canary $([ $FAIL = 0 ] && echo PASS || echo FAIL)"; exit $FAIL; }
 # 3. API two-turn with memory on (the pin), through Open WebUI's backend, no chat_id (no tools: fast)
 T=$(docker exec -i -e ACCEPT_NONCE="$N" "${OWUI_CONTAINER:-open-webui-new}" python3 - <<'PY' 2>/dev/null
@@ -111,25 +134,6 @@ curl -s -m 300 -o /dev/null -H "Authorization: Bearer $K" -H "Content-Type: appl
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Say OK."}],"max_tokens":8}'
 t4=$(python3 -c "print(round($(date +%s.%N) - $t0, 1))")
 if [ "${t4%.*}" -le 45 ]; then say "4. request behind an abandoned one" "PASS answered in ${t4}s"; else say "4. request behind an abandoned one" "FAIL ${t4}s (need <=45)"; FAIL=1; fi
-# 5. a reply must be ALLOWED TO FINISH (2026-09-13). Every other check here pins its own
-# max_tokens (16, 24, 32, 8), so not one of them can see a reply cut off by the SERVER cap --
-# and that is how `--max-tokens 256` sat in ~/start_glm53.sh from the first day of Open WebUI
-# service while this gate passed daily. openai_server.py clamps every request DOWN to that cap
-# and Open WebUI sends no max_tokens, so 256 was the ceiling on every real answer; a tool-calling
-# turn spent it opening a <tool_call> box it could never close and the owner's chat showed
-# nothing at all. So: send NO max_tokens (exactly as Open WebUI does), ask for an answer that
-# cannot fit in a few hundred tokens, and require finish_reason=stop. A `length` here means the
-# operator's cap is truncating real answers, whatever the latency numbers above say.
-FIN=$(curl -s -m 1800 -H "Authorization: Bearer $K" -H "Content-Type: application/json" $URL/v1/chat/completions \
-  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"List the days of the week, and for each one write two full sentences about what people typically do on that day."}]}' \
-  | python3 -c 'import json,sys
-try:
-    d=json.load(sys.stdin); c=d["choices"][0]
-    print(c.get("finish_reason"), d.get("usage",{}).get("completion_tokens"))
-except Exception: print("error 0")')
-fr=$(echo "$FIN" | awk '{print $1}'); ct=$(echo "$FIN" | awk '{print $2}')
-if [ "$fr" = "stop" ]; then say "5. a reply may finish (no max_tokens)" "PASS finish=$fr gen=$ct";
-else say "5. a reply may finish (no max_tokens)" "FAIL finish=$fr gen=$ct -- the server --max-tokens cap is truncating real answers"; FAIL=1; fi
 ledger_check "$L0" strict || FAIL=1  # again, now covering checks 3 and 4 — and a follow-up
                                      # ran, so at least one continuation MUST have been checked
 grep "CANCEL" "$LOG" | tail -1 | cut -c1-120

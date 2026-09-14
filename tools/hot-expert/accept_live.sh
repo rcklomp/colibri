@@ -111,6 +111,25 @@ curl -s -m 300 -o /dev/null -H "Authorization: Bearer $K" -H "Content-Type: appl
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Say OK."}],"max_tokens":8}'
 t4=$(python3 -c "print(round($(date +%s.%N) - $t0, 1))")
 if [ "${t4%.*}" -le 45 ]; then say "4. request behind an abandoned one" "PASS answered in ${t4}s"; else say "4. request behind an abandoned one" "FAIL ${t4}s (need <=45)"; FAIL=1; fi
+# 5. a reply must be ALLOWED TO FINISH (2026-09-13). Every other check here pins its own
+# max_tokens (16, 24, 32, 8), so not one of them can see a reply cut off by the SERVER cap --
+# and that is how `--max-tokens 256` sat in ~/start_glm53.sh from the first day of Open WebUI
+# service while this gate passed daily. openai_server.py clamps every request DOWN to that cap
+# and Open WebUI sends no max_tokens, so 256 was the ceiling on every real answer; a tool-calling
+# turn spent it opening a <tool_call> box it could never close and the owner's chat showed
+# nothing at all. So: send NO max_tokens (exactly as Open WebUI does), ask for an answer that
+# cannot fit in a few hundred tokens, and require finish_reason=stop. A `length` here means the
+# operator's cap is truncating real answers, whatever the latency numbers above say.
+FIN=$(curl -s -m 1800 -H "Authorization: Bearer $K" -H "Content-Type: application/json" $URL/v1/chat/completions \
+  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"List the days of the week, and for each one write two full sentences about what people typically do on that day."}]}' \
+  | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); c=d["choices"][0]
+    print(c.get("finish_reason"), d.get("usage",{}).get("completion_tokens"))
+except Exception: print("error 0")')
+fr=$(echo "$FIN" | awk '{print $1}'); ct=$(echo "$FIN" | awk '{print $2}')
+if [ "$fr" = "stop" ]; then say "5. a reply may finish (no max_tokens)" "PASS finish=$fr gen=$ct";
+else say "5. a reply may finish (no max_tokens)" "FAIL finish=$fr gen=$ct -- the server --max-tokens cap is truncating real answers"; FAIL=1; fi
 ledger_check "$L0" strict || FAIL=1  # again, now covering checks 3 and 4 — and a follow-up
                                      # ran, so at least one continuation MUST have been checked
 grep "CANCEL" "$LOG" | tail -1 | cut -c1-120

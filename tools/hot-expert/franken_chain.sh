@@ -157,7 +157,12 @@ assert_glm_resident() {   # assert_glm_resident <label> -- preflight only;
 
 # ---- A arm (glm53, engine mode) --------------------------------------
 run_A() {   # run_A <arm-label>
-  local arm=$1 json="$OUT/${TAG}_${arm}.jsonl" elog="$OUT/${TAG}_${arm}_engine.log" \
+  # arm must be its own `local` statement: bash expands every word of a
+  # single `local a=1 b=$a` line before any assignment takes effect, so a
+  # same-line `${arm}` reads the OUTER (unset) arm, not this one -- found live
+  # on the rig (`set -u`: "arm: unbound variable") the first smoke run.
+  local arm=$1
+  local json="$OUT/${TAG}_${arm}.jsonl" elog="$OUT/${TAG}_${arm}_engine.log" \
         console="$OUT/${TAG}_${arm}_console.log" rc
   echo "=== arm $arm (GLM, engine mode) $(date -Is)"
   precheck "$arm-pre"
@@ -230,7 +235,8 @@ stop_hipfire() {
 }
 
 run_B() {   # run_B <arm-label>
-  local arm=$1 json="$OUT/${TAG}_${arm}.jsonl" hlog="$OUT/${TAG}_${arm}_hipfire.log" rc
+  local arm=$1   # own statement -- see run_A's comment on this exact bug
+  local json="$OUT/${TAG}_${arm}.jsonl" hlog="$OUT/${TAG}_${arm}_hipfire.log" rc
   echo "=== arm $arm (hipFire, HTTP mode) $(date -Is)"
   precheck "$arm-pre"
   assert_vram_free "$arm-pre" || return 1

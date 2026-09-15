@@ -7,6 +7,19 @@ Follow it before forming any plan.
 
 ## Read first, in this order
 
+**Step 0, before any of the four below: run `tools/hot-expert/doc_currency.sh`.**
+It exits non-zero when the docs this section tells you to trust are behind the
+tree, and it takes seconds — no rig, no engine. It exists because on 2026-09-15
+three separate stale pointers were found in one day and every one of them was
+found late, by the owner pushing, not by the session checking: the prefill
+roadmap sat four days behind while a live-incident fix (P12) went unrecorded,
+its item table had no rows for P11 or P12, and Track Q's "what is next" still
+told the reader to run a probe that had already been completed. Run against the
+tree as it stood at the start of that session the script fails immediately on
+the first of those. **This section calls the roadmaps "current by construction";
+that is a claim to verify, not to assume.**
+
+
 0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` — the prefill /
    interactive-use track, opened 2026-09-06 when Open WebUI exposed that
    nothing had ever measured time-to-first-token. **Read the top of the

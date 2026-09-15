@@ -725,6 +725,51 @@ static inline __m256 e4m3x8_to_f32x8(__m128i b8)
  * sibling hyperthreads and slow the eight that work. A second FMA chain per
  * block was likewise measured and rejected (no change at either thread count),
  * so the loop below is deliberately the plain one. */
+/* Q5: the body of matmul_fp8 with NO parallel region of its own, for callers
+ * that have already opened one and want several matmuls inside it. Rows are
+ * computed exactly as matmul_fp8 computes them -- same loads, same block
+ * accumulation, same FMA order -- so the two agree bit for bit; only who owns
+ * the team changes. `omp for` (not `parallel for`) because the caller's region
+ * is already open; the implicit barrier at its end is what makes a dependent
+ * matmul safe to issue straight after. */
+static void matmul_fp8_inregion(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                                int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    #ifdef _OPENMP
+    #pragma omp for schedule(static)
+    #endif
+    for(int o=0;o<O;o++){
+        const uint8_t *w = q8 + (int64_t)o*I;
+        int64_t blkO = o / FP8_BLOCK;
+        const float *scl = bscale + blkO*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi];
+#if defined(__AVX2__) && defined(__FMA__)
+                __m256 vacc=_mm256_setzero_ps(); int i=base;
+                for(;i+8<=base+blen;i+=8){
+                    __m128i wb=_mm_loadl_epi64((const __m128i*)(w+i));
+                    __m256 wf=e4m3x8_to_f32x8(wb);
+                    __m256 xf=_mm256_loadu_ps(xs+i);
+                    vacc=_mm256_fmadd_ps(xf,wf,vacc);
+                }
+                float buf[8]; _mm256_storeu_ps(buf,vacc);
+                float acc=buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+                for(;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+#else
+                float acc=0;
+                for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+#endif
+                a += (double)acc*sc;
+            }
+            y[(int64_t)s*O+o]=(float)a;
+        }
+    }
+}
+
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);

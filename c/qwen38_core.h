@@ -688,6 +688,52 @@ static inline float q38_sigmoid(float x) {
     float z=expf(x); return z/(1.f+z);
 }
 static inline float q38_silu(float x) { return x * q38_sigmoid(x); }
+
+/* Q5: one routed expert's gate/up/silu/down in ONE OpenMP region.
+ *
+ * The CPU share called q38_weight_matmul three times per expert and each of
+ * those opens its own parallel region: 3 fork/joins x the CPU experts of a
+ * token. Here the region is opened once and the three matmuls run as `omp for`
+ * worksharing inside it, with the swiglu as a fourth. The implicit barrier at
+ * the end of each `omp for` is what makes the dependency safe -- eg and eu are
+ * complete before the swiglu reads them, eh is complete before down reads it.
+ *
+ * Bit-identical by construction: matmul_fp8_inregion computes each row exactly
+ * as matmul_fp8 does (same loads, same block accumulation, same FMA order) and
+ * the swiglu is the same expression per element; only who owns the thread team
+ * changes. Rows are independent, so distributing them differently cannot move a
+ * single sum.
+ *
+ * Applies only when all three weights are plain FP8 -- no int8 simulation
+ * attached, no int4 simulation knob, no F32/BF16 member. Anything else returns
+ * 0 and the caller takes the original three-call path, which is also what keeps
+ * QP's simulation knobs behaving exactly as before. */
+static int q38_expert_fused_fp8(const Slot *ex,const float *xs,float *eg,float *eu,
+                                float *eh,float *eo,int H,int I) {
+    const Q38Weight *g=&ex->gate,*u=&ex->up,*d=&ex->down;
+    if(g_q38_i4_sim) return 0;
+    const Q38Weight *w[3]={g,u,d};
+    for(int k=0;k<3;k++){
+        if(!w[k]||!w[k]->data||!w[k]->scales) return 0;
+        if(w[k]->kind!=Q38_WEIGHT_FP8) return 0;
+        if(w[k]->sim_q||w[k]->sim_s) return 0;
+    }
+    if(g->rows!=I||g->cols!=H||u->rows!=I||u->cols!=H||d->rows!=H||d->cols!=I) return 0;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        matmul_fp8_inregion(eg,xs,(const uint8_t*)g->data,g->scales,1,H,I);
+        matmul_fp8_inregion(eu,xs,(const uint8_t*)u->data,u->scales,1,H,I);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(int j=0;j<I;j++) eh[j]=q38_silu(eg[j])*eu[j];
+        matmul_fp8_inregion(eo,eh,(const uint8_t*)d->data,d->scales,1,I,H);
+    }
+    return 1;
+}
+
 static inline float q38_softplus(float x) { return x > 20.f ? x : log1pf(expf(x)); }
 
 /* Qwen4-Exp RMSNorms are zero-centered: the learned scale is 1+weight. */
@@ -2923,8 +2969,10 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             for(int zi=0;zi<q38vk_cpu_n;zi++){
                 int z=q38vk_cpu_idx[zi];
                 Slot *ex=q38_expert_get(m,layer,idx[z]);
-                q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-                for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+                if(!q38_expert_fused_fp8(ex,xs,eg,eu,eh,eo,H,I)){   /* Q5: one region, else the three-call path */
+                    q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
+                    for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+                }
                 for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             }
             q38_tm_add_live(m,Q38_TM_EXPERT_CPU,cpu_started);
@@ -2937,8 +2985,10 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
                     if(rc){ for(int d=0;d<H;d++)ys[d]+=route_gates[z]*bufY[dev][(int64_t)n*H+d]; }
                     else {  /* the join failed: compute this device's experts on the CPU now */
                         Slot *ex=q38_expert_get(m,layer,idx[z]);
-                        q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-                        for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+                        if(!q38_expert_fused_fp8(ex,xs,eg,eu,eh,eo,H,I)){   /* Q5: one region, else the three-call path */
+                            q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
+                            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+                        }
                         for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
                     }
                 }
@@ -2953,8 +3003,10 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
         for(int z=0;z<K;z++){
             Slot *ex=loaded_batch?selected[z]:q38_expert_get(m,layer,idx[z]);phase_started=now_s();
-            q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+            if(!q38_expert_fused_fp8(ex,xs,eg,eu,eh,eo,H,I)){   /* Q5: one region, else the three-call path */
+                q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
+                for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+            }
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
             q38_tm_add_live(m,Q38_TM_EXPERT_CPU,phase_started);

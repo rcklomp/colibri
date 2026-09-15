@@ -49,6 +49,23 @@ for f in "$RM" "$PF"; do
   done
 done
 
+echo "=== references that no longer resolve ==="
+for f in $(git ls-files 'tools/hot-expert/*.md' CLAUDE.md); do
+  grep -oE '\b(tools|c)/[A-Za-z0-9_./-]+\.(sh|py|c|h|md|mjs|comp|spv)\b' "$f" 2>/dev/null | sort -u | while read -r p; do
+    [ -e "$p" ] || echo "  DEAD  $f -> $p"
+  done
+done | sort -u | grep . && fail=1 || echo "  ok: every repo path named in the docs exists"
+
+echo
+echo "=== untracked files loitering in the working tree ==="
+n=$(git status --porcelain | grep -c '^??') || true
+if [ "${n:-0}" -gt 0 ]; then
+  echo "  $n untracked file(s) -- these keep git status dirty and hide real changes:"
+  git status --porcelain | grep '^??' | sed 's/^/    /'
+  fail=1
+else echo "  ok: none"; fi
+
+echo
 echo
 [ $fail -eq 0 ] && echo "doc_currency: PASS" || echo "doc_currency: FAIL -- the docs are behind the tree"
 exit $fail

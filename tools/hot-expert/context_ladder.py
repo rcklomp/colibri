@@ -152,6 +152,15 @@ def main():
             # The contract. Turn 1 reuses nothing by construction; after that a
             # turn that does not reuse the whole previous context is measuring
             # something else, and the ladder must not average the two together.
+            #
+            # The floor is the previous turn's PROMPT length, not prompt+reply.
+            # Reuse is all-or-nothing, so a turn that reuses at all reuses
+            # everything the slot holds (prompt + generated - 1, the last token
+            # being emitted but never re-ground); the only two outcomes are
+            # ">= prev_tokens" and "0". Asserting the exact prompt+reply total
+            # would additionally assume every generation ran to --gen rather
+            # than stopping on EOS, and would abort a perfectly good ladder over
+            # a one-token miscount hours in.
             if i > 0 and reused < prev_tokens:
                 print(f"\nABORT at turn {i+1}: the engine reused {reused} of the "
                       f"{prev_tokens} tokens it held, so this turn re-prefilled the "
@@ -188,7 +197,7 @@ def main():
             # carried for a reader; the pin is what renders.
             raw = "".join(ev["text"])
             messages.append({"role": "assistant", "content": raw, pin_field: raw})
-            prev_tokens = total + max(0, ev["ntok"] - 1)
+            prev_tokens = total
     finally:
         drv.close()
 

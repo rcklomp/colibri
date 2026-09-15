@@ -180,6 +180,16 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - A change that alters numerics ships behind an env knob, off by default,
   with the logit diff in the commit body.
 - Repeat the headline number at least twice; report both.
+- **Source `tools/hot-expert/gate_lib.sh` and let it decide, rather than reading
+  the numbers yourself.** `gate_compare` REFUSES a comparison whose pattern is
+  absent from either side — two empty `grep`s diffed against each other print
+  IDENTICAL, and that is how a gate once reported a passing numerics oracle from
+  two runs that had produced no output at all. `gate_ab_verdict` refuses a
+  verdict from a single unpaired sample, and reports NO VERDICT when the arms
+  overlap. **Run arms interleaved A,B,B,A.** On this box an uninterleaved pair
+  read **+20%** and **+11%** on two changes whose real effects were +3.9% and
+  zero: the second arm inherits a warm page cache, and that is worth more here
+  than most optimisations. Validated against all three of those real cases.
 - The numbers go in the commit body and one row goes into the record. A
   change without a measured delta does not merge.
 - **A binary is in service only when `tools/hot-expert/accept_live.sh`

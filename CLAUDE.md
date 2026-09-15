@@ -62,8 +62,8 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 ## The machine and its traps
 
 - EPYC 7F32 (8 cores / 16 threads, Zen 2, AVX2+FMA+F16C, no AVX-512),
-  247 GB RAM, three RX 7900 XTX on RADV/Vulkan (no hardware FP8), one NVMe.
-- **Threads:** the `coli` launcher and `tools/datapoint.py` pin engines to
+  247 GiB RAM (MemTotal; **that is 265.6 GB** — this box's RAM is habitually quoted in GiB and labelled GB, and that exact confusion produced a real bug: PR #1321's budget formula subtracted a true-GB model size from a GiB total), three RX 7900 XTX on RADV/Vulkan (no hardware FP8), one NVMe.
+- **Threads:** the `coli` launcher and `c/tools/datapoint.py` pin engines to
   physical cores (8). All recorded numbers are 8-thread numbers. Direct
   engine runs must set `OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close`
   or say explicitly that they did not.
@@ -163,7 +163,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 ## How a change is measured (no exceptions)
 
 - Before and after, same prompt, same regime. The serving regime is
-  `tools/datapoint.py` (persistent engine, cold / warm-identical / rotating);
+  `c/tools/datapoint.py` (persistent engine, cold / warm-identical / rotating);
   the rotating median is the headline, the warm-identical row is an upper
   bound, and a fresh-process run is a diagnosis, not a result.
 - **Oracle:** greedy output text identical, and last-token logits compared
@@ -226,11 +226,19 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   binary in service before the item. **Every gate runs with
   `GLM53_PREFIX_CKPT=0` and a private `COLI_CKPT_DIR`**: two gates nearly
   passed for the wrong reason because the candidate restored a checkpoint
-  the pristine had just written. **All four qwen38 C tests
-  pass** as of 2026-09-06. `tests/test_qwen38_prefix` used to SIGFPE on every
-  tree; that was C1's merge blocker and it is fixed (unguarded
-  `m->max_t / c->idx_ratio` in `ensure_kv`, which the test's fabricated Model
-  leaves at 0). If it crashes again, that guard is the first place to look.
+  the pristine had just written. **qwen38 C tests, re-run 2026-09-15: there are SEVEN, not four, and six
+  pass.** `test_qwen38_native_weights` FAILS at
+  `tests/test_qwen38_native_weights.c:587` (`!memcmp(want,got,sizeof want)`) and
+  has failed since at least 2026-09-08 (the dev merge `132d177`) -- NOT caused by
+  anything in the Q track, verified by rebuilding and running it at `132d177`,
+  `9ef6ff4` and `902077d`. This sentence previously claimed all four passed as of
+  2026-09-06; that had been untrue for a week. **Open defect, unowned,
+  undiagnosed.** `tests/test_qwen38_prefix` used to SIGFPE -- **on OUR tree, not
+  "on every tree" as this line used to say**: upstream's `ensure_kv` has no
+  `IK_pooled` and no `idx_ratio` divide at all, so the crash arrived with our own
+  G5 pooled-index cache and could never have happened upstream. It is fixed
+  (unguarded `m->max_t / c->idx_ratio` in `ensure_kv`, which the test's fabricated
+  Model leaves at 0). If it crashes again, that guard is the first place to look.
 
 ## Git
 

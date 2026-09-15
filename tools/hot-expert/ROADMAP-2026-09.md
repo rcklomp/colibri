@@ -16,7 +16,7 @@ whether it worked: the gate judges.
 | **Fable 5.1** | the two design documents (dense-off-DRAM, MTP), the choice of KDA approach after the GLM profile, and arbitration when a measurement contradicts the record | the expensive part is deciding, not typing |
 
 Rule for every item, whatever the tier: measure before, measure after, same
-prompt, same regime (`tools/datapoint.py`, physical-core threads, page cache
+prompt, same regime (`c/tools/datapoint.py`, physical-core threads, page cache
 state verified with `fincore`), greedy text identical or the logit diff
 explained, and the numbers go in the commit body. The record's three traps
 (thread count, per-device caps, foreign-branch binaries) are in the harness so

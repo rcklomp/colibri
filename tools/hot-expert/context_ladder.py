@@ -89,7 +89,11 @@ def main():
     ap.add_argument("--kv-slots", type=int, default=4, help="4 = what the gateway serves")
     ap.add_argument("--cap", type=int, default=None)
     ap.add_argument("--tools", default=None)
-    ap.add_argument("--min-resident", type=float, default=95.0)
+    # 90, not ttft_serve's 96: the engine under measurement is itself ~89 GB of
+    # anon memory on this box, so the shards cannot be 96% resident while it
+    # runs. majflt per turn is the check that the model is not being re-read
+    # from NVMe inside the measurement, and it is recorded on every row.
+    ap.add_argument("--min-resident", type=float, default=90.0)
     ap.add_argument("--warm", action="store_true")
     ap.add_argument("--json", default=None)
     ap.add_argument("--tag", default="ctx")

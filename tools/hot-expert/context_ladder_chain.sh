@@ -36,6 +36,16 @@ STEPS=${STEPS:-1024,1024,2048,4096,8192,8192,8192,8192,8192,8192,8192}
 GEN=${GEN:-32}
 FOLLOWUPS=${FOLLOWUPS:-2}
 MAXT=${MAXT:-98304}
+# 90, not ttft_serve's 96. A loaded glm53 holds ~89 GB of anon memory beside a
+# 183 GiB model on a 247 GB box, so the shards CANNOT be 96% resident while the
+# engine that is being measured is running: the first attempt here re-warmed
+# twice (31 s each, reading 182 GiB and fighting the engine for the same pages)
+# and climbed only 92.3 -> 94.0. ttft_serve.py's own comment records the same
+# thing -- "the gateway's engine sits at ~91.6%". The floor is a proxy for the
+# question that matters, which is whether the run is re-reading the model from
+# NVMe inside the measurement; majflt per turn answers that directly and is
+# recorded on every row, so it is the check to read in the results.
+MIN_RESIDENT=${MIN_RESIDENT:-90}
 
 start_gateway() {
   env -u COLI_CKPT_DIR -u GLM53_PREFIX_CKPT -u GLM53_MAXT \
@@ -83,7 +93,7 @@ export GLM53_VERBOSE=1
 python3 "$HERE/context_ladder.py" \
     --engine "$BIN" \
     --steps "$STEPS" --gen "$GEN" --followups "$FOLLOWUPS" \
-    --kv-slots 4 --warm --min-resident 95 \
+    --kv-slots 4 --warm --min-resident "$MIN_RESIDENT" \
     --tag "$TAG" --json "$OUT/$TAG.jsonl" \
     --engine-log "$OUT/engine_$TAG.log"
 rc=$?

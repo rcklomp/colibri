@@ -1031,10 +1031,21 @@ by guess; where a position is a judgment call rather than a number, it says so.
    separate Track G item (see below). Items #2–#5 were screened out
    (#2/#3 already exist under different names, #4/#5 don't apply or are
    refactor-only).
-   **NEXT, as of 2026-09-12 evening: Q12 is PARKED (declined on expected
-   value, not killed — see its row), so the next item is Q9 (MTP): its chunk
-   probe (step 1, re-gated now that Q8 is dead) is the half-day gate on the
-   track's largest remaining multiplier. Q14's step 0 is DONE and its
+   **NEXT, as of 2026-09-15: NOTHING ON THIS ROADMAP. Every Q item is in a
+   terminal state and so is every prefill item — do not go looking for one.**
+   Q5 DONE, Q9 step 1 DONE, Q13 measured and handed to the owner, Q12
+   revisited on schedule and declined on standing evidence. The one thing
+   left on the board is **not a roadmap item**: Q9's chunk probe answered the
+   MTP question (Qwen dedups −29.04% where GLM measured FLAT, so GLM's ~1.2×
+   refusal does NOT transfer) and the row's own rule therefore says MTP is
+   worth a **Fable spec**, then a 5–8 day build. That is a new project to
+   open deliberately, not a tail to finish.
+   *Superseded pointer, kept so the change is visible:* "NEXT, as of
+   2026-09-12 evening: Q12 is PARKED (declined on expected value, not killed
+   — see its row), so the next item is Q9 (MTP): its chunk probe (step 1,
+   re-gated now that Q8 is dead) is the half-day gate on the track's largest
+   remaining multiplier." **That probe has since been run and is DONE
+   (2026-09-15); do not re-run it.** Q14's step 0 is DONE and its
    hypothesis is REFUTED** (record
    §Q14 step 0): the OpenMP wait policy has zero headroom, the cores never
    leave the boost ceiling during decode at any mask, and the ~5.4 ms/token

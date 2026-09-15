@@ -94,18 +94,18 @@ trap on_exit EXIT INT TERM HUP
 
 echo "=== h0_chain $TAG $(date -Is)"
 
-echo "--- step 1: pre-checks"
+echo "--- step 1: stop gateway"
+stop_gateway || exit 1
+
+echo "--- step 1b: pre-checks (post-stop: engines idle, VRAM free, DPM/sclk recorded)"
 for e in glm53 qwen38 qwen38-vk; do
-  pgrep -x "$e" >/dev/null && { echo "FATAL: $e already running"; exit 1; }
+  pgrep -x "$e" >/dev/null && { echo "FATAL: $e still running after stop_gateway"; exit 1; }
 done
 for c in 0 1 2; do
   v=$(VRAM "$c")
   echo "card$c: vram_used=$v dpm=$(DPMLVL "$c") sclk=[$(SCLK "$c")]"
-  [ "$v" -lt 1073741824 ] || { echo "FATAL: card$c VRAM $v >= 1 GiB before starting"; exit 1; }
+  [ "$v" -lt 1073741824 ] || { echo "FATAL: card$c VRAM $v >= 1 GiB after stopping the gateway"; exit 1; }
 done
-
-echo "--- step 2: stop gateway"
-stop_gateway || exit 1
 
 echo "--- step 3: hipFire H0"
 [ -x "$HIPFIRE_BIN" ] || { echo "FATAL: $HIPFIRE_BIN missing"; exit 1; }

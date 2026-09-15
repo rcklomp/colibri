@@ -445,7 +445,8 @@ class HttpDriver:
         if self.tools:
             body["tools"] = self.tools
         ev = {"submit": time.time(), "accept": None, "first": None, "done": None,
-              "ntok": 0, "prompt_tokens": None, "cancelled": False, "error": None, "text": []}
+              "ntok": 0, "prompt_tokens": None, "completion_tokens": None,
+              "cancelled": False, "error": None, "text": []}
         req = urllib.request.Request(self.url, data=json.dumps(body).encode(),
                                      headers=self.headers, method="POST")
         try:
@@ -460,6 +461,11 @@ class HttpDriver:
                     j = json.loads(data)
                     if j.get("usage"):
                         ev["prompt_tokens"] = j["usage"].get("prompt_tokens")
+                        # the authoritative decode count when the server reports
+                        # it: a delta count is chunk granularity, not tokens
+                        # (MEASURING.md's streaming-granularity risk), and
+                        # completion_tokens is what a batching server actually sent
+                        ev["completion_tokens"] = j["usage"].get("completion_tokens")
                     for ch in j.get("choices", []):
                         d = ch.get("delta", {})
                         if d.get("content") or d.get("reasoning_content") or d.get("tool_calls"):

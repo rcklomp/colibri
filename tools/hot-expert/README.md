@@ -16,11 +16,8 @@ someone profiles this path.
 | script | what it adds |
 | --- | --- |
 | `patch_io.py` | Times `expert_read`, prints `[IO] expert_read wall=… n=… avg=…ms`. This is how the page-cache problem was found. |
-| `patch_other.py` | Wall-clock timers around the attention call sites and `ffn_layer`; prints `[OTHER] attn=… ffn=…`. Independent of Vulkan. |
 | `patch_score.py` | Dumps the top-16 `(expert, score)` per `(layer, token)` to `$COLI_TRACE` as `S <layer> <token> <rank> <eid> <score>`. |
-| `patch_trace.py` | Routing trace + resident-set dump (`$COLI_TRACE`, `$COLI_DUMP_RESIDENT`). |
 | `patch_histgpu.py` | Collects an expert-usage histogram for the *current* config into `$COLI_USAGE_OUT`, separate from the ranking map read from `$COLI_USAGE_PATH`. |
-| `patch_hist.py` | Older histogram collector; writes back to `$COLI_USAGE_PATH`. |
 
 `analyze_scores.py` compares two `S`-format traces positionally and reports
 per-rank differences, score-delta buckets, top-8 set churn, layer concentration,
@@ -36,9 +33,16 @@ call, so `(layer, token)` is not a unique key across decode steps.
 ## Feature patches (already committed; kept for provenance)
 
 `patch_hybrid.py`, `patch_dev2.py`, `patch_dev2fix.py`, `patch_dev3_backend.py`,
-`patch_dev3_glm.py`, `patch_cachefix.py`, plus earlier exploratory ones
-(`patch_fused.py`, `patch_hotexpert.py`, `patch_lastmile.py`, `patch_perlayer.py`,
-`patch_poc*.py`, `patch_scores.py`).
+`patch_dev3_glm.py`, `patch_cachefix.py`.
+
+**This file is not an index of the directory** (checked 2026-09-15): it names 17
+scripts, 29 are present, and 8 of the 17 it named had been deleted —
+`patch_other.py`, `patch_trace.py`, `patch_hist.py`, `patch_fused.py`,
+`patch_hotexpert.py`, `patch_lastmile.py`, `patch_perlayer.py`,
+`patch_scores.py`, plus a `patch_poc*.py` glob matching nothing. Those are gone
+from the text above. The ones that were never listed — the qwen38, fp8, kda,
+mmap and shader patches — are still undocumented here; `ls tools/hot-expert/patch_*.py`
+is the authority, not this page.
 
 Apply order if you ever need to rebuild the stack from a clean tree:
 `patch_hybrid` → `patch_dev2` → `patch_dev2fix` → `patch_dev3_backend` →

@@ -57,6 +57,26 @@ for f in $(git ls-files 'tools/hot-expert/*.md' CLAUDE.md); do
 done | sort -u | grep . && fail=1 || echo "  ok: every repo path named in the docs exists"
 
 echo
+echo "=== bare filenames named in the docs that exist nowhere ==="
+# NOT just prefixed paths: the dead-reference check below used to require a
+# tools/ or c/ prefix, so `patch_trace.py` sitting in a markdown table was
+# invisible -- and eight such scripts had been deleted while README.md still
+# documented them. Rig-side scripts (~/bench) and build artefacts (.spv, and
+# generated fixtures) are excluded: they legitimately do not live in the repo.
+git ls-files 'tools/hot-expert/*.md' CLAUDE.md | xargs grep -ohE '`[A-Za-z0-9_][A-Za-z0-9_.-]*\.(py|sh|mjs)`' 2>/dev/null \
+  | tr -d '`' | sort -u | while read -r n; do
+      grep -qE "\b$n\b" <<<"$(git ls-files)" && continue
+      case "$n" in *_chain.sh|q7_lib.sh|owui_report.sh) continue;; esac   # rig-side, live in ~/bench
+      grep -qE "(~/bench|bench/)$n" $(git ls-files 'tools/hot-expert/*.md' CLAUDE.md) 2>/dev/null && continue
+      # a name the docs explicitly record as deleted is documentation, not rot;
+      # look at the surrounding paragraph, not the single line -- the marker
+      # phrase and the name are usually a couple of lines apart.
+      grep -qE "had been deleted|no longer exists|is gone|glob matching nothing" \
+        <<<"$(grep -h -B4 -A4 "$n" $(git ls-files 'tools/hot-expert/*.md' CLAUDE.md) 2>/dev/null)" && continue
+      echo "  DEAD  $n named in the docs, present nowhere in the repo"
+    done | sort -u | grep . && fail=1 || echo "  ok: every bare script name in the docs resolves"
+
+echo
 echo "=== untracked files loitering in the working tree ==="
 n=$(git status --porcelain | grep -c '^??') || true
 if [ "${n:-0}" -gt 0 ]; then

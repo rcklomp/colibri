@@ -41,6 +41,54 @@ the decisive unknown is whether it reuses prefixes across turns. If it does
 not, its per-turn wait at 18k is a full re-prefill and Colibri's incremental
 turn may still win the number the owner actually waits for.
 
+## 0b. CORRECTION (2026-09-15, after §0 was written): the same-model pair EXISTS
+
+§0 says "no pair of engines here can run the same model in the same placement
+on both backends". That was reasoned from the two models on this box's NVMe and
+it is **wrong**. The model set is not limited to what is already downloaded.
+
+**Qwen3.6-35B-A3B runs on both.** hipFire ships eight SKUs of it
+(`qwen3.6:35b-a3b`, `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq5`, `-mq6`;
+MQ4R is 18.7 GB needing ~22 GB VRAM) with RDNA3 among the
+architecture-tuned targets. This fork ships `c/qwen36.c` and
+`c/tools/convert_qwen36.py`, whose own usage line is
+`--repo Qwen/Qwen3.6-35B-A3B`. The HF repo exists: BF16 safetensors, 35B total /
+3B activated, 256 experts (8 routed + 1 shared). This box has 2.3 TB free.
+
+What is actually in the way is two CODE GAPS on this fork, not model
+availability:
+
+1. `c/qwen36_tier.h` is `#ifdef COLI_CUDA`, and its own comment says the
+   `!COLI_CUDA` path keeps "the engine CPU-only with zero overhead". So today
+   Colibri serves this model on the CPU here. `backend_vulkan.c` already exists
+   and already serves `glm53` and `qwen38-vk`; nothing structural prevents a
+   Vulkan expert tier for `qwen36`.
+2. `convert_qwen36.py`: "The engine (c/qwen36.c) currently reads ebits>=5
+   (int8); the int4 path is WIP." So the Colibri arm is int8 (~35 GB, which
+   needs more than one 24 GB card) against hipFire's 4-bit MQ4R. For quant
+   parity compare against `-mq5`/`-mq6`, or finish the int4 path.
+
+**This changes the plan's centre of gravity.** §2's "no honest same-weights
+GPU pair" premise is replaced by a prerequisite item:
+
+- **V1 — a Vulkan expert tier for `qwen36`.** Port the pattern that
+  `glm53`/`qwen38-vk` already use (heat-ranked preload, per-device budget,
+  `COLI_VK_DEV2/3`) to `qwen36`'s tier, behind the same kind of env knob.
+  Tier: Opus (it is `backend_vulkan.c` surface), and it is a PORT of an
+  existing measured pattern, which is the one thing this fork is best at.
+  Gate: bit-identical to the CPU path on `teacher_forcing` with the tier off;
+  with it on, the KL bar of X2; and a decode A,B,B,A through `gate_ab_verdict`.
+
+V1 is worth doing whether or not hipFire ever runs here, because it is exactly
+the "second, VRAM-resident lane" §3 branch O1 wants — a 3B-active model in VRAM
+— but inside Colibri's serving stack, so P7 checkpoints, the P9 ledger and the
+KV slots survive. The head-to-head then becomes GPU-vs-GPU on the same
+weights, which is what was asked for in the first place.
+
+Sequencing note: downloading ~70 GB of BF16 and converting it is NVMe and page
+cache work, and would evict the model residency the 64Ki ladder asserts before
+every turn. It waits for the lock, like everything else.
+
 ## 1. What is established (do not re-derive)
 
 | fact | value | kind | source |

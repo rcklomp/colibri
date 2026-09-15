@@ -1,10 +1,91 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 25, 2026-09-11)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 26, 2026-09-15)
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap
 optimised **decode throughput** (tok/s on short prompts). This one is about
 **time-to-first-token on real prompts** — the number a person actually waits on
 in an interactive UI. Nothing in the decode roadmap moves it.
+
+**Rev 26 (2026-09-15): P12 landed 09-13 and is recorded here late; and the
+serving cap incident of 09-13/14 — every reply this box ever produced was
+truncated at 256 tokens, and no gate on this track could see it.**
+
+**P12 / P12b (landed 2026-09-13, `da5f530`, `9e12c6e`, merged `9ef6ff4`).** A
+live conversation's ledger diverged on every turn that carried a tool call:
+the raw text of one generation is re-parsed for tool calls at several
+independent points (the API response, P8's reply-pin, P9's ledger record) and a
+`uuid.uuid4()` id came out different at each parse — not only between requests,
+*within* one. P9's ledger compares two parses for equality, so it read every
+tool-call turn as a mismatch. Ids are now derived from
+`sha1(index, name, arguments)`, so every independent parse of the same raw text
+agrees. P12b additionally records a turn's actual `tool_calls` instead of
+discarding them. **This rev is the first time either appears on this roadmap,
+which is the failure CLAUDE.md warns about at the top of this file: work landed
+and the pointer did not move.**
+
+**The 256-token cap (2026-09-13 22:06 incident; fixed 09-14).** `~/start_glm53.sh`
+ran `--max-tokens 256` from the first day of Open WebUI service (oldest surviving
+copy `~/bench/start_glm53.sh.p6base`, 2026-09-06 23:05). It is rome_bench's
+generation length, not a serving budget. `openai_server.py` clamps every request
+DOWN to the server cap and Open WebUI sends no `max_tokens`, so 256 was the
+ceiling on every real answer. Proved against the live gateway: asked 2000, got
+exactly 256, `finish_reason=length`. The owner's chat produced *nothing at all*
+because a tool-calling turn spent the whole 256 opening a `<tool_call>` box it
+could never close — the strict parser needs both tags and `_unclosed_tail`
+cannot recover a cut inside `<arg_value>` — so the client got zero `tool_calls`
+plus raw markers and Open WebUI stored no assistant message. Now 4096.
+
+**Why this track's gates could not see it, which is the part that matters.**
+Every `accept_live.sh` check pins its own `max_tokens` (16, 24, 32, 8) and
+`owui_ui_turn.sh` hardcodes 16. Not one of them ever lets a reply finish, so the
+gate is structurally blind to a server-cap truncation and passed daily
+throughout — including the 05:00 canary. Added **check 5, "a reply may finish"**:
+no `max_tokens` (exactly as Open WebUI sends), a question that cannot fit in a
+few hundred tokens, require `finish_reason=stop`. It sits ABOVE the canary's
+early exit, so the unattended daily run covers it too. Verified on the live
+gateway: full gate PASS `finish=stop gen=274`, canary PASS `finish=stop gen=267`
+— both over the old 256, so the check discriminates. Same shape as P7b: the gate
+measured everything except what the owner experiences.
+
+**Two traps hit while fixing it, both now written down** (`rig-process-hygiene`,
+and `tools/hot-expert/rig/README.md`): a `#` comment placed between
+backslash-continued argument lines makes bash join the logical line and silently
+drop every argument after it — the gateway came up with no `--max-tokens`, no
+`--kv-slots 4` (KV_SLOTS=1, re-creating the P6 eviction) and no `--allowed-host`,
+while `bash -n` passed; and editing `start_glm53.sh` while a copy of it is
+running makes bash re-read it at its saved byte offset mid-execution. The
+restart path now verifies the RUNNING process's arguments from
+`/proc/<pid>/cmdline` rather than trusting a syntax check
+(`~/bench/restart_gw2.sh`), and restores the gateway on every exit path.
+
+**`~/start_glm53.sh` is now under version control** at
+`tools/hot-expert/rig/start_glm53.sh`, byte-identical, because when asked who
+set 256 and why, nobody could answer: the file lived only in `$HOME` with no
+history anywhere. `restart_gw2.sh` diffs live against the repo copy before every
+restart.
+
+**Not a regression, checked because it was asked:** GLM-5.3 decode re-measured
+after the cap change with the decode track's own tool — 3.03 / 2.98 tok/s
+rotating (3.44 / 3.45 warm, 1.86 / 1.90 cold), against g5's 3.08–3.10 on
+2026-09-11. Inside this rig's documented run-to-run spread, and cold is
+identical. Recorded in `ROME-3x7900XTX-2026-09-04.md`. GLM-5.3 has never been
+recorded above 3.10 rotating; the 4+ rows in that table are `qwen38-vk`.
+
+**Upstream, in flight (2026-09-14/15), because it changes what a future merge
+inherits:** PR #1321 rebased onto `dev` and un-conflicted — it also carries two
+unit fixes, our own GiB-vs-GB (the original patch subtracted true GB from GiB,
+which is why it reported picking 44.3 GB and now picks 61.1) and upstream's
+`kb/1e6` for `/proc/meminfo` KiB. Issue #1519: `st.h`'s lazy shard-mapping table
+is written without synchronisation and `glm53` reaches it from an OpenMP region
+— latent only because `COLI_MAP_EXPERTS` is opt-in, and #1350 is preparing to
+flip that. **Do not take an upstream `dev` merge before #1519 resolves**, or the
+merge adopts that race wholesale on a box that hammers the path. Issue #1520:
+the Vulkan routed-expert kernel skips the swiglu clamp (record §G15). PRs #1521
+and #1524: the mHC and KDA parallelisations, bit-identical, +3.9% / +3.0% on an
+upstream CPU-only build.
+
+**What is next on this track:** unchanged from Rev 25 — nothing new was opened
+here. The open prefill items below stand as written.
 
 **Rev 25 (2026-09-11): sync only -- PCAP's int3-experts lever is dead.** No new
 prefill-track work this rev. `ROADMAP-2026-09.md` 4h / G15 ran its numerics

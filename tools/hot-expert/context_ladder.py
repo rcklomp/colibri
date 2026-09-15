@@ -110,6 +110,7 @@ def main():
     T.assert_resident(args, "start")
 
     drv = T.EngineDriver(args)
+    pin_field = getattr(drv.rt, "REPLY_PIN_FIELD", "_coli_reply_pin")
     records, messages, cursor, cum_prefill = [], [], 0, 0.0
     prev_tokens = 0
 
@@ -177,7 +178,16 @@ def main():
                   f"{(ttft or 0):>9.2f} {(rec['ms_per_new_token'] or 0):>10.2f} "
                   f"{(rec['decode_tps'] or 0):>8.2f} {cum_prefill:>14.1f}", flush=True)
 
-            messages.append({"role": "assistant", "content": "".join(ev["text"])})
+            # P8's reply pin, by its own field name, because this harness IS the
+            # gateway in engine mode and nothing else will apply it. Without it
+            # render_chat_glm53's assistant branch emits
+            #     <|assistant|><think></think>{content.strip()}
+            # while the engine's KV holds <|assistant|><think> followed by the
+            # RAW generation -- they diverge on the token after <think>, reuse is
+            # 0, and every later turn is a cold re-prefill. `content` is still
+            # carried for a reader; the pin is what renders.
+            raw = "".join(ev["text"])
+            messages.append({"role": "assistant", "content": raw, pin_field: raw})
             prev_tokens = total + max(0, ev["ntok"] - 1)
     finally:
         drv.close()

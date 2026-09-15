@@ -313,9 +313,16 @@ static int check_fixture_mode(const char *directory,int native_fp8,int expect_fa
        verify_loaded_fp8_slot(first,0,native_fp8))goto cleanup;
     void *slab=first->fp8_slab;
     if(expect_fast){
-        if(!native_fp8||!slab||first->gate.data!=slab||
-           first->up.data!=(unsigned char*)slab+6||
-           first->down.data!=(unsigned char*)slab+12||
+        /* A native fp8 expert is served fast in one of two shapes: the slot
+         * owns a slab holding gate|up|down back to back (the pread path), or
+         * the three matrices point straight into the shard mapping and the
+         * slab was released (st_map_shard_range, COLI_MAP_EXPERTS=1). The
+         * invariants are the adjacency and the read counters; which memory
+         * holds the bytes is not one, and asserting the slab made this test
+         * fail on every build that maps experts by default. */
+        const unsigned char *g=(const unsigned char*)first->gate.data;
+        if(!native_fp8||!g||(slab&&g!=(const unsigned char*)slab)||
+           first->up.data!=g+6||first->down.data!=g+12||
            model.expert_weight_reads!=2||model.expert_scale_reads!=2||
            model.expert_pair_reads!=1||model.expert_scale_bytes!=24)
             goto cleanup;
@@ -584,7 +591,25 @@ int main(void){
     float want[S*O],got[S*O];
     reference_fp8_matmul(want,x,raw,fp8.scales,S,I,O);
     q38_weight_matmul(got,x,&fp8,S,I,O);
-    CHECK(!memcmp(want,got,sizeof want));
+    /* The reference sums each block left to right; a vectorised
+     * q38_weight_matmul (AVX2, eight lanes folded at the end) sums in a
+     * different order, so the two agree to rounding and not to the bit. The
+     * bound is relative to the sum of the ABSOLUTE terms of each dot product,
+     * because a result near zero can sit on partial sums in the thousands:
+     * measured 8.3e-8 of that sum on AVX2+FMA (about 1.4 ulp), so 1e-6 has a
+     * 12x margin, while a wrong decode, scale block or layout is off by O(1)
+     * of the same sum and still fails. */
+    {   int64_t input_blocks=fp8_nblk(I);
+        for(int s=0;s<S;s++)for(int o=0;o<O;o++){
+            double absum=0.0;
+            for(int k=0;k<I;k++)
+                absum+=fabs((double)e4m3_decode(raw[(int64_t)o*I+k])*
+                            fp8.scales[(o/FP8_BLOCK)*input_blocks+k/FP8_BLOCK]*
+                            x[s*I+k]);
+            int i=s*O+o;
+            CHECK(fabs((double)got[i]-want[i])<=1e-6*absum+1e-6);
+        }
+    }
     void *same=fp8.data;q38_weight_reserve(&fp8,Q38_WEIGHT_FP8,O,I);
     CHECK(fp8.data==same);
     q38_weight_free(&fp8);CHECK(fp8.kind==Q38_WEIGHT_NONE&&!fp8.data&&!fp8.scales);

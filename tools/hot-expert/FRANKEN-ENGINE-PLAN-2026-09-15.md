@@ -13,18 +13,40 @@
 > through host RAM". This plan's answer, before any measurement: **those are two
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
+>
+> **Rev 2 (2026-09-16).** Rev 1's §0 said no pair of engines could run the same
+> model in the same placement on both backends. That was reasoned from what is
+> on the rig's NVMe, and the owner rightly rejected it: the model set is not what
+> is downloaded. Qwen3.6-35B-A3B runs on hipFire (eight registry SKUs, verified
+> at its README: `qwen3.6:35b-a3b`, `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`,
+> `-mq5`, `-mq6`; MQ4R is its validated RDNA3 route) and on this fork
+> (`c/qwen36.c`, `c/tools/convert_qwen36.py --repo Qwen/Qwen3.6-35B-A3B`, the
+> published int4-gs64 container). What stands between them is **one code gap on
+> this fork** — `qwen36`'s VRAM tier is CUDA-only — and that gap is a port of a
+> pattern this tree already has twice. So the same-weights GPU pair does not
+> exist *today* and does exist *after item V1*; §0, §2.6 and §3 are rewritten
+> around that, H2 stays first because it needs no code, and a second claimed
+> gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
 ## 0. Decision in one paragraph
 
-The head-to-head (§2) cannot separate "HIP beats Vulkan" from "a 3B-active
-model in 960 GB/s VRAM beats a 180 GB model whose misses come from host DRAM",
-because no pair of engines here can run the same model in the same placement
-on both backends. So it is not designed to answer the backend question. It is
-designed to answer the **product** question — what the owner's turn costs at
-depth in each world, and whether the moat (P7/P9 prefix reuse) survives — with
-the one same-weights control that is possible (§2.3). The backend question is
-answered separately and cheaply by a same-op microbenchmark (§3, D-3), and the
-profile already says its ceiling: **the GLM-5.3 token is CPU/DRAM-bound, not
+The first head-to-head (§2, H2) cannot separate "HIP beats Vulkan" from "a
+3B-active model in 960 GB/s VRAM beats a 180 GB model whose misses come from
+host DRAM", because **today** no engine here runs the same model in the same
+placement on both backends: Colibri's Qwen3.6-35B-A3B engine has a VRAM tier
+for CUDA only, so on this box it is a CPU engine. H2 is therefore not designed
+to answer the backend question. It answers the **product** question — what the
+owner's turn costs at depth in each world, and whether the moat (P7/P9 prefix
+reuse) survives — with the one same-weights control possible today (§2.3), and
+it needs no code. **The same-weights GPU pair exists after one port, V1 (§2.6):
+a Vulkan expert tier for `qwen36`**, the pattern `glm53` and `qwen38-vk` already
+use. V1 is worth building on its own account — it is the "second, VRAM-resident
+lane" inside Colibri's serving stack, with P7, P9 and the KV slots intact — and
+once it exists, H2b (§2.6) is the engine-vs-engine number on the same weights in
+the same placement. Even then the backend question proper is answered by the
+same-op microbenchmark (§3, D-3), because an engine comparison still folds in
+schedulers, formats and submit models; and the profile already says the
+backend's ceiling on the daily driver: **the GLM-5.3 token is CPU/DRAM-bound, not
 GPU-kernel-bound** (G3: 69 % of the token on one core; §RP1-CORRECTION: CPU int4
 experts 40.3 ms/token at ~57 % memory-bound; GPU expert groups were 22 ms of a
 373 ms token at G3 and have been overlapped with CPU work since G9). A faster
@@ -41,54 +63,6 @@ the decisive unknown is whether it reuses prefixes across turns. If it does
 not, its per-turn wait at 18k is a full re-prefill and Colibri's incremental
 turn may still win the number the owner actually waits for.
 
-## 0b. CORRECTION (2026-09-15, after §0 was written): the same-model pair EXISTS
-
-§0 says "no pair of engines here can run the same model in the same placement
-on both backends". That was reasoned from the two models on this box's NVMe and
-it is **wrong**. The model set is not limited to what is already downloaded.
-
-**Qwen3.6-35B-A3B runs on both.** hipFire ships eight SKUs of it
-(`qwen3.6:35b-a3b`, `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq5`, `-mq6`;
-MQ4R is 18.7 GB needing ~22 GB VRAM) with RDNA3 among the
-architecture-tuned targets. This fork ships `c/qwen36.c` and
-`c/tools/convert_qwen36.py`, whose own usage line is
-`--repo Qwen/Qwen3.6-35B-A3B`. The HF repo exists: BF16 safetensors, 35B total /
-3B activated, 256 experts (8 routed + 1 shared). This box has 2.3 TB free.
-
-What is actually in the way is two CODE GAPS on this fork, not model
-availability:
-
-1. `c/qwen36_tier.h` is `#ifdef COLI_CUDA`, and its own comment says the
-   `!COLI_CUDA` path keeps "the engine CPU-only with zero overhead". So today
-   Colibri serves this model on the CPU here. `backend_vulkan.c` already exists
-   and already serves `glm53` and `qwen38-vk`; nothing structural prevents a
-   Vulkan expert tier for `qwen36`.
-2. `convert_qwen36.py`: "The engine (c/qwen36.c) currently reads ebits>=5
-   (int8); the int4 path is WIP." So the Colibri arm is int8 (~35 GB, which
-   needs more than one 24 GB card) against hipFire's 4-bit MQ4R. For quant
-   parity compare against `-mq5`/`-mq6`, or finish the int4 path.
-
-**This changes the plan's centre of gravity.** §2's "no honest same-weights
-GPU pair" premise is replaced by a prerequisite item:
-
-- **V1 — a Vulkan expert tier for `qwen36`.** Port the pattern that
-  `glm53`/`qwen38-vk` already use (heat-ranked preload, per-device budget,
-  `COLI_VK_DEV2/3`) to `qwen36`'s tier, behind the same kind of env knob.
-  Tier: Opus (it is `backend_vulkan.c` surface), and it is a PORT of an
-  existing measured pattern, which is the one thing this fork is best at.
-  Gate: bit-identical to the CPU path on `teacher_forcing` with the tier off;
-  with it on, the KL bar of X2; and a decode A,B,B,A through `gate_ab_verdict`.
-
-V1 is worth doing whether or not hipFire ever runs here, because it is exactly
-the "second, VRAM-resident lane" §3 branch O1 wants — a 3B-active model in VRAM
-— but inside Colibri's serving stack, so P7 checkpoints, the P9 ledger and the
-KV slots survive. The head-to-head then becomes GPU-vs-GPU on the same
-weights, which is what was asked for in the first place.
-
-Sequencing note: downloading ~70 GB of BF16 and converting it is NVMe and page
-cache work, and would evict the model residency the 64Ki ladder asserts before
-every turn. It waits for the lock, like everything else.
-
 ## 1. What is established (do not re-derive)
 
 | fact | value | kind | source |
@@ -104,7 +78,9 @@ every turn. It waits for the lock, like everything else.
 | qwen38-vk serving numbers | warm-identical 7.23, rotating 5.3–5.4 | measured | Q7 row |
 | qwen38-vk submit overhead | `vk-issue` 13.8 + `vk-take` 4.8 ms/token; per-submit gaps 0.30 / 1.50 ms; "a 2.7 ms submit ramps its own clocks" | measured | Q9 spec table, Q7 row |
 | `backend_vulkan.c` re-records its command buffers on every submit | `vkResetCommandBuffer`/`vkBeginCommandBuffer` at 1007, 1113, 1177, 1268 (56 reset/begin/submit sites) | read | `c/backend_vulkan.c` |
-| Colibri's Qwen3.6-35B-A3B engine | `c/qwen36.c`: 40 layers (10 × [3 DeltaNet + 1 attention]), 256 experts top-8 + 1 shared; dense int8 in RAM, experts LRU-cached in RAM; **CPU-only by default, the VRAM tier is CUDA-only** (`qwen36_tier.h` is compiled under `COLI_CUDA` only; no Vulkan symbol in the file); int4-gs64 container ~20 GB, ~30 GB RAM | read | `docs/qwen36.md`, `c/qwen36_tier.h`, `c/Makefile` |
+| Colibri's Qwen3.6-35B-A3B engine | `c/qwen36.c`: 40 layers (10 × [3 DeltaNet + 1 attention]), 256 experts top-8 + 1 shared; dense int8 in RAM, experts LRU-cached in RAM; **CPU-only by default, the VRAM tier is CUDA-only** (`qwen36_tier.h` is compiled under `COLI_CUDA` only; no Vulkan symbol in the file; the tier API is ~20 `qt_*` entry points, 28 call sites in `qwen36.c`); int4-gs64 container ~20 GB, ~30 GB RAM | read | `docs/qwen36.md`, `c/qwen36_tier.h`, `c/Makefile` |
+| The engine DOES read int4 containers; the converter's "int4 path is WIP" is stale | `qwen36.c` detects packed int4 by on-disk size (lines 1445–1529), unpacks to int8 for the CPU path and **keeps the packed nibbles (`g4/u4/d4`) for a GPU tier**; `qt_init` takes `expert_is_int4`; `docs/qwen36.md` recommends the int4-gs64 container over per-row int4 (GLM's #455 think-loops). So a Vulkan tier holds ~20 GB of packed int4 experts — one card — not ~35 GB of int8. **Open for V1 step 0:** whether the CUDA tier's kernels take gs64 group scales or only per-row `gs/us/ds`; the answer decides which container V1 serves | read | `c/tools/convert_qwen36.py` line 113 vs `c/qwen36.c`, `c/qwen36_tier.h` |
+| Also on the rig's disk, and unusable by Colibri | `Qwen3.8-27B-UD-Q5_K_M.gguf` (19.8 GB), a UD-IQ4_XS GGUF of Qwen3.8-Flash-Next, `DeepSeek-V4-Flash-0731-UD-IQ2_M` (85 GB, over the 72 GB of aggregate VRAM). Colibri maps safetensors (`st_map_shard_range`), not GGUF; none of these is a candidate on either side | reported by the coordinator, formats checked against `c/st.h` | — |
 | That engine's only numbers | 9.2–11.3 tok/s with a CUDA tier on 8 GB cards; **0.35 tok/s CPU-only before the tier** — on a Threadripper 3945WX, not this box | measured elsewhere | `docs/qwen36-cuda-tier.md` |
 | Vulkan vs HIP on the same card, Colibri's own | on an RX 9070 (RDNA4) the Vulkan backend is faster than Colibri's ROCm/HIP backend | measured elsewhere | `docs/vulkan.md` |
 | Vulkan vs HIP on the same card, hipEngine's own | p4096: hipEngine 290.6 / 18.69 vs Vulkan (halo box) 420.95 / 24.55 vs llama.cpp HIP 395.02 / 19.63 prefill / decode; the gap attributed to "dataflow submission efficiency" | published | briefing |
@@ -117,18 +93,27 @@ every turn. It waits for the lock, like everything else.
 
 Two things the table makes unavoidable:
 
-1. **hipFire vs Colibri is a model-class comparison whatever the harness does.**
-   GLM-5.3-Flash int4-g64 is 183 GB; hipFire has no GLM. Qwen3.8 (Colibri's
-   other engine) is 173 GiB of FP8 with 512 routed experts per layer — an MQ4R
-   of it is far larger than one card and larger than all three (72 GB), so
-   hipFire cannot serve the model class this box serves today at all. The only
-   same-weights run available is Colibri's `qwen36` on the CPU, which measures
-   an 8-core CPU against a 7900 XTX, not Vulkan against HIP.
+1. **H2, as it can be run today, is a model-class comparison.** GLM-5.3-Flash
+   int4-g64 is 183 GB; hipFire has no GLM. Qwen3.8 (Colibri's other engine) is
+   173 GiB of FP8 with 512 routed experts per layer — an MQ4R of it is far
+   larger than one card and larger than all three (72 GB), so hipFire cannot
+   serve the model class this box serves today at all. The only same-weights
+   run available *today* is Colibri's `qwen36` on the CPU, which measures an
+   8-core CPU against a 7900 XTX, not Vulkan against HIP. **The same-weights
+   GPU pair is one port away (V1, §2.6), not unavailable** — Rev 1 got that
+   wrong.
 2. **A backend port cannot be paid for by the GLM profile.** Even a 2× GPU
    expert kernel is worth ≤ ~10 ms of a 135 ms token (≤ 7 %), and G14 already
    showed the CPU half of that bucket is exhausted without changing numerics.
 
-## 2. The head-to-head (items H0–H4)
+## 2. The head-to-head (items H0–H4 today; V1 and H2b after the port)
+
+Two phases. **H2** runs on what exists — no engine code, ~4 h of rig time —
+and answers the product question. **H2b** runs after V1 and is the
+engine-vs-engine number on the same weights in the same placement. H2 is not
+made to wait for V1: its decisive unknown (does hipFire reuse prefixes, Q2)
+is independent of anything Colibri builds, and its GLM arm is the daily
+driver's own curve.
 
 ### 2.1 The pair, and what is honestly not comparable
 
@@ -217,6 +202,19 @@ cold-sweep TTFT, and T_B^lad(d) its ladder TTFT at the same depth.
 - **Q4 — decode at depth.** D_B(18k) vs D_A(18k) = 2.23 measured. The
   published 160 would be 72×. Anything ≥ 10× is the same decision.
 
+### 2.6 The port and the same-weights pair (V1, H2b)
+
+| id | item | evidence | expected | effort | tier | gate |
+|---|---|---|---|---|---|---|
+| **V1** | **A Vulkan expert tier for `qwen36`.** Port the tier `qwen38-vk` already has (heat-ranked preload from a histogram, per-device budget with a reserve, `COLI_VK_DEV2/3`, expert-group issue/take through `backend_vulkan.c`) behind `qwen36_tier.h`'s existing `qt_*` contract, so the engine's 28 call sites do not move; packed int4 experts (`g4/u4/d4`) in VRAM, ~20 GB on one card. **Step 0 (Sonnet, no rig):** read the CUDA tier's kernels for whether they take gs64 group scales; read `qwen38_core.h`'s `q38vk_*` path for the piece to copy; write the step list. **Step 1 (Opus):** tier off = the CPU engine, bit-identical. **Step 2 (Opus):** tier on. The model must first be fetched and converted (the published int4-gs64 container, or `convert_qwen36.py --gs 64` from the BF16 ~70 GB) — NVMe and page-cache work that waits for the lock, like everything else. **Sequenced after X1**, because Q7's measured gaps put a ≤ 28 tok/s ceiling on a 40-layer per-op-submit path (§3, branch 3), and a same-weights comparison taken under that ceiling would measure Colibri's submit model, not its backend | the pattern exists twice in the tree; `docs/qwen36-cuda-tier.md` measured the CUDA version at 9.2–11.3 tok/s on 8 GB cards, 83 % of experts resident on two cards — here all 256 × 40 fit on one | a Colibri-served VRAM-resident 35B with P7/P9/slots intact; tok/s **unknown** until X1 has a number (the ceiling above is the prior) | 1–3 weeks | Sonnet (step 0), Opus (1–2) | tier off: `teacher_forcing` and logits bit-identical to the CPU path; tier on: X2's KL bar against the CPU path, `tworeq.py` at 4 slots IDENTICAL, `[MAP]`/tier line asserts the residency it claims, decode A,B,B,A vs tier-off through `gate_ab_verdict` |
+| **H2b** | **Same weights, same placement, two engines.** A′ = Colibri `qwen36` + V1 on int4-gs64, one card (dev3); B = hipFire on the same card, `-mq4r` **and** `-mq5` (the quant nearest a gs64 int4 by bits per weight; report both rows, do not average them). Same chain shape as H2 (A′,B,B,A′; fresh processes; VRAM and DPM asserted; ladder to 18k with `--gen 128`, cold sweep on both sides — affordable now on both). Colibri's arm keeps its REUSE-line contract; hipFire's keeps the sweep ratio | V1 | the first number that compares engines rather than model classes | ~2 h rig | Haiku runs | `context_compare` per depth through `gate_ab_verdict`; **plus** greedy-text agreement between A′ and B on the first 64 tokens of each turn reported as a count (a sanity on two different quantisations, not an oracle) |
+
+Still not comparable in H2b, said plainly: the quantisation (int4-gs64 vs MQ4R
+/ MQ5 — different formats, different error), and everything above the kernels
+(scheduler, submit model, KV layout). H2b answers "which engine serves this
+model better on this card"; only D-3 answers "which backend runs this op
+faster". Both are asked; neither is asked of the other's number.
+
 ## 3. Decision tree (after H3), with what falsifies each branch
 
 ```
@@ -262,19 +260,20 @@ redundant for that lane; without it, branch 2 is O2 and is not taken. This
 branch is the owner's, not a measurement's; the plan only makes its cost
 visible. Falsifier: O2, or H4.
 
-**Branch 3 — graft: a Colibri-native VRAM-resident path.** Port the qwen36
-CUDA tier's *concept* (all experts resident, per-device homes, expert-group
-dispatch) to Vulkan on the pattern `qwen38-vk` already uses in
-`backend_vulkan.c`, so the 35B runs on Colibri with P7/P9/slots/gateway intact.
-Its ceiling before a line is written, **projected from Q7's measured gaps**:
-40 layers × ≥ 3 submits per layer × ≥ 0.30 ms per gap ≥ **36 ms/token of submit
-gaps alone → ≤ 28 tok/s** before any compute, against hipFire's published 160+.
-That is why graft X1 (retained command buffers) is a *precondition* of this
-branch, not an optimisation of it, and why the branch is not started before X1
-has a measured number. Opus, weeks. Gate: D_Colibri-vk(18k) ≥ 0.6 × D_B(18k)
-from H3, with `teacher_forcing` against the CPU `qwen36` path identical and
-the KL bar of X2. Falsifier: X1 lands below 2× on the submit buckets, in
-which case the ceiling stands and the branch is dead on arithmetic.
+**Branch 3 — the Colibri-native VRAM-resident lane: that is V1 (§2.6).** The
+35B runs on Colibri with P7/P9/slots/gateway intact. Its ceiling before a line
+is written, **projected from Q7's measured gaps**: 40 layers × ≥ 3 submits per
+layer × ≥ 0.30 ms per gap ≥ **36 ms/token of submit gaps alone → ≤ 28 tok/s**
+before any compute, against hipFire's published 160+. That is why graft X1
+(retained command buffers) is a *precondition* of V1, not an optimisation of
+it, and why V1's step 2 is not started before X1 has a measured number (V1's
+step 0 needs no rig and can start now). Branch 3 is taken — V1 becomes the
+serving lane rather than a measurement vehicle — when H2b shows
+D_A′(18k) ≥ 0.6 × D_B(18k) and W_A′(18k) ≤ W_B(18k); below that, hipFire is
+the better engine for this class on this card and V1 remains what makes H2b
+and D-3 honest. Falsifier of the whole branch: X1 lands below 2× on the submit
+buckets, in which case the ceiling stands and the lane is dead on arithmetic
+before V1's step 2 is built.
 
 **D-3 — the backend question, answered on its own terms.** One microbenchmark,
 same card, same shape: hipFire's gfx11 MMQ int4 kernel vs `qmatmul_tile.spv`
@@ -399,6 +398,10 @@ This plan will **not**:
 | D-3 | same-op microbench | Opus | 30 min under lock | 1 day |
 | X1 | retained command buffers | Opus | ~3 h (both engines, A,B,B,A) | 3–5 days |
 | X2 | KL oracle | Sonnet | ~1 h | 1 day |
+| V1 step 0 | gs64-vs-per-row scales in the CUDA tier; the `q38vk_*` piece to copy; step list — **can start now, no rig** | Sonnet | 0 | 1 day |
+| model fetch + convert | int4-gs64 container or BF16 → `--gs 64`; after the lock frees, never under a running ladder | Haiku | NVMe/page cache, ~1 h | — |
+| V1 steps 1–2 | the Vulkan tier, after X1's number | Opus | ~3 h (gates) | 1–3 weeks |
+| H2b | same weights, same card, A′,B,B,A′ with `-mq4r` and `-mq5` | Haiku runs | ~2 h | — |
 | L1 | GLM on two cards, only under O1 | Haiku | ~2 h | — |
 | X3 step 0 | which bucket grows at 18k (from A1's log; no extra rig time) | Opus | 0 | ½ day |
 

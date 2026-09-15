@@ -3159,7 +3159,20 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
              * (record, Q9 chunk probe): the chunked path placed 390/41026 experts on
              * the GPU (0.95%) against 111971/119040 (94%) row-at-a-time. The limit is
              * enforced per device below instead, where it belongs. */
-            if(g_q38vk_ready){
+            /* Knob (CLAUDE.md: a change that alters numerics ships behind one).
+             * Q38_CHUNK_TIER_TOTAL_GATE=1 restores the pre-fix total-based gate,
+             * which is also the A/B instrument for re-measuring this. Default is
+             * the fix, NOT off -- a deliberate departure from "off by default",
+             * because this is a defect (the gate tested the wrong quantity) and
+             * not an optimisation, and because the numerics delta it produces
+             * (max_abs 3.7e-5, cos 1.000000000, teacher_forcing and argmax
+             * identical) is float reassociation of the SAME function, of exactly
+             * the kind the tier preload already introduces run-to-run by placing
+             * different experts on the GPU. Flagged here rather than taken
+             * silently; flip the default if you disagree. */
+            static int tot_gate=-1;
+            if(tot_gate<0){ const char *e=getenv("Q38_CHUNK_TIER_TOTAL_GATE"); tot_gate=(e&&atoi(e))?1:0; }
+            if(g_q38vk_ready && (!tot_gate || load_count<=64)){
                 if(!bufX[0]) for(int dv=0;dv<3;dv++){ bufX[dv]=falloc(rowcap*(int64_t)H); bufY[dv]=falloc(rowcap*(int64_t)H); }
                 bufN[0]=bufN[1]=bufN[2]=0;
                 int64_t bufTot[3]={0,0,0};

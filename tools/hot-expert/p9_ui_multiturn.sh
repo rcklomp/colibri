@@ -53,7 +53,7 @@ MARK=$(ssh "$RIG" 'grep -c "\[ledger\] " ~/glm53_server.log 2>/dev/null || echo 
 echo "=== p9_ui_multiturn $TURNS turns $(date +%Y-%m-%dT%H:%M:%S%z) nonce=$NONCE ledger_mark=$MARK"
 R=$(OWUI_TOKEN=$(cat "$TOKENFILE") node "$HERE/ui/ui_probe.mjs" --url "$URL" \
       --question "Hello. Answer each of my next questions in one word. [$NONCE]" \
-      --follow-ups $((TURNS - 1)) --nonce "$NONCE" --timeout 1800 | tee /dev/stderr | grep "^RESULT")
+      --follow-ups $((TURNS - 1)) --nonce "$NONCE" --timeout 1800 | tee -a /dev/stderr | grep "^RESULT")
 FAIL=0
 ok=$(echo "$R" | sed -n 's/.*[ ]ok=\([0-9]*\).*/\1/p')
 got=$(echo "$R" | sed -n 's/.*[ ]turns=\([0-9]*\).*/\1/p')

@@ -1,0 +1,30 @@
+# Qwen3.8 / GLM-5.3 on an EPYC 7F32 + 3× RX 7900 XTX box — placement measurements (2026-09-04)
+
+Lab record, same spirit as the rest of this directory: what was measured, how,
+and what it decided. Harness sources are next to this file
+(`rome_cpubench.c`, `rome_vkbench.c`, `rome_fp8test.c`, one-file harnesses,
+build lines in their headers); they hardcode
+Qwen3.8 shapes and build against `quant.h` / `backend_vulkan.o`.
+
+## The machine
+
+| | |
+|---|---|
+| CPU | AMD EPYC 7F32, 8 cores / 16 threads, Zen 2 (AVX2+FMA+F16C, **no AVX-512**), 128 MB L3. SMT siblings are `i` and `i+8`. |
+| RAM | 8 × 32 GB DDR4-2400. Measured read bandwidth 18.8 / 35.7 / 57.1 / 70.9 / 91.6 GB/s at 1 / 2 / 4 / 8 / 16 threads. |
+| GPUs | 3 × Radeon RX 7900 XTX (gfx1100, RDNA3), 24 GB each, RADV (Mesa 26.0.8, Vulkan 1.4). Cooperative matrix and int8 dot product are exposed; **no FP8 in hardware**, `fmt=8` is emulated in the shader. |
+| Disk | one NVMe. Both checkpoints (Qwen 173 GiB FP8, GLM 182 GiB int4) fit in the 247 GB page cache one at a time, not together. |
+
+The one fact that reshapes every prior number in this repository: on this box
+**the disk is not the wall** once a checkpoint is in the page cache. Every
+"expert streaming is disk-bound" assumption in `docs/` is about 25–128 GB
+machines.
+
+## Baselines (before any change on this branch)
+
+Prompt: 48 tokens, greedy, 64 new tokens, expert cap 512, page cache warm
+(`fincore` checked), `COLI_TIMERS=1`.
+
+| engine | decode | prefill / TTFT | per-token phases |
+|---|---:|---:|---|
+| Qwen3.8 CPU 16 thr, cap 64 | 1.16 tok/s | 18.3 s | routed 555 ms, resident BF16 158, deltanet 

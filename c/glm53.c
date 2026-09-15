@@ -5900,6 +5900,30 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     }
 }
 
+/* X2: per-position logit dump for the KL oracle
+ * (tools/hot-expert/kl_compare.py). `GLM53_LOGIT_DUMP` above dumps one
+ * request's last-token logits from the serve path; the KL oracle needs every
+ * prefill position, not only the last, to tell drift that is confined to the
+ * end of the prompt from drift that starts near the front. A top-K + logsumexp
+ * dump would be smaller, but a full float32 vocab (154 880) over a 450-position
+ * packet is ~270 MB -- cheap on this box's NVMe -- and it is simpler and exactly
+ * reproducible, so this writes the whole `logits` buffer `forward_prefill`
+ * already computed rather than a lossy summary. Off by default, and it runs
+ * only in the CLI's teacher_forcing path (main(), below), not SERVE=1. */
+static void dump_logits_all(const char *path, const float *logits, int count, int vocab) {
+    if (!path || !*path || !logits) return;
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "GLM53_LOGIT_DUMP_ALL: non apro %s\n", path); return; }
+    uint32_t header[4];
+    header[0] = 0x444b4c47u;  /* "GLKD", little-endian on this box */
+    header[1] = 1u;           /* format version */
+    header[2] = (uint32_t)count;
+    header[3] = (uint32_t)vocab;
+    fwrite(header, sizeof(uint32_t), 4, f);
+    fwrite(logits, sizeof(float), (size_t)count * (size_t)vocab, f);
+    fclose(f);
+}
+
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
@@ -6034,6 +6058,8 @@ int main(int argc, char **argv) {
         for (int v = 0; v < model.c.vocab; v++) printf(" %.9g", last[v]);
         printf("\n");
     }
+    if (getenv("GLM53_LOGIT_DUMP_ALL"))
+        dump_logits_all(getenv("GLM53_LOGIT_DUMP_ALL"), logits, count, model.c.vocab);
     if (greedy > 0) {
         int stops[8];
         const int n_stops = has_tokenizer ? load_stops(dir, stops, 8) : 0;

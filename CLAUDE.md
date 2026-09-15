@@ -243,30 +243,31 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   binary in service before the item. **Every gate runs with
   `GLM53_PREFIX_CKPT=0` and a private `COLI_CKPT_DIR`**: two gates nearly
   passed for the wrong reason because the candidate restored a checkpoint
-  the pristine had just written. **qwen38 C tests, re-run 2026-09-15: there are SEVEN, not four, and six
-  pass.** `test_qwen38_native_weights` FAILS at
-  `tests/test_qwen38_native_weights.c:587` (`!memcmp(want,got,sizeof want)`) and
-  has failed since at least 2026-09-08 (the dev merge `132d177`) -- NOT caused by
-  anything in the Q track, verified by rebuilding and running it at `132d177`,
-  `9ef6ff4` and `902077d`. This sentence previously claimed all four passed as of
-  2026-09-06; that had been untrue for a week. **Diagnosed 2026-09-15, and it is
-  OUR divergence, not a bug in the engine:** line 587 is
-  `memcmp(want,got)` between the test's own scalar `reference_fp8_matmul` and
-  `q38_weight_matmul`. This fork VECTORISED `matmul_fp8` (AVX2/FMA 8-lane
-  accumulation, `9f2cce2`, then the F16C decode `b3b20fb`); upstream still has
-  only the scalar LUT. Eight-lane accumulation summed as `buf[0]+..+buf[7]` is a
-  different summation order from a scalar left-to-right loop, so a bit-exact
-  `memcmp` against a scalar reference cannot pass. Proved by rebuilding the test
-  with `-mno-avx2 -mno-fma`: line 587 then PASSES. **The test encodes an
-  assumption our own optimisation broke — it is not reporting a wrong answer.**
-  Two consequences: the fix is a tolerance comparison rather than `memcmp` (an
-  upstream test change, not a local edit), and if the FP8 vectorisation is ever
-  offered upstream this test will fail there too, which is the concrete form of
-  "not bit-identical to upstream" noted against that contribution.
-  **A SECOND, separate failure hides behind it:** with the scalar build the test
-  gets further and fails at line 635, `check_fixture_mode(adjacent_directory,1,1)`
-  — an expert-layout/ABI check (`q38_segment_expert_layout` byte counts), nothing
-  to do with numerics. NOT diagnosed; it was masked by 587 aborting first. `tests/test_qwen38_prefix` used to SIGFPE -- **on OUR tree, not
+  the pristine had just written. **qwen38 C tests: there are SEVEN, not four, and as of 2026-09-15 evening
+  all seven pass.** `test_qwen38_native_weights` had failed since at least the
+  dev merge `132d177` (2026-09-08) for TWO independent reasons, both in the
+  TEST's assumptions and neither in the engine; both are fixed in the test and
+  both fixes are upstream-worthy. (1) Line 587 did a bit-exact `memcmp`
+  between the test's scalar `reference_fp8_matmul` and `q38_weight_matmul`;
+  this fork VECTORISED `matmul_fp8` (AVX2/FMA eight-lane accumulation,
+  `9f2cce2`, then the F16C decode `b3b20fb`) and a different summation order
+  cannot pass a `memcmp` — proved by `-mno-avx2 -mno-fma`, which made 587
+  pass. It is now a tolerance of 1e-6 of the sum of absolute terms of each dot
+  product (measured 8.3e-8 on AVX2+FMA; a wrong decode, scale block or layout
+  is off by O(1) of that sum). If the FP8 vectorisation is ever offered
+  upstream, upstream's copy of this test fails the same way. (2) Line 635,
+  `check_fixture_mode(adjacent_directory,1,1)`, asserted that a fast
+  native-FP8 expert lives in a slot-owned slab; this fork serves experts from
+  the shard mapping by default (`COLI_MAP_EXPERTS_DEFAULT 1`), which releases
+  the slab by design — bytes, read counters and gate/up/down adjacency all
+  correct, only the owner of the memory differs. Proved 2026-09-15 by building
+  the test at the merge base `1ccee43` and at `upstream/dev` on the Mac:
+  both PASS by default and both FAIL at 635 with `COLI_MAP_EXPERTS=1`.
+  **A hand-off had blamed a "partial merge" that dropped `qt_ready` /
+  `qt_note` / `q38_tier_note` from upstream `a5d177b`; that commit is not an
+  ancestor of the merge base, nothing from it was ever taken, and the merge
+  base passes without those symbols. The claim was wrong — do not re-inherit
+  it.** Full table in `tools/hot-expert/UPSTREAM-POLICY-2026-09-15.md`. `tests/test_qwen38_prefix` used to SIGFPE -- **on OUR tree, not
   "on every tree" as this line used to say**: upstream's `ensure_kv` has no
   `IK_pooled` and no `idx_ratio` divide at all, so the crash arrived with our own
   G5 pooled-index cache and could never have happened upstream. It is fixed
@@ -297,6 +298,11 @@ answer that question from memory — run the script.**
   measured, in numbers, plus which oracle passed.
 - Do not push to `hot-expert-tier` directly; land on a `perf/...` branch and
   merge after the gate is met.
+- **No whole-`upstream/dev` merges (decided 2026-09-15,
+  `tools/hot-expert/UPSTREAM-POLICY-2026-09-15.md`).** Take upstream fixes by
+  `git cherry-pick -x`, one at a time, each through its own gate; send ours up
+  as PRs. A full re-port is re-opened only when #1519 is closed upstream AND
+  upstream lands something this box needs that a cherry-pick cannot carry.
 
 ## Model tiers (from the roadmap)
 

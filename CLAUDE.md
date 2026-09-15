@@ -125,7 +125,14 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `tools/rome_bench.sh` now takes the lock and handles the stop/restart
   itself; if you ever stop the gateway some other way, take the lock first.
 - **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
-  `openai_server.py` on 8081 with `--kv-slots 4` and `COLI_KDA_GPU=2`
+  `openai_server.py` on 8081 with **`--max-tokens 4096`** (2026-09-14: it was
+  `256` from the first day of Open WebUI service, and `openai_server.py` clamps
+  every request DOWN to the server cap while Open WebUI sends no `max_tokens` of
+  its own — so 256 was the ceiling on every reply the box had ever produced, and
+  a tool-calling turn spent it opening a `<tool_call>` box it could never close,
+  which is why the owner's chat returned nothing at all. `accept_live.sh` check 5
+  exists to catch a recurrence and runs in the daily canary too), `--kv-slots 4`
+  and `COLI_KDA_GPU=2`
   (P6b, 2026-09-07: each slot has its own KDA device state, pool allocated
   before the expert preload — dev0 holds 1 248 experts instead of 1 296),
   `GLM53_PREFIX_CKPT=1` and `COLI_PREFIX_PIN=1` (P7: prefix checkpoints under

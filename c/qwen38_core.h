@@ -3026,12 +3026,35 @@ typedef struct {
     float gate;
 } Q38RouteAssignment;
 
+/* Q9 step 0 (2026-09-15): Qwen had no integer chunk-size knob, only the bool
+ * Q38_PREFILL_BATCH and the compile-time Q38_PREFILL_BATCH_ROWS=32. The verify
+ * cost curve V(S) this item measures needs a runtime cap on the chunk itself,
+ * without touching the memory-budget arithmetic below. Q38_PREFILL_ROWS caps
+ * `requested` before it reaches q38_bounded_prefill_rows; at its default (32,
+ * i.e. Q38_PREFILL_BATCH_ROWS) the cap is a no-op -- q38_bounded_prefill_rows
+ * already clamps to that same constant -- so the knob is bit-identical unset.
+ * Values above 32 or below 1 clamp to the same range q38_bounded_prefill_rows
+ * itself enforces; the chunk is only ever shortened, never lengthened. */
+static int q38_prefill_rows_cap(void) {
+    static int cap=-1;
+    if(cap<0) {
+        const char *e=getenv("Q38_PREFILL_ROWS");
+        int v=e&&*e?atoi(e):Q38_PREFILL_BATCH_ROWS;
+        if(v<1)v=1;
+        if(v>Q38_PREFILL_BATCH_ROWS)v=Q38_PREFILL_BATCH_ROWS;
+        cap=v;
+    }
+    return cap;
+}
+
 /* Pick a prefill size from a fixed workspace budget.  The number of rows is
  * deliberately bounded independently of the context length: a long prompt
  * therefore reuses the same route, expert and matmul buffers one chunk at a
  * time.  A single assignment needs input, gate/up activations and output;
  * these are the only buffers that scale with the number of routed rows. */
 static int q38_moe_prefill_rows(const Cfg *c,int requested) {
+    int cap=q38_prefill_rows_cap();
+    if(requested>cap)requested=cap;
     int64_t H=c->hidden,I=c->inter,E=c->experts,K=c->topk,SI=c->shared_inter;
     uint64_t per_assignment=(uint64_t)(2LL*((int64_t)H+I))*sizeof(float)+
                              sizeof(Q38RouteAssignment)+2*sizeof(int);
@@ -3691,6 +3714,14 @@ static void q38_tm_report_placement(const Model *m) {
 static void tm_report(const Model *m) {
     q38_tm_report_bank(&m->timers,"total");
     if(m->timers_split){
+        /* Q9 step 0: m->timers_prefill is the snapshot taken right after the
+         * single prefill step() call (generate()'s comment above the
+         * assignment), so it already IS the prefill-only bank -- forwards=1,
+         * one call covering every internal chunk of the whole prompt. Printed
+         * with the same q38_tm_report_optime used for "decode only" below, so
+         * the two banks are read the same way (record §Q-PROFILE's rule: the
+         * eight top buckets partition the step, everything else nests). */
+        q38_tm_report_optime(&m->timers_prefill,"prefill only");
         Q38Timers decode=q38_tm_delta(&m->timers,&m->timers_prefill);
         q38_tm_report_optime(&decode,"decode only");
     }

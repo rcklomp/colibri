@@ -3150,7 +3150,29 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             /* Row budget per device batch: bounded by the scratch buffers
              * below (Q38_MAX_TOPK*Q38_PREFILL_BATCH_ROWS covers the worst
              * case -- every expert in the group claimed by every row). */
-            if(g_q38vk_ready&&load_count<=64){
+            /* Q9 (2026-09-15): the gate used to read `load_count<=64`, i.e. the TOTAL
+             * distinct experts in the group -- but 64 is the per-DEVICE limit of
+             * eg_prepare_submit, and what reaches it is bufN[dev], after the experts
+             * have been split across three devices. A 240-token chunk makes ~114
+             * distinct experts; split ~38/38/38 every device is legal, yet the whole
+             * block was skipped and all 114 went to the CPU. Measured consequence
+             * (record, Q9 chunk probe): the chunked path placed 390/41026 experts on
+             * the GPU (0.95%) against 111971/119040 (94%) row-at-a-time. The limit is
+             * enforced per device below instead, where it belongs. */
+            /* Knob (CLAUDE.md: a change that alters numerics ships behind one).
+             * Q38_CHUNK_TIER_TOTAL_GATE=1 restores the pre-fix total-based gate,
+             * which is also the A/B instrument for re-measuring this. Default is
+             * the fix, NOT off -- a deliberate departure from "off by default",
+             * because this is a defect (the gate tested the wrong quantity) and
+             * not an optimisation, and because the numerics delta it produces
+             * (max_abs 3.7e-5, cos 1.000000000, teacher_forcing and argmax
+             * identical) is float reassociation of the SAME function, of exactly
+             * the kind the tier preload already introduces run-to-run by placing
+             * different experts on the GPU. Flagged here rather than taken
+             * silently; flip the default if you disagree. */
+            static int tot_gate=-1;
+            if(tot_gate<0){ const char *e=getenv("Q38_CHUNK_TIER_TOTAL_GATE"); tot_gate=(e&&atoi(e))?1:0; }
+            if(g_q38vk_ready && (!tot_gate || load_count<=64)){
                 if(!bufX[0]) for(int dv=0;dv<3;dv++){ bufX[dv]=falloc(rowcap*(int64_t)H); bufY[dv]=falloc(rowcap*(int64_t)H); }
                 bufN[0]=bufN[1]=bufN[2]=0;
                 int64_t bufTot[3]={0,0,0};
@@ -3160,6 +3182,10 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                     int dev=q38vk_expert_ensure(m,layer,e);
                     if(dev<0||dev>2) continue;
                     int count=group_counts[e],first=group_offsets[e];
+                    if(bufN[dev]>=64) continue;             /* per-device VK limit (eg_prepare_submit
+                                                               refuses count>64, and every buf*[3][64]
+                                                               above is sized for it): leave unplaced,
+                                                               CPU handles it -- same path as below */
                     if(bufTot[dev]+count>rowcap) continue;   /* scratch exhausted: leave unplaced, CPU handles it */
                     ColiVkTensor **reg=q38vk_reg_at(layer,e);
                     int n=bufN[dev]++;
@@ -3192,6 +3218,13 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             int cpu_idx[Q38_MAX_TOPK],cpu_n=load_count;
             for(int z=0;z<load_count;z++) cpu_idx[z]=z;
 #endif
+            /* Q9: the [OPTIME] placement counter only ever counted the decode /
+             * row-at-a-time path, so the chunked prefill path reported gpu=0 cpu=0
+             * and the first chunk probe measured nothing at all. Count it here,
+             * after cpu_idx is final, so both legs of Q38_PREFILL_BATCH are
+             * comparable. Pure accounting: no placement decision reads these. */
+            m->expert_placed_cpu += (uint64_t)cpu_n;
+            m->expert_placed_gpu += (uint64_t)(load_count - cpu_n);
             if(cpu_n>0){
                 static int unplaced[Q38_MAX_TOPK];
                 for(int zi=0;zi<cpu_n;zi++) unplaced[zi]=unique[unique_base+cpu_idx[zi]];

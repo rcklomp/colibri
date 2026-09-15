@@ -1,0 +1,359 @@
+# Franken-engine plan: a VRAM-resident model class on rome, and what to do about it (Fable, 2026-09-15)
+
+> Written at the Fable tier, from the Mac, while the rig lock was held by a
+> benchmark with ~7.5 h to run. Nothing here was run on the rig. Every number
+> is one of three kinds and is labelled: **measured** (tonight's context ladder
+> on this rig, or a row in the record / roadmaps / CLAUDE.md), **published**
+> (the three reference projects' own figures, on their hardware, not ours),
+> or **projected** (derived here, with the derivation shown). A projection is
+> a thing to be beaten or refuted by the items below, never a result.
+>
+> The question the owner asked is "should the compute backend move to HIP, and
+> should this box serve a 27–35B VRAM-resident model instead of dragging 180 GB
+> through host RAM". This plan's answer, before any measurement: **those are two
+> questions, the second one is the real one, and the first one is mostly
+> already answered by the profile.** Sections 1–5 say why and what to measure.
+
+## 0. Decision in one paragraph
+
+The head-to-head (§2) cannot separate "HIP beats Vulkan" from "a 3B-active
+model in 960 GB/s VRAM beats a 180 GB model whose misses come from host DRAM",
+because no pair of engines here can run the same model in the same placement
+on both backends. So it is not designed to answer the backend question. It is
+designed to answer the **product** question — what the owner's turn costs at
+depth in each world, and whether the moat (P7/P9 prefix reuse) survives — with
+the one same-weights control that is possible (§2.3). The backend question is
+answered separately and cheaply by a same-op microbenchmark (§3, D-3), and the
+profile already says its ceiling: **the GLM-5.3 token is CPU/DRAM-bound, not
+GPU-kernel-bound** (G3: 69 % of the token on one core; §RP1-CORRECTION: CPU int4
+experts 40.3 ms/token at ~57 % memory-bound; GPU expert groups were 22 ms of a
+373 ms token at G3 and have been overlapped with CPU work since G9). A faster
+GPU kernel moves the GLM token by single-digit percent. **No result of the
+head-to-head justifies rewriting Colibri's backend.** What it can justify is a
+second, VRAM-resident lane on this box, and a short, ranked list of grafts
+(§4) — the first of which (retained command buffers) helps every Vulkan
+engine here today and is what makes any future Colibri-native resident path
+viable at all.
+
+Expected outcome, stated so a surprise reads as one: hipFire runs, decodes
+the 35B at ≥ 10× GLM-5.3 at every depth (arithmetic, not a close race), and
+the decisive unknown is whether it reuses prefixes across turns. If it does
+not, its per-turn wait at 18k is a full re-prefill and Colibri's incremental
+turn may still win the number the owner actually waits for.
+
+## 1. What is established (do not re-derive)
+
+| fact | value | kind | source |
+|---|---|---|---|
+| GLM-5.3 prefill rate vs depth on this rig | ms/token ≈ 113.9 + 0.01258·d (5 points, 643..13 628, fit within ~1.5 %) | measured | tonight's ladder |
+| cold prefill of N tokens, integrated | 113.9·N + 0.00629·N² ms → 2k **260 s**, 4k **572 s**, 8k **1 355 s**, 16k **3 555 s**, 18 055 **4 107 s (68 min)**, 64Ki **34 480 s (9.6 h)** | projected from the fit | derivation: ∫₀ᴺ(113.9+0.01258·d)dd |
+| GLM-5.3 decode vs depth | 3.71 @1 287, 4.06 @2 559, 3.59 @4 920, 2.99 @9 171, **2.23 @18 055** tok/s (1.82× fall from peak) | measured | tonight's ladder |
+| GLM-5.3 serving numbers, decode track | 3.03 / 2.98 rotating, 3.44 / 3.45 warm-identical, 1.86 / 1.90 cold | measured | PREFILL-ROADMAP rev 26 |
+| GLM-5.3 fresh-process token | 134.90 ms knob-on (`COLI_KDA_GPU=2`), 156.77 knob-off | measured | ROADMAP Track G header |
+| GLM-5.3 new chat / follow-up through the gateway | ~20 s (P7 restores the ~4 000-token tool block) / ~2 s; a changed tool set pays ~10 min cold | measured | CLAUDE.md |
+| GLM-5.3 routed expert: size and tier share | 171 GB resident / 12 096 mappable ≈ **14.1 MB per expert**; tier serves ~79 % of routed calls, ~21 % from the CPU | measured | briefing, CLAUDE.md `[MAP]` line, G15 note |
+| CPU int4 expert kernel, isolated, 8 threads | 21.95 GB/s | measured | §G11 |
+| qwen38-vk serving numbers | warm-identical 7.23, rotating 5.3–5.4 | measured | Q7 row |
+| qwen38-vk submit overhead | `vk-issue` 13.8 + `vk-take` 4.8 ms/token; per-submit gaps 0.30 / 1.50 ms; "a 2.7 ms submit ramps its own clocks" | measured | Q9 spec table, Q7 row |
+| `backend_vulkan.c` re-records its command buffers on every submit | `vkResetCommandBuffer`/`vkBeginCommandBuffer` at 1007, 1113, 1177, 1268 (56 reset/begin/submit sites) | read | `c/backend_vulkan.c` |
+| Colibri's Qwen3.6-35B-A3B engine | `c/qwen36.c`: 40 layers (10 × [3 DeltaNet + 1 attention]), 256 experts top-8 + 1 shared; dense int8 in RAM, experts LRU-cached in RAM; **CPU-only by default, the VRAM tier is CUDA-only** (`qwen36_tier.h` is compiled under `COLI_CUDA` only; no Vulkan symbol in the file); int4-gs64 container ~20 GB, ~30 GB RAM | read | `docs/qwen36.md`, `c/qwen36_tier.h`, `c/Makefile` |
+| That engine's only numbers | 9.2–11.3 tok/s with a CUDA tier on 8 GB cards; **0.35 tok/s CPU-only before the tier** — on a Threadripper 3945WX, not this box | measured elsewhere | `docs/qwen36-cuda-tier.md` |
+| Vulkan vs HIP on the same card, Colibri's own | on an RX 9070 (RDNA4) the Vulkan backend is faster than Colibri's ROCm/HIP backend | measured elsewhere | `docs/vulkan.md` |
+| Vulkan vs HIP on the same card, hipEngine's own | p4096: hipEngine 290.6 / 18.69 vs Vulkan (halo box) 420.95 / 24.55 vs llama.cpp HIP 395.02 / 19.63 prefill / decode; the gap attributed to "dataflow submission efficiency" | published | briefing |
+| hipFire single-XTX figure | 253.3 tok/s TG128 (empty context); its own multi-turn 191 average, **160 at ~18k**; MQ4R 35B-A3B 18.7 GB, ~22 GB VRAM | published | briefing |
+| MTP on host-resident models here | Q9 step 0: V*(4)/V*(1) = 2.668 ≥ 2.4, kill fired; hipEngine 0.955× AR | measured / published | Q9 row, briefing |
+| ROCm on the box | 6.2.0 at `/opt/rocm-6.2.0`, not on PATH, never used; `librccl.so` present; rccl-tests not built; all three GPUs PCIe 4.0 x16 CPU-direct, AtomicOpsCap 32/64+, ReqEn+, Routing+ on the bridges | verified tonight | briefing |
+| Colibri's tiers fill every card | G6: cap 2200 stops at 1752 experts on "25.0 of 25.7 GB used, 1.0 reserve"; serving runs 1695/1695 on dev2/dev3 and 1248 + KDA pool + dense on dev0 | measured | G6 row, CLAUDE.md |
+| dev0's identity | `0000:83:00.0` = `/sys/class/drm/card1`; card numbers are scrambled | measured | record §Q13 |
+| run-to-run spread on this box | 3–5 %; an uninterleaved pair read +20 % / +11 % on true +3.9 % / 0 | measured | Q9 spec, `gate_lib.sh` |
+
+Two things the table makes unavoidable:
+
+1. **hipFire vs Colibri is a model-class comparison whatever the harness does.**
+   GLM-5.3-Flash int4-g64 is 183 GB; hipFire has no GLM. Qwen3.8 (Colibri's
+   other engine) is 173 GiB of FP8 with 512 routed experts per layer — an MQ4R
+   of it is far larger than one card and larger than all three (72 GB), so
+   hipFire cannot serve the model class this box serves today at all. The only
+   same-weights run available is Colibri's `qwen36` on the CPU, which measures
+   an 8-core CPU against a 7900 XTX, not Vulkan against HIP.
+2. **A backend port cannot be paid for by the GLM profile.** Even a 2× GPU
+   expert kernel is worth ≤ ~10 ms of a 135 ms token (≤ 7 %), and G14 already
+   showed the CPU half of that bucket is exhausted without changing numerics.
+
+## 2. The head-to-head (items H0–H4)
+
+### 2.1 The pair, and what is honestly not comparable
+
+**Arm A — Colibri, the serving configuration.** `glm53` from the binary in
+service, GLM-5.3-Flash-colibri-int4-g64, the gateway's env exactly as
+`ttft_serve.engine_env` sets it (8 pinned threads, three devices,
+`COLI_VK_EXPERTS2/3=1695`, `COLI_KDA_GPU=2`, a *copy* of the histogram),
+`--kv-slots 4`, **`GLM53_PREFIX_CKPT=0` with a private `COLI_CKPT_DIR`** (as
+every gate on this track; a restored checkpoint would report a prefill that
+never happened), `GLM53_MAXT=32768`. Driven in engine mode by
+`context_ladder.py`, the harness that produced tonight's numbers.
+
+**Arm B — hipFire, one card.** Qwen3.6-35B-A3B MQ4R (18.7 GB) on **one** gfx1100
+— the card that is Colibri's **dev3** (an expert-only device), so that if a
+two-lane configuration is ever built GLM keeps dev0 (dense + KDA) and dev2.
+H0 records the PCI-BDF → HIP-index map. Driven over HTTP by the same ladder.
+
+**Arm C — control, same weights, Colibri CPU-only.** `qwen36` on the
+int4-gs64 container of the same Qwen3.6-35B-A3B, all experts RAM-resident
+(`cache/layer` = 256), 8 pinned threads, served by `coli serve` on a side
+port and driven by the same HTTP driver as arm B. **This is not an engine
+comparison** — it is (i) the floor any Colibri-native resident path (§3, branch
+3) has to beat, (ii) the only same-weights sanity check on hipFire's output,
+and (iii) what the owner would have on this model if hipFire fails H0. Bounded
+to `--sizes 512,2048`, one repeat, 30 min wall, run last.
+
+| held constant | how |
+|---|---|
+| the user text | `context_ladder.py`'s deterministic corpus slices from `ROME-3x7900XTX-2026-09-04.md` (624 KB; a 64Ki ladder needs ~236 KB), same `--steps`, same question suffix, byte-identical on every arm |
+| the turn structure | one growing conversation; the reply fed back verbatim (engine mode: with P8's pin; HTTP mode: as received) |
+| generation | `--gen 128` on every arm (32 is ~0.2 s at 160 tok/s and would measure the SSE chunking, not the engine); temperature 0 |
+| the clock and the formula | one harness; decode = (n−1)/(t_done − t_first) on every side; TTFT = first content delta |
+| the box's state | GPU DPM level read from sysfs and recorded before every arm, never changed; no other engine (`pgrep -x glm53`, `pgrep -x qwen38`, `pgrep -x qwen38-vk`, `pgrep -f "hipf[i]re"` all empty before each arm); VRAM asserted free before every arm (sysfs `mem_info_vram_used` < 1 GB on all three cards) |
+| residency | arm A: fincore ≥ 90 % on the GLM shards before every turn and `majflt` per turn recorded (must stay 0); arm B/C: fincore on their own model files, same floor |
+| order | **A, B, B, A**, then C — the GLM arm brackets the pair; each B arm is a fresh server process so B2 cannot inherit B1's KV or prefix cache |
+
+| not comparable, said plainly | why it stays in the report anyway |
+|---|---|
+| the model (GLM-5.3-Flash vs Qwen3.6-35B-A3B) | it is the decision: the owner is choosing a model class, and no throughput number substitutes for reading the answers (§2.5) |
+| the quantisation (int4-g64 / MQ4R / int4-gs64: three formats, none bit-comparable) | arm C vs arm B agreement is reported as a sanity, not an oracle |
+| the placement (host + 3 tiers vs one resident card) | this *is* the class difference |
+| the backend (RADV Vulkan vs ROCm HIP) | confounded with every row above; **the head-to-head says nothing about it**; D-3 in §3 does |
+| depth in tokens (two tokenizers) | depth is reported in each engine's own tokens and in characters (identical by construction); comparison at matched *turn index*, with the token counts printed beside it |
+
+### 2.2 Items
+
+| id | item | evidence | expected | effort | tier | gate |
+|---|---|---|---|---|---|---|
+| **H0** | **hipFire on this box at all.** Under the rig lock with the gateway stopped (a chain, not by hand — the watchdog): check `/dev/kfd` access for the user (`id -nG` includes `render`/`video`; if not, that is an owner action, `usermod`, and the item stops there and says so); `ROCM_PATH=/opt/rocm-6.2.0 rocminfo` lists three gfx1100; build hipFire (Rust toolchain user-local via rustup; `hipcc` from `/opt/rocm-6.2.0/bin`) — **read its README for its minimum ROCm first; if it needs > 6.2, stop and report: installing a second ROCm is a system change the owner decides, not this item**; download the Qwen3.6-35B-A3B MQ4R; serve it on dev3's HIP index on a side port; one request through its HTTP API. Record: the API shape (OpenAI-compatible `/v1/chat/completions` with SSE, or Ollama-style `/api/chat` NDJSON — the driver needs to know), whether the response carries `usage.prompt_tokens` / prompt-eval timings, whether it exposes **any prefix/KV cache across requests** and **any speculative/MTP knob** (both decide items below), its CPU thread setting, and the PCI-BDF → HIP-index map | ROCm 6.2 unused so far; RADV has been the only path | runs, or fails on a named cause | ½ day + a short lock window | Sonnet (+ owner if a group membership is missing) | a coherent 64-token greedy reply on the ladder's question, `usage` or an equivalent token count reported, VRAM released after exit (sysfs `mem_info_vram_used` back under 1 GB on that card) — **or a named blocker** |
+| **H1** | **Extend `context_ladder.py` with `--url`** (reuse `ttft_serve.HttpDriver`, add its `--api-key`, `--model-id`, `--server-log`, `--tools` arguments), plus: residency over the files under `--snap` whatever their extension; the P8 reply pin only in engine mode (an unknown message field may be rejected by another server); in HTTP mode the REUSE-based abort is replaced by a loud `REUSE UNVERIFIED (http)` note and `reused=None` in the row — **the cold sweep decides reuse, not a guess**; `--cold-sweep 2048,4096,8192,16384 --sweep-offset-chars 300000` (fresh single-message prompts of those sizes from a disjoint corpus region, each its own conversation, HTTP mode only; **refused in engine mode with the arithmetic** — 2k+4k+8k+16k on GLM is 260+572+1355+3555 s = 96 min per pass); `side`/`arm` fields in every JSON row; decode from `usage.completion_tokens` when the stream reports it, else delta count, and the row says which. If H0 found an Ollama-style API, a second small driver class with the same `run()` contract. **Plus `context_compare`** (new, Python, under `tools/hot-expert/`): reads the jsonl of the four arms, pairs rows by turn index, prints per depth D_A×2, D_B×2, TTFT_inc×2 each, applies `gate_ab_verdict`'s rule (overlap → NO VERDICT; conservative worst-against-best when separated; refuse < 2 samples per arm) by sourcing `gate_lib.sh`, and prints the reuse ratio r (§2.4) per sweep depth | `HttpDriver` already reads SSE, `usage`, and the gateway log; the ladder hardcodes `EngineDriver` | a driver that is symmetric across arms | 1 day | Sonnet | (i) engine mode reproduces tonight's ladder turn 1–2 within the box's spread (374 tokens 45.4 s / 121.5 ms/token; turn 2 REUSE 381/731 at 110.8 ms/token — `eb4dd5b`), (ii) `--url http://127.0.0.1:8081 --steps 256,256 --gen 16` against the **live** gateway (read-only, no stop, prefill-snapshot style) shows the REUSE lines from `~/glm53_server.log` covering the previous prompt on turn 2 — the HTTP driver is proven on the engine whose reuse signal exists before it meets one whose does not |
+| **H2** | **The chain, `franken_chain.sh`**, launched only through `run_chain.sh` (lock; refused while the current benchmark holds it): stop gateway → `wait_no_engine` → warm GLM shards, assert ≥ 90 % → **A1** ladder `--steps 1024,1024,2048,4096,8192 --gen 128 --followups 2` (cumulative user text 1/2/4/8/16 Ki; the engine's own count lands near tonight's 18 055 point) → stop engine, assert VRAM free → **B1** start hipFire, throwaway request, ladder with the same steps **plus** `--steps …,8192,8192,8192,8192,8192,8192` to 64Ki (cheap for it; the 64Ki rows are B-only and labelled so; Colibri's 64Ki is the 9.6 h projection, not run), then the cold sweep → stop hipFire, assert VRAM free → **B2** identical, fresh process → assert VRAM free, re-warm GLM, assert ≥ 90 % → **A2** identical to A1 → **C** (`coli serve` on `qwen36`, `--sizes 512,2048`, 30 min cap) → re-warm GLM → restart gateway on every exit path → `accept_live.sh` (the request *after* the measurement is part of the measurement) | every rule in CLAUDE.md "How a change is measured"; MEASURING.md's factor-of-two on cache state | rig ≈ 70 min (A1) + ~20 (B1) + ~20 (B2) + 70 (A2) + ≤ 30 (C) + ~20 warm/restart ≈ **4 h**; schedule at night, tell the owner the gateway is down for it | Sonnet writes, Haiku runs | the chain exits 0 with four jsonl files whose A rows all carry `majflt=0`, every arm's pre-checks logged (DPM level, VRAM free, residency), `accept_live.sh` PASS at the end; **any A row with majflt > 0 or residency < 90 % invalidates that arm and the chain says so instead of averaging it** |
+| **H3** | **The table.** `context_compare` output, plus D_B at empty context from the throwaway (the transfer check, §2.4 Q1), plus arm C's rows, plus the reuse ratio, into the record as §FRANKEN-H2 with the raw jsonl paths | — | one table | ½ day | Haiku | every cell either a measured number with its two samples or `NO VERDICT` / `REFUSED` from `gate_lib.sh`; no cell computed by hand |
+| **H4** | **The owner's read (§2.5)**, not a gate: the same 12 prompts through both lanes, tabulated side by side, `finish_reason` and tool-call outcome per row | ninfer's 225-response audit is the pattern: throughput is not usable output | a page the owner reads | ½ day | Haiku | all 12 rows present for both lanes with `finish_reason=stop` counts; no scoring |
+
+### 2.3 Why the ladder and not TG128, and why not a 64Ki cold prefill
+
+TG128 at empty context is where hipFire's 253.3 lives and where nobody's
+conversation lives: Open WebUI's tool block alone is ~4 000 tokens, and tonight's
+curve loses 1.82× between 2.5k and 18k on GLM (hipFire's own multi-turn figures
+lose 1.58× from 253 to 160). The ladder gives decode and incremental TTFT at
+every depth in one pass, on the shape Open WebUI sends, and the same corpus on
+every arm. A cold 64Ki prefill on GLM is 9.6 h projected and would add nothing:
+the rate fit already covers 643–13 628 within 1.5 % and the ladder's 16Ki step
+lands on the 18k point measured tonight; the B arm runs to 64Ki because it can.
+
+### 2.4 The four numbers the chain must produce, and their thresholds
+
+Let D_X(d) be decode tok/s at depth d, W_X(d) the incremental TTFT of the
+follow-up turn at full depth (the two `--followups`), T_B^cold(d) hipFire's
+cold-sweep TTFT, and T_B^lad(d) its ladder TTFT at the same depth.
+
+- **Q1 — do hipFire's numbers transfer to this box?** D_B(≈0) from the
+  throwaway. `≥ 150` (0.6 × the published 253.3): proceed. `80–150`: read the
+  DPM level recorded (§Q13 found dev0 idling low and `high` changing numbers);
+  do not change it mid-chain; a second chain with the level pinned is a
+  separate, labelled run. `< 80`: **stop; something on this box is wrong**
+  (driver, power, card) and no decision is taken on that number.
+- **Q2 — does hipFire reuse prefixes?** r = T_B^lad(16k) / T_B^cold(16k).
+  `r ≤ 0.25`: reuse. `r ≥ 0.8`: no reuse — every turn re-prefills.
+  In between: NO VERDICT from the ratio; the server's own counters (H0)
+  decide or the cell says unknown.
+- **Q3 — the owner's wait at depth.** W_B(18k) vs W_A(18k). Projected
+  W_A(18k) for a ~50-token follow-up = 50 × (113.9 + 0.01258 × 18 055) ms
+  = 50 × 341 ms ≈ **17 s** (the chain measures it; the projection is for the
+  reader). Without reuse W_B(18k) = T_B^cold(18k).
+- **Q4 — decode at depth.** D_B(18k) vs D_A(18k) = 2.23 measured. The
+  published 160 would be 72×. Anything ≥ 10× is the same decision.
+
+## 3. Decision tree (after H3), with what falsifies each branch
+
+```
+H0 fails on a named blocker ──────────────────────────────► O3: stop. Record the cause.
+                                                             Vulkan stays. Nothing else changes.
+H0 passes
+ └─ Q1 < 80 ────────────────────────────────────────────────► O4: diagnose before deciding (driver /
+ └─ Q1 ≥ 150 (or 80–150 with the DPM level explained)        DPM / card). No branch is taken on it.
+     ├─ Q2 = no reuse AND W_B(18k) > W_A(18k) ───────────────► O2: the moat is real. hipFire wins decode
+     │                                                          and loses the wait at depth. Do NOT
+     │                                                          replace the lane. Go to branch 3 or wait
+     │                                                          for hipFire to add prefix caching; re-run
+     │                                                          H2 when it does.
+     ├─ Q2 = reuse (or W_B(18k) ≤ W_A(18k)/2) AND Q4 ≥ 10× ──► O1: the fast lane is real. Two follow-ups:
+     │                                                          L1 (two-lane cost on GLM) and the owner's
+     │                                                          read (H4). Then branch 1 or 2, owner's call.
+     └─ anything else (e.g. Q4 between 3× and 10×, W_B ≈ W_A) ► NO VERDICT on the product question.
+                                                                Report the table. Fable arbitrates only
+                                                                if the owner wants a call on partial data.
+```
+
+**Branch 1 — two lanes.** hipFire serves the 35B on dev3 as a second OpenAI
+connection in Open WebUI (no gateway change; the daily driver on 8081 is
+untouched); GLM-5.3 runs on **two** cards. Cost to GLM, **projected**: dev3
+holds 1 695 of the 4 638 tier-resident experts (37 % of the tier); if hits
+scaled with tier size the CPU share would go from ~21 % to ~21 + 0.37 × 79 ≈
+50 % of routed calls, the CPU expert bucket from ~40 to ~95 ms/token, the
+token from ~135 to ~190 ms — **about −29 % decode**. Heat ranking makes the
+coldest third of the tier carry fewer hits than its share, so the bracket is
+**−15 to −30 %**, and dev0's KDA pool and dense stream are untouched. Item
+**L1** measures it: `tools/rome_bench.sh glm53 <name> COLI_VK_EXPERTS3=` with a
+config name that says dev3 is skipped (an unset cap skips the device — CLAUDE.md;
+verify the tier line says dev3 absent, or the row is invalid), interleaved
+A,B,B,A against the three-card config, **and** `prefill_snapshot.sh` for the
+TTFT side (both tracks, because the question is what the owner loses on GLM).
+Haiku. Falsifier of the branch: L1 > −30 % or the owner rejects the 35B's
+answers in H4.
+
+**Branch 2 — replace.** The owner decides after H4 that the 35B is his daily
+model; GLM-5.3 becomes on-demand. Then hipFire + Open WebUI is the stack and
+the Colibri moat matters exactly as much as Q2 says: with reuse, P7/P9 are
+redundant for that lane; without it, branch 2 is O2 and is not taken. This
+branch is the owner's, not a measurement's; the plan only makes its cost
+visible. Falsifier: O2, or H4.
+
+**Branch 3 — graft: a Colibri-native VRAM-resident path.** Port the qwen36
+CUDA tier's *concept* (all experts resident, per-device homes, expert-group
+dispatch) to Vulkan on the pattern `qwen38-vk` already uses in
+`backend_vulkan.c`, so the 35B runs on Colibri with P7/P9/slots/gateway intact.
+Its ceiling before a line is written, **projected from Q7's measured gaps**:
+40 layers × ≥ 3 submits per layer × ≥ 0.30 ms per gap ≥ **36 ms/token of submit
+gaps alone → ≤ 28 tok/s** before any compute, against hipFire's published 160+.
+That is why graft X1 (retained command buffers) is a *precondition* of this
+branch, not an optimisation of it, and why the branch is not started before X1
+has a measured number. Opus, weeks. Gate: D_Colibri-vk(18k) ≥ 0.6 × D_B(18k)
+from H3, with `teacher_forcing` against the CPU `qwen36` path identical and
+the KL bar of X2. Falsifier: X1 lands below 2× on the submit buckets, in
+which case the ceiling stands and the branch is dead on arithmetic.
+
+**D-3 — the backend question, answered on its own terms.** One microbenchmark,
+same card, same shape: hipFire's gfx11 MMQ int4 kernel vs `qmatmul_tile.spv`
+at GLM's routed-expert GEMV shape (M = 1, and the tiled S-row case), each
+warmed, each ≥ 5 repeats, interleaved. `tools/hot-expert/rome_vkbench.c` is the
+Vulkan side's existing harness. **Migrating any Colibri op to HIP is justified
+only if the HIP kernel is ≥ 1.5× on that op AND the op is ≥ 20 % of the token
+it lives in.** On GLM the second condition is false by the profile (§0), so
+the outcome can at most name a candidate for the *resident* path of branch 3.
+Opus, 1 day, one short lock window. Falsifier of "the backend is not the
+lever": ≥ 2× on the op — then X-HIP (a knob-gated HIP expert kernel) enters §4
+at the bottom, priced by the op's share.
+
+## 4. The graft list, by value per unit of risk
+
+| rank | id | graft | source | what it replaces or adds in Colibri | expected | risk | tier | gate |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **X1** | **Retained command buffers for the per-token-invariant stream** — record once, re-submit per token; keep the MoE expert groups dynamic (their set changes every token) | hipFire "Redline" (record the kernel graph, retain invariant command state); CUDA-Graph analogue. Vulkan supports it natively: a command buffer recorded without `ONE_TIME_SUBMIT` is re-submittable | `backend_vulkan.c` resets and re-records on every submit (lines 1007–1009, 1113–1115, 1177–1179, 1268–1270). Targets: Q7's dense stream on qwen38-vk (`dn-proj`, `qsa-proj`, `lm-head`), G12's KDA path on glm53 | **projected**: a fraction of `vk-issue` 13.8 + `vk-take` 4.8 ms/token on qwen38-vk — the CPU-side re-record and validation, not the GPU wait; call it −3 to −8 ms/token (2–6 % of 138) and be pleased to be wrong upward; on glm53 smaller (its GPU stream is thinner). The larger value is strategic: it is the floor-remover for branch 3 | medium: shared file, both engines rebuild and re-measure; descriptor/buffer addresses must be stable across tokens | Opus | bit-identical (same kernels, same order) on `teacher_forcing`, `last_logits`, `tworeq.py` at 4 slots; `rome_bench.sh qwen38-vk` and `glm53` A,B,B,A through `gate_ab_verdict`; `[OPTIME] vk-issue` before/after in the commit body |
+| 2 | **X2** | **KL oracle**: per-position logits over a fixed packet (450 rows, the hipEngine size), mean/max KL and top-1 agreement, as a third oracle beside greedy text and last-token cosine | hipEngine's gate methodology (it rejected a 5 % prefill win on this bar) | adds to `ttft_serve.compare_logits` / the `teacher_forcing` path a per-position dump (`GLM53_LOGIT_DUMP` today dumps the last token); a script that prints mean/max KL and top-1 % | a single scale on which G12 (cos 0.99992, text identical), G14's int8 (cos 0.98964, text changed) and G15 (cos 0.878) order themselves; the swiglu-clamp item (§G15's by-product) gets a number instead of "8 of 1232" | low | Sonnet | reproduces those three cases in the same order; refuses (via `gate_compare`) when either dump is empty |
+| 3 | **X3** | **QSA block-sparse attention at depth for GLM's MLA** (pool 4 → 1 key, select 512 blocks; dense-identical below 2 052 tokens) — **profile first, then decide** | hipEngine QSA | GLM already has a DSA indexer with cached pooled keys (G5); this is a stricter selection at long context. Step 0: one 18k turn with `[OPTIME] mla split` on, from the A1 engine log — which bucket grows from 2.5k to 18k? | if attention/indexer is ≥ 30 % of the 18k token, a knob-gated selection with X2's bar; if the growth is KV read bandwidth, **dead at step 0** | medium (numerics change; ships off by default, per house rule) | Opus | bit-identical below 2 052 tokens by construction (checked, not assumed); KL within X2's bar at 18k; D_A(18k) A,B,B,A |
+| 4 | **X4** | **The audit table** — N fixed prompts, `finish_reason`, tool-call outcome, length, per lane, kept as a page | ninfer's 225-response audit; this fork's own 256-cap incident (every reply truncated for a week and no gate saw it) | extends `accept_live.sh` check 5's idea into a table the owner reads; doubles as H4 | product visibility, not speed | very low | Haiku | all rows present, `finish_reason=stop` count reported, no scoring |
+| 5 | **X5** | **MTP re-test, but only in a VRAM-resident regime** | ninfer 59–61 % acceptance on resident models; Q9's kill here (2.668) and hipEngine's 0.955× are host-resident results — the verify block's cost is linear in S when the routed experts come from DRAM per row, and sub-linear when the weights are read once per block from VRAM; that is the discriminator, and it does not transfer either way | nothing in Colibri today. If H0 found a speculative/MTP knob in hipFire: A/B it inside hipFire on the ladder (free). If branch 3 is built: Q9's spec applies to *that* engine, from step 0 | unknown; the point is that Q9's number is not evidence about this regime | low (measurement only) | Sonnet | interleaved knob on/off on the B ladder; `gate_ab_verdict`; text identical or divergences explained as near-ties |
+| 6 | **X6** | **Bounded double-buffered pinned row-gather** (stream cold experts into the GPU instead of computing them on the CPU) | hipEngine's PLE streaming | would replace the CPU int4 path for tier misses on GLM | **projected, and it loses at batch 1**: one 14.1 MB expert over PCIe 4.0 x16 at a practical ~25 GB/s (of 32 nominal; not measured here) = 0.56 ms + a launch, vs 14.1 MB from DRAM at the measured 21.95 GB/s = 0.64 ms. Equal within the uncertainty, and the miss set changes every token so nothing amortises. Worth revisiting only for prefill chunks, where Q9 step 1 measured 29 % expert dedup across 32 rows on Qwen | medium | — | not scheduled; the derivation is the record |
+| 7 | **X7** | Native artifact format / no load-time conversion | ninfer `.ninfer`, hipFire MQ4R | Colibri already has its own containers and maps shards; load time here is page cache, not conversion | none measurable | — | — | not scheduled |
+| 8 | **X8** | Exact-batch decode / C1–C8 batching | ninfer | throughput under concurrency; this box has one user and the gateway serialises | none for the owner's latency | — | — | not scheduled unless the usage changes |
+
+## 5. Multi-GPU: three gfx1100, and why "3" is the wrong question for speed
+
+**M0 — the cheap proof (do it; it is information, not a decision).** Under the
+lock with the gateway stopped (RCCL needs VRAM the tiers currently fill):
+build rccl-tests against `/opt/rocm-6.2.0` (`make MPI=0 HIP_HOME=/opt/rocm-6.2.0
+RCCL_HOME=/opt/rocm-6.2.0`), run `all_reduce_perf -b 8 -e 128M -f 2 -g 3` and
+`-g 2`. Record: whether it runs at all; the small-message (8 B – 64 KB) latency
+in µs; the large-message bus bandwidth in GB/s; and `NCCL_DEBUG=INFO`'s
+transport line (P2P over PCIe vs host-staged). Sonnet, ½ day, a 15-minute lock
+window. Outcomes:
+
+- **does not run** ("hostcall not supported", atomics, or KFD access): the
+  tonight's-lspci reading was necessary but not sufficient; TP/EP via RCCL is
+  off the table on this box; only pipeline placement (no collectives) or one
+  card. That is a finding worth the half day.
+- **runs**: the small-message latency L is the number that matters for decode
+  TP, and here is the arithmetic it is measured against. Tensor-parallel decode
+  of the 35B places one all-reduce after attention and one after the MLP per
+  layer: 40 layers × 2 = **80 collectives per token**. At 4 ms/token on one card
+  (the published 250 tok/s) and compute split perfectly three ways, TP3 breaks
+  even only if 4/3 + 80·L < 4 ms, i.e. **L < 33 µs** (projected; the proof step
+  supplies L). Over PCIe without a GPU-to-GPU fabric that bar is the whole
+  question, and the plan does not assume the answer.
+- either way, **3 is an awkward TP degree** (head and expert counts rarely
+  divide by 3; hipFire's documented TP/EP runs are 4–5 × gfx1201, never
+  gfx1100), and **EP at batch 1 is what Colibri already does** across its three
+  devices from the host — same latency structure, no new information.
+
+**M1 — the honest use of the third card.** For a model that fits on one card,
+the other two are *capacity*, not speed: a second lane (branch 1), or a larger
+resident model across cards by pipeline placement (a model-class change again,
+with its own H2). **TP3 for decode of a one-card model is not pursued** unless
+M0 returns L well under 33 µs, and even then only as a measured item with the
+ladder as its gate.
+
+**M2 — not scheduled:** any Colibri multi-device change on the basis of M0.
+Colibri's three-device expert groups are already measured (G2: round-based
+issue-all/take-all; G9: CPU work in the gap) and nothing in M0 speaks to them.
+
+## 6. Risks, and what this plan will not do
+
+Risks, each with the check that catches it:
+
+- **ROCm user-space on a RADV box.** HIP talks to `amdgpu` through `/dev/kfd`;
+  Mesa through `/dev/dri`. They coexist, but `/dev/kfd` needs group membership
+  the user may not have, and hipFire may want a newer ROCm than 6.2. Both are
+  H0's first checks and both are owner decisions if they fail. **No system
+  package is installed and no group is changed by a session.**
+- **VRAM not released after a hipFire exit** would make the A2 arm's preload
+  spill and the arm invalid. The chain asserts `mem_info_vram_used` < 1 GB on
+  every card before every arm and refuses to proceed otherwise.
+- **Page cache.** GLM's 182 GiB plus the MQ4R's 18.7 GB fit in 247 GiB; arm C's
+  ~30 GB RSS may evict GLM pages, which is why C runs last and the chain
+  re-warms GLM before the restart; the owner's first chat after the chain
+  must not pay 100k major faults.
+- **Clocks.** §Q13 showed the DPM level moves numbers; the chain records it
+  before every arm and changes nothing. A run with a different level is a
+  different, labelled run.
+- **Two tokenizers.** Depth is matched by turn index and characters; token
+  counts are printed beside every cell. A reader who compares tok/s across
+  arms without the token counts is comparing two units.
+- **Streaming granularity.** A server that batches deltas would misreport
+  TTFT and decode; `usage.completion_tokens` is preferred and the row says
+  which source it used. If neither exists the cell is REFUSED, not estimated.
+- **The daily driver is down for ~4 h.** Once, at night, announced. The chain
+  restarts it on every exit path and `accept_live.sh` proves it.
+- **The current benchmark.** Nothing here runs until it releases the lock;
+  `run_chain.sh` refuses otherwise.
+
+This plan will **not**:
+
+- run anything on the rig, stop the gateway, or take the lock before the
+  running benchmark finishes;
+- write a HIP kernel into Colibri, or open a backend port, on the strength of
+  the head-to-head — only D-3 can put a HIP op on the list, and only for the
+  resident path;
+- run a 64Ki cold prefill on GLM (9.6 h projected for a number the fit
+  already gives), or TP3 for decode;
+- declare a quality verdict on the 35B — H4 puts the answers side by side and
+  the owner reads them;
+- merge `upstream/dev`, or change `~/start_glm53.sh`, the tier caps, the DPM
+  level, or the histogram;
+- treat any of hipFire's published numbers as this rig's until Q1 has been
+  measured here.
+
+## 7. Order of execution and effort
+
+| step | what | tier | rig time | wall |
+|---|---|---|---|---|
+| H1 | ladder `--url`, cold sweep, `context_compare`; gate against tonight's ladder and the live gateway | Sonnet | 0 (live gateway, read-only) | 1 day |
+| H0 | hipFire on the box; API/prefix-cache/MTP facts; device map | Sonnet (+ owner) | one short lock window | ½ day |
+| M0 | rccl-tests, `-g 3` and `-g 2` | Sonnet | 15 min under lock | ½ day |
+| H2 | the chain, A B B A + C, at night | Haiku runs | ~4 h | — |
+| H3 | the table into the record | Haiku | 0 | ½ day |
+| H4 / X4 | the audit page, both lanes | Haiku | ~1 h under lock (the B lane) | ½ day |
+| D-3 | same-op microbench | Opus | 30 min under lock | 1 day |
+| X1 | retained command buffers | Opus | ~3 h (both engines, A,B,B,A) | 3–5 days |
+| X2 | KL oracle | Sonnet | ~1 h | 1 day |
+| L1 | GLM on two cards, only under O1 | Haiku | ~2 h | — |
+| X3 step 0 | which bucket grows at 18k (from A1's log; no extra rig time) | Opus | 0 | ½ day |
+
+Fable's part ends here unless H3 lands in the NO VERDICT region and the owner
+wants a call on partial data, or D-3 returns ≥ 2× and the backend question
+reopens for the resident path.

@@ -263,6 +263,22 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   (unguarded `m->max_t / c->idx_ratio` in `ensure_kv`, which the test's fabricated
   Model leaves at 0). If it crashes again, that guard is the first place to look.
 
+## Sending anything upstream
+
+**Run `tools/hot-expert/upstream_lint.sh upstream/dev <branch>` before opening or
+updating a PR against another project, and re-run it after every edit.** It fails
+on added lines carrying references that mean nothing outside this fork: roadmap
+row labels (`G4`, `Q10`, `P7b`), `tools/hot-expert/...` paths, `CLAUDE.md`, the
+rig's name, `~/bench/...`, "see the record". Say what the thing *describes*
+instead; the substance — especially a negative result — is worth keeping, the
+label is not.
+
+It exists because a reviewer had to ask for this on PR #1521 (2026-09-15), and
+because when asked whether the sibling PR had the same problem the answer was
+"no" from memory and was wrong: #1524 carried two more labels, a link to a path
+that does not exist upstream, the rig's name and "see the record". **Do not
+answer that question from memory — run the script.**
+
 ## Git
 
 - Canonical remote is Gitea (`gitea`); GitHub is a mirror of it. The rig

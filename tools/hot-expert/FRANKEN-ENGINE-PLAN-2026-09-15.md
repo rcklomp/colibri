@@ -28,6 +28,36 @@
 > around that, H2 stays first because it needs no code, and a second claimed
 > gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
+> **Rev 3 (2026-09-16, execution night 1).** Three corrections from running
+> the plan, all measured on the rig, none changing the decision tree:
+> 1. **H0 and M0 are blocked, not failed.** hipFire (upstream `warpfront/hipfire`
+>    v0.3.1) builds, pulls the MQ4R SKU and serves its API on this box, but it
+>    JIT-compiles its kernels at request time through ROCm's clang, and this
+>    ROCm 6.2.0 install has no `rocm-device-libs` package; rccl-tests fails on
+>    the identical error. The triton-bundled bitcode on the box lacks the
+>    `oclc_*` control set and clang refuses it. Owner action:
+>    `sudo apt install rocm-device-libs` (candidate 1.0.0.60200-66~24.04),
+>    then `h0_chain.sh` reruns unchanged. Record: §FRANKEN-H0, §FRANKEN-M0.
+> 2. **The H2 validity rule "any A row with majflt > 0 invalidates the arm"
+>    was wrong** and is withdrawn: `c790851` had already measured that a
+>    loaded `glm53` (~89 GB anon) beside the 183 GiB model on a 247 GiB box
+>    caps residency near 92 % and turn 1 always faults (reference ladder
+>    `ctx09152003`: majflt 21 663 / 6 611 / 4 521 / 4 176 on turns 1–4 — that
+>    IS the serving regime). `franken_chain.sh` now invalidates an arm only on
+>    a residency floor breach (< 90 %), prints majflt per row, and flags a
+>    turn `MAJFLT-HIGH` above 2× the reference; H3 annotates such cells rather
+>    than dropping them.
+> 3. **Arm C has its first number** (smoke, `fk09152356`, CPU-only `qwen36`
+>    on the gs64 container, all experts resident, 8 threads): 512-token turn
+>    TTFT 32.85 s, decode **14.84 tok/s**; follow-up 20.67 s / 14.38 tok/s.
+>    That is the floor branch 3 (V1) must beat, and it is already ~4–5× GLM's
+>    decode at the same depth on the CPU alone.
+> Also found and fixed in passing: every chain ending in `accept_live.sh` was
+> truncating its own log (`tee /dev/stderr` under `nohup > log 2>&1`;
+> `5062ff4`). H1 landed (`perf/franken-h1`); V1 step 0 landed
+> (`tools/hot-expert/V1-STEP0-2026-09-16.md`: the CUDA tier takes gs64 group
+> scales, no new shader needed, one nibble-encoding difference to drop).
+
 ## 0. Decision in one paragraph
 
 The first head-to-head (§2, H2) cannot separate "HIP beats Vulkan" from "a

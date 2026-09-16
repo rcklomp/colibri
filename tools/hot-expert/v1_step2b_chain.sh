@@ -45,6 +45,7 @@ STEPS=${V1_STEPS:-256}
 GEN=${V1_GEN:-16}
 FOLLOWUPS=${V1_FOLLOWUPS:-1}
 ARM_TIMEOUT=${V1_ARM_TIMEOUT:-900}
+NEXPERTS=${V1_NEXPERTS:-10240}     # 40 layers x 256 experts
 BIN=~/bench/qwen36-vk.v1
 LOG=~/glm53_server.log
 KEY=$(cat ~/.colibri_api_key 2>/dev/null)
@@ -133,10 +134,27 @@ done
 
 precheck() {                       # precheck <label>
   echo "--- precheck $1"
+  # WAIT for VRAM, do not just read it once. The driver releases an 18 GB
+  # expert tier over several seconds AFTER the process is gone, so a snapshot
+  # taken the instant the previous arm exits reports gigabytes that are already
+  # being freed -- which is how the first run of this chain refused arms B2 and
+  # A2 at 3371 MB and 2347 MB (falling) and left gate_ab_verdict with one
+  # sample an arm. Poll up to 180 s, then refuse for real.
+  local waited=0 busy=1
+  while [ "$waited" -lt 180 ]; do
+    busy=0
+    for c in /sys/class/drm/card*/device/mem_info_vram_used; do
+      [ -r "$c" ] || continue
+      [ "$(cat "$c")" -gt 1073741824 ] && busy=1
+    done
+    [ "$busy" = 0 ] && break
+    sleep 5; waited=$((waited+5))
+  done
+  [ "$waited" -gt 0 ] && echo "    (waited ${waited}s for VRAM to be released)"
   for c in /sys/class/drm/card*/device/mem_info_vram_used; do
     [ -r "$c" ] || continue
     used=$(cat "$c"); echo "    $c = $((used/1048576)) MB"
-    [ "$used" -le 1073741824 ] || { echo "[v1s2b] REFUSED at $1: $c holds $((used/1048576)) MB"; return 1; }
+    [ "$used" -le 1073741824 ] || { echo "[v1s2b] REFUSED at $1: $c holds $((used/1048576)) MB after ${waited}s"; return 1; }
   done
   local pct
   pct=$(fincore --bytes --output FILE,SIZE,RES "$M"/*.safetensors | python3 -c "
@@ -180,12 +198,22 @@ arm() {
   [ "$up" = 1 ] || { echo "[v1s2b] arm $name FAILED: coli serve never answered"; tail -30 "$clog"; stop_srv; return 1; }
   echo "  server up, pid=$SRV_PID"
   if [ "$tier" = on ]; then
-    if grep -qE '^\[qtier-vk\] resident|Vulkan VRAM expert tier active' "$clog"; then
-      grep -E '^\[qtier-vk\]' "$clog" | tail -3 | sed 's/^/    /'
-    else
-      echo "[v1s2b] arm $name FAILED: no [qtier-vk] line -- the tier did not come up"
+    # In SERVE mode qt_stats() is never reached (serve_loop does not return),
+    # so the residency assertion is the warmstart line the engine prints before
+    # it starts answering: "[qtier] warmstart (parallel): all N experts in RAM
+    # (...), M in VRAM". M must be the whole set.
+    grep -E '^\[qtier-vk\]|^\[qtier\] warmstart|^\[VK\] dev3 ready' "$clog" | tail -6 | sed 's/^/    /'
+    local invram
+    invram=$(grep -oE '[0-9]+ in VRAM' "$clog" | tail -1 | grep -oE '^[0-9]+')
+    if [ -z "$invram" ]; then
+      echo "[v1s2b] arm $name FAILED: no warmstart line -- the tier did not come up"
       tail -30 "$clog"; stop_srv; return 1
     fi
+    if [ "$invram" != "$NEXPERTS" ]; then
+      echo "[v1s2b] arm $name FAILED: $invram of $NEXPERTS experts in VRAM"
+      stop_srv; return 1
+    fi
+    echo "    residency asserted: $invram/$NEXPERTS experts in VRAM on dev3"
   else
     grep -qE '^\[qtier-vk\]' "$clog" && { echo "[v1s2b] arm $name FAILED: the tier spoke in a tier-OFF arm"; stop_srv; return 1; }
   fi
@@ -212,20 +240,34 @@ except FileNotFoundError:
   # the identity invariant, on the tier-on arm only (see the header)
   if [ "$tier" = on ] && [ "$name" = B1 ]; then
     echo "  --- sequential identity: P1, P2, P1 again in ONE server process"
-    idq() {                         # idq <file> <prompt>
+    # The model id is whatever /v1/models advertises ("qwen3.6-colibri" here),
+    # NOT the engine's file name: the first run of this chain hardcoded
+    # "qwen36", got three 404s, and its identity check compared three identical
+    # PARSE-FAIL lines and would have called that IDENTICAL had the filenames
+    # matched. Ask the server, and refuse if the reply is not real text.
+    local MID
+    MID=$(curl -s -m 20 "http://127.0.0.1:$PORT/v1/models" \
+          | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null)
+    echo "      model id: ${MID:-<none>}"
+    idq() {                         # idq <basepath> <prompt>
       curl -s -m 300 -H 'Content-Type: application/json' \
-        -d "{\"model\":\"qwen36\",\"messages\":[{\"role\":\"user\",\"content\":\"$2\"}],\"max_tokens\":24,\"temperature\":0}" \
-        "http://127.0.0.1:$PORT/v1/chat/completions" > "$1" 2>&1
+        -d "{\"model\":\"$MID\",\"messages\":[{\"role\":\"user\",\"content\":\"$2\"}],\"max_tokens\":24,\"temperature\":0}" \
+        "http://127.0.0.1:$PORT/v1/chat/completions" > "$1.json" 2>&1
       python3 -c "
-import json,sys
-try: print(json.load(open('$1'))['choices'][0]['message']['content'])
+import json
+try: print(json.load(open('$1.json'))['choices'][0]['message']['content'])
 except Exception as e: print('PARSE-FAIL', e)
 " > "$1.txt"
     }
-    idq "$OUT/${TAG}_id_p1a.json" "List the days of the week in order."
-    idq "$OUT/${TAG}_id_p2.json"  "Name three prime numbers greater than one hundred."
-    idq "$OUT/${TAG}_id_p1b.json" "List the days of the week in order."
+    idq "$OUT/${TAG}_id_p1a" "List the days of the week in order."
+    idq "$OUT/${TAG}_id_p2"  "Name three prime numbers greater than one hundred."
+    idq "$OUT/${TAG}_id_p1b" "List the days of the week in order."
     local n1
+    if grep -q 'PARSE-FAIL' "$OUT/${TAG}_id_p1a.txt" 2>/dev/null; then
+      echo "      REFUSED: the server did not return a completion -- $(head -c 160 "$OUT/${TAG}_id_p1a.json")"
+      IDENT=REFUSED
+      stop_srv; return 0
+    fi
     n1=$(tr -d '[:space:]' < "$OUT/${TAG}_id_p1a.txt" | wc -c)
     if [ "${n1:-0}" -lt 8 ]; then
       echo "      REFUSED: P1's reply is ${n1:-0} non-space chars -- an empty identity check is not a pass"

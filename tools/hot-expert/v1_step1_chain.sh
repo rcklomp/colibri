@@ -200,10 +200,21 @@ run() {                     # run <tag> <binary> <promptfile> <n_new>
     /usr/bin/time -v "$bin" "$CAP" 4 "$pf" ) \
       > "$OUT/$tag.out" 2> "$OUT/$tag.err"
   local rc=$?
-  local pos maj
+  local pos maj ttft speed
   pos=$(awk '/^teacher_forcing/{print NF-1}' "$OUT/$tag.out")
-  maj=$(awk -F': ' '/Major .page faults/{print $2}' "$OUT/$tag.err")
-  echo "[v1s1] $(date +%H:%M:%S) run $tag rc=$rc positions=${pos:-0} majflt=${maj:-?} dumpall=$(wc -c < "$OUT/$tag.dumpall" 2>/dev/null || echo 0)B last=$(wc -c < "$OUT/$tag.last" 2>/dev/null || echo 0)B"
+  maj=$(awk -F': ' '/Major .*page faults/{print $2}' "$OUT/$tag.err")
+  ttft=$(awk '/^TTFT:/{print $2}' "$OUT/$tag.err")
+  speed=$(awk -F'[ (]' '/^Speed:/{print $2}' "$OUT/$tag.err")
+  # The greedy text goes to STDOUT (print_decoded writes there; only the
+  # "Text      : " label is on stderr). Split it out so the gate compares the
+  # text and not the label -- an empty label line diffs IDENTICAL against
+  # another empty label line, which is gate_lib.sh's whole reason to exist.
+  grep -v '^teacher_forcing' "$OUT/$tag.out" > "$OUT/$tag.text"
+  echo "[v1s1] $(date +%H:%M:%S) run $tag rc=$rc positions=${pos:-0} majflt=${maj:-?}" \
+       "ttft=${ttft:-?}s tok/s(incl prefill)=${speed:-?}" \
+       "dumpall=$(wc -c < "$OUT/$tag.dumpall" 2>/dev/null || echo 0)B" \
+       "last=$(wc -c < "$OUT/$tag.last" 2>/dev/null || echo 0)B" \
+       "text=$(tr -d '[:space:]' < "$OUT/$tag.text" | wc -c)chars"
   grep -E '^\[qtier' "$OUT/$tag.err" | head -3
   return $rc
 }
@@ -217,6 +228,14 @@ if ! grep -q '^teacher_forcing' "$OUT/sh_cpu.out"; then
   tail -20 "$OUT/sh_cpu.err"; exit 1
 fi
 run sh_vk  "$VK_BIN"  "$SHORT"  16
+# N_NEW=1: generate()'s DUMP= fires at s == n_new-1, so with ONE new token the
+# last-token dump IS the prefill's own return value from step(). That makes leg
+# 5 a non-circular check -- the per-position dump's last row against the vector
+# the engine itself used to choose the first generated token. At N_NEW>1 they
+# are different things and comparing them proves nothing, which is what the
+# first run of this chain found out.
+run sc_cpu "$CPU_BIN" "$SHORT"  1
+run sc_vk  "$VK_BIN"  "$SHORT"  1
 run pk_cpu "$CPU_BIN" "$PACKET" 8
 run pk_vk  "$VK_BIN"  "$PACKET" 8
 
@@ -227,11 +246,17 @@ echo "=== V1 step 1 gate: qwen36-vk (tier OFF) vs qwen36 ==="
 RC=0
 
 echo "-- leg 2: teacher_forcing (per-position argmax over the whole prefill)"
+for p in pk sh sc; do
+  n=$(awk '/^teacher_forcing/{print NF-1}' "$OUT/${p}_cpu.out")
+  echo "     ${p}: ${n:-0} positions"
+  [ "${n:-0}" -ge 20 ] || { echo "     REFUSED: ${p} prefill is ${n:-0} positions -- too short to be an oracle"; RC=1; }
+done
 gate_compare "packet teacher_forcing" "$OUT/pk_cpu.out" "$OUT/pk_vk.out" "^teacher_forcing" || RC=1
 gate_compare "short  teacher_forcing" "$OUT/sh_cpu.out" "$OUT/sh_vk.out" "^teacher_forcing" || RC=1
+gate_compare "short1 teacher_forcing" "$OUT/sc_cpu.out" "$OUT/sc_vk.out" "^teacher_forcing" || RC=1
 
 echo "-- leg 3: last-token logits, byte-identical"
-for p in pk sh; do
+for p in pk sh sc; do
   a="$OUT/${p}_cpu.last"; b="$OUT/${p}_vk.last"
   if [ ! -s "$a" ] || [ ! -s "$b" ]; then
     printf '  %-34s REFUSED: a dump is missing or empty (A=%s B=%s bytes)\n' \
@@ -244,16 +269,29 @@ for p in pk sh; do
   fi
 done
 
-echo "-- leg 4: greedy text"
-gate_compare "packet greedy text" "$OUT/pk_cpu.err" "$OUT/pk_vk.err" "^Text" || RC=1
-gate_compare "short  greedy text" "$OUT/sh_cpu.err" "$OUT/sh_vk.err" "^Text" || RC=1
+echo "-- leg 4: greedy text (the decoded tokens on stdout, not the stderr label)"
+for p in pk sh; do
+  a="$OUT/${p}_cpu.text"; b="$OUT/${p}_vk.text"
+  na=$(tr -d '[:space:]' < "$a" 2>/dev/null | wc -c); nb=$(tr -d '[:space:]' < "$b" 2>/dev/null | wc -c)
+  if [ "${na:-0}" -lt 8 ] || [ "${nb:-0}" -lt 8 ]; then
+    printf '  %-34s REFUSED: %s / %s non-space chars -- an empty text is NOT a pass\n' \
+      "$p greedy text" "$na" "$nb"; RC=1
+  elif cmp -s "$a" "$b"; then
+    printf '  %-34s IDENTICAL (%s non-space chars)\n' "$p greedy text" "$na"
+  else
+    printf '  %-34s DIFFERS\n' "$p greedy text"; RC=1
+  fi
+done
+echo "     reference text (packet, first 200 chars):"
+head -c 200 "$OUT/pk_cpu.text" | tr '\n' ' '; echo
 
-echo "-- leg 5: the per-position dump agrees with the engine's own last-token logits"
+echo "-- leg 5: the per-position dump's last row IS the engine's own prefill logits"
+echo "   (only the N_NEW=1 runs: at N_NEW>1 the DUMP= vector is a decode step, not the prefill)"
 python3 - "$OUT" <<'PY'
 import sys, os, struct
 out = sys.argv[1]
 bad = 0
-for p in ("pk_cpu", "pk_vk", "sh_cpu", "sh_vk"):
+for p in ("sc_cpu", "sc_vk"):
     da, la = f"{out}/{p}.dumpall", f"{out}/{p}.last"
     if not (os.path.exists(da) and os.path.exists(la)):
         print(f"  {p:<32} REFUSED: dump missing"); bad += 1; continue
@@ -274,6 +312,28 @@ for p in ("pk_cpu", "pk_vk", "sh_cpu", "sh_vk"):
 sys.exit(1 if bad else 0)
 PY
 [ $? -eq 0 ] || RC=1
+
+echo "-- leg 6: the whole per-position dump, byte-identical between the two binaries"
+for p in pk sh sc; do
+  a="$OUT/${p}_cpu.dumpall"; b="$OUT/${p}_vk.dumpall"
+  sa=$(wc -c < "$a" 2>/dev/null || echo 0); sb=$(wc -c < "$b" 2>/dev/null || echo 0)
+  if [ "$sa" -lt 1000 ] || [ "$sb" -lt 1000 ]; then
+    printf '  %-34s REFUSED: dump is %s / %s bytes\n' "$p dumpall" "$sa" "$sb"; RC=1
+  elif cmp -s "$a" "$b"; then
+    printf '  %-34s IDENTICAL (%s bytes)\n' "$p dumpall" "$sa"
+  else
+    printf '  %-34s DIFFERS\n' "$p dumpall"; RC=1
+  fi
+done
+
+echo "-- leg 7: majflt per run (qwen36 reads experts with st_read_raw, it has no"
+echo "   st_map_shard_range mapping, so there is no [MAP] line to check -- this is"
+echo "   the whole-process figure /usr/bin/time reports)"
+for t in sh_cpu sh_vk sc_cpu sc_vk pk_cpu pk_vk; do
+  m=$(awk -F': ' '/Major .*page faults/{print $2}' "$OUT/$t.err")
+  printf '  %-10s majflt=%s\n' "$t" "${m:-?}"
+  [ "${m:-1}" = 0 ] || { echo "     WARNING: $t took ${m} major faults -- the container was not fully resident"; }
+done
 
 echo "-- leg 1 recap: C tests $TPASS/$NTESTS passed"
 [ "$TFAIL" -eq 0 ] || RC=1

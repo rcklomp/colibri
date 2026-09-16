@@ -1,4 +1,17 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 26, 2026-09-15)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 27, 2026-09-16)
+
+**Rev 27 (2026-09-16): a third track opened beside this one — the Franken-engine
+plan, `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` (read its highest
+`Rev N` entry the way this file's is read).** Nothing on this roadmap moved.
+Landed from that track on execution night 1: H1 (`context_ladder.py --url`,
+`context_compare.py`; `perf/franken-h1`), V1 step 0
+(`tools/hot-expert/V1-STEP0-2026-09-16.md`), the H2 chain
+(`franken_chain.sh`, smoke-gated with the B arm skipped), and the record
+sections §FRANKEN-H0 / §FRANKEN-M0 (both blocked on the absent
+`rocm-device-libs` package — owner action). One fix touches this track's own
+gate: `accept_live.sh` truncated the log of every chain that called it
+(`tee /dev/stderr` under `nohup > log 2>&1`; `5062ff4`, `tee -a`).
+
 
 A separate track, because it has a different goal, a different gate, and a
 different bottleneck from everything in `ROADMAP-2026-09.md`. That roadmap

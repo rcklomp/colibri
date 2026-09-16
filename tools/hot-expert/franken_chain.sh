@@ -12,6 +12,12 @@
 #       ~/src/colibri-h2/tools/hot-expert/franken_chain.sh [--smoke] [--skip-b] \
 #       >> ~/bench/franken_chain.log 2>&1 < /dev/null &
 #
+# For a scheduled full run (a fixed wall-clock start, e.g. tonight at a
+# quiet hour), use franken_full_launch.sh instead -- run_chain.sh alone is
+# one-shot and loses the whole night to a single REFUSED if the lock is held
+# at the exact target second; the launcher retries every 5 min for up to 2 h
+# past the target before giving up.
+#
 # Flags:
 #   --smoke    tiny steps for proving the chain's shape, not a measurement:
 #              A/B --steps 256,256 --gen 16 --followups 1, plus a 2-size cold
@@ -158,14 +164,33 @@ precheck() {   # precheck <label>
 }
 
 assert_vram_free() {   # assert_vram_free <label>
-  local label=$1 v c bad=0
+  # Found live on the rig, first B1 smoke run (tag fk09160840, 2026-09-16):
+  # hipFire's process was confirmed dead (no pgrep match) but card0 VRAM read
+  # 21.49 -> 21.10 -> 19.04 GB used across three checks a few seconds apart --
+  # the amdgpu/KFD driver reclaims a ~19 GB allocation's page tables over
+  # real wall-clock time after the process exits, not atomically with it.
+  # h0_chain.sh/h0d2_chain.sh already knew this (their own post-hipfire check
+  # is a WARNING with one `sleep 3`, never a FATAL); this one gates the NEXT
+  # arm's preload, so it retries with a bound instead of either silently
+  # downgrading to a warning or failing on a timing race. Bound: 60 s in 2 s
+  # steps, comfortably above the drain observed above.
+  local label=$1 v c bad attempt
+  for attempt in $(seq 1 30); do
+    bad=0
+    for c in 0 1 2; do
+      v=$(VRAM "$c")
+      [ "$v" -lt 0 ] || [ "$v" -ge 1073741824 ] && bad=1
+    done
+    [ "$bad" = 0 ] && { [ "$attempt" -gt 1 ] && echo "[$label] VRAM free after ${attempt} checks (~$(( (attempt-1) * 2 ))s)"; return 0; }
+    sleep 2
+  done
   for c in 0 1 2; do
     v=$(VRAM "$c")
     if [ "$v" -lt 0 ] || [ "$v" -ge 1073741824 ]; then
-      echo "FATAL [$label]: card$c VRAM $v >= 1 GiB (or unreadable)"; bad=1
+      echo "FATAL [$label]: card$c VRAM $v >= 1 GiB (or unreadable) after 60s of retries"
     fi
   done
-  return $bad
+  return 1
 }
 
 wait_no_proc() {   # wait_no_proc <procname>

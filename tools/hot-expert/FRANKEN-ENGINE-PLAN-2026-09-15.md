@@ -14,6 +14,28 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 11 (2026-09-17 00:45 CEST, 2026-09-16 22:45 UTC) — the two probes are
+> measured; the reuse rule is withdrawn.** Record §PCIE-STREAM: host→GPU one
+> card 28.0 GB/s; dev0+dev3 share an upstream link (35.9 GB/s aggregate, 18
+> each); three cards concurrently 61.4–62.0 GB/s; CPU DRAM read 91.6 GB/s.
+> X6's one-card 25 GB/s derivation is replaced: the three-card stream is 2.8×
+> the CPU int4 path's byte rate. Record §GPTOSS-3CARD (gpt-oss-120b MXFP4,
+> 63 GB, llama.cpp, the test vehicle — not a daily-driver candidate, per the
+> owner): fully resident across the three cards, decode 75 tok/s at 18k on
+> Vulkan and 76 on HIP (decode equal within 1 %, HIP prefill 1.7× faster,
+> ladder TTFT 4.3 s vs 7.5 s at 18k); experts of 18/36 layers on the CPU:
+> 28 tok/s, TTFT 66 s at 18k; all experts on the CPU: 17.6 tok/s, TTFT 127 s.
+> Beside Colibri's GLM-5.3 at the same turn (different model): 2.27 tok/s,
+> TTFT 2 561 s. **§2.4 Q2's r = T_lad/T_cold rule is withdrawn:** T_lad at
+> "16k" is a ladder step that prefills ~9k new tokens, so a reusing server
+> reads r ≈ 0.5, which is what every arm produced; the follow-up TTFT at
+> depth is the reuse number, and by it llama.cpp (0.3–0.7 s at 18.5k on the
+> resident arms) and hipFire (0.44 s at 85k, §FRANKEN-H2) both reuse. **In
+> flight:** the owner's own llama.cpp GLM-5.3-Flash deployment (UD-IQ4_XS,
+> 18 GPU layers, ROCm 7.14 container) on the same ladder, two runs, beside
+> Colibri's A1/A2 — the same-model answer to "under 2 tok/s at realistic
+> depth" (record §GLM53FLASH-LADDER when done). Parked: H2b, H4, D-3, L1.
+>
 > **Rev 10 (2026-09-16 evening) — H2 answered, H2c closed, and the owner's
 > redirect.** H2 ran in full (record §FRANKEN-H2): hipFire on Qwen3.6-35B-A3B
 > decodes 27× (turn 1) to 39× (18k) faster than GLM-5.3 on this box, with MTP

@@ -28,6 +28,30 @@
 > around that, H2 stays first because it needs no code, and a second claimed
 > gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
+> **Rev 6 (2026-09-16, day 1). V1 is BUILT and GATED — steps 1 and 2 both pass
+> (record §V1, branch `perf/v1-qwen36-vk-tier`), so the same-weights GPU pair
+> §0 says H2b needs now exists.** `make -C c qwen36-vk VK=1` is a Vulkan expert
+> tier for `qwen36` behind the existing `qt_*` contract: all **10 240** experts
+> (40 × 256, int4-gs64) resident on dev3 in **18.12 GB**, filled in **6.9 s**,
+> VRAM hit rate **100 %**, `Q36_VULKAN=1` to turn it on and bit-identical to
+> the CPU engine with it off. Per-position KL against the tier-off arm is
+> **−1.2e-10 mean / 100 % top-1 / cosine 1.000000000** over the 625-position
+> packet — seven to nine orders below the bar §4's X2 rows set. In arm C's own
+> harness, A,B,B,A: decode **14.58 → 21.64 tok/s (+45.6 % conservative)**, TTFT
+> **33.45 → 10.67 s (−67.8 % conservative)**, with the tier-off arms
+> reproducing arm C's floor to within 1–2 %. Two corrections this produced:
+> **(a)** V1-STEP0 §(c)/(d)/(e) had the int4 nibble convention backwards — both
+> backends take offset binary at their upload API and `qwen36`'s container is
+> two's-complement, so the `stage()` XOR is KEPT, not dropped (proved
+> exhaustively, `c/tests/test_qwen36_vk_nibble.c`; the document is corrected in
+> place). **(b)** `dev_alloc_footprint`'s cudaMalloc granularity curve does NOT
+> transfer to RADV — payload accounting is within **0.8 %** of what the driver
+> reports, against CUDA's 22–28 %. §3's branch 3 is now measurable rather than
+> projected, and what §4's X-items should target on this engine is the
+> remaining ~46 ms/token, which is still entirely CPU: V1 moved the routed
+> experts only, and the trunk (DeltaNet, attention, dense, LM head, shared
+> expert) is untouched. **H2b is unblocked.**
+
 > **Rev 5 (2026-09-16, day 1). H0 is closed as O3 on this box as it stands;
 > M0 has its answer; the H-track waits on one owner decision.** After
 > `rocm-device-libs` was installed, two more mismatches surfaced and were
@@ -288,7 +312,7 @@ cold-sweep TTFT, and T_B^lad(d) its ladder TTFT at the same depth.
 
 | id | item | evidence | expected | effort | tier | gate |
 |---|---|---|---|---|---|---|
-| **V1** | **A Vulkan expert tier for `qwen36`.** Port the tier `qwen38-vk` already has (heat-ranked preload from a histogram, per-device budget with a reserve, `COLI_VK_DEV2/3`, expert-group issue/take through `backend_vulkan.c`) behind `qwen36_tier.h`'s existing `qt_*` contract, so the engine's 28 call sites do not move; packed int4 experts (`g4/u4/d4`) in VRAM, ~20 GB on one card. **Step 0 (Sonnet, no rig):** read the CUDA tier's kernels for whether they take gs64 group scales; read `qwen38_core.h`'s `q38vk_*` path for the piece to copy; write the step list. **Step 1 (Opus):** tier off = the CPU engine, bit-identical. **Step 2 (Opus):** tier on. The model must first be fetched and converted (the published int4-gs64 container, or `convert_qwen36.py --gs 64` from the BF16 ~70 GB) — NVMe and page-cache work that waits for the lock, like everything else. **Sequenced after X1**, because Q7's measured gaps put a ≤ 28 tok/s ceiling on a 40-layer per-op-submit path (§3, branch 3), and a same-weights comparison taken under that ceiling would measure Colibri's submit model, not its backend | the pattern exists twice in the tree; `docs/qwen36-cuda-tier.md` measured the CUDA version at 9.2–11.3 tok/s on 8 GB cards, 83 % of experts resident on two cards — here all 256 × 40 fit on one | a Colibri-served VRAM-resident 35B with P7/P9/slots intact; tok/s **unknown** until X1 has a number (the ceiling above is the prior) | 1–3 weeks | Sonnet (step 0), Opus (1–2) | tier off: `teacher_forcing` and logits bit-identical to the CPU path; tier on: X2's KL bar against the CPU path, `tworeq.py` at 4 slots IDENTICAL, `[MAP]`/tier line asserts the residency it claims, decode A,B,B,A vs tier-off through `gate_ab_verdict` |
+| **V1 — DONE 2026-09-16, GATE PASS (record §V1, `perf/v1-qwen36-vk-tier`)** | **A Vulkan expert tier for `qwen36`.** Port the tier `qwen38-vk` already has (heat-ranked preload from a histogram, per-device budget with a reserve, `COLI_VK_DEV2/3`, expert-group issue/take through `backend_vulkan.c`) behind `qwen36_tier.h`'s existing `qt_*` contract, so the engine's 28 call sites do not move; packed int4 experts (`g4/u4/d4`) in VRAM, ~20 GB on one card. **Step 0 (Sonnet, no rig):** read the CUDA tier's kernels for whether they take gs64 group scales; read `qwen38_core.h`'s `q38vk_*` path for the piece to copy; write the step list. **Step 1 (Opus):** tier off = the CPU engine, bit-identical. **Step 2 (Opus):** tier on. The model must first be fetched and converted (the published int4-gs64 container, or `convert_qwen36.py --gs 64` from the BF16 ~70 GB) — NVMe and page-cache work that waits for the lock, like everything else. **Sequenced after X1**, because Q7's measured gaps put a ≤ 28 tok/s ceiling on a 40-layer per-op-submit path (§3, branch 3), and a same-weights comparison taken under that ceiling would measure Colibri's submit model, not its backend | the pattern exists twice in the tree; `docs/qwen36-cuda-tier.md` measured the CUDA version at 9.2–11.3 tok/s on 8 GB cards, 83 % of experts resident on two cards — here all 256 × 40 fit on one | a Colibri-served VRAM-resident 35B with P7/P9/slots intact; tok/s **unknown** until X1 has a number (the ceiling above is the prior) | 1–3 weeks | Sonnet (step 0), Opus (1–2) | tier off: `teacher_forcing` and logits bit-identical to the CPU path; tier on: X2's KL bar against the CPU path, `tworeq.py` at 4 slots IDENTICAL, `[MAP]`/tier line asserts the residency it claims, decode A,B,B,A vs tier-off through `gate_ab_verdict` |
 | **H2b** | **Same weights, same placement, two engines.** A′ = Colibri `qwen36` + V1 on int4-gs64, one card (dev3); B = hipFire on the same card, `-mq4r` **and** `-mq5` (the quant nearest a gs64 int4 by bits per weight; report both rows, do not average them). Same chain shape as H2 (A′,B,B,A′; fresh processes; VRAM and DPM asserted; ladder to 18k with `--gen 128`, cold sweep on both sides — affordable now on both). Colibri's arm keeps its REUSE-line contract; hipFire's keeps the sweep ratio | V1 | the first number that compares engines rather than model classes | ~2 h rig | Haiku runs | `context_compare` per depth through `gate_ab_verdict`; **plus** greedy-text agreement between A′ and B on the first 64 tokens of each turn reported as a count (a sanity on two different quantisations, not an oracle) |
 
 Still not comparable in H2b, said plainly: the quantisation (int4-gs64 vs MQ4R
@@ -494,7 +518,7 @@ This plan will **not**:
 | X2 | KL oracle | Sonnet | ~1 h | 1 day |
 | V1 step 0 | gs64-vs-per-row scales in the CUDA tier; the `q38vk_*` piece to copy; step list — **can start now, no rig** | Sonnet | 0 | 1 day |
 | model fetch + convert | int4-gs64 container or BF16 → `--gs 64`; after the lock frees, never under a running ladder | Haiku | NVMe/page cache, ~1 h | — |
-| V1 steps 1–2 | the Vulkan tier, after X1's number | Opus | ~3 h (gates) | 1–3 weeks |
+| V1 steps 1–2 | **DONE 2026-09-16, GATE PASS** — the Vulkan tier on dev3 (record §V1) | Opus | ~35 min of lock across three chains | 1 day |
 | H2b | same weights, same card, A′,B,B,A′ with `-mq4r` and `-mq5` | Haiku runs | ~2 h | — |
 | L1 | GLM on two cards, only under O1 | Haiku | ~2 h | — |
 | X3 step 0 | which bucket grows at 18k (from A1's log; no extra rig time) | Opus | 0 | ½ day |

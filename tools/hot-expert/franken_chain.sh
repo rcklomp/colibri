@@ -14,19 +14,20 @@
 #
 # Flags:
 #   --smoke    tiny steps for proving the chain's shape, not a measurement:
-#              A/B --steps 256,256 --gen 16 --followups 1, no cold sweep;
-#              C --steps 256 --gen 16 --followups 1 (2 rows: one ladder step,
-#              one followup). Budget: <= 40 min (qwen36's first load is cold
-#              on the NVMe).
-#   --skip-b   the B arm (hipFire) cannot generate tonight: FRANKEN-H0
-#              (branch perf/franken-h0, record §FRANKEN-H0) found this
-#              ROCm 6.2.0 install has no rocm-device-libs, so hipFire's
-#              request-time JIT fails closed on every request after it
-#              answers /v1/models. With this flag the B arm is replaced by a
-#              logged "B SKIPPED: <reason>" line -- no hipfire process is
-#              started, no GPU is touched by this arm -- and the chain still
-#              runs A1, A2, C so the rest of the shape is proven. Re-run
-#              without this flag once the owner installs rocm-device-libs.
+#              A/B --steps 256,256 --gen 16 --followups 1, plus a 2-size cold
+#              sweep on B (1024,2048); C --steps 256 --gen 16 --followups 1
+#              (2 rows: one ladder step, one followup). Budget: <= 40 min
+#              (qwen36's first load is cold on the NVMe).
+#   --skip-b   B (hipFire) DOES run by default now: FRANKEN-H0d (branch
+#              perf/franken-h0, record §FRANKEN-H0d, merged into
+#              hot-expert-tier) found the box's system ROCm 6.2.0 was the
+#              blocker (no rocm-device-libs), not hipFire or the box's
+#              hardware -- a user-local ROCm 10.0.0 venv (~/venvs/rocm)
+#              rebuilds and runs it clean (ttft ~248 ms, decode 148-164
+#              tok/s at empty context). --skip-b is kept as an escape hatch
+#              for a future blocker on this arm specifically: it replaces B
+#              with a logged "B SKIPPED: <reason>" line -- no hipfire process
+#              started, no GPU touched -- and the chain still runs A1, A2, C.
 #
 # Order (plan §2.1, §2.2): stop gateway -> wait_no_engine -> warm GLM, assert
 # >=90% -> A1 -> stop engine, assert VRAM<1GiB on every card, record DPM
@@ -55,6 +56,37 @@
 #
 # GLM53_PREFIX_CKPT=0 with a private COLI_CKPT_DIR on every GLM invocation
 # (CLAUDE.md: a restored checkpoint reports a prefill that never happened).
+#
+# THE THINKING DECISION (coordinator amendment, 2026-09-16, after FRANKEN-H0d
+# found the B arm runs): hipFire ERRORS ("open think span at end of
+# generation") when --max-tokens ends inside <think> -- measured at 16 and 64
+# tokens, clean at 900 (FRANKEN-H0d2). B disables thinking: every B request
+# carries chat_template_kwargs={"enable_thinking": false}
+# ($THINK_OFF_CTK below), hipFire's own documented mechanism for this exact
+# arch (docs/SERVE.md line ~229 "Qwen3.8 -- disable thinking natively (empty
+# closed think block)"; docs/CONFIG.md's family table: "Qwen3.6
+# (non-effort-native template) | same on/off"). With it, the model never
+# opens a think span at all, so no --max-tokens value can end inside one --
+# this is *why* thinking-off is the fix, not merely a workaround for it, and
+# it is also why B's own max_tokens can stay small in --smoke (16) rather
+# than needing H0d2's 900-token margin.
+#
+# The SAME switch is NOT applied to A: it does not exist there. glm53's own
+# renderer (c/openai_server.py, render_chat_glm53) is explicit that GLM-5.3's
+# chat template has no thinking-off form -- the generation prompt always
+# opens a bare <think>, and enable_thinking=False (already what EngineDriver
+# has sent on every A request since before this item, ttft_serve.py's
+# EngineDriver.render) does not turn reasoning off, it selects "Reasoning
+# Effort: Low", the template's minimum -- reasoning still happens; only a
+# fabricated closed-think form (once tried, #1278/#1282, measured false and
+# withdrawn) could hide it, and it does not exist in what the model was
+# trained on. This is a DELIBERATE, DOCUMENTED ASYMMETRY, not a gap: A always
+# reasons (at the template's minimum effort, unavoidably), B never does. Both
+# arms still count "first delta of any kind" -- content, reasoning_content,
+# or tool_calls -- as TTFT (ttft_serve.HttpDriver already does; EngineDriver
+# reads the engine's raw token stream, which starts with A's own <think>
+# tokens), because that is what the owner's screen shows streaming, on
+# either side of the asymmetry.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 H2_ROOT=$(cd "$HERE/../.." && pwd)
@@ -62,11 +94,17 @@ PRISTINE=~/src/colibri                       # binary in service; H1's own conve
 GLM_BIN="$PRISTINE/c/glm53"
 GLM_SNAP=${GLM_SNAP:-~/models/GLM-5.3-Flash-colibri-int4-g64}
 C_MODEL=${C_MODEL:-/home/ronald/models/qwen36_i4_gs64}
-HIPFIRE_BIN=~/src/hipfire/target/release/hipfire
+# FRANKEN-H0d: system ROCm 6.2.0 lacks rocm-device-libs; hipFire is built and
+# run here against a user-local ROCm 10.0.0 venv instead (TheRock stable pip
+# wheels, ~/venvs/rocm) -- a different binary, a different root, not a system
+# change. ROCM_ROOT is resolved at run time (the venv's own tool), not
+# hardcoded, in case the venv path changes.
+HIPFIRE_BIN=~/src/hipfire/target-rocm7/release/hipfire
 HIPFIRE_MODEL="qwen3.6:35b-a3b-mq4r"
 HIPFIRE_MODEL_DIR=~/.hipfire/models
 HIPFIRE_PORT=${HIPFIRE_PORT:-11436}
 HIPFIRE_DEV=${HIPFIRE_DEV:-1}                 # dev3's HIP/physical index, §FRANKEN-H0
+THINK_OFF_CTK='{"enable_thinking": false}'    # B only -- see the header note
 C_PORT=${C_PORT:-8600}
 GLOG=~/glm53_server.log
 KEY=$(cat ~/.colibri_api_key 2>/dev/null)
@@ -85,7 +123,11 @@ done
 
 if [ "$SMOKE" = 1 ]; then
   A_STEPS="256,256"; A_GEN=16; A_FOLLOWUPS=1
-  B_STEPS="256,256"; B_GEN=16; B_FOLLOWUPS=1; DO_COLD_SWEEP=0; COLD_SWEEP_SIZES=""
+  # 2-size cold sweep even in --smoke (coordinator amendment): this is B's
+  # first real execution and the sweep is part of what --smoke has to prove,
+  # not only the ladder. Small sizes -- hipFire's own numbers (~248 ms ttft,
+  # 148-164 tok/s at empty context) make even 2048 cheap.
+  B_STEPS="256,256"; B_GEN=16; B_FOLLOWUPS=1; DO_COLD_SWEEP=1; COLD_SWEEP_SIZES="1024,2048"
   C_STEPS="256";     C_GEN=16; C_FOLLOWUPS=1; C_TIMEOUT=1200
 else
   A_STEPS="1024,1024,2048,4096,8192"; A_GEN=128; A_FOLLOWUPS=2
@@ -272,7 +314,7 @@ print(','.join(flagged))
   return 0
 }
 
-# ---- B arm (hipFire, HTTP mode) -- UNVERIFIED, see --skip-b above -----
+# ---- B arm (hipFire, HTTP mode) -- FRANKEN-H0d/H0d2 verified it serves ----
 HIPFIRE_PID=""
 stop_hipfire() {
   [ -n "$HIPFIRE_PID" ] && kill -0 "$HIPFIRE_PID" 2>/dev/null && {
@@ -292,11 +334,21 @@ run_B() {   # run_B <arm-label>
   assert_vram_free "$arm-pre" || return 1
   [ -x "$HIPFIRE_BIN" ] || { echo "FATAL: $HIPFIRE_BIN missing"; return 1; }
 
-  ROCM_PATH=/opt/rocm-6.2.0 HIP_PATH=/opt/rocm-6.2.0 HIPFIRE_DEVICES=$HIPFIRE_DEV \
+  # Exact env from h0d2_chain.sh (FRANKEN-H0d/H0d2, the branch this box's
+  # first working hipFire serve came from) -- venv ROCm 10.0.0's own root,
+  # not the system 6.2.0 this arm used to point at; CPLUS_INCLUDE_PATH so
+  # hipFire's child clang++ finds GCC 15's headers instead of autodetecting
+  # the headerless GCC 16; LD_LIBRARY_PATH at the venv root's lib dir, NO
+  # libxml2 shim (that was a 6.2-only ld.lld dependency, absent here).
+  local rocm_root; rocm_root=$(~/venvs/rocm/bin/rocm-sdk path --root)
+  rm -f ~/.hipfire_kernels/gfx1100/*.tmp 2>/dev/null || true
+  ROCM_PATH="$rocm_root" HIP_PATH="$rocm_root" HIPFIRE_DEVICES=$HIPFIRE_DEV \
+    CPLUS_INCLUDE_PATH=/usr/include/c++/15:/usr/include/x86_64-linux-gnu/c++/15 \
+    LD_LIBRARY_PATH="$rocm_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     "$HIPFIRE_BIN" serve "$HIPFIRE_MODEL" 0.0.0.0:"$HIPFIRE_PORT" \
     >> "$hlog" 2>&1 < /dev/null &
   HIPFIRE_PID=$!
-  echo "hipfire serve pid=$HIPFIRE_PID port=$HIPFIRE_PORT dev=$HIPFIRE_DEV"
+  echo "hipfire serve pid=$HIPFIRE_PID port=$HIPFIRE_PORT dev=$HIPFIRE_DEV rocm_root=$rocm_root"
 
   local up=0
   for _ in $(seq 1 60); do
@@ -307,10 +359,13 @@ run_B() {   # run_B <arm-label>
   done
   if [ "$up" != 1 ]; then echo "$arm: FAILED -- hipfire never answered /v1/models"; stop_hipfire; return 1; fi
 
-  echo "throwaway request (D_B(~0) preview, not scored):"
+  # enable_thinking=false on every B request, throwaway included: hipFire's
+  # own off switch (see the header note), and what keeps a small --max-tokens
+  # (16 here) from ending inside an open <think> span.
+  echo "throwaway request (D_B(~0) preview, not scored; thinking off):"
   curl -s -m 120 "http://127.0.0.1:$HIPFIRE_PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$HIPFIRE_MODEL\",\"temperature\":0,\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one word.\"}]}" \
+    -d "{\"model\":\"$HIPFIRE_MODEL\",\"temperature\":0,\"max_tokens\":16,\"chat_template_kwargs\":${THINK_OFF_CTK},\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one word.\"}]}" \
     >> "$OUT/${TAG}_${arm}_throwaway.json" 2>&1
 
   local cs_args=()
@@ -321,6 +376,7 @@ run_B() {   # run_B <arm-label>
       --url "http://127.0.0.1:$HIPFIRE_PORT" --model-id "$HIPFIRE_MODEL" \
       --steps "$B_STEPS" --gen "$B_GEN" --followups "$B_FOLLOWUPS" \
       "${cs_args[@]}" \
+      --chat-template-kwargs "$THINK_OFF_CTK" \
       --snap "$HIPFIRE_MODEL_DIR" --min-resident 90 --warm \
       --arm "$arm" --tag "$TAG" --json "$json" \
       --server-log "$hlog"
@@ -429,11 +485,12 @@ assert_vram_free "post-A1" || exit 1
 
 # ---- B1, B2 (or skipped) ------------------------------------------------
 if [ "$SKIP_B" = 1 ]; then
-  echo "B SKIPPED: hipFire cannot generate on this box tonight (FRANKEN-H0, "\
-"branch perf/franken-h0: this ROCm 6.2.0 install has no rocm-device-libs, so "\
-"hipFire's request-time JIT compile fails closed on every request after it "\
-"answers /v1/models -- named blocker, owner action pending). No hipfire "\
-"process started, no GPU touched by this arm."
+  echo "B SKIPPED: --skip-b was passed. hipFire itself is not blocked on this box "\
+"any more (FRANKEN-H0d, branch perf/franken-h0, record section FRANKEN-H0d: the system "\
+"ROCm 6.2.0 install lacked rocm-device-libs; a user-local ROCm 10.0.0 venv "\
+"rebuilds and serves it clean). This flag is now only an operator escape hatch "\
+"for a future blocker on this arm specifically. No hipfire process started, "\
+"no GPU touched by this arm."
 else
   run_B B1
   precheck "post-B1"

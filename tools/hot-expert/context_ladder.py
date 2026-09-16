@@ -216,6 +216,19 @@ def main():
     ap.add_argument("--model-id", default=None, help="HTTP mode: default the first /v1/models entry")
     ap.add_argument("--server-log", default=os.path.expanduser("~/glm53_server.log"),
                     help="HTTP mode: gateway/server log to read REUSE/CKPT lines from")
+    ap.add_argument("--chat-template-kwargs", default=None,
+                    help="HTTP mode only: a JSON object merged into every request's "
+                         "chat_template_kwargs field, e.g. '{\"enable_thinking\": false}' "
+                         "-- hipFire's own documented off switch (docs/SERVE.md,CONFIG.md: "
+                         "\"Qwen3.6 (non-effort-native template) | same on/off\"), and how "
+                         "the B arm avoids ending --max-tokens inside an open <think> span "
+                         "(FRANKEN-H0d2: hipFire errors closed on that, at 16 and 64 tokens). "
+                         "Refused in engine mode: glm53's chat template has no such switch "
+                         "(render_chat_glm53's own comment -- enable_thinking=False there "
+                         "means Reasoning Effort: Low, the minimum, not off; the model always "
+                         "opens <think> and there is no closed-think form it has ever seen, "
+                         "#1278/#1282) -- forwarding this silently would claim a symmetry "
+                         "that does not exist on that side")
     ap.add_argument("--arm", default=None,
                     help="which head-to-head arm this run is (A1/B1/B2/A2/... "
                          "FRANKEN-ENGINE-PLAN \xa72.2 H2) -- written into every row so "
@@ -238,6 +251,11 @@ def main():
 
     if cold_sweep_sizes and not is_http:
         refuse_cold_sweep_in_engine_mode(cold_sweep_sizes)
+    if args.chat_template_kwargs and not is_http:
+        sys.exit("REFUSED: --chat-template-kwargs is HTTP mode only -- glm53's chat "
+                 "template has no thinking-off switch to forward it to (see the flag's "
+                 "own --help text); passing it in engine mode would silently claim a "
+                 "symmetry this box does not have")
 
     if not is_http:
         # HTTP mode's entire point is talking to an engine that is already running

@@ -416,6 +416,18 @@ class HttpDriver:
         if key:
             self.headers["Authorization"] = "Bearer " + key
         self.tools = load_tools(args.tools)
+        # Optional, additive: a JSON object merged into every request body's
+        # `chat_template_kwargs` field -- hipFire's own documented mechanism
+        # (docs/SERVE.md, docs/CONFIG.md: "Qwen3.6 (non-effort-native
+        # template) | same on/off" -- `enable_thinking=false` forces a native
+        # empty closed think, not just a truncated one) for FRANKEN-ENGINE-
+        # PLAN item H2's B arm: without it, a small --max-tokens ends inside
+        # an open <think> span and hipFire errors closed (measured on this
+        # box, FRANKEN-H0d2). getattr, not args.chat_template_kwargs, because
+        # every OTHER caller of this class (ttft_serve.py's own CLI, the
+        # prefill track) has no such flag and must not need one.
+        raw_ctk = getattr(args, "chat_template_kwargs", None)
+        self.chat_template_kwargs = json.loads(raw_ctk) if isinstance(raw_ctk, str) else raw_ctk
         # The gateway's log carries the engine's REUSE/CKPT lines: in service
         # that is where they land, and the live check needs the same verdict
         # the engine-mode check gets.
@@ -444,6 +456,8 @@ class HttpDriver:
                 "max_tokens": gen, "temperature": 0, "stream_options": {"include_usage": True}}
         if self.tools:
             body["tools"] = self.tools
+        if self.chat_template_kwargs:
+            body["chat_template_kwargs"] = self.chat_template_kwargs
         ev = {"submit": time.time(), "accept": None, "first": None, "done": None,
               "ntok": 0, "prompt_tokens": None, "completion_tokens": None,
               "cancelled": False, "error": None, "text": []}

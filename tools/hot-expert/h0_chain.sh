@@ -109,8 +109,23 @@ done
 
 echo "--- step 3: hipFire H0"
 [ -x "$HIPFIRE_BIN" ] || { echo "FATAL: $HIPFIRE_BIN missing"; exit 1; }
+# Standing workaround (2026-09-16), NOT a system change: this box has GCC
+# 11/15/16 with no libstdc++-16-dev, so ROCm's clang picks the headerless
+# GCC 16 unless told otherwise; CPLUS_INCLUDE_PATH is honoured even then.
+# ld.lld (used for the amdgcn device link) wants libxml2.so.2, a 24.04
+# soname this 26.04 box only ships as libxml2.so.16 -- ~/compat/lib holds a
+# same-box symlink libxml2.so.2 -> the installed libxml2.so.16 (lld only
+# consults it for a Windows-manifest path it never takes here; verified with
+# a device-only cmath kernel compile, 7680-byte hsaco, one "no version
+# information available" warning and no functional difference). hipFire
+# spawns clang++ as a child, so it inherits both exported here. Proper fix
+# is the owner's choice: libstdc++-16-dev for the headers, a ROCm build
+# targeting 26.04 for the linker.
+rm -f ~/.hipfire_kernels/gfx1100/*.tmp 2>/dev/null || true
 HIPFIRE_LOG="$OUT/${TAG}_hipfire.log"
 ROCM_PATH=/opt/rocm-6.2.0 HIP_PATH=/opt/rocm-6.2.0 HIPFIRE_DEVICES=$HIPFIRE_DEV \
+  CPLUS_INCLUDE_PATH=/usr/include/c++/15:/usr/include/x86_64-linux-gnu/c++/15 \
+  LD_LIBRARY_PATH="$HOME/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   "$HIPFIRE_BIN" serve "$HIPFIRE_MODEL" 0.0.0.0:"$HIPFIRE_PORT" \
   > "$HIPFIRE_LOG" 2>&1 < /dev/null &
 HIPFIRE_PID=$!

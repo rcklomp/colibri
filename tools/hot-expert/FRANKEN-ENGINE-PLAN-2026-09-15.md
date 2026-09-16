@@ -28,6 +28,27 @@
 > around that, H2 stays first because it needs no code, and a second claimed
 > gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
+> **Rev 8 (2026-09-16, day 1, evening). H2 is armed: the full A,B,B,A + C chain
+> starts 2026-09-16 21:00 UTC** (`franken_full_launch.sh`, pid 2384291 on the
+> rig, retries a held lock every 5 min until 23:00 UTC; the gateway is down for
+> the chain, ~4 h; `accept_live.sh` closes it). The B arm's own smoke passed
+> (`fk09160857`): hipFire on dev3, thinking OFF through its documented
+> `chat_template_kwargs.enable_thinking=false` — the fix for the "open think
+> span" error, not a workaround — TTFT 0.39 / 0.52 / 0.18 s at 409 / 833 / 875
+> tokens, decode 88 / 100 / 124 tok/s, cold sweep 1 024 → 0.66 s, 2 048 →
+> 1.06 s; a fresh process (B2) reproduced within 3 %. **One documented
+> asymmetry:** GLM-5.3's template has no thinking-off form (its
+> `enable_thinking=false` is "reasoning effort low"), so the A arm still thinks
+> and the B arm does not; both arms count the first delta of any kind as TTFT.
+> A real chain defect found by the smoke: VRAM after hipFire exits drains over
+> ~15 s, so the free-VRAM assert now retries for 60 s instead of failing the
+> arm. After the chain: H3 (table, Haiku), H4/X4 (audit page, Haiku), then
+> H2b (same weights, same card: `qwen36-vk` at 21.6 tok/s vs hipFire; Haiku
+> runs) and D-3 (Opus). M0c (record §FRANKEN-M0c): under the venv ROCm 10,
+> RCCL runs over device P2P; 4 KB all-reduce 25.1–25.7 µs, under the 33 µs
+> bar — TP3's precondition is met, its case is thin (3.4 vs 4 ms at perfect
+> scaling), M1 stands.
+
 > **Rev 7 (2026-09-16, day 1, V1). V1 is BUILT and GATED — steps 1 and 2 both pass
 > (record §V1, branch `perf/v1-qwen36-vk-tier`), so the same-weights GPU pair
 > §0 says H2b needs now exists.** `make -C c qwen36-vk VK=1` is a Vulkan expert

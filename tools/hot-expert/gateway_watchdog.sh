@@ -21,9 +21,27 @@ if rig_lock_maintenance; then exit 0; fi                      # a chain owns the
 KEY=$(cat "$HOME/.colibri_api_key" 2>/dev/null)
 code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" \
         http://127.0.0.1:8081/v1/models 2>/dev/null)
+
+# /v1/models is NOT a liveness check. On 2026-09-16 a chain's exit trap killed the gateway's
+# engine child (pkill -9 -x glm53) while openai_server.py stayed up: /v1/models kept answering
+# 200 for 28 minutes, every chat request failed with "colibri engine dispatcher stopped", and
+# this watchdog saw nothing. The server never respawns its engine, so "server alive, engine
+# gone" is a dead gateway whatever the HTTP code says. The 180 s grace covers a fresh restart
+# that has not spawned its engine yet.
+srv=$(pgrep -f "openai_[s]erver.py" | head -1)
+if [ -n "$srv" ] && ! pgrep -x glm53 >/dev/null; then
+  age=$(ps -o etimes= -p "$srv" 2>/dev/null | tr -d ' ')
+  if [ "${age:-0}" -gt 180 ]; then
+    say "gateway server alive (pid $srv, ${age}s) but its glm53 engine is GONE (/v1/models=$code) — restarting"
+    pkill -f "openai_[s]erver.py"; sleep 3
+    code=000
+    srv=""
+  fi
+fi
+
 [ "$code" = 200 ] && exit 0
 
-if pgrep -f "openai_[s]erver.py" >/dev/null; then
+if [ -n "$srv" ] && pgrep -f "openai_[s]erver.py" >/dev/null; then
   # up but not answering: either warming after a restart, or busy with a long prefill, both
   # of which are normal here. Only complain if it stays that way.
   say "gateway process alive, /v1/models=$code — leaving it alone"

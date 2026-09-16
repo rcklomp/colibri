@@ -25,6 +25,13 @@ echo "=== run_chain $NAME exited rc=$rc $(date +%Y-%m-%dT%H:%M:%S%z)"
 KEY=$(cat "$HOME/.colibri_api_key" 2>/dev/null)
 code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" \
         http://127.0.0.1:8081/v1/models 2>/dev/null)
+# A server whose engine child is gone still answers /v1/models=200 while every chat request
+# fails (2026-09-16: a chain's exit trap killed the engine by name; 28 min unnoticed). Treat
+# "server alive, no glm53" as down.
+if [ "$code" = 200 ] && pgrep -f "openai_[s]erver.py" >/dev/null && ! pgrep -x glm53 >/dev/null; then
+  echo "run_chain: /v1/models=200 but the gateway's glm53 engine is GONE -- treating as down"
+  code=dead-engine
+fi
 if [ "$code" != 200 ]; then
   echo "run_chain: the gateway is NOT answering after the chain (/v1/models=$code) -- restarting"
   pkill -f "openai_[s]erver.py"; sleep 3; pkill -9 -x glm53 2>/dev/null

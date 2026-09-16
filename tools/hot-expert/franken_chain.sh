@@ -37,12 +37,21 @@
 # gateway on every exit path -> accept_live.sh (the request AFTER the chain
 # is part of the measurement, CLAUDE.md).
 #
-# Any A row with majflt > 0 or a per-turn residency print below 90% marks
-# that arm INVALID in a summary line rather than being silently averaged
-# (checked below from each A run's own jsonl + console log, not assumed --
-# context_ladder.py aborts outright on a residency floor breach mid-ladder,
-# so an A run that DID complete but logged a borderline value is what this
-# catches, the H1 gate's own majflt=7805-at-90.25%-resident case).
+# An A arm is INVALID only on residency: below 90% at arm start, or any
+# turn's residency check settling below 90% (checked below from each A
+# run's own console log, not assumed -- context_ladder.py aborts outright
+# on a residency floor breach mid-ladder, so an A run that DID complete but
+# logged a borderline value is what this re-checks, the H1 gate's own
+# majflt=7805-at-90.25%-resident case). majflt does NOT invalidate an arm:
+# commit c790851 established that a loaded glm53's ~89 GB anon memory beside
+# the 183 GiB model on 247 GiB caps residency near 92% with the engine up,
+# so every turn major-faults reading its own working set in and majflt>0 is
+# this box's own floor, not a defect -- the reference ladder ctx09152003
+# (majflt 21663/6611/4521/4176, turns 1-4) is what majflt is compared
+# against instead: a turn is flagged MAJFLT-HIGH, not invalid, when it
+# exceeds 2x that same-turn reference (turns beyond 4 compare to turn 4),
+# and the summary names the flagged turns so H3's table can annotate rather
+# than drop them.
 #
 # GLM53_PREFIX_CKPT=0 with a private COLI_CKPT_DIR on every GLM invocation
 # (CLAUDE.md: a restored checkpoint reports a prefill that never happened).
@@ -196,29 +205,70 @@ run_A() {   # run_A <arm-label>
   return $rc
 }
 
+# Reference per-turn majflt from the recorded baseline ladder (tag
+# ctx09152003), turns 1-4. commit c790851: a loaded glm53 is ~89 GB of anon
+# memory beside a 183 GiB model on a 247 GiB box, so residency tops out near
+# 92% with the engine up and turn 1 always major-faults reading its own
+# working set in -- majflt>0 is this box's own floor, not a defect, and
+# cannot be the thing that invalidates an arm (it always fires). Turns
+# beyond 4 compare against turn 4's reference value.
+REF_MAJFLT_TAG="ctx09152003"
+REF_MAJFLT=(21663 6611 4521 4176)
+
 check_a_arm_valid() {   # check_a_arm_valid <arm> <json> <console>
-  local arm=$1 json=$2 console=$3 bad_majflt bad_resid
+  local arm=$1
+  local json=$2 console=$3 bad_resid py_out majflt_report flagged
   [ -f "$json" ] || { echo "SUMMARY: arm $arm INVALID -- no jsonl produced"; return 1; }
-  bad_majflt=$(python3 -c "
-import json
-bad=[]
-for line in open('$json'):
-    line=line.strip()
-    if not line: continue
-    r=json.loads(line)
-    if r.get('kind') in ('ladder','followup') and (r.get('majflt') or 0) > 0:
-        bad.append((r.get('turn'), r.get('majflt')))
-print(bad)
-")
+
+  # (1) The ONLY invalidating condition: residency at arm start (this
+  # label's own "$arm-pre" pre-check, printed by assert_glm_resident above,
+  # bash-level) or any turn's residency check settling below 90%. The
+  # python-side "[resid <label>] files=N resident=X% short=S" summary line
+  # is the only one carrying a literal "resident=" substring (the
+  # "re-warm N -> X%" transient probe line does not), so this greps exactly
+  # the settled/gating values, not every intermediate re-warm attempt; and
+  # since context_ladder.py itself sys.exit()s (aborting the whole run) on
+  # a settled value under the floor, a completed run reaching this function
+  # should never actually trip it -- this re-checks the same floor rather
+  # than re-deriving a new one, per CLAUDE.md "do not re-derive".
   bad_resid=$(grep -oE 'resident=[0-9.]+' "$console" 2>/dev/null | cut -d= -f2 \
               | awk '{if ($1+0<90) print}')
-  if [ "$bad_majflt" != "[]" ]; then
-    echo "SUMMARY: arm $arm INVALID -- majflt>0 at turns $bad_majflt"; return 1
-  fi
+
+  # (2) majflt is reported per turn, never invalidating: flagged
+  # MAJFLT-HIGH when it exceeds 2x the reference ladder's same-turn value
+  # (REF_MAJFLT/REF_MAJFLT_TAG above), so H3's table can annotate a turn
+  # rather than the whole arm being dropped.
+  py_out=$(python3 -c "
+import json
+ref = [21663, 6611, 4521, 4176]
+rows = []
+for line in open('$json'):
+    line = line.strip()
+    if not line: continue
+    r = json.loads(line)
+    if r.get('kind') in ('ladder', 'followup'):
+        rows.append((r.get('turn'), r.get('majflt') or 0))
+parts, flagged = [], []
+for turn, mf in rows:
+    idx = min(max((turn or 1) - 1, 0), len(ref) - 1)
+    hi = mf > 2 * ref[idx]
+    parts.append(f'{turn}={mf}' + ('(MAJFLT-HIGH)' if hi else ''))
+    if hi:
+        flagged.append(str(turn))
+print(' '.join(parts))
+print(','.join(flagged))
+")
+  majflt_report=$(printf '%s\n' "$py_out" | sed -n '1p')
+  flagged=$(printf '%s\n' "$py_out" | sed -n '2p')
+
   if [ -n "$bad_resid" ]; then
     echo "SUMMARY: arm $arm INVALID -- residency below 90% seen: $bad_resid"; return 1
   fi
-  echo "SUMMARY: arm $arm valid (majflt=0, residency>=90% on every printed check)"
+  if [ -n "$flagged" ]; then
+    echo "SUMMARY: arm $arm valid (residency>=90% throughout); majflt per turn: $majflt_report; flagged turns: $flagged (>2x $REF_MAJFLT_TAG's same-turn reference [${REF_MAJFLT[*]}], box floor per c790851 -- not invalid)"
+  else
+    echo "SUMMARY: arm $arm valid (residency>=90% throughout); majflt per turn: $majflt_report; flagged turns: none (all <=2x $REF_MAJFLT_TAG's same-turn reference [${REF_MAJFLT[*]}])"
+  fi
   return 0
 }
 

@@ -28,6 +28,36 @@
 > around that, H2 stays first because it needs no code, and a second claimed
 > gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
+> **Rev 4 (2026-09-16, execution night 1, closing).** Two results that change
+> §3 and §4, both measured (record §X1, §X2):
+> 1. **X1 is rejected.** Retained command buffers are bit-identical on both
+>    engines and worth **2.8 µs of a 25 µs submit** (`VK_PROF`: desc+record
+>    2.5–3.1 µs, submit 25–27 µs, wait 331–348 µs per call; ceiling 97 × 2.8 µs
+>    = −0.27 ms/token on qwen38-vk, ≈ −0.12 on glm53, against the projected
+>    −3 to −8). A,B,B,A: NO VERDICT on every rotating/cold pair; warm-identical
+>    qwen38-vk +0.2 % conservative. The branch `perf/x1-retained-cmdbuf` stays
+>    unmerged; the record keeps the numbers.
+> 2. **The Branch 3 ceiling (≤ 28 tok/s) is withdrawn.** Its derivation took
+>    Q7's 0.30 ms per-submit *gap* for driver overhead; the profile says the
+>    gap is the engine's own CPU work between submits, and the driver's share
+>    is ~25 µs per submit — ~2.8 ms/token for ~120 submits. The lever on a
+>    resident path is fewer submits, not cheaper recording. **V1 step 2 is not
+>    gated on X1.** X1's own falsifier fired at 1.00×.
+> 3. **X2 landed** (`GLM53_LOGIT_DUMP_ALL`, `kl_compare.py`, `gate_kl`;
+>    G14/G15/clamp reproduce the record's order: KL 0.030 / 0.251 / 0.028) and
+>    found something bigger than its gate: on the pristine serving binary the
+>    **CLI/`--prompt` path under `COLI_KDA_GPU=2` generates garbage on the
+>    564-token packet** (teacher_forcing dominated by token 154822; decoded text
+>    "# 3.1.1.1…"), while the same binary at `=0`, and the served 4-slot path at
+>    `=2`, are coherent; an 11-token prompt is fine. Gates whose teacher_forcing
+>    oracle came from a CLI run at `=2` (p5, p5b, cancel, devmerge's memfloor)
+>    compared garbage with garbage; `prefill_gate.sh` ran its oracle at `=0`
+>    and is sound. Bisect is the next item on GLM (prefill roadmap rev 28), not
+>    part of this plan. X1's glm53 CLI oracle is void for the same reason; its
+>    serving-path evidence is the 4-slot `tworeq` text identity.
+> Cost note: the night used one Opus agent (X1), four Sonnet, one Haiku, and
+> hit the session limit once; the H-track waits on the owner's package install.
+
 > **Rev 3 (2026-09-16, execution night 1).** Three corrections from running
 > the plan, all measured on the rig, none changing the decision tree:
 > 1. **H0 and M0 are blocked, not failed.** hipFire (upstream `warpfront/hipfire`

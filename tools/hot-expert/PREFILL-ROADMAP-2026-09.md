@@ -1,4 +1,27 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 27, 2026-09-16)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 28, 2026-09-16)
+
+**Rev 28 (2026-09-16): P13 opened — the CLI/`--prompt` path under
+`COLI_KDA_GPU=2` generates garbage on long prompts; the served path is fine;
+several landed gates' oracles were blind.** Found by the Franken track's X2
+(record §X2, `perf/x2-kl-oracle`): on the pristine serving binary
+(`a8e10ecf09edc05c`) a 564-token CLI run at `COLI_KDA_GPU=2` produces a
+teacher_forcing line dominated by token 154822 and decoded text "# 3.1.1.1…",
+while `=0` on the same prompt continues it coherently and the gateway (`=2`,
+4 slots) answers normally; an 11-token prompt at `=2` is fine. **This is what
+the owner is NOT served, but it is what the gates measured**: `p5_chain.sh`,
+`p5b_chain.sh`, `cancel_chain.sh` and `devmerge_chain.sh`'s `memfloor()` took
+their teacher_forcing oracle from a CLI run at `=2` — garbage compared with
+garbage prints IDENTICAL (the `gate_compare` failure in a new form).
+`prefill_gate.sh` runs its oracle at `=0` by design and is sound; `p8_gate.sh`
+and the `tworeq`/`ttft_serve.py` checks use the 4-slot server path and are
+sound. **What is next (P13, Opus):** bisect between G12's landing (09-05) and
+HEAD — first suspects `23ed436`/`0b75c42` (P2.1/P2.4, UNGATED, "profile cap
+512": the broken prompt is 564 tokens, the fine one 11), `75ec4bb` (P5.2),
+`7b70112` (P6b) — with `tools/hot-expert/x2_regime_chain.sh` as the
+reproducer; then re-run the four affected items' oracles at `=0` and record
+whether any of them shipped a numerics change. Until P13 closes, every CLI
+oracle on glm53 runs at `COLI_KDA_GPU=0`.
+
 
 **Rev 27 (2026-09-16): a third track opened beside this one — the Franken-engine
 plan, `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` (read its highest

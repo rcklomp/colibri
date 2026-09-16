@@ -14,6 +14,27 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 12 (2026-09-17 01:30 CEST, 2026-09-16 23:30 UTC) — the same-model
+> pair is measured (record §GLM53FLASH-LADDER).** GLM-5.3-Flash under the
+> owner's own llama.cpp deployment (UD-IQ4_XS, 18 of the layers on the three
+> cards, the rest and every expert in RAM, ROCm 7.14 container) beside
+> Colibri's GLM-5.3 (int4-gs64, attention on dev0, 1 695-expert tiers on
+> dev2/dev3, the rest in RAM), two runs each on the H2 ladder, A not
+> interleaved with GF (same day, separate chains): decode at 1.3k 4.79 vs
+> 2.85 tok/s (Colibri ahead, −40 %); at 18k 2.27 vs 2.80 (llama.cpp ahead,
+> +23 %); ladder-turn TTFT at 18k 2 561 s vs 108 s (llama.cpp 24× faster
+> prefill); cold 19k prefill 213 s on llama.cpp (Colibri: not run, projected
+> hours); follow-up TTFT at 18.4k 6.9 s vs 7.1/5.6 s. **Both offload designs
+> decode under 3 tok/s at 18k on this model; they differ by 24× on prefill.**
+> With §PCIE-STREAM (61 GB/s into three cards) and §GPTOSS-3CARD (75 tok/s
+> resident; 28 with half the experts in RAM; 17.6 with all of them), the
+> regime map for the Franken-engine on this box is now measured end to end:
+> decode at depth is bytes-from-RAM per token divided by the path's rate, and
+> only residency or a faster path moves it; prefill is where Colibri's
+> current design loses an order of magnitude and llama.cpp's batched
+> CPU-expert path does not. What to build from these numbers is the next
+> revision's subject, written with the owner, not by a probe.
+>
 > **Rev 11 (2026-09-17 00:45 CEST, 2026-09-16 22:45 UTC) — the two probes are
 > measured; the reuse rule is withdrawn.** Record §PCIE-STREAM: host→GPU one
 > card 28.0 GB/s; dev0+dev3 share an upstream link (35.9 GB/s aggregate, 18

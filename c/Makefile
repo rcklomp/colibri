@@ -1039,6 +1039,16 @@ endif
 qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
+# V1: opt-in Vulkan VRAM expert tier for qwen36 (VK=1 required), the same
+# separate-binary shape qwen38-vk uses -- `make qwen36` above stays exactly
+# what it is, CPU-only, linking no Vulkan. The tier is COMPILED IN here but
+# OFF at run time unless Q36_VULKAN=1; with it off this binary takes the same
+# code path as qwen36 and is gated to be bit-identical to it (teacher_forcing,
+# last-token logits, greedy text). qwen36_tier_vk.c implements the same qt_*
+# contract as qwen36_tier.c, so qwen36.c is the same source in both builds.
+qwen36-vk$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h qwen36_tier_vk.c st.h json.h compat.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(VK_OBJ) $(VK_SPV)
+	$(CC) $(NOCUDA_CFLAGS) -DQ36_VK_TIER qwen36.c qwen36_tier_vk.c $(VK_OBJ) -o qwen36-vk$(EXE) $(NOCUDA_LDFLAGS)
+
 # Qwen3.8-Flash-Next text-only sibling. This target is intentionally CPU-only;
 # qwen38.c owns the direct checkpoint loader and SERVE=1 protocol, with no
 # CUDA/Metal tier advertised by the control plane.
@@ -1086,6 +1096,12 @@ tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h
 
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# V1: the int4 staging transformation the Vulkan tier applies, checked
+# exhaustively against the engine's own unpack. Pure host arithmetic -- no
+# model, no GPU, no Vulkan link, so it builds and runs everywhere qwen36 does.
+tests/test_qwen36_vk_nibble$(EXE): tests/test_qwen36_vk_nibble.c qwen36.c qwen36_tier.h st.h json.h compat.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)

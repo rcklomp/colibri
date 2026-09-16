@@ -16,12 +16,20 @@
  * Enable with COLI_CUDA=1 [COLI_GPUS=0,1] [CUDA_EXPERT_GB=<G>|auto]
  * [HEAT_FILE=<path>] [QT_NO_WARMSTART=1]. Compiled only when the build sets
  * -DCOLI_CUDA (CUDA=1); otherwise the inline stubs below keep the engine
- * CPU-only with zero overhead. */
+ * CPU-only with zero overhead.
+ *
+ * V1 (2026-09-16): a SECOND implementation of this same contract exists over
+ * Vulkan, in qwen36_tier_vk.c, built into the separate `qwen36-vk` binary with
+ * -DQ36_VK_TIER (VK=1). It is one device, no uploader thread, no LFRU, and it
+ * turns on with Q36_VULKAN=1 rather than COLI_CUDA=1; see that file's header.
+ * The prototypes below are shared by both, so qwen36.c's call sites are the
+ * same source in all three builds (CUDA, Vulkan, neither). */
 #ifndef QWEN36_TIER_H
 #define QWEN36_TIER_H
 #include <stdint.h>
+#include <stddef.h>
 
-#ifdef COLI_CUDA
+#if defined(COLI_CUDA) || defined(Q36_VK_TIER)
 
 /* Init after model load. Returns 1 when the tier is active.
  * cap_experts_per_layer must equal n_experts (full RAM residency): the tier
@@ -116,7 +124,7 @@ void qt_fill_wait(void);   /* blocks until the upload queue is drained */
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
-#else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
+#else /* no tier compiled in: inline stubs, engine stays CPU-only */
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
@@ -140,5 +148,5 @@ static inline void qt_note_block(int a,int b,const uint8_t*c,const uint8_t*d,con
 static inline void qt_fill_wait(void){}
 static inline void qt_stats(void){}
 
-#endif /* COLI_CUDA */
+#endif /* COLI_CUDA || Q36_VK_TIER */
 #endif /* QWEN36_TIER_H */

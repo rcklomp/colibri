@@ -86,8 +86,13 @@ echo "--- step 2: build (no lock needed for a build, but we hold it already via 
 [ -x "$PROBE" ] || {
   echo "building $PROBE"
   BUILD_LOG="$OUT/${TAG}_build.log"
-  CPLUS_INCLUDE_PATH=/usr/include/c++/15:/usr/include/x86_64-linux-gnu/c++/15 \
-    "$ROCM_ROOT/bin/hipcc" --offload-arch=gfx1100 -O2 -fopenmp \
+  # --gcc-install-dir (not CPLUS_INCLUDE_PATH) is required for this
+  # host-linked build: CPLUS_INCLUDE_PATH alone compiled the object but
+  # left the link step unable to find -lstdc++ (see pcie_stream_probe.cpp
+  # header for the confirmed failure and the record's rocm_p2p_probe.cpp
+  # precedent, §FRANKEN-H0d).
+  "$ROCM_ROOT/bin/hipcc" --offload-arch=gfx1100 \
+    --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15 -O2 -fopenmp \
     "$HERE/pcie_stream_probe.cpp" -o "$PROBE" > "$BUILD_LOG" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ] || [ ! -x "$PROBE" ]; then

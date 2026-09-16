@@ -16,10 +16,18 @@
 //
 // Build (venv ROCm 10 recipe, see tools/hot-expert/h0d_chain.sh /
 // m0c_chain.sh headers -- this box's system GCC 16 has no libstdc++-16-dev,
-// so clang's autodetected GCC-install must be steered off it):
+// so clang's autodetected GCC-install must be steered off it). For a
+// *device*-only or JIT-spawned build, CPLUS_INCLUDE_PATH alone is enough
+// (h0d_chain.sh's hipFire recipe). This is a plain host-linked build, whose
+// link step also needs -lstdc++, which CPLUS_INCLUDE_PATH does not supply
+// (confirmed here: it built the object fine and then failed at
+// `ld.lld: error: unable to find library -lstdc++`) -- --gcc-install-dir
+// fixes both the include and the link search path in one flag, exactly as
+// the record's own rocm_p2p_probe.cpp recipe (§FRANKEN-H0d) uses for its
+// own session-controlled, non-JIT build:
 //   ROCM_ROOT=$(~/venvs/rocm/bin/rocm-sdk path --root)
-//   CPLUS_INCLUDE_PATH=/usr/include/c++/15:/usr/include/x86_64-linux-gnu/c++/15 \
-//     "$ROCM_ROOT/bin/hipcc" --offload-arch=gfx1100 -O2 -fopenmp \
+//   "$ROCM_ROOT/bin/hipcc" --offload-arch=gfx1100 \
+//     --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15 -O2 -fopenmp \
 //     pcie_stream_probe.cpp -o pcie_stream_probe
 // Run:
 //   LD_LIBRARY_PATH="$ROCM_ROOT/lib" OMP_NUM_THREADS=8 OMP_PLACES=cores \

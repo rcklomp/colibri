@@ -2238,6 +2238,28 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     free(nrm); free(tmp);
 }
 
+/* ---- V1 oracle: per-position prefill logits ------------------------------
+ * step() applies the LM head only to the LAST row, because that is all decode
+ * needs. A KL oracle needs every prefill position, or it cannot tell drift that
+ * starts at the front of the prompt from drift confined to its end -- which is
+ * precisely the distinction record SX2 needed on glm53. Rather than a second
+ * forward function that could silently diverge from step(), this is a flag
+ * step() honours: same trunk, same layers_forward_range call, one extra head
+ * pass over the rows it already has in hand.
+ *
+ * The head pass is deliberately the PER-ROW matmul_d(...,1,...), not the S>1
+ * batched one: matmul_q_batch is a different (exact, but differently ordered)
+ * multi-row kernel, and taking the dump through it would make row S-1 of the
+ * dump disagree with step()'s own returned logits for no reason. As written,
+ * the dump's last row is bit-identical to what DUMP= writes, which is a check
+ * the chain runs on the dump itself.
+ *
+ * Off unless Q36_TEACHER_FORCING=1 or Q36_LOGIT_DUMP_ALL=<path> is set; costs
+ * nothing otherwise. Never armed in SERVE=1. */
+static int    g_tf_all = 0;
+static float *g_tf_logits = NULL;
+static int    g_tf_rows = 0;
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (m->resident_mode && m->first_step) m->resident_collecting = 1;
@@ -2274,6 +2296,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     if (!qt_lmhead_matmul(logit, last, D, c->vocab))
         matmul_d(logit, last, m->lm_head, 1, D, c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
+    if (g_tf_all && S > 1) {                       /* V1 oracle, see above */
+        g_tf_all = 0;                              /* the prefill pass only */
+        free(g_tf_logits);
+        g_tf_logits = falloc((int64_t)S * c->vocab);
+        float *nrm = falloc((int64_t)S * D);
+        for (int s = 0; s < S; s++)
+            rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
+        for (int s = 0; s < S; s++)
+            matmul_d(g_tf_logits + (int64_t)s*c->vocab, nrm + (int64_t)s*D,
+                     m->lm_head, 1, D, c->vocab);
+        free(nrm);
+        g_tf_rows = S;
+    }
     free(x); free(last);
     if (lf) fclose(lf);
     if (m->resident_collecting) {
@@ -2508,6 +2543,29 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     int *r = malloc(a->len * sizeof(int));
     for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
     *n_out = a->len; return r;
+}
+
+/* V1 oracle, part 2: write every prefill position's full float32 logit vector.
+ * Byte-for-byte the container c/glm53.c's GLM53_LOGIT_DUMP_ALL writes ("GLKD"
+ * magic, version, count, vocab, all uint32 LE, then count*vocab float32
+ * row-major by position), so tools/hot-expert/kl_compare.py reads a qwen36 dump
+ * with no change at all -- the same mean/max KL, top-1 agreement and
+ * last-position cosine, on the same scale record SX2's rows are stated on.
+ * 564 positions x 248 320 vocab x 4 B = 560 MB per dump; cheap on this NVMe and
+ * exactly reproducible, which a top-K summary would not be. */
+static void dump_logits_all(const char *path, const float *logits, int count, int vocab) {
+    if (!path || !*path || !logits || count <= 0) return;
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Q36_LOGIT_DUMP_ALL: cannot open %s\n", path); return; }
+    uint32_t header[4];
+    header[0] = 0x444b4c47u;   /* "GLKD" */
+    header[1] = 1u;            /* format version */
+    header[2] = (uint32_t)count;
+    header[3] = (uint32_t)vocab;
+    fwrite(header, sizeof(uint32_t), 4, f);
+    fwrite(logits, sizeof(float), (size_t)count * (size_t)vocab, f);
+    fclose(f);
+    fprintf(stderr, "[dump-all] wrote %d positions x %d logits -> %s\n", count, vocab, path);
 }
 
 #ifndef QWEN36_NO_MAIN
@@ -3046,9 +3104,35 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Generated (%d new tokens):\nText : ", n_new); fflush(stderr);
         }
     }
+    /* V1 oracle: arm the per-position capture for the prefill pass inside
+     * generate(). Two knobs, one mechanism -- the argmax line is the cheap
+     * oracle (this engine's equivalent of glm53's `teacher_forcing`), the dump
+     * is the KL one. Neither is on by default. */
+    if (getenv("Q36_LOGIT_DUMP_ALL") ||
+        (getenv("Q36_TEACHER_FORCING") && atoi(getenv("Q36_TEACHER_FORCING")))) g_tf_all = 1;
     double t = now_s();
     generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
+
+    if (g_tf_rows > 0 && g_tf_logits) {
+        printf("teacher_forcing");
+        for (int tpos = 0; tpos < g_tf_rows; tpos++) {
+            const float *r = g_tf_logits + (int64_t)tpos * m.c.vocab;
+            int best = 0; float bv = r[0];
+            for (int v = 1; v < m.c.vocab; v++) if (r[v] > bv) { bv = r[v]; best = v; }
+            printf(" %d", best);
+        }
+        printf("\n");
+        fflush(stdout);
+        dump_logits_all(getenv("Q36_LOGIT_DUMP_ALL"), g_tf_logits, g_tf_rows, m.c.vocab);
+    } else if (g_tf_all) {
+        /* Armed and nothing captured: a one-token prompt never reaches the
+         * S>1 branch. Say so instead of printing an empty oracle line that a
+         * diff would call IDENTICAL against another empty one (gate_lib.sh's
+         * gate_compare exists because that happened). */
+        fprintf(stderr, "[oracle] Q36_TEACHER_FORCING armed but the prompt had no "
+                        "multi-row prefill -- no teacher_forcing line written\n");
+    }
 
     /* DUMP=<path>: write last-token logits (raw float32, vocab) for a torch-free
      * cosine comparison against tools/_ref_dn.py --dump. */

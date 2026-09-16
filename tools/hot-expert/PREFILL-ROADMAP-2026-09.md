@@ -1,6 +1,28 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 29, 2026-09-16)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 30, 2026-09-16)
 
-**Rev 29 (2026-09-16): P13's bisect ran — no culprit commit; the defect did
+**Rev 30 (2026-09-16): rev 29's "intermittent race" is WRONG — P13 is
+CLOSED as a test-harness bug, not an engine defect (record §P13's
+correction).** The coordinator's field-by-field diff of X2's exact
+invocation against this bisect's found the real cause: X2's reproductions
+always ran the pristine binary against `~/src/colibri-x2/c/shaders`, a
+long-lived side clone whose `kda_step.spv` was silently left stale — orphaned
+by `x2_chain.sh`'s own G14-reference-binary build, which detours through
+pre-`75ec4bb` commit `be95eb5`, rebuilds all shaders from that OLD source
+(`conv_channel()` with 2 params, before P5.2 added `qbase`), and never
+rebuilds them again after switching back to the branch. Confirmed
+deterministic (not probabilistic) by an X,P,P,X interleaved test: pristine
+binary + `colibri-x2`'s stale shader = degenerate output 2/2; pristine
+binary + its own (matching, correctly-built) shader = correct 2/2;
+disassembly confirms the stale `.spv` is missing the parameter. Production
+(`start_glm53.sh`) always points at `colibri`'s own shaders and was never
+affected. **No culprit commit — there was never a code-level defect to
+bisect.** Every CLI oracle on `glm53` can go back to `COLI_KDA_GPU=2` once
+someone updates the rule rev 28 set (out of P13's scope to flip it here);
+`colibri-x2`'s stale `.spv`s should be rebuilt or the clone discarded
+before it is used again for anything shader-sensitive.
+
+**Rev 29 (2026-09-16, RETRACTED by rev 30 above): P13's bisect ran — no
+culprit commit; the defect did
 not reproduce (record §P13).** Tested the G12-landing sha and all four
 named suspects (`23ed436`/`0b75c42`/`75ec4bb`/`7b70112`) plus 7 independent
 repeats of the pristine binary itself, on the exact packet and conditions

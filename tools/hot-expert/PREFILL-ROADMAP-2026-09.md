@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 30, 2026-09-16)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 31, 2026-09-17)
+
+**Rev 31 (2026-09-17): no prefill-track change; the Franken track moved.** Tonight's results live in `FRANKEN-ENGINE-PLAN-2026-09-15.md` rev 11 and the record's §FRANKEN-H2, §PCIE-STREAM, §GPTOSS-3CARD, §X3 step 0, §FRANKEN-H2c. One finding touches this track's own harness: the ladder's cold-sweep reuse ratio (plan §2.4 Q2) was miscalibrated for the ladder shape and is withdrawn; the follow-up TTFT at depth is the reuse number. What is next on this track is unchanged from rev 30.
 
 **Rev 30 (2026-09-16): rev 29's "intermittent race" is WRONG — P13 is
 CLOSED as a test-harness bug, not an engine defect (record §P13's

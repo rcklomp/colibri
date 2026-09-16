@@ -28,6 +28,28 @@
 > around that, H2 stays first because it needs no code, and a second claimed
 > gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
+> **Rev 5 (2026-09-16, day 1). H0 is closed as O3 on this box as it stands;
+> M0 has its answer; the H-track waits on one owner decision.** After
+> `rocm-device-libs` was installed, two more mismatches surfaced and were
+> lifted user-locally (record §FRANKEN-H0: this ROCm 6.2.0 is a 24.04 build on
+> Ubuntu 26.04 — `CPLUS_INCLUDE_PATH` to the GCC 15 headers, and a
+> `libxml2.so.2` alias for `ld.lld`). hipFire then compiles and caches its
+> kernels but every request fails inside its own forward ("bench_decode
+> forward failed", no HIP error exposed), unchanged across `--kv-backend
+> vmm/contiguous` and prewarm on/off. hipFire documents "ROCm 6 or newer" for
+> this card and took its own 7900 XTX numbers on 6.4.3; 6.2.0 is simply
+> untested by them. **Owner decision:** Ubuntu 26.04's own archive ships ROCm
+> 7.1 (`apt install rocm`, built for this release, so neither mismatch above
+> applies); with it, `h0_chain.sh` reruns unchanged and, on a pass, the full
+> H2 chain launches that night. Without it the track ends at O3 and Vulkan
+> stays, as §3 says. **M0 (record §FRANKEN-M0):** rccl-tests builds and RCCL
+> sees all three cards, but P2P setup fails (`hipIpcGetMemHandle: invalid
+> argument`) on both `-g 3` and `-g 2` — no collective runs; TP/EP over RCCL
+> is off the table here (§5's first outcome); the kernel line lacks
+> `iommu=pt`, an owner-side thing to test, not a session's. hipFire's MTP and
+> Redline knobs are recorded for X5 (`HIPFIRE_MTP_MODE`, `HIPFIRE_MTP_K`,
+> `HIPFIRE_REPLAY_BACKEND`).
+
 > **Rev 4 (2026-09-16, execution night 1, closing).** Two results that change
 > §3 and §4, both measured (record §X1, §X2):
 > 1. **X1 is rejected.** Retained command buffers are bit-identical on both

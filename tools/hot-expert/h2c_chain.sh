@@ -79,6 +79,13 @@ HIPENGINE_MODEL_DIR=/home/ronald/models/hipengine_qwen36_gguf
 HIPENGINE_MODEL_ID=qwen36-hipengine
 HIPENGINE_PORT=${HIPENGINE_PORT:-11437}     # hipFire uses 11436, gateway 8081, C-arm 8600
 HIPENGINE_DEV=${HIPENGINE_DEV:-1}           # dev3's HIP index, see header
+# Run 1 (tag h2c09162052, 2026-09-16 20:52 UTC) loaded the weights to 21.23 of
+# 23.98 GiB and then failed: "automatic GGUF resident context sizing found no
+# allocatable context tokens", followed by HIP OOM in the runtime-workspace
+# preparation on every request (hipEngine's own 35B-A3B rows were taken on a
+# 48 GB W7900). --max-context-tokens pins the KV pool instead of letting the
+# estimator ask for the model's full window; override or extend here.
+HIPENGINE_EXTRA_ARGS=${HIPENGINE_EXTRA_ARGS:---max-context-tokens 16384}
 THINK_OFF_CTK='{"enable_thinking": false}'  # hipEngine's documented Qwen-compatible off switch
 GLOG=~/glm53_server.log
 KEY=$(cat ~/.colibri_api_key 2>/dev/null)
@@ -89,7 +96,7 @@ B_STEPS="256,256"; B_GEN=16; B_FOLLOWUPS=1
 DO_COLD_SWEEP=1; COLD_SWEEP_SIZES="1024,2048"
 
 echo "=== h2c_chain $TAG $(date -Is)"
-echo "=== model=$HIPENGINE_MODEL port=$HIPENGINE_PORT dev=$HIPENGINE_DEV"
+echo "=== model=$HIPENGINE_MODEL port=$HIPENGINE_PORT dev=$HIPENGINE_DEV extra_args=[$HIPENGINE_EXTRA_ARGS]"
 echo "=== B_STEPS=$B_STEPS gen=$B_GEN followups=$B_FOLLOWUPS cold_sweep=$COLD_SWEEP_SIZES"
 
 VRAM() { cat "/sys/class/drm/card$1/device/mem_info_vram_used" 2>/dev/null || echo -1; }
@@ -200,6 +207,7 @@ ROCM_PATH="$ROCM_ROOT" HIP_PATH="$ROCM_ROOT" HIP_VISIBLE_DEVICES=$HIPENGINE_DEV 
     --served-model-name "$HIPENGINE_MODEL_ID" \
     --host 0.0.0.0 --port "$HIPENGINE_PORT" \
     --prefix-cache radix \
+    $HIPENGINE_EXTRA_ARGS \
     >> "$HLOG" 2>&1 < /dev/null &
 HIPENGINE_PID=$!
 echo "hipengine serve pid=$HIPENGINE_PID port=$HIPENGINE_PORT dev=$HIPENGINE_DEV (HIP_VISIBLE_DEVICES=$HIPENGINE_DEV) rocm_root=$ROCM_ROOT"

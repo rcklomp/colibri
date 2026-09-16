@@ -101,7 +101,10 @@ PY
 }
 
 echo "=== p13_chain $TAG $(date -Is)"
-for _eng in glm53 qwen38 qwen38-vk; do
+# glm53 is expected to be running here -- it is the owner's gateway, and
+# stop_gateway (next) kills it properly (server wrapper + engine, so it does
+# not respawn). Only refuse on an unrelated engine already on the box.
+for _eng in qwen38 qwen38-vk; do
   if pgrep -x "$_eng" >/dev/null 2>&1; then echo "[p13] $_eng is running -- refusing"; exit 1; fi
 done
 

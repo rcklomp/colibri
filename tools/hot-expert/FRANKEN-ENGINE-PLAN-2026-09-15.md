@@ -14,6 +14,34 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 10 (2026-09-16 evening) — H2 answered, H2c closed, and the owner's
+> redirect.** H2 ran in full (record §FRANKEN-H2): hipFire on Qwen3.6-35B-A3B
+> decodes 27× (turn 1) to 39× (18k) faster than GLM-5.3 on this box, with MTP
+> on; Q2 (reuse) NO VERDICT at every depth (r 0.45–0.69); Q3 measured W_A(18.6k)
+> = 6.87 s against the 17 s projection; Q4 ≈ 39×. H2c: hipEngine v0.5.0 cannot
+> serve the 35B Q4_K_M on a 24 GB card (OOM sizing its KV pool after the weights
+> take 21.2 GiB; its 35B rows are W7900-48 GB), closed. X3 step 0: the A-arm
+> `[OPTIME]` table does not exist and cannot in engine mode (destructor vs
+> SIGTERM), UNDECIDED, 1 h 45 m window or the stdin-close fix. D-3 is written
+> (`perf/franken-d3`), not built or run. H4's script (`perf/franken-h4`) is not
+> usable as written. H2b is written (`perf/franken-h2b`), not run.
+> **The owner then said the plan measures the wrong thing:** the goal is a model
+> larger than one card, spread over the three GPUs with experts or KV offloaded
+> to RAM, at usable speed at realistic depth; every engine he has tried does one
+> of those well and the others not (hence "Franken"). Two probes replace the
+> single-card engine comparison, both in flight tonight: **PCIE-STREAM** (aggregate
+> host→GPU bandwidth with three cards pulling concurrently vs one, pinned and
+> pageable, plus CPU DRAM read — the measured replacement for X6's one-card
+> arithmetic) and **GPTOSS-3CARD** (gpt-oss-120b MXFP4, 63.4 GB, 36 layers,
+> 128 experts top-4, fully resident across the three cards on llama.cpp Vulkan
+> and, if the container runs, HIP; then the same model with 18/36 and 36/36
+> layers' experts on the CPU — the offload cost curve on a GPU engine, on the H2
+> ladder so the rows sit beside GLM's 2.27 tok/s at 18k). The rig already carries
+> the owner's own llama.cpp deployments (GLM-5.3-Flash UD-IQ4_XS at ngl 18 with
+> CPU offload, Qwen3.8-Flash-Next 125B) in a ROCm 7.14 container; those are the
+> baselines the redirect is about, and they have not been measured on this ladder
+> either. H2b, H4, D-3, L1 are parked until those two results are in.
+>
 > **Rev 2 (2026-09-16).** Rev 1's §0 said no pair of engines could run the same
 > model in the same placement on both backends. That was reasoned from what is
 > on the rig's NVMe, and the owner rightly rejected it: the model set is not what

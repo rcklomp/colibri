@@ -329,6 +329,7 @@ See `docs/glm53-flash.md`.
 | `GLM53_MAX_IMAGE_TOKENS` | checkpoint's (8000) | Ceiling on tokens per image. Each covers 28×28 pixels, so 256 keeps ordinary text legible and 64 keeps shapes and colours. The image is shrunk, not cropped. Lower it: 8000 is 2691 tokens for a 1080p photo, i.e. a prefill nobody will sit through. |
 | `GLM53_VERBOSE` | unset | Print the parsed geometry, the expert budget and the per-token cache cost to stderr. |
 | `GLM53_DUMP_INDEX` | unset | Print the rows the sparse indexer selected. The first place to look when the engine diverges only at certain lengths. |
+| `GLM53_LOGIT_DUMP_ALL` | unset | CLI path only (`main()`, not `SERVE=1`): write the whole prefill's logits — every position, not only the last — to the given file, as a small header (`GLKD`, format version, position count, vocab size, all `uint32`) followed by raw float32, row-major by position. Feeds `tools/hot-expert/kl_compare.py`, the per-position KL oracle beside the existing greedy-text and last-token-cosine checks. Full float32 over the ~154 880-word vocab is chosen over a top-K/logsumexp summary because it is simpler and exactly reproducible; at the 450-position packet the file is ~270 MB, cheap on this box's NVMe. Off by default, zero cost otherwise. |
 | `COLI_VULKAN` | `0` | Route the resident matrices through the shared Vulkan backend. Needs a `VK=1` build and the compiled shaders (`COLI_VK_SHADERS`). Experts stay on the CPU: they arrive from disk on every use, so uploading one costs what reading it costs. |
 
 ## Kimi K3 engine (`kimi_k3`)

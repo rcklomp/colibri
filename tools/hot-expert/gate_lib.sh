@@ -64,3 +64,19 @@ print(f"  {'':<34} SEPARATED: {delta:+.1f}% on means, {cons:+.1f}% conservative 
       f"(worst-against-best) -- quote the conservative figure")
 PY
 }
+
+# gate_kl <label> <ref-dump> <cand-dump>
+#   X2's per-position KL oracle, added beside gate_compare and
+#   gate_ab_verdict above (their two functions are unchanged by this one).
+#   Thin wrapper around kl_compare.py, which applies gate_compare's own
+#   refusal rule in Python (that script does not source this file -- it has
+#   no bash to source into -- but mirrors the rule exactly): REFUSES
+#   (propagates exit 2) when either dump is empty/corrupt or the two dumps'
+#   position counts differ. Prints mean/max KL, top-1 agreement % and the
+#   last-position cosine on one scale; see kl_compare.py's own docstring.
+gate_kl() {
+  local label="$1" ref="$2" cand="$3"
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  python3 "$here/kl_compare.py" "$label" "$ref" "$cand"
+}

@@ -1,4 +1,23 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 28, 2026-09-16)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 29, 2026-09-16)
+
+**Rev 29 (2026-09-16): P13's bisect ran — no culprit commit; the defect did
+not reproduce (record §P13).** Tested the G12-landing sha and all four
+named suspects (`23ed436`/`0b75c42`/`75ec4bb`/`7b70112`) plus 7 independent
+repeats of the pristine binary itself, on the exact packet and conditions
+§X2 used (verified: packet bytes, shader source, expert preload count and
+KDA slot pool all match). **12 of 12 runs came back IDENTICAL, zero
+reproductions**, including the pristine binary that §X2 caught the defect
+on once. A single-sample bisect cannot localize an intermittent defect;
+none of these results support naming a commit, and none is named. Fits
+§X2's own hypothesis (ii): a host readout racing the GPU's command-buffer
+fence, present since G12's own single-submit design rather than introduced
+later. **What is next (Opus, not a bisect item anymore):** confirm the
+race directly (fence-wait assertion or timing instrumentation around the
+CLI `teacher_forcing` readout) before any further bisection is attempted.
+A live-service incident during this run (~28 min, 15:11-15:39 UTC, caused
+by a bug in the bisect's own chain script that has since been fixed) is
+recorded in §P13 along with the recovery. Every CLI oracle on `glm53`
+still runs at `COLI_KDA_GPU=0` per rev 28's rule, unchanged.
 
 **Rev 28 (2026-09-16): P13 opened — the CLI/`--prompt` path under
 `COLI_KDA_GPU=2` generates garbage on long prompts; the served path is fine;

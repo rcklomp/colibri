@@ -28,6 +28,28 @@
 > around that, H2 stays first because it needs no code, and a second claimed
 > gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
+> **Rev 6 (2026-09-16, day 1, afternoon). H0 PASSES; Q1 says proceed; the
+> blocker was the box's ROCm, and the fix is user-local.** A ROCm 10.0.0
+> installed as AMD's TheRock pip wheels in `~/venvs/rocm` (no sudo, nothing
+> outside `$HOME`, the system 6.2.0 untouched; record §FRANKEN-H0d for the
+> exact index and packages) runs hipFire v0.3.1 rebuilt against it end to end
+> on dev3: throwaway ttft 248.5 ms / **163.8 tok/s**, the ladder question
+> 238.7 ms / 147.5 tok/s, both streamed repeats `finish_reason=stop` at
+> 248.3 / 248.4 ms — **Q1: D_B(≈0) = 163.8 ≥ 150, proceed** (0.65 × the
+> published 253.3; the DPM level was recorded). Identical ttft on the repeat is
+> the first evidence for Q2 = no reuse; the cold sweep decides. One trap for
+> the chain: the model is a reasoning model and hipFire errors on "open think
+> span at end of generation" when `max_tokens` lands inside `<think>`; the H2
+> chain handles it symmetrically and documents the choice. The same venv makes
+> `hipIpcGetMemHandle` succeed on all three cards (it failed per device under
+> 6.2), so M0's device-P2P number is being measured as M0c. **M0b** (host-staged,
+> `NCCL_P2P_DISABLE=1`): 8 B 31 µs, 4 KB 34.5 µs, 64 KB 61 µs; the 35B's hidden
+> state is 2048 × fp16 = 4 KB, so 80 × 34.5 = 2.8 ms + 1.33 > 4 ms — TP3 decode
+> loses on that path even with perfect scaling. **Also in the box's favour:**
+> Colibri's engines link Vulkan only and ROCm is not on the loader path, so
+> none of this can touch the daily driver. H2 runs tonight (21:00 UTC), the
+> full A,B,B,A + C.
+
 > **Rev 5 (2026-09-16, day 1). H0 is closed as O3 on this box as it stands;
 > M0 has its answer; the H-track waits on one owner decision.** After
 > `rocm-device-libs` was installed, two more mismatches surfaced and were

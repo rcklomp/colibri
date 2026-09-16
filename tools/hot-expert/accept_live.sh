@@ -38,8 +38,8 @@ N="$$-$(date +%s)"
 # Where the log stood before this run, so the ledger check below judges the
 # requests THIS run drove and not whatever the owner did an hour ago.
 L0=$(grep -c "\[ledger\] " "$LOG" 2>/dev/null); L0=${L0:-0}
-A=$("$HERE/owui_ui_turn.sh" "Which day comes after Tuesday? One word. [$N-a]" | tee /dev/stderr | grep "^RESULT")
-B=$("$HERE/owui_ui_turn.sh" "Name one prime number greater than ten. One word. [$N-b]" | tee /dev/stderr | grep "^RESULT")
+A=$("$HERE/owui_ui_turn.sh" "Which day comes after Tuesday? One word. [$N-a]" | tee -a /dev/stderr | grep "^RESULT")
+B=$("$HERE/owui_ui_turn.sh" "Name one prime number greater than ten. One word. [$N-b]" | tee -a /dev/stderr | grep "^RESULT")
 v() { echo "$2" | sed -n "s/.*$1=\([0-9.]*\).*/\1/p"; }
 pa=$(v prompt "$A"); ra=$(v reused "$A"); ta=$(v ttft "$A")
 pb=$(v prompt "$B"); rb=$(v reused "$B"); tb=$(v ttft "$B")

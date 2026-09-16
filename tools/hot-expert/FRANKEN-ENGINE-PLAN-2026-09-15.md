@@ -28,6 +28,21 @@
 > around that, H2 stays first because it needs no code, and a second claimed
 > gap (the converter's "int4 path is WIP") is recorded in §1 as stale.
 
+> **Rev 9 (2026-09-16, day 1, night). P13 is closed as a harness bug, and Rev 4's
+> "four gates compared garbage with garbage" is WITHDRAWN.** The bisect found no
+> culprit (12 runs IDENTICAL, record §P13); the invocation diff found the cause:
+> every X2 run pointed `COLI_VK_SHADERS` at its scratch clone, where an earlier
+> detour build at `be95eb5` had left a stale `kda_step.spv` whose `conv_channel`
+> takes two parameters while the current engine (since P5.2, `75ec4bb`) passes
+> three — a host/shader ABI mismatch that only the GPU-KDA path exercises.
+> Interleaved X,P,P,X on the pristine binary is deterministic: stale shaders →
+> degenerate, own shaders → coherent. `start_glm53.sh` and every gate use a
+> binary's own shaders; nothing served or measured was affected. Standing rule
+> from it: gitignored build artefacts survive `git checkout` — a chain that
+> builds another commit must do so in its own clone (as `p13_chain.sh` does),
+> and `COLI_VK_SHADERS` always names the shaders built with the binary. The
+> record's §X2 G12 row is therefore an artefact, not a G12 finding.
+
 > **Rev 8 (2026-09-16, day 1, evening). H2 is armed: the full A,B,B,A + C chain
 > starts 2026-09-16 21:00 UTC** (`franken_full_launch.sh`, pid 2384291 on the
 > rig, retries a held lock every 5 min until 23:00 UTC; the gateway is down for

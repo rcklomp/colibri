@@ -1,0 +1,28 @@
+#version 450
+// vk_stream_reduce.comp -- FRANKEN-ENGINE-PLAN-2026-09-15.md item F0b:
+// no vkCmdCopyBuffer at all. Reads a host-visible|host-coherent staging
+// buffer directly as a storage buffer over PCIe (RADV keeps it in system
+// RAM, never DEVICE_LOCAL -- see vk_stream_probe.c's find_memtype avoid
+// mask) and reduces it into a 4-byte device-local accumulator with
+// atomicAdd, so the read cannot be optimised away. A grid-stride loop over
+// `n` uint32 words, where `n` is set per trial via the push constant --
+// the SAME persistent buffer, pipeline and descriptor set serve every
+// (block, batch) combination the probe sweeps; only `n` and the trial's
+// timing window change.
+//
+// Build: glslc --target-env=vulkan1.2 vk_stream_reduce.comp -o vk_stream_reduce.spv
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Src { uint data[]; } src;
+layout(std430, binding = 1) buffer Dst { uint result[]; } dst;
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint acc = 0u;
+    for (uint i = idx; i < pc.n; i += stride) acc += src.data[i];
+    atomicAdd(dst.result[0], acc);
+}

@@ -337,7 +337,7 @@ static void barrier_wait(atomic_int *ready, int nparty) {
  * submit+fence-wait until >= MIN_SECONDS have elapsed. */
 
 typedef struct {
-    double gbps;          /* headline: upload gbps for hv-*/ext-host, combined for memcpy+upload */
+    double gbps;          /* headline: upload gbps for hv-coherent, hv-cached and ext-host; combined for memcpy+upload */
     double gbps_memcpy;   /* memcpy+upload only */
     double gbps_upload;   /* memcpy+upload only (upload leg alone) */
     long long bytes;

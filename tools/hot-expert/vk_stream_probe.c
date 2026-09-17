@@ -477,9 +477,14 @@ static void *trial_thread(void *argp) {
         VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp,
             .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt};
         VkDeviceMemory ext_mem;
-        if (vkAllocateMemory(d->dev, &ai, NULL, &ext_mem) != VK_SUCCESS) {
+        VkResult amr = vkAllocateMemory(d->dev, &ai, NULL, &ext_mem);
+        if (amr != VK_SUCCESS) {
             vkDestroyBuffer(d->dev, ext_buf, NULL);
-            out->unavailable = 1; snprintf(out->reason, sizeof(out->reason), "vkAllocateMemory(import) failed"); barrier_wait(a->ready, a->nparty); return NULL;
+            out->unavailable = 1;
+            snprintf(out->reason, sizeof(out->reason),
+                     "vkAllocateMemory(import) rc=%d mt=%d relaxed=%d req.size=%llu win=%zu bits=0x%x hostbits=0x%x",
+                     (int)amr, mt, relaxed, (unsigned long long)req.size, win, bits, hostProps.memoryTypeBits);
+            barrier_wait(a->ready, a->nparty); return NULL;
         }
         VKCHECK(vkBindBufferMemory(d->dev, ext_buf, ext_mem, 0), "bind imported");
 

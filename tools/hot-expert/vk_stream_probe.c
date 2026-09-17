@@ -15,31 +15,55 @@
  * genuinely concurrent across its participating devices, exactly as
  * pcie_stream_probe.cpp does for HIP streams.
  *
- * Four source kinds per (config, block):
- *   hv-coherent     HOST_VISIBLE|HOST_COHERENT staging buffer (plain host
- *                   RAM, explicitly NOT DEVICE_LOCAL -- see find_memtype's
- *                   avoid mask) -> device-local dst via vkCmdCopyBuffer.
- *                   The "pinned" analogue.
- *   hv-cached       same, +HOST_CACHED, if the device offers that
- *                   combination (RADV usually does); "unavailable"
- *                   otherwise.
- *   memcpy+upload   the page-cache analogue: memcpy from an mmap'd region
- *                   of a GLM shard already resident in page cache (read
- *                   only, never written) into the hv-coherent staging
- *                   buffer, THEN the same vkCmdCopyBuffer upload. The
- *                   memcpy leg and the upload leg are timed separately and
- *                   reported via INFO breakdown lines; the ROW line's gbps
- *                   is the combined figure (bytes / (memcpy+upload secs)).
- *   ext-host        VK_EXT_external_memory_host: import the mmap'd host
- *                   pointer directly as device memory bound to a buffer,
- *                   and vkCmdCopyBuffer straight from it -- no memcpy leg
- *                   at all. "unavailable" if the extension, the function
- *                   pointer, a compatible memory type, or a large-enough
- *                   file window is missing (each reported with its own
- *                   reason on stderr).
+ * Six source kinds per (config, block):
+ *   hv-coherent       HOST_VISIBLE|HOST_COHERENT staging buffer (plain host
+ *                     RAM, explicitly NOT DEVICE_LOCAL -- see find_memtype's
+ *                     avoid mask) -> device-local dst via vkCmdCopyBuffer,
+ *                     on the transfer-preferred queue family (§F0's own
+ *                     original pick: TRANSFER_BIT without GRAPHICS_BIT --
+ *                     RADV's async-compute-and-DMA family). The "pinned"
+ *                     analogue.
+ *   hv-cached         same, +HOST_CACHED, if the device offers that
+ *                     combination (RADV usually does); "unavailable"
+ *                     otherwise.
+ *   memcpy+upload     the page-cache analogue: memcpy from an mmap'd region
+ *                     of a GLM shard already resident in page cache (read
+ *                     only, never written) into the hv-coherent staging
+ *                     buffer, THEN the same vkCmdCopyBuffer upload (also on
+ *                     the transfer-preferred family). The memcpy leg and
+ *                     the upload leg are timed separately and reported via
+ *                     INFO breakdown lines; the ROW line's gbps is the
+ *                     combined figure (bytes / (memcpy+upload secs)).
+ *   ext-host          VK_EXT_external_memory_host: import the mmap'd host
+ *                     pointer directly as device memory bound to a buffer,
+ *                     and vkCmdCopyBuffer straight from it -- no memcpy leg
+ *                     at all. "unavailable" if the extension, the function
+ *                     pointer, a compatible memory type, or a large-enough
+ *                     file window is missing (each reported with its own
+ *                     reason on stderr).
+ *   hv-coherent-gfxq  F0b (2026-09-17): the F0 gate cannot be decided on
+ *                     the transfer-preferred family alone -- on RADV that
+ *                     family is the SDMA engine, known to be far slower
+ *                     than the GPU's own compute/graphics engines for
+ *                     host->device traffic. Same hv-coherent buffer and
+ *                     same vkCmdCopyBuffer, but on the SAME queue family
+ *                     backend_vulkan.c's coli_vk_init() picks for the real
+ *                     engines (`pick_backend_qfam`: first family with
+ *                     VK_QUEUE_COMPUTE_BIT set, verified per device, not
+ *                     assumed to be family 0).
+ *   shader-host-read  F0b: no vkCmdCopyBuffer at all. A trivial compute
+ *                     shader (vk_stream_reduce.comp, one storage-buffer
+ *                     binding on the hv-coherent staging buffer, one on a
+ *                     4-byte device-local accumulator) reads the staging
+ *                     buffer directly over PCIe as a storage buffer and
+ *                     sums it with atomicAdd, so the read cannot be
+ *                     optimised away; dispatched on the same backend queue
+ *                     family as hv-coherent-gfxq, timed by fences, bytes
+ *                     read per second as the metric.
  *
- * Every submit batches BATCH copies of `block` bytes (all into the same
- * device-local dst region -- content is never read back, only bytes/sec
+ * Every submit batches BATCH copies/reads of `block` bytes (all into the
+ * same device-local dst region for the copy paths, or the same `n` words
+ * for the shader path -- content is never read back, only bytes/sec
  * matters, so overwrite hazards are harmless) so the record's own
  * complaint about 0.3-1.5 ms per-submit gaps (§Q7) is amortised; BATCH is
  * printed once via `INFO batch_size=`.
@@ -53,13 +77,15 @@
  *
  * Build (see vk_stream_chain.sh step 2 for the exact recipe):
  *   gcc -O2 -pthread vk_stream_probe.c -o vk_stream_probe -lvulkan -lm
+ *   glslc --target-env=vulkan1.2 vk_stream_reduce.comp -o vk_stream_reduce.spv
  * Run:
  *   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json \
- *     ./vk_stream_probe 2.0 ~/models/GLM-5.3-Flash-colibri-int4-g64/model-00002-of-00062.safetensors
+ *     ./vk_stream_probe 2.0 ~/models/GLM-5.3-Flash-colibri-int4-g64/model-00002-of-00062.safetensors \
+ *     vk_stream_reduce.spv
  *
  * Output: INFO lines (setup/diagnostic, human+grep readable) then one ROW
  * line per (cfg,src,block,dev) measurement:
- *   ROW cfg=<1|2|3> src=<hv-coherent|hv-cached|memcpy+upload|ext-host> block=<MiB> dev=<busid|all> gbps=<..> n=<..>
+ *   ROW cfg=<1|2|3> src=<hv-coherent|hv-cached|memcpy+upload|ext-host|hv-coherent-gfxq|shader-host-read> block=<MiB> dev=<busid|all> gbps=<..> n=<..>
  * gbps uses GB = 1e9 bytes, matching every other probe in this record.
  */
 #define _GNU_SOURCE
@@ -97,6 +123,7 @@ static double now_s(void) {
 static double MIN_SECONDS = 2.0;
 static const int REPS_PER_VISIT = 3;   /* sequence 1,2,3,3,2,1 -> n=6 per row */
 static const int BATCH = 4;            /* copies per submit, amortises the 0.3-1.5 ms/submit gap (§Q7) */
+#define NCOMBO 12                       /* 6 source kinds x 2 block sizes (F0b added hv-coherent-gfxq, shader-host-read) */
 static const size_t MIB = 1024ull * 1024ull;
 static const size_t MAXBLOCK = 256ull * 1024ull * 1024ull;         /* dst buffer size */
 static const size_t MAXSTAGE = 4ull * 256ull * 1024ull * 1024ull;  /* BATCH * MAXBLOCK */
@@ -139,6 +166,91 @@ static void flags_str(VkMemoryPropertyFlags f, char *out, size_t n) {
     if (!out[0]) strncpy(out, "(none)", n - 1);
 }
 
+static void qflags_str(VkQueueFlags f, char *out, size_t n) {
+    out[0] = 0;
+    #define ADDQ(bit, name) if (f & (bit)) { if (out[0]) strncat(out, "|", n - strlen(out) - 1); strncat(out, name, n - strlen(out) - 1); }
+    ADDQ(VK_QUEUE_GRAPHICS_BIT, "GRAPHICS")
+    ADDQ(VK_QUEUE_COMPUTE_BIT, "COMPUTE")
+    ADDQ(VK_QUEUE_TRANSFER_BIT, "TRANSFER")
+    ADDQ(VK_QUEUE_SPARSE_BINDING_BIT, "SPARSE_BINDING")
+    ADDQ(VK_QUEUE_VIDEO_DECODE_BIT_KHR, "VIDEO_DECODE")
+    ADDQ(VK_QUEUE_VIDEO_ENCODE_BIT_KHR, "VIDEO_ENCODE")
+    #undef ADDQ
+    if (!out[0]) strncpy(out, "(none)", n - 1);
+}
+
+/* F0b: the SAME algorithm backend_vulkan.c's coli_vk_init() uses to pick its
+ * queue family -- first family with VK_QUEUE_COMPUTE_BIT set, scanning in
+ * enumeration order. Read here, not assumed to be family 0 (it is, on this
+ * rig's three cards, but the point of this function is to derive that, not
+ * state it). */
+static int pick_backend_qfam(VkPhysicalDevice phys) {
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, NULL);
+    VkQueueFamilyProperties qf[16]; if (nq > 16) nq = 16;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, qf);
+    for (uint32_t i = 0; i < nq; i++)
+        if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) return (int)i;
+    return -1;
+}
+
+/* Loads raw SPIR-V from `path` (backend_vulkan.c's load_spv, copied verbatim
+ * in spirit: same size/alignment checks, same error reporting). */
+static VkShaderModule load_spv(VkDevice dev, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "FATAL: cannot open shader %s\n", path); exit(1); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n % 4 != 0) { fprintf(stderr, "FATAL: bad SPIR-V size %ld in %s\n", n, path); exit(1); }
+    uint32_t *code = malloc((size_t)n);
+    if (!code || fread(code, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "FATAL: read %s failed\n", path); exit(1); }
+    fclose(f);
+    VkShaderModuleCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = (size_t)n, .pCode = code};
+    VkShaderModule m;
+    VkResult r = vkCreateShaderModule(dev, &si, NULL, &m);
+    free(code);
+    if (r != VK_SUCCESS) { fprintf(stderr, "FATAL: vkCreateShaderModule(%s) rc=%d\n", path, (int)r); exit(1); }
+    return m;
+}
+
+/* Two-binding compute pipeline (storage buffers) + one 4-byte push constant,
+ * for vk_stream_reduce.comp -- backend_vulkan.c's build_pipeline() shape,
+ * copied rather than re-abstracted since this probe links nothing from
+ * backend_vulkan.o. */
+static void build_reduce_pipeline(VkDevice dev, VkShaderModule shader,
+                                   VkDescriptorSetLayout *dsl, VkPipelineLayout *plyt,
+                                   VkPipeline *pipe, VkDescriptorPool *dpool, VkDescriptorSet *dset) {
+    VkDescriptorSetLayoutBinding b[2];
+    for (int i = 0; i < 2; i++) b[i] = (VkDescriptorSetLayoutBinding){
+        .binding = (uint32_t)i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2, .pBindings = b};
+    VKCHECK(vkCreateDescriptorSetLayout(dev, &dsli, NULL, dsl), "reduce descSetLayout");
+    VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 4};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+    VKCHECK(vkCreatePipelineLayout(dev, &pli, NULL, plyt), "reduce pipelineLayout");
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+        .layout = *plyt};
+    VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "reduce pipeline");
+    VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2};
+    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+    VKCHECK(vkCreateDescriptorPool(dev, &dpi, NULL, dpool), "reduce descPool");
+    VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = *dpool, .descriptorSetCount = 1, .pSetLayouts = dsl};
+    VKCHECK(vkAllocateDescriptorSets(dev, &dsa, dset), "reduce allocDescSet");
+}
+
+/* Fixed dispatch width: enough workgroups to saturate memory bandwidth at
+ * the largest block (256 MiB * BATCH = 1 GiB); vk_stream_reduce.comp's
+ * grid-stride loop makes this correct (not just efficient) for every
+ * smaller `n` too. */
+static const uint32_t REDUCE_WORKGROUPS = 4096;
+
 /* ---- per-device persistent context -------------------------------------- */
 
 typedef struct {
@@ -157,6 +269,16 @@ typedef struct {
     VkCommandBuffer cmd;
     VkFence fence;
 
+    /* F0b: the backend's own queue family (pick_backend_qfam), for
+     * hv-coherent-gfxq and shader-host-read. A separate pool/cmd/fence even
+     * when qfam_gfx == qfam (harmless, simpler than branching everywhere). */
+    uint32_t qfam_gfx;
+    int gfx_same_family;
+    VkQueue queue_gfx;
+    VkCommandPool cpool_gfx;
+    VkCommandBuffer cmd_gfx;
+    VkFence fence_gfx;
+
     VkBuffer dst_buf; VkDeviceMemory dst_mem;
     VkBuffer stage_coh_buf; VkDeviceMemory stage_coh_mem; void *stage_coh_ptr;
     int has_cached;
@@ -165,6 +287,15 @@ typedef struct {
     int has_ext_host;
     VkDeviceSize ext_host_align;
     PFN_vkGetMemoryHostPointerPropertiesEXT fn_getHostPtrProps;
+
+    /* F0b shader-host-read pipeline */
+    VkShaderModule shader_reduce;
+    VkDescriptorSetLayout dsl_reduce;
+    VkPipelineLayout plyt_reduce;
+    VkPipeline pipe_reduce;
+    VkDescriptorPool dpool_reduce;
+    VkDescriptorSet dset_reduce;
+    VkBuffer dst_reduce_buf; VkDeviceMemory dst_reduce_mem;
 } DevCtx;
 
 static VkInstance g_inst;
@@ -186,7 +317,7 @@ static void create_buffer(VkDevice dev, VkPhysicalDevice phys, VkDeviceSize size
     if (mapped) VKCHECK(vkMapMemory(dev, *mem, 0, size, 0, mapped), "vkMapMemory");
 }
 
-static void dev_setup(DevCtx *d) {
+static void dev_setup(DevCtx *d, const char *reduce_spv_path) {
     /* queue family: prefer a transfer-capable family that is NOT
      * graphics-capable (this rig's async-compute family, which also
      * carries TRANSFER_BIT) over the universal graphics/compute/transfer
@@ -198,6 +329,19 @@ static void dev_setup(DevCtx *d) {
     vkGetPhysicalDeviceQueueFamilyProperties(d->phys, &nq, NULL);
     VkQueueFamilyProperties qf[16]; if (nq > 16) nq = 16;
     vkGetPhysicalDeviceQueueFamilyProperties(d->phys, &nq, qf);
+
+    /* F0b: print every family's flags once per device, as enumerated --
+     * before any pick is made, so the pick can be checked against it. */
+    {
+        char line[512] = ""; char one[64];
+        for (uint32_t i = 0; i < nq; i++) {
+            char fl[128]; qflags_str(qf[i].queueFlags, fl, sizeof(fl));
+            snprintf(one, sizeof(one), "%sfam%u=%s", i ? " " : "", i, fl);
+            strncat(line, one, sizeof(line) - strlen(line) - 1);
+        }
+        fprintf(stderr, "INFO %s queue_family_props: %s\n", d->label, line);
+    }
+
     int best = -1, best_rank = -1;
     for (uint32_t i = 0; i < nq; i++) {
         VkQueueFlags f = qf[i].queueFlags;
@@ -210,6 +354,14 @@ static void dev_setup(DevCtx *d) {
     if (best < 0) { fprintf(stderr, "FATAL: %s has no usable queue family\n", d->label); exit(1); }
     d->qfam = (uint32_t)best;
     d->qfam_dedicated = (qf[best].queueFlags & VK_QUEUE_TRANSFER_BIT) && !(qf[best].queueFlags & VK_QUEUE_GRAPHICS_BIT);
+
+    /* F0b: the family the real engines use (backend_vulkan.c's own pick). */
+    int backend_qfam = pick_backend_qfam(d->phys);
+    if (backend_qfam < 0) { fprintf(stderr, "FATAL: %s: pick_backend_qfam found nothing\n", d->label); exit(1); }
+    d->qfam_gfx = (uint32_t)backend_qfam;
+    d->gfx_same_family = (d->qfam_gfx == d->qfam);
+    fprintf(stderr, "INFO %s qfam_xfer=%u (dedicated_transfer=%d) qfam_gfx=%u (backend pick) same_family=%d\n",
+            d->label, d->qfam, d->qfam_dedicated, d->qfam_gfx, d->gfx_same_family);
 
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(d->phys, NULL, &ne, NULL);
@@ -225,14 +377,20 @@ static void dev_setup(DevCtx *d) {
     const char *dext[2]; uint32_t ndext = 0;
     if (ext_host_avail) dext[ndext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
 
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = d->qfam, .queueCount = 1, .pQueuePriorities = &prio};
+    float prio[2] = {1.0f, 1.0f};
+    VkDeviceQueueCreateInfo qis[2];
+    uint32_t nqis = 0;
+    qis[nqis++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = d->qfam, .queueCount = 1, .pQueuePriorities = &prio[0]};
+    if (!d->gfx_same_family)
+        qis[nqis++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = d->qfam_gfx, .queueCount = 1, .pQueuePriorities = &prio[1]};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+        .queueCreateInfoCount = nqis, .pQueueCreateInfos = qis,
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
     VKCHECK(vkCreateDevice(d->phys, &di, NULL, &d->dev), "vkCreateDevice");
     vkGetDeviceQueue(d->dev, d->qfam, 0, &d->queue);
+    vkGetDeviceQueue(d->dev, d->qfam_gfx, 0, &d->queue_gfx);
 
     d->has_ext_host = 0;
     d->ext_host_align = 0;
@@ -260,15 +418,46 @@ static void dev_setup(DevCtx *d) {
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(d->dev, &fi, NULL, &d->fence), "fence");
 
+    /* F0b: a second pool/cmd/fence on the backend's queue family, always
+     * created even when it equals qfam (harmless, avoids branching every
+     * call site below). */
+    VkCommandPoolCreateInfo cpci_gfx = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = d->qfam_gfx};
+    VKCHECK(vkCreateCommandPool(d->dev, &cpci_gfx, NULL, &d->cpool_gfx), "gfx cmdPool");
+    VkCommandBufferAllocateInfo cbi_gfx = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = d->cpool_gfx, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VKCHECK(vkAllocateCommandBuffers(d->dev, &cbi_gfx, &d->cmd_gfx), "gfx cmdBuf");
+    VKCHECK(vkCreateFence(d->dev, &fi, NULL, &d->fence_gfx), "gfx fence");
+
     int relaxed_dst = 0, relaxed_coh = 0, relaxed_cached = 0;
     create_buffer(d->dev, d->phys, (VkDeviceSize)MAXBLOCK, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                   &d->dst_buf, &d->dst_mem, NULL, &relaxed_dst);
-    create_buffer(d->dev, d->phys, (VkDeviceSize)MAXSTAGE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    /* F0b: +STORAGE_BUFFER_BIT so shader-host-read can bind this SAME
+     * hv-coherent staging buffer directly, without a second allocation. */
+    create_buffer(d->dev, d->phys, (VkDeviceSize)MAXSTAGE,
+                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                   &d->stage_coh_buf, &d->stage_coh_mem, &d->stage_coh_ptr, &relaxed_coh);
     memset(d->stage_coh_ptr, 0x5a, MAXSTAGE);
+
+    /* F0b: shader-host-read's pipeline and its tiny device-local accumulator. */
+    d->shader_reduce = load_spv(d->dev, reduce_spv_path);
+    build_reduce_pipeline(d->dev, d->shader_reduce, &d->dsl_reduce, &d->plyt_reduce,
+                           &d->pipe_reduce, &d->dpool_reduce, &d->dset_reduce);
+    int relaxed_rdst = 0;
+    create_buffer(d->dev, d->phys, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                  &d->dst_reduce_buf, &d->dst_reduce_mem, NULL, &relaxed_rdst);
+    VkDescriptorBufferInfo dbi[2] = {
+        {.buffer = d->stage_coh_buf, .offset = 0, .range = VK_WHOLE_SIZE},
+        {.buffer = d->dst_reduce_buf, .offset = 0, .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wr[2];
+    for (int i = 0; i < 2; i++) wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = d->dset_reduce, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &dbi[i]};
+    vkUpdateDescriptorSets(d->dev, 2, wr, 0, NULL);
 
     /* HOST_CACHED staging: probe for the memtype first without allocating,
      * so an absent combination is "unavailable", not a fatal exit. */
@@ -346,27 +535,51 @@ typedef struct {
     char reason[256];
 } TrialOut;
 
-static void record_copy_cb(DevCtx *d, VkBuffer src, size_t block) {
-    VKCHECK(vkResetCommandBuffer(d->cmd, 0), "reset cmd");
+/* Generalised so hv-coherent-gfxq can record into cmd_gfx against the SAME
+ * dst_buf while hv-coherent/hv-cached/memcpy+upload/ext-host keep using
+ * cmd (the transfer-preferred family). */
+static void record_copy_cb2(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, size_t block) {
+    VKCHECK(vkResetCommandBuffer(cmd, 0), "reset cmd");
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    VKCHECK(vkBeginCommandBuffer(d->cmd, &bi), "begin cmd");
+    VKCHECK(vkBeginCommandBuffer(cmd, &bi), "begin cmd");
     VkBufferCopy regions[16];
     for (int i = 0; i < BATCH; i++) {
         regions[i].srcOffset = (VkDeviceSize)i * block;
         regions[i].dstOffset = 0;
         regions[i].size = (VkDeviceSize)block;
     }
-    vkCmdCopyBuffer(d->cmd, src, d->dst_buf, BATCH, regions);
-    VKCHECK(vkEndCommandBuffer(d->cmd), "end cmd");
+    vkCmdCopyBuffer(cmd, src, dst, BATCH, regions);
+    VKCHECK(vkEndCommandBuffer(cmd), "end cmd");
+}
+static void record_copy_cb(DevCtx *d, VkBuffer src, size_t block) {
+    record_copy_cb2(d->cmd, src, d->dst_buf, block);
 }
 
-static void submit_wait(DevCtx *d) {
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1, .pCommandBuffers = &d->cmd};
-    VKCHECK(vkResetFences(d->dev, 1, &d->fence), "reset fence");
-    VKCHECK(vkQueueSubmit(d->queue, 1, &si, d->fence), "submit");
-    VKCHECK(vkWaitForFences(d->dev, 1, &d->fence, VK_TRUE, 30000000000ULL), "wait fence");
+/* F0b: one dispatch of vk_stream_reduce.comp reading `n_words` uint32s from
+ * the hv-coherent staging buffer (already bound at binding 0, whole range)
+ * into the binding-1 accumulator, via push constant `n`. Recorded into
+ * cmd_gfx. */
+static void record_shader_cb(DevCtx *d, uint32_t n_words) {
+    VKCHECK(vkResetCommandBuffer(d->cmd_gfx, 0), "reset reduce cmd");
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(d->cmd_gfx, &bi), "begin reduce cmd");
+    vkCmdBindPipeline(d->cmd_gfx, VK_PIPELINE_BIND_POINT_COMPUTE, d->pipe_reduce);
+    vkCmdBindDescriptorSets(d->cmd_gfx, VK_PIPELINE_BIND_POINT_COMPUTE, d->plyt_reduce,
+                             0, 1, &d->dset_reduce, 0, NULL);
+    vkCmdPushConstants(d->cmd_gfx, d->plyt_reduce, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n_words);
+    vkCmdDispatch(d->cmd_gfx, REDUCE_WORKGROUPS, 1, 1);
+    VKCHECK(vkEndCommandBuffer(d->cmd_gfx), "end reduce cmd");
 }
+
+static void submit_wait2(VkDevice dev, VkQueue q, VkCommandBuffer cmd, VkFence f) {
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    VKCHECK(vkResetFences(dev, 1, &f), "reset fence");
+    VKCHECK(vkQueueSubmit(q, 1, &si, f), "submit");
+    VKCHECK(vkWaitForFences(dev, 1, &f, VK_TRUE, 30000000000ULL), "wait fence");
+}
+static void submit_wait(DevCtx *d) { submit_wait2(d->dev, d->queue, d->cmd, d->fence); }
+static void submit_wait_gfx(DevCtx *d) { submit_wait2(d->dev, d->queue_gfx, d->cmd_gfx, d->fence_gfx); }
 
 typedef struct {
     DevCtx *d;
@@ -515,6 +728,36 @@ static void *trial_thread(void *argp) {
         vkFreeMemory(d->dev, ext_mem, NULL);
         return NULL;
     }
+    if (!strcmp(a->src, "hv-coherent-gfxq")) {
+        /* F0b: same hv-coherent buffer and copy, but on the backend's own
+         * queue family (qfam_gfx / cmd_gfx / queue_gfx / fence_gfx), not
+         * the transfer-preferred one -- the SDMA-vs-shader-engine question. */
+        record_copy_cb2(d->cmd_gfx, d->stage_coh_buf, d->dst_buf, a->block);
+        submit_wait_gfx(d);                   /* warm-up, uncounted */
+        barrier_wait(a->ready, a->nparty);
+        long long n = 0; double t0 = now_s(), t = t0;
+        do { submit_wait_gfx(d); n++; t = now_s(); } while (t - t0 < MIN_SECONDS);
+        out->bytes = n * (long long)BATCH * a->block;
+        out->secs = t - t0;
+        out->gbps = out->gbps_upload = (double)out->bytes / out->secs / 1e9;
+        return NULL;
+    }
+    if (!strcmp(a->src, "shader-host-read")) {
+        /* F0b: no vkCmdCopyBuffer at all -- vk_stream_reduce.comp reads the
+         * SAME hv-coherent staging buffer directly as a storage buffer,
+         * over PCIe, on the backend's queue family. `n_words` covers
+         * BATCH*block bytes, matching every other path's bytes/submit. */
+        uint32_t n_words = (uint32_t)(((size_t)BATCH * a->block) / 4);
+        record_shader_cb(d, n_words);
+        submit_wait_gfx(d);
+        barrier_wait(a->ready, a->nparty);
+        long long n = 0; double t0 = now_s(), t = t0;
+        do { submit_wait_gfx(d); n++; t = now_s(); } while (t - t0 < MIN_SECONDS);
+        out->bytes = n * (long long)BATCH * a->block;
+        out->secs = t - t0;
+        out->gbps = out->gbps_upload = (double)out->bytes / out->secs / 1e9;
+        return NULL;
+    }
     out->unavailable = 1; snprintf(out->reason, sizeof(out->reason), "unknown source kind %s", a->src);
     barrier_wait(a->ready, a->nparty);
     return NULL;
@@ -565,6 +808,7 @@ static void print_row(const char *cfg, const char *src, size_t block_mib, const 
 int main(int argc, char **argv) {
     if (argc > 1) MIN_SECONDS = atof(argv[1]);
     const char *shard_path = argc > 2 ? argv[2] : NULL;
+    const char *reduce_spv_path = argc > 3 ? argv[3] : "vk_stream_reduce.spv";
 
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
@@ -609,7 +853,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    dev_setup(dev0); dev_setup(dev2); dev_setup(dev3);
+    dev_setup(dev0, reduce_spv_path); dev_setup(dev2, reduce_spv_path); dev_setup(dev3, reduce_spv_path);
 
     const uint8_t *filebase = NULL; size_t filesize = 0;
     if (shard_path) {
@@ -636,22 +880,23 @@ int main(int argc, char **argv) {
     }
     printf("INFO shard_path=%s shard_size=%zu mmap=%s\n", shard_path ? shard_path : "(none)", filesize, filebase ? "ok" : "unavailable");
 
-    const char *combos_src[] = {"hv-coherent", "hv-coherent", "hv-cached", "hv-cached", "memcpy+upload", "memcpy+upload", "ext-host", "ext-host"};
-    size_t combos_block[] = {14*MIB, 256*MIB, 14*MIB, 256*MIB, 14*MIB, 256*MIB, 14*MIB, 256*MIB};
-    const int NCOMBO = 8;
+    const char *combos_src[] = {"hv-coherent", "hv-coherent", "hv-cached", "hv-cached",
+                                 "memcpy+upload", "memcpy+upload", "ext-host", "ext-host",
+                                 "hv-coherent-gfxq", "hv-coherent-gfxq", "shader-host-read", "shader-host-read"};
+    size_t combos_block[] = {14*MIB, 256*MIB, 14*MIB, 256*MIB, 14*MIB, 256*MIB, 14*MIB, 256*MIB, 14*MIB, 256*MIB, 14*MIB, 256*MIB};
 
     DevCtx *cfg1_devs[3] = {dev0, dev2, dev3};
     DevCtx *cfg2_group[2] = {dev0, dev3};
     DevCtx *cfg3_group[3] = {dev0, dev2, dev3};
 
     /* accumulators: [combo][slot] where slot indexes into the relevant device list */
-    double cfg1_samp[8][3][64]; int cfg1_n[8][3];
-    double cfg2_dev_samp[8][2][64]; int cfg2_dev_n[8][2];
-    double cfg2_agg_samp[8][64]; int cfg2_agg_n[8];
-    double cfg3_dev_samp[8][3][64]; int cfg3_dev_n[8][3];
-    double cfg3_agg_samp[8][64]; int cfg3_agg_n[8];
+    double cfg1_samp[NCOMBO][3][64]; int cfg1_n[NCOMBO][3];
+    double cfg2_dev_samp[NCOMBO][2][64]; int cfg2_dev_n[NCOMBO][2];
+    double cfg2_agg_samp[NCOMBO][64]; int cfg2_agg_n[NCOMBO];
+    double cfg3_dev_samp[NCOMBO][3][64]; int cfg3_dev_n[NCOMBO][3];
+    double cfg3_agg_samp[NCOMBO][64]; int cfg3_agg_n[NCOMBO];
     /* memcpy+upload breakdown, cfg1 only (per-device, single-device legs are unambiguous) */
-    double cfg1_mcpy_samp[3][64], cfg1_up_samp[3][64]; int combo_is_mcpy[8];
+    double cfg1_mcpy_samp[3][64], cfg1_up_samp[3][64]; int combo_is_mcpy[NCOMBO];
     memset(cfg1_n, 0, sizeof(cfg1_n)); memset(cfg2_dev_n, 0, sizeof(cfg2_dev_n));
     memset(cfg2_agg_n, 0, sizeof(cfg2_agg_n)); memset(cfg3_dev_n, 0, sizeof(cfg3_dev_n));
     memset(cfg3_agg_n, 0, sizeof(cfg3_agg_n));

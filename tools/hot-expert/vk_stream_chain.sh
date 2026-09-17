@@ -1,8 +1,12 @@
 #!/bin/bash
-# vk_stream_chain.sh -- FRANKEN-ENGINE-PLAN-2026-09-15.md item F0: does
+# vk_stream_chain.sh -- FRANKEN-ENGINE-PLAN-2026-09-15.md item F0 (+F0b): does
 # Vulkan/RADV host->device streaming match the HIP rate §PCIE-STREAM
 # measured (1 card 28.0 GB/s, three cards concurrent 61.4-62.0 GB/s)?
-# Builds and runs tools/hot-expert/vk_stream_probe.c.
+# Builds and runs tools/hot-expert/vk_stream_probe.c and its
+# vk_stream_reduce.comp shader (F0b: the transfer-preferred queue family
+# F0 originally used is RADV's SDMA engine, too slow to decide the gate on
+# alone -- F0b adds hv-coherent-gfxq and shader-host-read on the backend's
+# own queue family, backend_vulkan.c's pick).
 #
 # UNLIKE most chains in this directory, this one does NOT stop the owner's
 # gateway, for the same reason pcie_stream_chain.sh doesn't: the gateway is
@@ -59,23 +63,34 @@ done
 
 echo "--- step 2: build (VK_ICD_FILENAMES per llama-profile.sh's convention)"
 export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
-[ -x "$PROBE" ] || {
-  echo "building $PROBE"
-  BUILD_LOG="$OUT/${TAG}_build.log"
-  gcc -O2 -pthread "$HERE/vk_stream_probe.c" -o "$PROBE" -lvulkan -lm > "$BUILD_LOG" 2>&1
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ ! -x "$PROBE" ]; then
-    echo "FATAL: build failed rc=$rc, see $BUILD_LOG"
-    cat "$BUILD_LOG"
-    exit 1
-  fi
-  echo "build ok -> $PROBE"
-}
+REDUCE_SPV="$HERE/vk_stream_reduce.spv"
+BUILD_LOG="$OUT/${TAG}_build.log"
+# Always rebuild (not "build if missing"): F0b changed vk_stream_probe.c and
+# added vk_stream_reduce.comp, and a stale executable from F0's run must not
+# be reused silently.
+echo "building $PROBE"
+gcc -O2 -pthread "$HERE/vk_stream_probe.c" -o "$PROBE" -lvulkan -lm > "$BUILD_LOG" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] || [ ! -x "$PROBE" ]; then
+  echo "FATAL: probe build failed rc=$rc, see $BUILD_LOG"
+  cat "$BUILD_LOG"
+  exit 1
+fi
+echo "build ok -> $PROBE"
+echo "compiling $REDUCE_SPV (F0b shader-host-read path)"
+glslc --target-env=vulkan1.2 "$HERE/vk_stream_reduce.comp" -o "$REDUCE_SPV" >> "$BUILD_LOG" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] || [ ! -f "$REDUCE_SPV" ]; then
+  echo "FATAL: glslc failed rc=$rc, see $BUILD_LOG"
+  cat "$BUILD_LOG"
+  exit 1
+fi
+echo "shader ok -> $REDUCE_SPV"
 
 echo "--- step 3: run the probe (min 2 s/trial, interleaved 1,2,3,3,2,1)"
 PROBE_OUT="$OUT/${TAG}.txt"
 env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json \
-    "$PROBE" 2.0 "$SHARD" > "$PROBE_OUT" 2>&1
+    "$PROBE" 2.0 "$SHARD" "$REDUCE_SPV" > "$PROBE_OUT" 2>&1
 rc=$?
 echo "probe rc=$rc -> $PROBE_OUT"
 if [ "$rc" -ne 0 ]; then

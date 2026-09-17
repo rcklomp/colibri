@@ -453,9 +453,14 @@ static void *trial_thread(void *argp) {
             out->unavailable = 1; snprintf(out->reason, sizeof(out->reason), "vkCreateBuffer(external) failed"); barrier_wait(a->ready, a->nparty); return NULL;
         }
         VkMemoryHostPointerPropertiesEXT hostProps = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-        if (d->fn_getHostPtrProps(d->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT, hostptr, &hostProps) != VK_SUCCESS) {
+        VkResult hpr = d->fn_getHostPtrProps(d->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT, hostptr, &hostProps);
+        if (hpr != VK_SUCCESS) {
             vkDestroyBuffer(d->dev, ext_buf, NULL);
-            out->unavailable = 1; snprintf(out->reason, sizeof(out->reason), "vkGetMemoryHostPointerPropertiesEXT failed"); barrier_wait(a->ready, a->nparty); return NULL;
+            out->unavailable = 1;
+            snprintf(out->reason, sizeof(out->reason),
+                     "vkGetMemoryHostPointerPropertiesEXT rc=%d ptr=%p off=%zu win=%zu align=%llu",
+                     (int)hpr, hostptr, off, win, (unsigned long long)d->ext_host_align);
+            barrier_wait(a->ready, a->nparty); return NULL;
         }
         VkMemoryRequirements req; vkGetBufferMemoryRequirements(d->dev, ext_buf, &req);
         uint32_t bits = req.memoryTypeBits & hostProps.memoryTypeBits;

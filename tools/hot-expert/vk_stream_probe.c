@@ -605,7 +605,14 @@ int main(int argc, char **argv) {
             struct stat st;
             if (fstat(fd, &st) == 0) {
                 filesize = (size_t)st.st_size;
-                void *m = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, fd, 0);
+                /* PROT_WRITE + MAP_PRIVATE, not PROT_READ alone: amdgpu's
+                 * userptr pinning (what VK_EXT_external_memory_host's
+                 * HOST_ALLOCATION_BIT_EXT import uses under RADV) returned
+                 * EACCES (rc=-13) against a read-only mapping in testing.
+                 * MAP_PRIVATE means any write stays copy-on-write in this
+                 * process only -- the file itself is still never written --
+                 * and nothing here ever writes through this pointer. */
+                void *m = mmap(NULL, filesize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
                 if (m == MAP_FAILED) { fprintf(stderr, "WARN mmap(%s) failed: %s\n", shard_path, strerror(errno)); filesize = 0; }
                 else filebase = (const uint8_t *)m;
             }

@@ -1895,6 +1895,19 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     const double _tm1 = optime_on() ? optime_now() : 0.0;
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
+    /* F6a: the indexer's own #pragma omp parallel for regions (sparse_index.h)
+     * must not nest inside another one, or this box's libgomp collapses them
+     * to one thread and the parallel score pass silently buys nothing (G8's
+     * finding, max-active-levels=1). mla_layer's layer loop is sequential and
+     * this call sits outside every pragma in this function (1829, 1886, 1985,
+     * 1996, 2021) -- checked by inspection at F6a time; this catches a future
+     * change that moves the call without noticing. */
+#ifdef _OPENMP
+    if (omp_in_parallel()) {
+        fprintf(stderr, "indexer chiamato dentro una regione omp gia' attiva\n");
+        exit(1);
+    }
+#endif
     const int index_rc = index_cache_on()
         ? coli_sparse_index_select_range_cached(selected, iq, ik, gates, head_w, l->ikpa,
                                        valid, seen, IH, ID, c->index_kpool, c->index_topk,

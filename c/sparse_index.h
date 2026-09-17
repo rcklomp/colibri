@@ -33,10 +33,298 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* Width of one query's index row: topk expanded tokens plus the tail. */
 static inline int coli_sparse_index_width(int topk, int pool, int with_tail) {
     return with_tail ? topk + pool - 1 : topk;
+}
+
+/* F6a: GLM53_INDEX_SCALAR=1 restores the original serial, O(wanted*pools)
+ * scan below byte-for-byte -- the A/B against the parallel/heap path, named
+ * after the file's own GLM53_NO_INDEX_CACHE convention (glm53.c). Default
+ * (0) is the new path: it changes no arithmetic and no selection outcome,
+ * only how many threads compute it and how the top-`wanted` is found, so
+ * default-on is the same footing G4/G5/G7/G8 shipped on. */
+static inline int coli_sparse_index_scalar_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("GLM53_INDEX_SCALAR");
+        cached = (e && atoi(e)) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* A candidate pool for the top-`wanted` selection: its score and its own
+ * pool index, so ties can still be broken to the lower index after the
+ * score alone stops distinguishing two entries. */
+typedef struct { float score; int idx; } coli_index_cand_t;
+
+/* Is `a` strictly worse than `b` in the selection order -- lower score, or
+ * (tied score) the higher pool index? This is the total order the original
+ * greedy scan's `scores[p] > scores[best]` (strict) already imposes by
+ * scanning pools ascending and only ever replacing `best` on a strict
+ * improvement: the first pool (lowest index) at a given score is never
+ * displaced by a later one at the same score. */
+static inline int coli_index_cand_worse(const coli_index_cand_t *a, const coli_index_cand_t *b) {
+    if (a->score != b->score) return a->score < b->score;
+    return a->idx > b->idx;
+}
+
+static inline void coli_index_heap_sift_down(coli_index_cand_t *h, int n, int i) {
+    for (;;) {
+        int l = 2 * i + 1, r = 2 * i + 2, m = i;
+        if (l < n && coli_index_cand_worse(&h[l], &h[m])) m = l;
+        if (r < n && coli_index_cand_worse(&h[r], &h[m])) m = r;
+        if (m == i) break;
+        coli_index_cand_t t = h[i]; h[i] = h[m]; h[m] = t;
+        i = m;
+    }
+}
+
+static inline void coli_index_heap_sift_up(coli_index_cand_t *h, int i) {
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (!coli_index_cand_worse(&h[i], &h[p])) break;
+        coli_index_cand_t t = h[i]; h[i] = h[p]; h[p] = t;
+        i = p;
+    }
+}
+
+/* Descending by score, ties ascending by index -- rank order, lowest index
+ * first among ties, exactly what the original scan emits. */
+static inline int coli_index_cand_cmp_desc(const void *pa, const void *pb) {
+    const coli_index_cand_t *a = pa, *b = pb;
+    if (a->score != b->score) return a->score < b->score ? 1 : -1;
+    return a->idx - b->idx;
+}
+
+/* Exact equivalent of "scan `wanted` times, each time take the strict
+ * maximum of the remaining pools, ties to the lower index" -- computed with
+ * a bounded min-heap of size `wanted` (O(pools log wanted)) instead of the
+ * O(wanted * pools) repeated scan. `heap` is caller-owned scratch of at
+ * least `wanted` entries. Pools at exactly -FLT_MAX (incomplete, or not yet
+ * causally visible -- see the callers) are excluded, matching the
+ * `scores[p] > -FLT_MAX` filter the scan applies before ever comparing a
+ * pool to `best`. Returns how many entries were selected (< wanted when
+ * fewer than `wanted` pools were eligible); the caller's row was already
+ * initialised to -1 and is left that way past this count, same as the
+ * scan's own `break`. */
+static inline int coli_index_select_topk(int *row, const float *scores, int pools,
+                                          int pool, int first, int wanted,
+                                          coli_index_cand_t *heap) {
+    int hn = 0;
+    for (int p = 0; p < pools; p++) {
+        if (scores[p] == -FLT_MAX) continue;
+        coli_index_cand_t cand = { scores[p], p };
+        if (hn < wanted) {
+            heap[hn] = cand;
+            coli_index_heap_sift_up(heap, hn);
+            hn++;
+        } else if (coli_index_cand_worse(&heap[0], &cand)) {
+            heap[0] = cand;
+            coli_index_heap_sift_down(heap, hn, 0);
+        }
+    }
+    qsort(heap, (size_t)hn, sizeof(*heap), coli_index_cand_cmp_desc);
+    for (int rank = 0; rank < hn; rank++)
+        for (int j = 0; j < pool; j++)
+            row[rank * pool + j] = first + heap[rank].idx * pool + j;
+    return hn;
+}
+
+/* One row's score pass, pools as the parallel axis (G7's pattern, verbatim:
+ * each iteration writes only its own scores[p], reads pool_base/queries/
+ * head_w/complete read-only, no shared accumulator -- no score's own
+ * summation order changes, only the order pools are computed in). Used for
+ * the few-rows case (decode): a single row has no other axis to give the
+ * other cores. */
+static inline void coli_sparse_index_score_row(float *scores, const float *pool_base,
+        const float *queries, const float *head_w, const unsigned char *complete,
+        int q, int q_from, int first, int pools, int heads, int dim, int pool, float scale) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int p = 0; p < pools; p++) {
+        const int last = first + (p + 1) * pool - 1;
+        if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
+        const float *pv = pool_base + (size_t)p * dim;
+        float score = 0.0f;
+        for (int h = 0; h < heads; h++) {
+            const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
+            float dot = 0.0f;
+            for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
+            if (dot > 0.0f)                                  /* ReLU */
+                score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+        }
+        scores[p] = score;
+    }
+}
+
+/* The score pass and the top-`wanted` selection, shared by the plain and
+ * cached pooled-key paths below -- their score/select/tail loops were
+ * byte-for-byte identical, differing only in which pooled-key buffer they
+ * read (`pooled` vs `pool_cache`), which is `pool_base` here.
+ *
+ * Two axes, chosen once per call:
+ *   - many rows (prefill, q_to-q_from >= the thread count): parallel over
+ *     ROWS, one thread per row end to end, its own scratch -- fewer and
+ *     cheaper barriers than one per row;
+ *   - few rows (decode): parallel over POOLS within each row's score pass
+ *     (the axis above), one row at a time.
+ * Both compute exactly the serial code's own numbers, only in a different
+ * order (§G7's argument): no score's own summation order changes, and the
+ * selection is the same exact top-`wanted` by construction (see
+ * coli_index_select_topk). GLM53_INDEX_SCALAR=1 forces the original
+ * single-threaded O(wanted*pools) scan, unchanged, for the A/B.
+ *
+ * Returns 0, or -1 on allocation failure (the caller frees its own buffers
+ * and returns -1 in turn, same as every other failure path here). */
+static inline int coli_sparse_index_score_select(int *out, const float *pool_base,
+        const float *queries, const float *head_w, const unsigned char *complete,
+        const unsigned char *valid, int heads, int dim, int pool,
+        int wanted, int with_tail, int topk, int width,
+        int q_from, int q_to, int first, int pools) {
+    const float scale = 1.0f / sqrtf((float)dim);
+    const int scalar = coli_sparse_index_scalar_on();
+#ifdef _OPENMP
+    const int nthreads = scalar ? 1 : omp_get_max_threads();
+#else
+    const int nthreads = 1;
+#endif
+    const int rows = q_to - q_from;
+
+    if (scalar) {
+        float *scores = malloc((size_t)pools * sizeof(float));
+        unsigned char *taken = calloc((size_t)pools, 1);
+        if (!scores || !taken) { free(scores); free(taken); return -1; }
+        for (int q = q_from; q < q_to; q++) {
+            int *row = out + (size_t)(q - q_from) * width;
+            for (int i = 0; i < width; i++) row[i] = -1;
+            if (valid[q]) {
+                for (int p = 0; p < pools; p++) {
+                    const int last = first + (p + 1) * pool - 1;
+                    if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
+                    const float *pv = pool_base + (size_t)p * dim;
+                    float score = 0.0f;
+                    for (int h = 0; h < heads; h++) {
+                        const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
+                        float dot = 0.0f;
+                        for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
+                        if (dot > 0.0f)
+                            score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+                    }
+                    scores[p] = score;
+                }
+                for (int rank = 0; rank < wanted; rank++) {
+                    int best = -1;
+                    for (int p = 0; p < pools; p++)
+                        if (!taken[p] && scores[p] > -FLT_MAX &&
+                            (best < 0 || scores[p] > scores[best])) best = p;
+                    if (best < 0) break;
+                    taken[best] = 1;
+                    for (int j = 0; j < pool; j++) row[rank * pool + j] = first + best * pool + j;
+                }
+                memset(taken, 0, (size_t)pools);
+            }
+            if (with_tail) {
+                int visible = 0;
+                for (int i = first; i <= q; i++) if (valid[i]) visible++;
+                const int tail = visible % pool;
+                const int tail_start = first + visible - tail;
+                for (int j = 0; j < tail && j < pool - 1; j++)
+                    if (tail_start + j <= q && valid[tail_start + j])
+                        row[topk + j] = tail_start + j;
+            }
+        }
+        free(scores); free(taken);
+        return 0;
+    }
+
+    if (nthreads > 1 && rows >= nthreads) {
+        /* Per-thread scratch, 64-byte aligned and cache-line strided
+         * (P5b.1's false-sharing lesson) so two threads' buffers never
+         * share a line. */
+        const size_t sstride = (((size_t)pools * sizeof(float) + 63) / 64) * 64 / sizeof(float);
+        const size_t hstride = (((size_t)wanted * sizeof(coli_index_cand_t) + 63) / 64) * 64
+                                / sizeof(coli_index_cand_t);
+        float *scores_pool = malloc((size_t)nthreads * sstride * sizeof(float));
+        coli_index_cand_t *heap_pool =
+            malloc((size_t)nthreads * hstride * sizeof(coli_index_cand_t));
+        if (!scores_pool || !heap_pool) { free(scores_pool); free(heap_pool); return -1; }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int q = q_from; q < q_to; q++) {
+#ifdef _OPENMP
+            const int tid = omp_get_thread_num();
+#else
+            const int tid = 0;
+#endif
+            float *scores = scores_pool + (size_t)tid * sstride;
+            coli_index_cand_t *heap = heap_pool + (size_t)tid * hstride;
+            int *row = out + (size_t)(q - q_from) * width;
+            for (int i = 0; i < width; i++) row[i] = -1;
+            if (valid[q]) {
+                for (int p = 0; p < pools; p++) {
+                    const int last = first + (p + 1) * pool - 1;
+                    if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
+                    const float *pv = pool_base + (size_t)p * dim;
+                    float score = 0.0f;
+                    for (int h = 0; h < heads; h++) {
+                        const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
+                        float dot = 0.0f;
+                        for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
+                        if (dot > 0.0f)
+                            score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+                    }
+                    scores[p] = score;
+                }
+                coli_index_select_topk(row, scores, pools, pool, first, wanted, heap);
+            }
+            if (with_tail) {
+                int visible = 0;
+                for (int i = first; i <= q; i++) if (valid[i]) visible++;
+                const int tail = visible % pool;
+                const int tail_start = first + visible - tail;
+                for (int j = 0; j < tail && j < pool - 1; j++)
+                    if (tail_start + j <= q && valid[tail_start + j])
+                        row[topk + j] = tail_start + j;
+            }
+        }
+        free(scores_pool); free(heap_pool);
+        return 0;
+    }
+
+    /* Decode: one row at a time, parallel over pools within the score pass
+     * (the router's own axis, G7). */
+    {
+        float *scores = malloc((size_t)pools * sizeof(float));
+        coli_index_cand_t *heap = malloc((size_t)wanted * sizeof(coli_index_cand_t));
+        if (!scores || !heap) { free(scores); free(heap); return -1; }
+        for (int q = q_from; q < q_to; q++) {
+            int *row = out + (size_t)(q - q_from) * width;
+            for (int i = 0; i < width; i++) row[i] = -1;
+            if (valid[q]) {
+                coli_sparse_index_score_row(scores, pool_base, queries, head_w, complete,
+                                             q, q_from, first, pools, heads, dim, pool, scale);
+                coli_index_select_topk(row, scores, pools, pool, first, wanted, heap);
+            }
+            if (with_tail) {
+                int visible = 0;
+                for (int i = first; i <= q; i++) if (valid[i]) visible++;
+                const int tail = visible % pool;
+                const int tail_start = first + visible - tail;
+                for (int j = 0; j < tail && j < pool - 1; j++)
+                    if (tail_start + j <= q && valid[tail_start + j])
+                        row[topk + j] = tail_start + j;
+            }
+        }
+        free(scores); free(heap);
+    }
+    return 0;
 }
 
 /* Select the key blocks each query may attend.
@@ -74,11 +362,9 @@ static inline int coli_sparse_index_select_range(int *out, const float *queries,
     const int wanted = topk / pool;
 
     float *pooled = calloc((size_t)pools * dim, sizeof(*pooled));
-    float *scores = malloc((size_t)pools * sizeof(*scores));
     unsigned char *complete = calloc((size_t)pools, 1);
-    unsigned char *taken = calloc((size_t)pools, 1);
-    if (!pooled || !scores || !complete || !taken) {
-        free(taken); free(complete); free(scores); free(pooled);
+    if (!pooled || !complete) {
+        free(complete); free(pooled);
         return -1;
     }
 
@@ -114,51 +400,15 @@ static inline int coli_sparse_index_select_range(int *out, const float *queries,
         }
     }
 
-    const float scale = 1.0f / sqrtf((float)dim);
-    for (int q = q_from; q < q_to; q++) {
-        int *row = out + (size_t)(q - q_from) * width;
-        for (int i = 0; i < width; i++) row[i] = -1;
-        if (!valid[q]) continue;
-
-        for (int p = 0; p < pools; p++) {
-            const int last = first + (p + 1) * pool - 1;
-            if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
-            float score = 0.0f;
-            for (int h = 0; h < heads; h++) {
-                const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
-                float dot = 0.0f;
-                for (int d = 0; d < dim; d++) dot += query[d] * pooled[(size_t)p * dim + d];
-                if (dot > 0.0f)                                  /* ReLU */
-                    score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
-            }
-            scores[p] = score;
-        }
-
-        for (int rank = 0; rank < wanted; rank++) {
-            int best = -1;
-            for (int p = 0; p < pools; p++)
-                if (!taken[p] && scores[p] > -FLT_MAX &&
-                    (best < 0 || scores[p] > scores[best])) best = p;
-            if (best < 0) break;
-            taken[best] = 1;
-            for (int j = 0; j < pool; j++) row[rank * pool + j] = first + best * pool + j;
-        }
-        memset(taken, 0, (size_t)pools);
-
-        if (with_tail) {
-            int visible = 0;
-            for (int i = first; i <= q; i++) if (valid[i]) visible++;
-            const int tail = visible % pool;
-            const int tail_start = first + visible - tail;
-            for (int j = 0; j < tail && j < pool - 1; j++)
-                if (tail_start + j <= q && valid[tail_start + j])
-                    row[topk + j] = tail_start + j;
-        }
+    if (coli_sparse_index_score_select(out, pooled, queries, head_w, complete, valid,
+            heads, dim, pool, wanted, with_tail, topk, width,
+            q_from, q_to, first, pools)) {
+        free(complete);
+        free(pooled);
+        return -1;
     }
 
-    free(taken);
     free(complete);
-    free(scores);
     free(pooled);
     return 0;
 }
@@ -214,11 +464,9 @@ static inline int coli_sparse_index_select_range_cached(int *out, const float *q
     const int pools = (sequence + pool - 1) / pool;
     const int wanted = topk / pool;
 
-    float *scores = malloc((size_t)pools * sizeof(*scores));
     unsigned char *complete = calloc((size_t)pools, 1);
-    unsigned char *taken = calloc((size_t)pools, 1);
-    if (!scores || !complete || !taken) {
-        free(taken); free(complete); free(scores);
+    if (!complete) {
+        free(complete);
         return -1;
     }
 
@@ -266,52 +514,14 @@ static inline int coli_sparse_index_select_range_cached(int *out, const float *q
     }
     *pool_cache_count = frontier;
 
-    const float scale = 1.0f / sqrtf((float)dim);
-    for (int q = q_from; q < q_to; q++) {
-        int *row = out + (size_t)(q - q_from) * width;
-        for (int i = 0; i < width; i++) row[i] = -1;
-        if (!valid[q]) continue;
-
-        for (int p = 0; p < pools; p++) {
-            const int last = first + (p + 1) * pool - 1;
-            if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
-            const float *pv = pool_cache + (size_t)p * dim;
-            float score = 0.0f;
-            for (int h = 0; h < heads; h++) {
-                const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
-                float dot = 0.0f;
-                for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
-                if (dot > 0.0f)                                  /* ReLU */
-                    score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
-            }
-            scores[p] = score;
-        }
-
-        for (int rank = 0; rank < wanted; rank++) {
-            int best = -1;
-            for (int p = 0; p < pools; p++)
-                if (!taken[p] && scores[p] > -FLT_MAX &&
-                    (best < 0 || scores[p] > scores[best])) best = p;
-            if (best < 0) break;
-            taken[best] = 1;
-            for (int j = 0; j < pool; j++) row[rank * pool + j] = first + best * pool + j;
-        }
-        memset(taken, 0, (size_t)pools);
-
-        if (with_tail) {
-            int visible = 0;
-            for (int i = first; i <= q; i++) if (valid[i]) visible++;
-            const int tail = visible % pool;
-            const int tail_start = first + visible - tail;
-            for (int j = 0; j < tail && j < pool - 1; j++)
-                if (tail_start + j <= q && valid[tail_start + j])
-                    row[topk + j] = tail_start + j;
-        }
+    if (coli_sparse_index_score_select(out, pool_cache, queries, head_w, complete, valid,
+            heads, dim, pool, wanted, with_tail, topk, width,
+            q_from, q_to, first, pools)) {
+        free(complete);
+        return -1;
     }
 
-    free(taken);
     free(complete);
-    free(scores);
     return 0;
 }
 

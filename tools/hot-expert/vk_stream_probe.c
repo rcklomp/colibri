@@ -343,7 +343,7 @@ typedef struct {
     long long bytes;
     double secs;
     int unavailable;
-    char reason[160];
+    char reason[256];
 } TrialOut;
 
 static void record_copy_cb(DevCtx *d, VkBuffer src, size_t block) {

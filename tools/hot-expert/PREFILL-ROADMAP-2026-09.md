@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 31, 2026-09-17)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 32, 2026-09-18)
+
+**Rev 32 (2026-09-18): no prefill-track change; one prefill fact from the Franken track's F4/F6 work belongs here.** With per-request `[OPTIME]` in engine mode (F4, record §X3 step 0) the 18k ladder turn's 2 561 s decomposes per prompt row as ≈ 168 ms DSA indexer + 67 ms routed experts + attention/KDA/rest; the indexer's score pass is single-threaded scalar code with a quadratic top-512 (`c/sparse_index.h`, design in `tools/hot-expert/F6-INDEXER-DESIGN-2026-09-18.md`), so the first prefill lever at depth on this track is F6a (parallel, bit-identical), not the expert path. What is next on this track is unchanged from rev 30 until F6a's gate is in.
 
 **Rev 31 (2026-09-17): no prefill-track change; the Franken track moved.** Tonight's results live in `FRANKEN-ENGINE-PLAN-2026-09-15.md` rev 11 and the record's §FRANKEN-H2, §PCIE-STREAM, §GPTOSS-3CARD, §X3 step 0, §FRANKEN-H2c. One finding touches this track's own harness: the ladder's cold-sweep reuse ratio (plan §2.4 Q2) was miscalibrated for the ladder shape and is withdrawn; the follow-up TTFT at depth is the reuse number. What is next on this track is unchanged from rev 30.
 

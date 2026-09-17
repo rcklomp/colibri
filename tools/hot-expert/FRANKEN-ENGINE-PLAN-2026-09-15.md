@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 13 (2026-09-17, 02:00 CEST) — the Franken-engine design, §8.** Written
+> from the measured regime map only (§FRANKEN-H2, §PCIE-STREAM, §GPTOSS-3CARD,
+> §GLM53FLASH-LADDER, §X3 step 0, §G11, §RP1). Owner's stated goal: a model
+> larger than one card over the three GPUs with experts or KV in RAM, at usable
+> speed at realistic depth; GLM-class as the daily driver; gpt-oss-120b was the
+> test vehicle only. §8 says what to build, in what order, with the projected
+> delta and the falsifier for each item, and states plainly which goals the
+> numbers do not support on this box.
+>
 > **Rev 12 (2026-09-17 01:30 CEST, 2026-09-16 23:30 UTC) — the same-model
 > pair is measured (record §GLM53FLASH-LADDER).** GLM-5.3-Flash under the
 > owner's own llama.cpp deployment (UD-IQ4_XS, 18 of the layers on the three
@@ -654,3 +663,85 @@ This plan will **not**:
 Fable's part ends here unless H3 lands in the NO VERDICT region and the owner
 wants a call on partial data, or D-3 returns ≥ 2× and the backend question
 reopens for the resident path.
+
+
+## 8. Rev 13 — the Franken-engine on rome: what the measurements say to build
+
+### 8.1 The regime map, measured (all on this box, 2026-09-16)
+
+| regime | engine / model | decode @18k | ladder TTFT @18k | follow-up @18.5k | source |
+|---|---|---|---|---|---|
+| fully resident, 3 cards | llama.cpp, gpt-oss-120b MXFP4 (63 GB, 5 B active) | 75–76 tok/s | 4.3 s (HIP) / 7.5 s (VK) | 0.3–0.7 s | §GPTOSS-3CARD |
+| half the experts in RAM | same | 28 tok/s | 66 s | 3.6 s | §GPTOSS-3CARD |
+| all experts in RAM | same | 17.6 tok/s | 127 s | 1.0–6.3 s | §GPTOSS-3CARD |
+| GLM-5.3-Flash, llama.cpp offload (18 GPU layers) | IQ4_XS, ROCm 7.14 container | 2.80 tok/s | 108 s | 5.6–7.1 s | §GLM53FLASH-LADDER |
+| GLM-5.3-Flash, Colibri (tiers 79 % of calls, rest CPU) | int4-gs64 | 2.27 tok/s | 2 561 s | 6.9 s | §FRANKEN-H2 |
+| host→GPU stream, 3 cards concurrent | HIP probe | — | — | — | 61.4–62.0 GB/s (1 card 28.0; dev0+dev3 share a link) |
+| CPU int4 expert path | Colibri, 8 threads | — | — | — | 21.95 GB/s (§G11) |
+
+Two things follow before any design. **Decode at depth is bytes-from-RAM per
+token divided by the path's rate, plus whatever grows with context.** And on
+GLM-5.3-Flash the expert misses are *not* the growing part: the CPU path
+streams ~985 MB/token (§G11 note) at 21.95 GB/s ≈ 45 ms, inside a token that
+is 235 ms at 2.7k and 441 ms at 18.4k (§X3 step 0). Removing the miss cost
+entirely bounds decode at ≈ 1000/(441 − 45) ≈ **2.5 tok/s at 18k**. The 205
+ms/token that appears between 2.7k and 18k is unattributed (X3 step 0 could
+not run: the `[OPTIME]` table dies with the engine's SIGTERM). **So for the
+daily model the decode lever is the depth term, not the expert path**, and
+the prefill lever is the expert path — 2 561 s vs llama.cpp's 108 s on the
+same model is the order-of-magnitude gap, and it is a prefill gap.
+
+### 8.2 What the numbers do and do not support
+
+- **Supported:** GLM-5.3-Flash prefill from 2 561 s to the ~100 s class at
+  18k by chunked, batched prefill with non-resident experts streamed once per
+  chunk into the three cards (F2 below). Projected, derivation in F2.
+- **Supported:** a fully resident GLM-class model ≤ ~60 GB int4 across the
+  three cards at the 75 tok/s class with sub-second follow-ups — the measured
+  gpt-oss regime, on Colibri's own three-card tier (V1's code, one card today).
+  This is the only measured route to "usable speed at depth" and it requires
+  a model that fits 72 GB with KV. The owner picks the model (assumption held
+  here: GLM-5.3-Flash stays the daily driver, so this is regime B, optional).
+- **Not supported:** GLM-5.3-Flash (182 GiB int4) decoding above ~2.5 tok/s
+  at 18k by any placement change alone. 3 390 of 12 096 experts are resident
+  (79 % of calls); the other 21 % cost 45 ms; the remaining 396 ms/token are
+  attention, indexer, dense, submit. Until F4 attributes the 205 ms growth,
+  no decode projection for this model is honest, and none is made.
+- **Not supported:** tensor parallelism across the three cards as a speed
+  lever. Decode on a resident model is already 75 tok/s with layer split and
+  zero cross-card traffic per token; TP adds a 25 µs hop per layer (§M0c) for
+  a bandwidth split a 7900 XTX does not need at batch 1. KV offload to RAM:
+  the KV of a 18k context is not the bottleneck on either engine (follow-ups
+  at 18.5k are 0.3–7 s on all rows); it becomes one only at depths this box
+  does not reach in a session.
+
+### 8.3 Items
+
+| id | item | expected (projected, derivation shown) | gate | tier / effort |
+|---|---|---|---|---|
+| **F0** | **Vulkan host→device stream rate.** §PCIE-STREAM measured HIP. Colibri is Vulkan/RADV; measure `vkCmdCopyBuffer` from host-visible memory and from a mapped page-cache buffer, 14 MiB blocks, 1/2/3 cards concurrent, same probe shape (`tools/hot-expert/rome_vkbench.c` has the device setup) | ≥ 50 GB/s aggregate on three cards if RADV's upload path matches HIP's; **falsifier:** < 40 GB/s → F2 streams through HIP (the container) or a HIP upload helper, and D-3 leaves the parked list | ROW lines as §PCIE-STREAM; under the lock, gateway up | Sonnet, 1 day |
+| **F2** | **Chunked batched prefill with expert streaming.** Prefill in chunks of S rows (512 default, knob); per MoE layer, group the chunk's rows by expert (Q9 step 1's grouping exists); resident experts run on their tier as today; each **non-resident** expert is copied once per chunk into a per-card ring buffer (dev2 first — its link is its own; dev0/dev3 share ~33 GB/s) and run through `qmatmul_gate_up_tile.spv` / `qmatmul_tile.spv` on that card; the CPU int4 path stays as `COLI_PREFILL_STREAM=0`. | non-resident set ≈ 8 706 experts × 14.16 MB = 123 GB per chunk; at 61 GB/s = 2.0 s per 512 rows ≈ **3.9 ms/token** for the streamed experts, vs 113.9 ms/token today (fit, §1); with GPU tile compute and the attention/indexer prefill unchanged, 18k prefill projected **≈ 70–130 s** (vs 2 561 s measured, 108 s on llama.cpp). Chunk 2 048 rows: 9 chunks, ~1.1 s/1k tokens of streaming | `prefill_gate.sh` (oracle: `teacher_forcing` identical, last-token logits vs pristine), X2's KL bar, then the H2 ladder A,B,B,A vs today's A rows; **≥ 10× on the 18k ladder-turn TTFT** or the item is rejected; the row beside llama.cpp's 108 s is reported either way | Opus, 2–3 weeks; after F0 |
+| **F4** | **Attribute the 205 ms/token depth growth on GLM.** The zero-cost route: close the engine's stdin in `ttft_serve.EngineDriver.close()` (not in `openai_server.Engine.close()`) so `optime_print` runs; one A-arm ladder with `COLI_TIMERS=1` then carries the table. Fallback: the 1 h 45 m CLI chain in record §X3 step 0 | which bucket grows: attention core, DSA indexer, KV read, or dense/submit. **This decides the decode item:** ≥ 30 % attention+indexer → X3 (stricter selection, knob-gated, X2 bar); KV-read-bound → a KV layout/placement item; neither → the base token is the target (submit overhead, dense stream) | the `[OPTIME]` table at 2.7k and 18.4k in the record, both arms | Sonnet (fix + one arm, ~2 h rig) then Opus (interpretation) |
+| **F1** | **Streamed decode misses** (the 21 %): same ring buffer as F2, at batch 1, prefetch next layer's misses while this layer computes; CPU path becomes the fallback knob. Frees the 8 cores for dense/indexer work | ≤ 45 ms/token on GLM (≤ 19 % at 2.7k, ≤ 10 % at 18k) — real but small on this model; on a ≤ 60 GB model with a partial tier it is the whole miss cost. **Sequenced after F2** (shares its code) and after F4 (which may make it the wrong item) | X2's KL bar, text identical, A,B,B,A on the ladder; verdict through `gate_ab_verdict` | Opus, 1–2 weeks |
+| **F3** | **Three-card residency for any model that fits** (regime B): extend V1's Vulkan tier from one card to three (heat-ranked, per-device budget, `COLI_VK_DEV0/2/3`), attention/KV on dev0, tiers on all three, so a ≤ 60 GB int4 GLM-class model is 100 % resident with P7/P9 checkpoints and slots intact | the measured resident regime: 75 tok/s class at 18k (gpt-oss, layer-split; Colibri's number **unknown** until run — the submit-model ceiling of §3 branch 3 was withdrawn but not replaced by a measurement) | tier line asserts 100 % residency; A,B,B,A vs llama.cpp resident on the same GGUF-equivalent weights; the greedy-text agreement count of H2b | Opus, 1–2 weeks; **only when the owner names the model** |
+| **F5** | **MTP in the streamed regime** (X5): hipFire measured 131 tok/s at 1.4k *with* MTP on the resident 35B (§FRANKEN-H2 throwaway `mtp: true`); Q9 killed it here in the CPU-miss regime. Re-test only after F2/F1 change the verify block's cost | unknown; the discriminator is whether the verify block reads streamed experts once per block | interleaved knob on/off on the ladder; text identical | Sonnet, after F1 |
+| parked | H2b, H4, D-3 (branches exist), L1 | — | — | D-3 re-enters only under F0's falsifier |
+
+### 8.4 Order, and what each step must show before the next
+
+F0 (1 day) → F2 (the prefill item; the owner's long-document wait) in
+parallel with F4 (2 h of rig, the decode question) → the decode item F4
+names → F1 → F5. F3 runs whenever the owner names a ≤ 60 GB model; it is
+the shortest path to the 75 tok/s regime and does not wait for anything
+above. Every item ships behind a knob, off by default, with its oracle and
+its A,B,B,A row in the commit body; every projection above is a thing to be
+beaten or refuted by that row.
+
+### 8.5 The one decision that is the owner's
+
+Regime A keeps GLM-5.3-Flash: prefill falls by an order of magnitude (F2),
+decode at depth is whatever F4 finds, and stays under ~3 tok/s until then.
+Regime B takes a GLM-class model that fits 72 GB: 75 tok/s class at depth,
+measured, on the same engine after F3. Both can coexist behind `coli`'s
+model switch; the plan builds A first because it is the daily model, and
+F3 the moment a model is named.

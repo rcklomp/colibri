@@ -445,7 +445,7 @@ static void *trial_thread(void *argp) {
         void *hostptr = (void *)(a->filebase + off);   /* page-aligned: win and off are both multiples of the 4 KiB page */
 
         VkExternalMemoryBufferCreateInfo extbi = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
-            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT};
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &extbi,
             .size = (VkDeviceSize)win, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         VkBuffer ext_buf;
@@ -453,7 +453,7 @@ static void *trial_thread(void *argp) {
             out->unavailable = 1; snprintf(out->reason, sizeof(out->reason), "vkCreateBuffer(external) failed"); barrier_wait(a->ready, a->nparty); return NULL;
         }
         VkMemoryHostPointerPropertiesEXT hostProps = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-        VkResult hpr = d->fn_getHostPtrProps(d->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT, hostptr, &hostProps);
+        VkResult hpr = d->fn_getHostPtrProps(d->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostptr, &hostProps);
         if (hpr != VK_SUCCESS) {
             vkDestroyBuffer(d->dev, ext_buf, NULL);
             out->unavailable = 1;
@@ -473,7 +473,7 @@ static void *trial_thread(void *argp) {
             barrier_wait(a->ready, a->nparty); return NULL;
         }
         VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT, .pHostPointer = hostptr};
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = hostptr};
         VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp,
             .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt};
         VkDeviceMemory ext_mem;

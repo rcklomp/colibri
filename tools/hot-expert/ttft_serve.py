@@ -395,6 +395,29 @@ class EngineDriver:
         return ev
 
     def close(self):
+        # F4 (record sec X3 step 0): glm53 installs no signal handler and
+        # prints its [OPTIME] table (COLI_TIMERS) only from a
+        # __attribute__((destructor)), which runs when main() returns --
+        # serve_loop() returns only on stdin EOF. self.eng.close() below
+        # (openai_server.Engine.close(), the owner's gateway shutdown path,
+        # left untouched) SIGTERMs the process, whose default disposition
+        # skips destructors entirely, so no engine-mode run has ever
+        # produced that table. Closing stdin first gives the engine a
+        # chance to see EOF and exit through its own path; bounded so a
+        # wedged engine still falls through to the existing terminate/kill.
+        # When the process was already going to exit promptly on its own,
+        # this is the only change: Engine.close() finds process.poll() is
+        # not None and skips the terminate/wait/kill branch it would
+        # otherwise take, so behaviour there is unchanged.
+        try:
+            if self.eng.process.stdin is not None:
+                self.eng.process.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.eng.process.wait(timeout=60)
+        except Exception:
+            pass
         try:
             self.eng.close()
         except Exception:

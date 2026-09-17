@@ -4006,41 +4006,70 @@ static void optime_reset(void) {
     g_t_eg = g_t_cpu = 0.0; g_n_eg = g_n_eg_disp = g_n_cpu = g_n_devloss = 0;
 #endif
 }
-__attribute__((destructor)) static void optime_print(void) {
+/* F4 (record sec X3 step 0): the body of the report, parameterised on the
+ * line tag so a serve-mode request and the final destructor can share it.
+ * Reads the same accumulators optime_reset() zeroes; does not reset them
+ * itself; a no-op whenever optime_on() is false or nothing was timed. */
+static void optime_report(const char *tag) {
     if (!optime_on() || !g_on_layers) return;
     const double sum = g_ot_kda + g_ot_mla + g_ot_ffn_dense + g_ot_ffn_moe + g_ot_hc;
-    fprintf(stderr, "[OPTIME] forwards=%ld layers=%.3fs head=%.3fs (n=%ld)\n",
-            g_on_layers, g_ot_layers, g_ot_head, g_on_head);
-    fprintf(stderr, "[OPTIME] kda=%.3fs n=%ld (%.3f ms/call) | mla=%.3fs n=%ld (%.3f ms/call)\n",
-            g_ot_kda, g_on_kda, g_on_kda ? 1e3 * g_ot_kda / g_on_kda : 0.0,
+    fprintf(stderr, "%s forwards=%ld layers=%.3fs head=%.3fs (n=%ld)\n",
+            tag, g_on_layers, g_ot_layers, g_ot_head, g_on_head);
+    fprintf(stderr, "%s kda=%.3fs n=%ld (%.3f ms/call) | mla=%.3fs n=%ld (%.3f ms/call)\n",
+            tag, g_ot_kda, g_on_kda, g_on_kda ? 1e3 * g_ot_kda / g_on_kda : 0.0,
             g_ot_mla, g_on_mla, g_on_mla ? 1e3 * g_ot_mla / g_on_mla : 0.0);
-    fprintf(stderr, "[OPTIME] ffn_dense=%.3fs n=%ld (%.3f ms/call) | ffn_moe=%.3fs n=%ld (%.3f ms/call)\n",
-            g_ot_ffn_dense, g_on_ffn_dense, g_on_ffn_dense ? 1e3 * g_ot_ffn_dense / g_on_ffn_dense : 0.0,
+    fprintf(stderr, "%s ffn_dense=%.3fs n=%ld (%.3f ms/call) | ffn_moe=%.3fs n=%ld (%.3f ms/call)\n",
+            tag, g_ot_ffn_dense, g_on_ffn_dense, g_on_ffn_dense ? 1e3 * g_ot_ffn_dense / g_on_ffn_dense : 0.0,
             g_ot_ffn_moe, g_on_ffn_moe, g_on_ffn_moe ? 1e3 * g_ot_ffn_moe / g_on_ffn_moe : 0.0);
-    fprintf(stderr, "[OPTIME] hc+norm=%.3fs n=%ld (%.3f ms/site) | layers-sum=%.3fs unaccounted=%.3fs\n",
-            g_ot_hc, g_on_hc, g_on_hc ? 1e3 * g_ot_hc / g_on_hc : 0.0, sum, g_ot_layers - sum);
+    fprintf(stderr, "%s hc+norm=%.3fs n=%ld (%.3f ms/site) | layers-sum=%.3fs unaccounted=%.3fs\n",
+            tag, g_ot_hc, g_on_hc, g_on_hc ? 1e3 * g_ot_hc / g_on_hc : 0.0, sum, g_ot_layers - sum);
     if (g_kn_calls)
-        fprintf(stderr, "[OPTIME] kda split (n=%ld, gpu-batched=%ld): proj=%.3fs (%.3f ms) "
+        fprintf(stderr, "%s kda split (n=%ld, gpu-batched=%ld): proj=%.3fs (%.3f ms) "
                         "decay=%.3fs (%.3f) step=%.3fs (%.3f) norm=%.3fs (%.3f) ko=%.3fs (%.3f)\n",
-                g_kn_calls, g_kn_batched,
+                tag, g_kn_calls, g_kn_batched,
                 g_kt_proj,  1e3 * g_kt_proj  / g_kn_calls,
                 g_kt_decay, 1e3 * g_kt_decay / g_kn_calls,
                 g_kt_step,  1e3 * g_kt_step  / g_kn_calls,
                 g_kt_norm,  1e3 * g_kt_norm  / g_kn_calls,
                 g_kt_ko,    1e3 * g_kt_ko    / g_kn_calls);
     if (g_mn_calls)
-        fprintf(stderr, "[OPTIME] mla split (n=%ld, mean ctx=%.0f): proj=%.3fs (%.3f ms) "
+        fprintf(stderr, "%s mla split (n=%ld, mean ctx=%.0f): proj=%.3fs (%.3f ms) "
                         "index=%.3fs (%.3f ms) attn=%.3fs (%.3f ms) | index/ctx=%.4f us\n",
-                g_mn_calls, g_mn_seen / (double)g_mn_calls,
+                tag, g_mn_calls, g_mn_seen / (double)g_mn_calls,
                 g_mt_proj,  1e3 * g_mt_proj  / g_mn_calls,
                 g_mt_index, 1e3 * g_mt_index / g_mn_calls,
                 g_mt_attn,  1e3 * g_mt_attn  / g_mn_calls,
                 1e6 * g_mt_index / g_mn_seen);
-    fprintf(stderr, "[OPTIME] moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
+    fprintf(stderr, "%s moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
                     "eg and cpu experts are the [PROF] line; the rest of ffn_moe is bind+dispatch+accumulate\n",
-            g_ot_router, g_ot_shared, g_on_router,
+            tag, g_ot_router, g_ot_shared, g_on_router,
             g_on_router ? 1e3 * g_ot_router / g_on_router : 0.0,
             g_on_router ? 1e3 * g_ot_shared / g_on_router : 0.0);
+}
+/* F4: one table per completed serve-mode request, tagged with a request
+ * counter and that request's context length -- a cumulative table over a
+ * whole ladder mixes depths and cannot attribute growth (record sec X3 step
+ * 0). serve_one() below calls this at the END of a request and calls
+ * optime_reset() (already existed, above) at the START of the next one --
+ * the same reset-before-the-window-it-measures order the CLI path already
+ * uses to make its own single destructor table decode-only (this file, a
+ * few lines up: "so a --greedy run prints decode-only figures"). One
+ * consequence, intended: the LAST request's window is never reset (there is
+ * no next request to do it), so it is still sitting in the accumulators
+ * when the process exits -- the destructor's final print (unchanged, below)
+ * reports it, which is how a serve-mode run keeps a "final table" instead
+ * of ending on an empty one. serve_one() is the only caller; a CLI --greedy
+ * run never calls it and still gets exactly the one destructor table it
+ * always got. */
+static long g_serve_req_n = 0;
+static void optime_print_req(int ctx_tokens) {
+    if (!optime_on()) return;
+    char tag[64];
+    snprintf(tag, sizeof(tag), "[OPTIME req=%ld ctx=%d]", ++g_serve_req_n, ctx_tokens);
+    optime_report(tag);
+}
+__attribute__((destructor)) static void optime_print(void) {
+    optime_report("[OPTIME]");
 }
 
 static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
@@ -5548,6 +5577,11 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         return;
     }
 
+    /* F4: reset the per-op accumulators before THIS request's window, same
+     * order the CLI path already uses around forward_prefill/the decode loop
+     * (reset, then measure) -- see optime_print_req below, where this
+     * request's own window gets printed once it is done. */
+    if (optime_on()) optime_reset();
     const double started = now_s();
     const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
     const uint64_t s_fw = m->forwards;
@@ -5770,6 +5804,13 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                    m->t_attn - s_attn, m->t_head - s_head,
                    (unsigned long long)(m->forwards - s_fw));
     }
+    /* F4: one [OPTIME] table per completed request under COLI_TIMERS=1,
+     * tagged with a request counter and this request's prompt length, then
+     * the accumulators reset -- otherwise a cumulative table over a whole
+     * ladder mixes depths and cannot attribute growth (record sec X3 step
+     * 0). optime_print_req() itself is the only new call on this path and
+     * it returns immediately when optime_on() is false. */
+    optime_print_req(prompt_tokens);
     /* P9 (2026-09-10): `reused` come ULTIMO campo di STAT.
      *
      * Fino a ieri quel numero usciva solo su stderr (la riga REUSE qui sopra) e

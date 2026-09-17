@@ -14,6 +14,32 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 14 (2026-09-17 22:45 CEST, 20:45 UTC) — F0 PASS, F4 answered; §8.3
+> amended.** F0 (record §VK-STREAM): on RADV's dedicated transfer family
+> (SDMA) three cards stream 27 GB/s — the falsifier — but on the backend's own
+> queue family (the one `backend_vulkan.c` picks) `vkCmdCopyBuffer` reaches
+> 59.9–61.1 GB/s and a compute shader reading host-visible staging directly,
+> with no device copy at all, 62.2–63.3 GB/s: HIP's 61.4–62.0 matched, gate
+> PASS, F2 stays Vulkan. Two facts F2 must design around: amdgpu refuses to
+> import file-backed (page-cache) memory (`VK_EXT_external_memory_host`
+> EACCES), so streamed experts pass through a host-visible staging buffer;
+> and the probe's single-thread memcpy into that staging ran at 15 GB/s —
+> **the staging fill, not PCIe, is F2's first bottleneck**, so F2 opens with a
+> step 0 that measures a multi-threaded fill (8 threads read DRAM at 91.6
+> GB/s; a parallel memcpy or `pread` into staging must reach ≥ 60 GB/s or the
+> chunk arithmetic in F2 is off by 4×). F4 (record §X3 step 0, verdict): the
+> DSA indexer is the depth term — 275 ms of a 509 ms forward at 18.6k in the
+> decode-shaped windows, 26–54 % after the small-prefill caveat, slope
+> estimate 38 % — so the ≥ 30 % test passes and **X3 enters §8.3 as F6, the
+> decode item for GLM-5.3-Flash**, with its ceiling stated: 3.3 tok/s at 18k
+> if the indexer holds its shallow cost, 4.3 if it vanished; the MoE bucket
+> (125 ms/forward, of which CPU misses ≤ 45) and the KDA layers (42 ms) are
+> what remains after it. Order now: F2 step 0 (Sonnet, 1 day) → F2 (Opus)
+> in parallel with F6's design (Opus: which selection, what X2 bar, dense-
+> identical below 2 052 tokens by construction) → F1 → F5; F3 when a model
+> is named. Engine-mode `[OPTIME]` per request is now a standing tool
+> (`COLI_TIMERS=1` on any ladder arm).
+>
 > **Rev 13 (2026-09-17, 02:00 CEST) — the Franken-engine design, §8.** Written
 > from the measured regime map only (§FRANKEN-H2, §PCIE-STREAM, §GPTOSS-3CARD,
 > §GLM53FLASH-LADDER, §X3 step 0, §G11, §RP1). Owner's stated goal: a model
@@ -719,12 +745,13 @@ same model is the order-of-magnitude gap, and it is a prefill gap.
 
 | id | item | expected (projected, derivation shown) | gate | tier / effort |
 |---|---|---|---|---|
-| **F0** | **Vulkan host→device stream rate.** §PCIE-STREAM measured HIP. Colibri is Vulkan/RADV; measure `vkCmdCopyBuffer` from host-visible memory and from a mapped page-cache buffer, 14 MiB blocks, 1/2/3 cards concurrent, same probe shape (`tools/hot-expert/rome_vkbench.c` has the device setup) | ≥ 50 GB/s aggregate on three cards if RADV's upload path matches HIP's; **falsifier:** < 40 GB/s → F2 streams through HIP (the container) or a HIP upload helper, and D-3 leaves the parked list | ROW lines as §PCIE-STREAM; under the lock, gateway up | Sonnet, 1 day |
+| **F0 — DONE 2026-09-17, PASS (rev 14)** | **Vulkan host→device stream rate.** §PCIE-STREAM measured HIP. Colibri is Vulkan/RADV; measure `vkCmdCopyBuffer` from host-visible memory and from a mapped page-cache buffer, 14 MiB blocks, 1/2/3 cards concurrent, same probe shape (`tools/hot-expert/rome_vkbench.c` has the device setup) | ≥ 50 GB/s aggregate on three cards if RADV's upload path matches HIP's; **falsifier:** < 40 GB/s → F2 streams through HIP (the container) or a HIP upload helper, and D-3 leaves the parked list | ROW lines as §PCIE-STREAM; under the lock, gateway up | Sonnet, 1 day |
 | **F2** | **Chunked batched prefill with expert streaming.** Prefill in chunks of S rows (512 default, knob); per MoE layer, group the chunk's rows by expert (Q9 step 1's grouping exists); resident experts run on their tier as today; each **non-resident** expert is copied once per chunk into a per-card ring buffer (dev2 first — its link is its own; dev0/dev3 share ~33 GB/s) and run through `qmatmul_gate_up_tile.spv` / `qmatmul_tile.spv` on that card; the CPU int4 path stays as `COLI_PREFILL_STREAM=0`. | non-resident set ≈ 8 706 experts × 14.16 MB = 123 GB per chunk; at 61 GB/s = 2.0 s per 512 rows ≈ **3.9 ms/token** for the streamed experts, vs 113.9 ms/token today (fit, §1); with GPU tile compute and the attention/indexer prefill unchanged, 18k prefill projected **≈ 70–130 s** (vs 2 561 s measured, 108 s on llama.cpp). Chunk 2 048 rows: 9 chunks, ~1.1 s/1k tokens of streaming | `prefill_gate.sh` (oracle: `teacher_forcing` identical, last-token logits vs pristine), X2's KL bar, then the H2 ladder A,B,B,A vs today's A rows; **≥ 10× on the 18k ladder-turn TTFT** or the item is rejected; the row beside llama.cpp's 108 s is reported either way | Opus, 2–3 weeks; after F0 |
-| **F4** | **Attribute the 205 ms/token depth growth on GLM.** The zero-cost route: close the engine's stdin in `ttft_serve.EngineDriver.close()` (not in `openai_server.Engine.close()`) so `optime_print` runs; one A-arm ladder with `COLI_TIMERS=1` then carries the table. Fallback: the 1 h 45 m CLI chain in record §X3 step 0 | which bucket grows: attention core, DSA indexer, KV read, or dense/submit. **This decides the decode item:** ≥ 30 % attention+indexer → X3 (stricter selection, knob-gated, X2 bar); KV-read-bound → a KV layout/placement item; neither → the base token is the target (submit overhead, dense stream) | the `[OPTIME]` table at 2.7k and 18.4k in the record, both arms | Sonnet (fix + one arm, ~2 h rig) then Opus (interpretation) |
+| **F4 — DONE 2026-09-17, ANSWERED (rev 14): the DSA indexer** | **Attribute the 205 ms/token depth growth on GLM.** The zero-cost route: close the engine's stdin in `ttft_serve.EngineDriver.close()` (not in `openai_server.Engine.close()`) so `optime_print` runs; one A-arm ladder with `COLI_TIMERS=1` then carries the table. Fallback: the 1 h 45 m CLI chain in record §X3 step 0 | which bucket grows: attention core, DSA indexer, KV read, or dense/submit. **This decides the decode item:** ≥ 30 % attention+indexer → X3 (stricter selection, knob-gated, X2 bar); KV-read-bound → a KV layout/placement item; neither → the base token is the target (submit overhead, dense stream) | the `[OPTIME]` table at 2.7k and 18.4k in the record, both arms | Sonnet (fix + one arm, ~2 h rig) then Opus (interpretation) |
 | **F1** | **Streamed decode misses** (the 21 %): same ring buffer as F2, at batch 1, prefetch next layer's misses while this layer computes; CPU path becomes the fallback knob. Frees the 8 cores for dense/indexer work | ≤ 45 ms/token on GLM (≤ 19 % at 2.7k, ≤ 10 % at 18k) — real but small on this model; on a ≤ 60 GB model with a partial tier it is the whole miss cost. **Sequenced after F2** (shares its code) and after F4 (which may make it the wrong item) | X2's KL bar, text identical, A,B,B,A on the ladder; verdict through `gate_ab_verdict` | Opus, 1–2 weeks |
 | **F3** | **Three-card residency for any model that fits** (regime B): extend V1's Vulkan tier from one card to three (heat-ranked, per-device budget, `COLI_VK_DEV0/2/3`), attention/KV on dev0, tiers on all three, so a ≤ 60 GB int4 GLM-class model is 100 % resident with P7/P9 checkpoints and slots intact | the measured resident regime: 75 tok/s class at 18k (gpt-oss, layer-split; Colibri's number **unknown** until run — the submit-model ceiling of §3 branch 3 was withdrawn but not replaced by a measurement) | tier line asserts 100 % residency; A,B,B,A vs llama.cpp resident on the same GGUF-equivalent weights; the greedy-text agreement count of H2b | Opus, 1–2 weeks; **only when the owner names the model** |
 | **F5** | **MTP in the streamed regime** (X5): hipFire measured 131 tok/s at 1.4k *with* MTP on the resident 35B (§FRANKEN-H2 throwaway `mtp: true`); Q9 killed it here in the CPU-miss regime. Re-test only after F2/F1 change the verify block's cost | unknown; the discriminator is whether the verify block reads streamed experts once per block | interleaved knob on/off on the ladder; text identical | Sonnet, after F1 |
+| **F6** | **The indexer at depth (X3, promoted by F4).** A cheaper DSA selection at depth for GLM's MLA layers: profile says 25 ms per MLA call at 18.6k vs 5.8 at 1.3k (`index/ctx` 4.46 µs per context token per call over the pooled-key cache of G5). Design first (Opus): what the indexer reads per call today, whether a coarser pool or a two-level select cuts the bytes, dense-identical below 2 052 tokens by construction, knob-gated, X2's KL bar | ceiling stated in the record: holding the indexer at its 1.3k cost → ≈ 3.3 tok/s at 18k (from 2.27); the item is worth ≤ +45 % decode at depth and nothing at shallow depth | `[OPTIME req=]` index ms/call at 18.6k before/after; teacher_forcing identical below 2 052; X2 KL above; A,B,B,A ladder through `gate_ab_verdict` | Opus, design 2 days, implementation 1–2 weeks; after F2 step 0 |
 | parked | H2b, H4, D-3 (branches exist), L1 | — | — | D-3 re-enters only under F0's falsifier |
 
 ### 8.4 Order, and what each step must show before the next

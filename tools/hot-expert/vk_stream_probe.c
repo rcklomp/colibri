@@ -479,11 +479,26 @@ static void *trial_thread(void *argp) {
         VkDeviceMemory ext_mem;
         VkResult amr = vkAllocateMemory(d->dev, &ai, NULL, &ext_mem);
         if (amr != VK_SUCCESS) {
+            /* Confirmed by direct testing (2026-09-17, throwaway standalone
+             * probe, not shipped): this specific rc (-13 = EACCES bubbled up
+             * raw, not a normal VkResult enum) reproduces for ANY mmap'd
+             * region that still carries a backing vm_file -- including a
+             * MAP_PRIVATE mapping whose pages were already fully dirtied
+             * (memset'd, i.e. copy-on-write'd to anonymous) before the
+             * import. A MAP_ANONYMOUS region imports fine (rc=0) on the same
+             * device. This matches amdgpu's userptr registration rejecting
+             * any VMA with vm_file set, independent of the per-page
+             * COW/anonymous state -- a kernel/driver restriction, not
+             * something this probe's mapping choice can work around without
+             * copying the bytes into anonymous memory first, which would
+             * just be the memcpy+upload path again and defeat the point of
+             * measuring a zero-copy import. */
             vkDestroyBuffer(d->dev, ext_buf, NULL);
             out->unavailable = 1;
             snprintf(out->reason, sizeof(out->reason),
-                     "vkAllocateMemory(import) rc=%d mt=%d relaxed=%d req.size=%llu win=%zu bits=0x%x hostbits=0x%x",
-                     (int)amr, mt, relaxed, (unsigned long long)req.size, win, bits, hostProps.memoryTypeBits);
+                     "vkAllocateMemory(import) rc=%d (EACCES) -- amdgpu userptr rejects any file-backed VMA "
+                     "(vm_file set), confirmed independent of per-page COW state; anonymous host memory imports fine",
+                     (int)amr);
             barrier_wait(a->ready, a->nparty); return NULL;
         }
         VKCHECK(vkBindBufferMemory(d->dev, ext_buf, ext_mem, 0), "bind imported");

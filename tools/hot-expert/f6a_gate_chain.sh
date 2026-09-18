@@ -181,6 +181,7 @@ PY
 [ -s "$DEEP_PACKET" ] || { echo "FATAL: could not build the deep oracle packet"; exit 1; }
 
 run_oracle() {   # run_oracle <side> <bin> <shaders> <packet> <outtag> [extra_env="NAME=val"]
+  if [ "${F6A_REUSE_ORACLE:-0}" = 1 ] && [ -s "$OUT/${5}_${1}.out" ]; then echo "[oracle $5] $1: REUSING $OUT/${5}_${1}.out from an earlier run of this chain (F6A_REUSE_ORACLE=1)"; return 0; fi
   local side=$1 bin=$2 shaders=$3 packet=$4 outtag=$5 extra_env=${6:-}
   for e in glm53 qwen38 qwen38-vk; do
     pgrep -x "$e" >/dev/null 2>&1 && { echo "FATAL: $e already running before oracle $outtag-$side"; return 9; }
@@ -211,6 +212,11 @@ run_oracle() {   # run_oracle <side> <bin> <shaders> <packet> <outtag> [extra_en
 echo "--- deep oracle (>=4000 tokens): candidate vs pristine, timers off"
 run_oracle candidate "$CAND_BIN" "$F6A_ROOT/c/shaders" "$DEEP_PACKET" deep || exit 1
 run_oracle pristine "$PRISTINE_BIN" "$PRISTINE/c/shaders" "$DEEP_PACKET" deep || exit 1
+# The served pristine predates GLM53_LOGIT_DUMP_ALL (run 1, 2026-09-18: its dump was
+# never written and the gate REFUSED). The logit reference is therefore the SAME
+# candidate binary on the original scalar path (GLM53_INDEX_SCALAR=1), which is
+# itself checked against the pristine by teacher_forcing and the index dump below.
+run_oracle scalar "$CAND_BIN" "$F6A_ROOT/c/shaders" "$DEEP_PACKET" deep "GLM53_INDEX_SCALAR=1" || exit 1
 
 gate_compare "F6a oracle teacher_forcing (deep)" \
   "$OUT/deep_candidate.out" "$OUT/deep_pristine.out" '^teacher_forcing'
@@ -218,13 +224,13 @@ tf_rc=$?
 echo "=== teacher_forcing gate_compare exit=$tf_rc (0=IDENTICAL 1=DIFFERS 2=REFUSED)"
 
 echo "--- logit dump (GLM53_LOGIT_DUMP_ALL, every position x vocab, raw f32): cmp"
-if [ -s "$OUT/deep_dump_pristine.f32" ] && [ -s "$OUT/deep_dump_candidate.f32" ] \
-   && cmp -s "$OUT/deep_dump_pristine.f32" "$OUT/deep_dump_candidate.f32"; then
-  echo "F6a oracle logit dump: BIT-IDENTICAL ($(wc -c < "$OUT/deep_dump_pristine.f32") bytes)"
+if [ -s "$OUT/deep_dump_scalar.f32" ] && [ -s "$OUT/deep_dump_candidate.f32" ] \
+   && cmp -s "$OUT/deep_dump_scalar.f32" "$OUT/deep_dump_candidate.f32"; then
+  echo "F6a oracle logit dump: BIT-IDENTICAL ($(wc -c < "$OUT/deep_dump_scalar.f32") bytes)"
   dump_rc=0
 else
   dump_rc=1
-  python3 - "$OUT/deep_dump_pristine.f32" "$OUT/deep_dump_candidate.f32" <<'PY'
+  python3 - "$OUT/deep_dump_scalar.f32" "$OUT/deep_dump_candidate.f32" <<'PY'
 import sys, array
 try:
     a = open(sys.argv[1], "rb").read(); b = open(sys.argv[2], "rb").read()
@@ -270,7 +276,6 @@ else
 fi
 
 echo "--- knob-routing check: candidate with GLM53_INDEX_SCALAR=1 must still match pristine"
-run_oracle scalar "$CAND_BIN" "$F6A_ROOT/c/shaders" "$DEEP_PACKET" deep "GLM53_INDEX_SCALAR=1" || exit 1
 gate_compare "F6a knob-routing teacher_forcing (GLM53_INDEX_SCALAR=1 vs pristine)" \
   "$OUT/deep_scalar.out" "$OUT/deep_pristine.out" '^teacher_forcing'
 scalar_rc=$?

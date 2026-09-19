@@ -367,17 +367,25 @@ else logit_diff "O4 logits (chunk vs default)" "$OUT/deep_dump_off.f32" "$OUT/de
 # at the DEFAULT chunk, and it is the cell that decides whether F2 can ship
 # without the chunk's reassociation. Shallow, because it is a speed question:
 # the numerics of streaming alone are already O3's answer.
-echo "--- O5: streaming ON at the DEFAULT chunk 128 (the missing 2x2 cell), shallow"
-run_oracle stream128 "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+# F2_O5_DEPTH=deep takes this cell at the >= 4000-token packet, which is where
+# the answer lives: on the shallow packet chunk 512's LAST chunk is a ragged 13
+# rows that streams a full non-resident set for 13 tokens, so a shallow 2x2
+# flatters chunk 128.
+O5_DEPTH=${F2_O5_DEPTH:-shallow}
+if [ "$O5_DEPTH" = deep ]; then O5_PACKET="$DEEP_PACKET"; else O5_PACKET="$SHALLOW_PACKET"; fi
+echo "--- O5: streaming ON at the DEFAULT chunk 128 (the missing 2x2 cell), $O5_DEPTH"
+run_oracle stream128 "$CAND_BIN" "$CAND_SHADERS" "$O5_PACKET" "$O5_DEPTH" \
     "COLI_PREFILL_STREAM=1" "GLM53_PREFILL_CHUNK=128" "COLI_TIMERS=1" || exit 1
-gate_compare "O5 teacher_forcing (stream@128 vs off)" "$OUT/shallow_stream128.out" "$OUT/shallow_off.out" '^teacher_forcing'
+gate_compare "O5 teacher_forcing (stream@128 vs off)" "$OUT/${O5_DEPTH}_stream128.out" "$OUT/${O5_DEPTH}_off.out" '^teacher_forcing'
 o5_tf=$?
-echo "--- the 2x2, shallow packet, prefill wall seconds"
+if [ "${F2_SKIP_DIFFS:-0}" = 1 ]; then o5_lg=0; echo "  O5 logits: SKIPPED (F2_SKIP_DIFFS=1)"
+else logit_diff "O5 logits (stream@128 vs off)" "$OUT/${O5_DEPTH}_dump_off.f32" "$OUT/${O5_DEPTH}_dump_stream128.f32"; o5_lg=$?; fi
+echo "--- the 2x2, $O5_DEPTH packet, prefill wall seconds"
 for cell in off:"chunk 128, CPU" chunk:"chunk 512, CPU" stream128:"chunk 128, streamed" on:"chunk 512, streamed"; do
   sfx=${cell%%:*}; lbl=${cell#*:}
-  printf '  %-22s %s\n' "$lbl" "$(grep -a -o 'prefill [0-9]* token in [0-9.]*s' "$OUT/shallow_${sfx}.err" 2>/dev/null | tail -1)"
+  printf '  %-22s %s\n' "$lbl" "$(grep -a -o 'prefill [0-9]* token in [0-9.]*s' "$OUT/${O5_DEPTH}_${sfx}.err" 2>/dev/null | tail -1)"
 done
-grep -aE '\[STREAM\]' "$OUT/shallow_stream128.err" | tail -1 || true
+grep -aE '\[STREAM\]' "$OUT/${O5_DEPTH}_stream128.err" | tail -1 || true
 
 echo "--- streamed-expert accounting, knob ON then knob OFF (COLI_TIMERS=1 on the ON run)"
 grep -E 'moe split|\[STREAM\]|\[PROF\] eg=|prefill ring' "$OUT/deep_on.err" | tail -8 || echo "(none)"
@@ -391,7 +399,7 @@ echo "  O1 (knob off == pristine, HARD GATE): tf_deep=$o1_tf dump_deep=$o1_dump 
 echo "  O2 (on vs off, reported):             tf=$o2_tf logits=$o2_lg"
 echo "  O3 (on vs EXPERTS_CPU=2, GATED):      tf=$o3_tf logits=$o3_lg"
 echo "  O4 (chunk alone, reported):           tf=$o4_tf logits=$o4_lg"
-echo "  O5 (stream@128, reported):            tf=$o5_tf"
+echo "  O5 (stream@128, reported):            tf=$o5_tf logits=$o5_lg"
 if [ "$o1_tf" != 0 ] || [ "$o1_dump" != 0 ] || [ "$o1_tf_sh" != 0 ] || [ "$o1_dump_sh" != 0 ]; then
   echo "FATAL: O1 failed -- COLI_PREFILL_STREAM=0 is NOT inert. Stopping before the ladder."
   oracle_rc=1

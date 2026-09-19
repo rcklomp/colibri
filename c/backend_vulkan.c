@@ -64,6 +64,15 @@ static struct {
      * VK_NULL_HANDLE when the shader is absent or COLI_VK_TILE=0. Used only
      * for S > 1 and fmt 1/4 -- decode never sees them. */
     VkShaderModule shader_t, shader_gu_t; VkPipeline pipe_t, pipe_gu_t; int tile_on;
+    /* Step 2a: the swiglu-CLAMPED twins of pipe_gu / pipe_gu_t, on their OWN
+     * pipeline layout (seven push constants instead of six). Built only when
+     * coli_vk_set_swiglu_limit() is given a positive limit; until then every
+     * handle here is VK_NULL_HANDLE, swiglu_limit is 0, and the expert-group
+     * path binds exactly the pipeline, layout and 24 push-constant bytes it
+     * always did -- which is what makes the knob provably inert for glm53 and
+     * literally inert for qwen38-vk. */
+    VkShaderModule sh_gu_c, sh_gu_tc; VkPipelineLayout plyt_gu_c;
+    VkPipeline pipe_gu_c, pipe_gu_tc; float swiglu_limit; char spv[512];
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
@@ -139,6 +148,10 @@ static struct {
 } G;
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
+/* Step 2a: struct PC plus the swiglu limit. The first six fields are PC's,
+ * in PC's order, so pushing sizeof(struct PC) bytes out of a PCL is
+ * byte-identical to pushing a PC -- the unclamped path does exactly that. */
+struct PCL { int fmt, S, I, O, rowWords, gs; float limit; };
 struct PCN { int S, D; float eps; };
 /* P5.2: `tok` selects this dispatch's slice of the chunk's qkv/gate/beta/out.
  * Every single-token caller leaves it 0 and gets the indices it always had. */
@@ -823,6 +836,9 @@ int coli_vk_init(const char *spv_path) {
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
 
     vkts_setup(0, G.phys, G.dev, G.qfam);
+    /* Step 2a: remember where the shaders came from, so the clamped gate_up
+     * twins can be loaded later without re-plumbing the path. */
+    snprintf(G.spv, sizeof(G.spv), "%s", spv_path);
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
@@ -1277,12 +1293,20 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     {
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok4(G.pipe_gu_t, fmt, rows[c], D) ? G.pipe_gu_t : G.pipe_gu;
+            /* Step 2a: with a positive swiglu limit this binds the CLAMPED
+             * twin and its own 28-byte layout; with limit 0 -- the default,
+             * and always for qwen38-vk -- `cl` is 0 and every argument below
+             * is byte-for-byte the one this loop always passed. */
+            const int cl = (G.swiglu_limit > 0.0f && G.pipe_gu_c != VK_NULL_HANDLE);
+            VkPipeline tile = cl ? G.pipe_gu_tc : G.pipe_gu_t;
+            VkPipelineLayout guL = cl ? G.plyt_gu_c : G.plyt_gu;
+            VkPipeline want = vk_tile_ok4(tile, fmt, rows[c], D) ? tile : (cl ? G.pipe_gu_c : G.pipe_gu);
             if (want != cur) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
-            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
-            vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), want == G.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            struct PCL pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, G.swiglu_limit};
+            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, guL, 0, 1, &G.eg_gu[c], 0, NULL);
+            vkCmdPushConstants(G.eg_cmd, guL, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               cl ? sizeof(struct PCL) : sizeof(struct PC), &pc);
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), want == tile ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
             if (vkts >= 2) vkts_mark(0, G.eg_cmd, (uint32_t)(3 + c));
         }
     }
@@ -1369,6 +1393,15 @@ static struct {
     VkDescriptorSetLayout dsl, dsl_gu; VkPipelineLayout plyt, plyt_gu;
     VkPipeline pipe, pipe_gu;
     VkShaderModule sh_qmm_t, sh_gu_t; VkPipeline pipe_t, pipe_gu_t;   /* P4 tiles */
+    /* Step 2a: the swiglu-CLAMPED twins of pipe_gu / pipe_gu_t, on their OWN
+     * pipeline layout (seven push constants instead of six). Built only when
+     * coli_vk_set_swiglu_limit() is given a positive limit; until then every
+     * handle here is VK_NULL_HANDLE, swiglu_limit is 0, and the expert-group
+     * path binds exactly the pipeline, layout and 24 push-constant bytes it
+     * always did -- which is what makes the knob provably inert for glm53 and
+     * literally inert for qwen38-vk. */
+    VkShaderModule sh_gu_c, sh_gu_tc; VkPipelineLayout plyt_gu_c;
+    VkPipeline pipe_gu_c, pipe_gu_tc; float swiglu_limit; char spv[512];
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
@@ -1558,6 +1591,9 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G2.dev, &fi, NULL, &G2.fence), "d2 fence");
     vkts_setup(1, G2.phys, G2.dev, G2.qfam);
+    /* Step 2a: remember where the shaders came from, so the clamped gate_up
+     * twins can be loaded later without re-plumbing the path. */
+    snprintf(G2.spv, sizeof(G2.spv), "%s", spv_path);
     G2.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G2.phys, &p);
     fprintf(stderr, "[VK] dev2 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
@@ -1652,12 +1688,20 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok4(G2.pipe_gu_t, fmt, rows[c], D) ? G2.pipe_gu_t : G2.pipe_gu;
+            /* Step 2a: with a positive swiglu limit this binds the CLAMPED
+             * twin and its own 28-byte layout; with limit 0 -- the default,
+             * and always for qwen38-vk -- `cl` is 0 and every argument below
+             * is byte-for-byte the one this loop always passed. */
+            const int cl = (G2.swiglu_limit > 0.0f && G2.pipe_gu_c != VK_NULL_HANDLE);
+            VkPipeline tile = cl ? G2.pipe_gu_tc : G2.pipe_gu_t;
+            VkPipelineLayout guL = cl ? G2.plyt_gu_c : G2.plyt_gu;
+            VkPipeline want = vk_tile_ok4(tile, fmt, rows[c], D) ? tile : (cl ? G2.pipe_gu_c : G2.pipe_gu);
             if (want != cur) { vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
-            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-            vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
-            vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), want == G2.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            struct PCL pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, G2.swiglu_limit};
+            vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, guL, 0, 1, &G2.gu[c], 0, NULL);
+            vkCmdPushConstants(G2.cmd, guL, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               cl ? sizeof(struct PCL) : sizeof(struct PC), &pc);
+            vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), want == tile ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
             if (vkts >= 2) vkts_mark(1, G2.cmd, (uint32_t)(3 + c));
         }
     }
@@ -1733,6 +1777,15 @@ static struct {
     VkDescriptorSetLayout dsl, dsl_gu; VkPipelineLayout plyt, plyt_gu;
     VkPipeline pipe, pipe_gu;
     VkShaderModule sh_qmm_t, sh_gu_t; VkPipeline pipe_t, pipe_gu_t;   /* P4 tiles */
+    /* Step 2a: the swiglu-CLAMPED twins of pipe_gu / pipe_gu_t, on their OWN
+     * pipeline layout (seven push constants instead of six). Built only when
+     * coli_vk_set_swiglu_limit() is given a positive limit; until then every
+     * handle here is VK_NULL_HANDLE, swiglu_limit is 0, and the expert-group
+     * path binds exactly the pipeline, layout and 24 push-constant bytes it
+     * always did -- which is what makes the knob provably inert for glm53 and
+     * literally inert for qwen38-vk. */
+    VkShaderModule sh_gu_c, sh_gu_tc; VkPipelineLayout plyt_gu_c;
+    VkPipeline pipe_gu_c, pipe_gu_tc; float swiglu_limit; char spv[512];
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
@@ -1923,6 +1976,9 @@ int coli_vk_init_dev3(const char *spv_path, int devidx) {
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G3.dev, &fi, NULL, &G3.fence), "d3 fence");
     vkts_setup(2, G3.phys, G3.dev, G3.qfam);
+    /* Step 2a: remember where the shaders came from, so the clamped gate_up
+     * twins can be loaded later without re-plumbing the path. */
+    snprintf(G3.spv, sizeof(G3.spv), "%s", spv_path);
     G3.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G3.phys, &p);
     fprintf(stderr, "[VK] dev3 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
@@ -2016,12 +2072,20 @@ static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok4(G3.pipe_gu_t, fmt, rows[c], D) ? G3.pipe_gu_t : G3.pipe_gu;
+            /* Step 2a: with a positive swiglu limit this binds the CLAMPED
+             * twin and its own 28-byte layout; with limit 0 -- the default,
+             * and always for qwen38-vk -- `cl` is 0 and every argument below
+             * is byte-for-byte the one this loop always passed. */
+            const int cl = (G3.swiglu_limit > 0.0f && G3.pipe_gu_c != VK_NULL_HANDLE);
+            VkPipeline tile = cl ? G3.pipe_gu_tc : G3.pipe_gu_t;
+            VkPipelineLayout guL = cl ? G3.plyt_gu_c : G3.plyt_gu;
+            VkPipeline want = vk_tile_ok4(tile, fmt, rows[c], D) ? tile : (cl ? G3.pipe_gu_c : G3.pipe_gu);
             if (want != cur) { vkCmdBindPipeline(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
-            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-            vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt_gu, 0, 1, &G3.gu[c], 0, NULL);
-            vkCmdPushConstants(G3.cmd, G3.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(G3.cmd, (uint32_t)((I + 7) / 8), want == G3.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            struct PCL pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, G3.swiglu_limit};
+            vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, guL, 0, 1, &G3.gu[c], 0, NULL);
+            vkCmdPushConstants(G3.cmd, guL, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               cl ? sizeof(struct PCL) : sizeof(struct PC), &pc);
+            vkCmdDispatch(G3.cmd, (uint32_t)((I + 7) / 8), want == tile ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
             if (vkts >= 2) vkts_mark(2, G3.cmd, (uint32_t)(3 + c));
         }
     }
@@ -2080,6 +2144,78 @@ int coli_vk_expert_group3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
     if (!eg3_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
     return coli_vk_expert_group_take3(y);
 }
+
+/* ============ Step 2a: the swiglu clamp on the routed-expert kernels ==========
+ * GLM-5.3 applies a clamped SwiGLU to its routed experts on the CPU path and
+ * this backend did not (record §G13/§G15): the fused gate+up kernel computed
+ * silu(gate)*up with no bound, so which experts happened to be tier-resident
+ * changed the model's output. F2 makes that worse, because it moves another
+ * ~11 % of the routed calls onto this kernel.
+ *
+ * The fix is opt-in and is built so that "off" is not a promise but a fact:
+ * the clamped kernels are a SECOND SPIR-V module (the same .comp compiled with
+ * -DSWIGLU_CLAMP) on a SECOND pipeline layout, and nothing is loaded, built or
+ * bound until coli_vk_set_swiglu_limit() is called with limit > 0. With the
+ * knob unset the expert-group path binds the same pipeline, the same layout
+ * and the same 24 push-constant bytes it always did -- so qwen38-vk, which
+ * drives the very same expert-group path and never sets a limit, is not merely
+ * numerically unaffected but literally unchanged.
+ *
+ * Returns the number of devices that got clamped pipelines. 0 with a positive
+ * limit means the .spv files are missing: the caller must then refuse to run
+ * clamped rather than silently run unclamped. */
+static VkPipelineLayout clamp_layout(VkDevice dev, VkDescriptorSetLayout dsl) {
+    VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                               .offset = 0, .size = (uint32_t)sizeof(struct PCL)};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &dsl,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+    VkPipelineLayout out = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(dev, &pli, NULL, &out) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return out;
+}
+
+int coli_vk_set_swiglu_limit(float limit) {
+    int built = 0;
+    struct Slot { int ready; VkDevice dev; const char *spv; VkDescriptorSetLayout dsl;
+                  VkPipeline base_tile;
+                  VkShaderModule *sh_c, *sh_tc; VkPipelineLayout *plyt_c;
+                  VkPipeline *pipe_c, *pipe_tc; float *lim; };
+    struct Slot sl[3] = {
+        {G.ready,  G.dev,  G.spv,  G.dsl_gu, G.pipe_gu_t,
+         &G.sh_gu_c,  &G.sh_gu_tc,  &G.plyt_gu_c,  &G.pipe_gu_c,  &G.pipe_gu_tc,  &G.swiglu_limit},
+        {G2.ready, G2.dev, G2.spv, G2.dsl_gu, G2.pipe_gu_t,
+         &G2.sh_gu_c, &G2.sh_gu_tc, &G2.plyt_gu_c, &G2.pipe_gu_c, &G2.pipe_gu_tc, &G2.swiglu_limit},
+        {G3.ready, G3.dev, G3.spv, G3.dsl_gu, G3.pipe_gu_t,
+         &G3.sh_gu_c, &G3.sh_gu_tc, &G3.plyt_gu_c, &G3.pipe_gu_c, &G3.pipe_gu_tc, &G3.swiglu_limit},
+    };
+    for (int i = 0; i < 3; i++) {
+        if (!sl[i].ready) continue;
+        if (limit <= 0.0f) { *sl[i].lim = 0.0f; continue; }
+        if (!*sl[i].pipe_c) {
+            char p1[512], p2[512];
+            derive_sibling(sl[i].spv, "_gate_up_clamp.spv", p1, sizeof(p1));
+            derive_sibling(sl[i].spv, "_gate_up_tile_clamp.spv", p2, sizeof(p2));
+            *sl[i].sh_c = load_spv(sl[i].dev, p1);
+            if (!*sl[i].sh_c) { fprintf(stderr, "[VK] swiglu clamp: %s missing\n", p1); continue; }
+            *sl[i].plyt_c = clamp_layout(sl[i].dev, sl[i].dsl);
+            if (!*sl[i].plyt_c) continue;
+            *sl[i].pipe_c = build_pipeline_on(sl[i].dev, *sl[i].sh_c, *sl[i].plyt_c);
+            if (!*sl[i].pipe_c) continue;
+            /* The tiled twin only if the unclamped tile is in use at all, so
+             * COLI_VK_TILE=0 keeps meaning what it means. */
+            if (sl[i].base_tile) {
+                *sl[i].sh_tc = load_spv(sl[i].dev, p2);
+                if (*sl[i].sh_tc) *sl[i].pipe_tc = build_pipeline_on(sl[i].dev, *sl[i].sh_tc, *sl[i].plyt_c);
+            }
+        }
+        *sl[i].lim = limit;
+        built++;
+    }
+    return built;
+}
+
+float coli_vk_swiglu_limit(void) { return G.swiglu_limit; }
 
 /* ==================== F2: the streamed-expert ring ==============================
  * FRANKEN-ENGINE-PLAN-2026-09-15.md item F2, design note

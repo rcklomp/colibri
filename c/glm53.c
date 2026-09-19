@@ -2849,10 +2849,6 @@ static int stream_on(void) {
     if (v < 0) { const char *e = getenv("COLI_PREFILL_STREAM"); v = (e && atoi(e) != 0) ? 1 : 0; }
     return v;
 }
-/* The chunk COLI_PREFILL_STREAM=1 implies when GLM53_PREFILL_CHUNK is unset.
- * Knob-off keeps forward_prefill's own 128 so the default engine is unchanged;
- * the chunk is a numerics change of its own (see the design note §3). */
-#define GLM53_STREAM_CHUNK_DEFAULT 512
 
 static int stream_ring_init(const Cfg *c) {
     if (g_ring_state >= 0) return g_ring_state;
@@ -4142,6 +4138,28 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                     free(is_kda);
                 }
             }
+            /* Step 2a: GLM53_VK_SWIGLU_CLAMP=1 gives the routed-expert GPU
+             * kernels the clamp the CPU path has always applied (§G13/§G15:
+             * without it the model's output depends on which experts happen to
+             * be tier-resident, and F2 hands the unclamped kernel another
+             * ~11 % of the calls). Resident AND streamed experts alike. Set
+             * BEFORE the preload only because that is where the model's
+             * swiglu_limit is known and nothing has dispatched yet; the
+             * pipelines it builds are separate objects and the unclamped ones
+             * are left exactly as they are.
+             *
+             * If the knob is set and the clamped .spv files are missing, the
+             * engine STOPS: silently running unclamped is the bug this fixes. */
+            if (getenv("GLM53_VK_SWIGLU_CLAMP") && atoi(getenv("GLM53_VK_SWIGLU_CLAMP")) != 0) {
+                const int nd = coli_vk_set_swiglu_limit(m->c.swiglu_limit);
+                if (nd < 1) {
+                    fprintf(stderr, "GLM53_VK_SWIGLU_CLAMP=1 ma i pipeline clampati non si "
+                                    "costruiscono (qmatmul_gate_up_clamp.spv in %s?)\n", spv);
+                    exit(1);
+                }
+                fprintf(stderr, "[VK] swiglu clamp sugli esperti instradati: limite %.1f su %d device\n",
+                        m->c.swiglu_limit, nd);
+            }
             vk_preload_tier(m);
         }
         fprintf(stderr, g_vk_ready
@@ -4846,17 +4864,15 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                               ServeCancel *cancel) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
-    /* F2: streaming raises the chunk, because the bytes a chunk streams
-     * SATURATE (nearly the same non-resident set at 512 rows as at 128), so
-     * the per-token cost falls as 1/S. An explicit GLM53_PREFILL_CHUNK still
-     * wins, and with the knob off the default is the unchanged 128 -- chunk
-     * size is a numerics change of its own (design note §3) and does not ride
-     * in on this knob by accident when it is not set. */
-    int chunk = setting ? atoi(setting)
-#if defined(COLI_VULKAN)
-              : stream_on() ? GLM53_STREAM_CHUNK_DEFAULT
-#endif
-              : 128;
+    /* F2 step 2c: COLI_PREFILL_STREAM does NOT touch the chunk. It used to
+     * raise the effective default to 512, because streaming's bytes per token
+     * fall as 1/S; that conflated two knobs with two different numerics
+     * (record §F2f: the chunk alone moves 3.24 % of the argmaxes at 6.3k and
+     * is worth 3 % of the speed) in one env var. They are separate now:
+     * streaming is a placement change, GLM53_PREFILL_CHUNK is a batching
+     * change that predates it, and the ladder decides the chunk on its own
+     * evidence. */
+    int chunk = setting ? atoi(setting) : 128;
     if (chunk < 1) chunk = 1;
     if (chunk > n) chunk = n;
 

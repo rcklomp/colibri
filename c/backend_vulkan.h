@@ -194,6 +194,25 @@ int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const f
                               float *out, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale, int Dout);
 
+/* GLM-5.3 applies a CLAMPED SwiGLU to its routed experts on the CPU path and
+ * the fused gate+up kernel here did not, so the model's output depended on
+ * which experts happened to be tier-resident. A positive `limit` switches the
+ * expert-group path to a second pair of pipelines compiled from the same
+ * shaders with -DSWIGLU_CLAMP (and their own 7-push-constant layout), applying
+ *     g = gate > limit ? limit : gate
+ *     u = up < -limit ? -limit : (up > limit ? limit : up)
+ *     hidden = (g / (1 + exp(-g))) * u
+ * -- transcribed from the CPU's swiglu_clamped, not re-derived. It applies to
+ * resident and streamed experts alike.
+ *
+ * Until this is called with limit > 0 nothing is loaded, built or bound, and
+ * the expert-group path uses the pipeline, layout and 24 push-constant bytes
+ * it always did. Returns the number of devices that got clamped pipelines;
+ * 0 with a positive limit means the _clamp.spv files are missing and the
+ * caller must refuse to run rather than silently run unclamped. */
+int    coli_vk_set_swiglu_limit(float limit);
+float  coli_vk_swiglu_limit(void);
+
 /* F2: a per-device RING of expert-sized weight slots, for experts that are not
  * tier-resident and are streamed in for the chunk that needs them. Allocated out
  * of the VRAM the tier's count cap leaves unused; the tier itself is untouched.

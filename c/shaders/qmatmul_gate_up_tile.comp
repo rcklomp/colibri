@@ -2,6 +2,24 @@
 // P4: qmatmul_gate_up.comp for a TILE of R input rows per workgroup. See
 // qmatmul_tile.comp for the design and the bit-identity argument; this is the
 // fused gate+up+silu variant with the same two weight streams as the per-row
+// GLM-5.3's routed experts are swiglu-CLAMPED on the CPU path and were not on
+// this one (record §G13/§G15: that gap alone moves 6 of 42 and 8 of 1232
+// teacher_forcing predictions, and it is why the model's output depends on
+// which experts happen to be tier-resident). Compiling this file with
+// -DSWIGLU_CLAMP adds the clamp and a seventh push constant carrying the
+// limit; the engine builds BOTH variants and binds the clamped one only when
+// coli_vk_set_swiglu_limit() has been given a positive limit, so the default
+// SPIR-V, the default pipeline layout and the default push-constant bytes are
+// byte-for-byte what they were.
+//
+// The form is transcribed from the C, not re-derived (c/glm53.c
+// swiglu_clamped, and the fused copies in mlp3_cpu):
+//     g = gate > limit ? limit : gate            one-sided, ceiling only
+//     u = up < -limit ? -limit : (up > limit ? limit : up)   two-sided
+//     out = (g / (1 + exp(-g))) * u              siluf_(g) * u
+// min()/clamp() would be the same for every finite input and are deliberately
+// not used: the ternaries are what the CPU executes.
+
 // shader. Formats 1 (int8, per-row scales) and 4 (grouped int4) only; the host
 // dispatches it only for those and only when an expert has more than one row.
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -19,6 +37,9 @@ layout(push_constant) uniform P {
     int S, I, O;    // I = input dim (hidden), O = moe_inter
     int rowWords;
     int gs;
+#ifdef SWIGLU_CLAMP
+    float limit;    // swiglu clamp; this field exists only in the clamped variant
+#endif
 } p;
 
 const int R = 8;
@@ -83,7 +104,13 @@ void main() {
         for (int r = 0; r < R; r++) {
             float gt = subgroupAdd(g[r]), ut = subgroupAdd(u[r]);
             if (p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }
+#ifdef SWIGLU_CLAMP
+            float gc = gt > p.limit ? p.limit : gt;
+            float uc = ut < -p.limit ? -p.limit : (ut > p.limit ? p.limit : ut);
+            if (lane == 0 && r < rows) hid[(s0 + r) * p.O + o] = (gc / (1.0 + exp(-gc))) * uc;
+#else
             if (lane == 0 && r < rows) hid[(s0 + r) * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;
+#endif
         }
     }
 }

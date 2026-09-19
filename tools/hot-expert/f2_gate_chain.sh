@@ -296,7 +296,11 @@ la = fa[(rows-1)*V:]; lb = fb[(rows-1)*V:]
 dot = sum(map(mul, la, lb))
 na = math.sqrt(sum(map(mul, la, la))); nb = math.sqrt(sum(map(mul, lb, lb)))
 cos = dot / (na * nb) if na > 0 and nb > 0 else float("nan")
-print(f"  {label:<44} last-token cosine={cos:.8f} max_abs={mx:.6g} "
+# max_abs here is over EVERY position, not the last one. kl_compare.py prints
+# the LAST position's max-abs, so the same pair reads 10.55 here and 1.53
+# there (the cosines agree to 9 digits, which is how the two were reconciled).
+# Both are right; the label used to imply "last-token" applied to both.
+print(f"  {label:<44} last-token cosine={cos:.8f} max_abs(all positions)={mx:.6g} "
       f"argmax {agree}/{rows} positions agree")
 sys.exit(0 if (cos >= 0.9999 and agree == rows) else 1)
 PY

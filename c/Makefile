@@ -626,7 +626,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_tile.spv shaders/qmatmul_gate_up_tile.spv shaders/qmatmul_gate_up_clamp.spv shaders/qmatmul_gate_up_tile_clamp.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/kda_step.spv shaders/kda_decay.spv shaders/kda_headnorm.spv
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_tile.spv shaders/qmatmul_gate_up_tile.spv shaders/qmatmul_gate_up_clamp.spv shaders/qmatmul_gate_up_tile_clamp.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/kda_step.spv shaders/kda_decay.spv shaders/kda_headnorm.spv shaders/mla_attn_score.spv shaders/mla_attn_softmax.spv shaders/mla_attn_pool.spv shaders/mla_attn_vproj.spv
 endif
 
 all: colibri$(EXE)

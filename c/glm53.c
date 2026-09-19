@@ -1795,6 +1795,77 @@ static int index_cache_on(void) {
     return g_index_cache;
 }
 
+/* F7 (tools/hot-expert/F7-MLA-ATTN-GPU-DESIGN-2026-09-19.md): the whole DSA
+ * attention core -- score, softmax, weighted pool, kvb_v value rows -- for a
+ * PREFILL chunk's rows at once on dev0, with the o-projection batched behind it.
+ *
+ * OFF by default. The CPU path below is unchanged and is the fallback on any
+ * Vulkan failure, on decode (tokens == 1), and on any shape the shaders do not
+ * cover. Knob-on changes the summation order of the score and pool passes and
+ * uses RADV's exp() and a float tree total instead of glibc's expf() and a
+ * sequential double -- so it is judged by the KL bar, not by bit-identity.
+ *
+ * GLM53_MLA_ATTN_SB is the sub-batch of rows per submit; it only bounds the
+ * score scratch (sb*H*width floats, 67 MB at 128) and does not change results. */
+static int g_mla_attn_gpu = -1;
+static int mla_attn_gpu_on(void) {
+    if (g_mla_attn_gpu < 0) {
+        const char *e = getenv("GLM53_MLA_ATTN_GPU");
+        g_mla_attn_gpu = (e && atoi(e)) ? 1 : 0;
+    }
+    return g_mla_attn_gpu;
+}
+static int mla_attn_gpu_sb(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GLM53_MLA_ATTN_SB");
+        v = e ? atoi(e) : 128;
+        if (v < 1) v = 128;
+    }
+    return v;
+}
+
+#ifdef COLI_VULKAN
+static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen, int width,
+                            const int *selected, const float *absorbed, const float *latent,
+                            float *out) {
+    const int H = c->n_heads, L = c->kv_lora, V = c->v_head;
+    if (!g_vk_ready || !coli_vk_mla_attn_ready()) return 0;
+    if (l->kvb_v.fmt != 1 && l->kvb_v.fmt != 4) return 0;
+    int *slot = malloc((size_t)tokens * width * sizeof(int));
+    int *used = malloc((size_t)tokens * sizeof(int));
+    float *ctx_all = malloc((size_t)tokens * H * V * sizeof(float));
+    if (!slot || !used || !ctx_all) { free(slot); free(used); free(ctx_all); return 0; }
+    /* Same compaction, in the same order, as the CPU path's slot_at[]. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < tokens; t++) {
+        const int *chosen = selected + (size_t)t * width;
+        int *dst = slot + (size_t)t * width;
+        int n = 0;
+        for (int i = 0; i < width; i++) {
+            const int at = chosen[i];
+            if (at < 0 || at >= seen) continue;
+            dst[n++] = at;
+        }
+        used[t] = n;
+    }
+    Mat *mw = (Mat *)&l->kvb_v;      /* ->vk is a cache inside a read-only Mat, as in mv() */
+    const int ok = coli_vk_mla_attn((ColiVkTensor **)&mw->vk,
+                                    mw->fmt == 4 ? (const void *)mw->q4 : (const void *)mw->q8,
+                                    mw->s, mw->fmt, mw->gs,
+                                    ctx_all, absorbed, latent, slot, used,
+                                    tokens, H, L, V, width, seen, mla_attn_gpu_sb(),
+                                    1.0f / sqrtf((float)c->qk_nope));
+    /* P2's mv_rows_s: per row bit-identical to the `tokens` separate mv() calls
+     * the CPU path makes, one submit instead of 512. */
+    if (ok) mv_rows_s(out, &l->o, ctx_all, tokens);
+    free(ctx_all); free(used); free(slot);
+    return ok;
+}
+#endif
+
 static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
@@ -1932,6 +2003,17 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
     if (optime_on()) { g_mt_index += optime_now() - _tm1; }
     const double _tm2 = optime_on() ? optime_now() : 0.0;
+#ifdef COLI_VULKAN
+    /* F7: the whole chunk's core on the GPU. Prefill only; anything at all that
+     * does not work falls through to the CPU nest below. */
+    if (mla_attn_gpu_on() && tokens > 1 &&
+        mla_attn_gpu_try(c, l, tokens, seen, width, selected, absorbed, latent, out)) {
+        if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+        free(selected); free(valid); free(head_w);
+        free(iq); free(absorbed); free(queries); free(qa);
+        return;
+    }
+#endif
     float *context = malloc((size_t)H * V * sizeof(float));
     /* score/pooled are the one thing 64 independent heads would share if run
      * concurrently -- each gets its own slice of a pool sized per thread,
@@ -4466,6 +4548,18 @@ static void optime_report(const char *tag) {
                 g_mt_index, 1e3 * g_mt_index / g_mn_calls,
                 g_mt_attn,  1e3 * g_mt_attn  / g_mn_calls,
                 1e6 * g_mt_index / g_mn_seen);
+#ifdef COLI_VULKAN
+    /* F7: where the GPU attention core's time went. Zero when the knob is off. */
+    if (mla_attn_gpu_on()) {
+        double f7_copy = 0, f7_gpu = 0; long f7_calls = 0, f7_sub = 0;
+        coli_vk_mla_attn_prof(&f7_copy, &f7_gpu, &f7_calls, &f7_sub);
+        if (f7_calls)
+            fprintf(stderr, "%s mla attn gpu (F7): calls=%ld submits=%ld copy=%.3fs gpu=%.3fs "
+                            "(%.3f + %.3f ms/call)\n",
+                    tag, f7_calls, f7_sub, f7_copy / 1e3, f7_gpu / 1e3,
+                    f7_copy / f7_calls, f7_gpu / f7_calls);
+    }
+#endif
     fprintf(stderr, "%s moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
                     "eg and cpu experts are the [PROF] line; the rest of ffn_moe is bind+dispatch+accumulate\n",
             tag, g_ot_router, g_ot_shared, g_on_router,

@@ -185,6 +185,20 @@ precheck "after-stop"
 warm_glm
 assert_glm_resident "pre" || { echo "FATAL: GLM not >=90% resident before the chain"; exit 1; }
 
+# The CLI oracle path does NOT get a usage histogram for free the way
+# ttft_serve.py's engine mode does (it copies ~/.glm53_explain.bin when
+# COLI_USAGE_PATH is unset). Without it vk_preload_tier prints
+# "[VK] no usage history loaded -- tier empty" and the oracle measures a
+# configuration that never serves: zero resident experts, so streaming moves
+# 100 % of the routed calls instead of the ~11 % it moves in service, and the
+# numerics delta it reports says nothing about the shipped engine. Measured
+# 2026-09-19: a 1 064-token oracle prefill with no tier is 177.0 s, with the
+# tier it is a different engine entirely. A per-chain COPY, never the
+# canonical file, so a run cannot mutate what the next one preloads from.
+HIST="$OUT/${TAG}_hist.bin"
+cp ~/.glm53_explain.bin "$HIST" || { echo "FATAL: no ~/.glm53_explain.bin to freeze"; exit 1; }
+echo "--- frozen usage histogram: $HIST ($(stat -c %s "$HIST") bytes)"
+
 DEEP_PACKET="$OUT/${TAG}_deep_packet.txt"
 SHALLOW_PACKET="$OUT/${TAG}_shallow_packet.txt"
 python3 - "$F2_ROOT/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md" "$DEEP_PACKET" "$SHALLOW_PACKET" \
@@ -214,6 +228,7 @@ run_oracle() {
     export COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695
     export COLI_KDA_GPU=0
     export GLM53_PREFIX_CKPT=0 COLI_CKPT_DIR="$OUT/ckpt_${outtag}_${side}"
+    export COLI_USAGE_PATH="$HIST"
     export GLM53_VERBOSE=1
     export GLM53_LOGIT_DUMP_ALL="$OUT/${outtag}_dump_${side}.f32"
     unset COLI_TIMERS COLI_PREFILL_STREAM GLM53_PREFILL_CHUNK GLM53_EXPERTS_CPU
@@ -221,15 +236,33 @@ run_oracle() {
     "$bin" --model "$GLM_SNAP" --prompt "$(cat "$packet")" --logits --greedy 0
   ) > "$OUT/${outtag}_${side}.out" 2> "$OUT/${outtag}_${side}.err"
   local rc=$?
-  echo "[oracle $outtag] $side rc=$rc $(grep -c ^teacher_forcing "$OUT/${outtag}_${side}.out") tf-line(s) $(grep -o 'prefill [0-9]* token' "$OUT/${outtag}_${side}.err" | tail -1)"
+  echo "[oracle $outtag] $side rc=$rc $(grep -c ^teacher_forcing "$OUT/${outtag}_${side}.out") tf-line(s) $(grep -a -o 'prefill [0-9]* token in [0-9.]*s' "$OUT/${outtag}_${side}.err" | tail -1)"
+  echo "           tier: $(grep -a 'preload dev2:\|preload dev3:\|preload:' "$OUT/${outtag}_${side}.err" | tr '\n' ' ')"
   wait_no_engine || true
+  if grep -aq 'tier empty' "$OUT/${outtag}_${side}.err"; then
+    echo "FATAL [oracle $outtag/$side]: the expert tier came up EMPTY -- that is not the served"
+    echo "      configuration and no numerics comparison taken on it means anything. Refusing."
+    return 8
+  fi
   return $rc
 }
 
-# logit_diff <label> <A.f32> <B.f32>  -- cosine / max-abs / argmax agreement
+# logit_diff <label> <A.f32> <B.f32>  -- cosine / max-abs / argmax agreement.
+#
+# Two things this got wrong on its first run and does not get wrong again.
+# (1) It guessed the vocab. The dump carries a 16-byte header (magic "GLKD",
+#     version, count, vocab -- dump_logits_all in c/glm53.c); GLM-5.3's vocab is
+#     154 880, the guess was 155 136, and a wrong vocab turns the argmax check
+#     into nonsense instead of an error. It reads the header now.
+# (2) It looped element-wise in Python. There is no numpy on this rig and a
+#     5 000-position dump is 774M floats: everything heavy here is a C-level
+#     builtin over array.array (per-row max+index for the argmaxes,
+#     map(sub)/map(abs) for the largest difference), and the cosine is taken on
+#     the LAST position, which is CLAUDE.md's own convention.
 logit_diff() {
   python3 - "$1" "$2" "$3" <<'PY'
-import sys, array, math
+import sys, array, math, struct
+from operator import sub, mul
 label, pa, pb = sys.argv[1:4]
 try:
     a = open(pa, "rb").read(); b = open(pb, "rb").read()
@@ -237,29 +270,32 @@ except OSError as e:
     print(f"  {label:<44} REFUSED: {e}"); sys.exit(2)
 if not a or not b:
     print(f"  {label:<44} REFUSED: empty dump (A={len(a)}B B={len(b)}B) is not a comparison"); sys.exit(2)
-fa = array.array('f'); fa.frombytes(a[:(len(a)//4)*4])
-fb = array.array('f'); fb.frombytes(b[:(len(b)//4)*4])
-if len(fa) != len(fb):
-    print(f"  {label:<44} REFUSED: different lengths ({len(fa)} vs {len(fb)} floats)"); sys.exit(2)
-V = 155136
-n = len(fa)
-rows = n // V if n % V == 0 else 0
+if len(a) != len(b):
+    print(f"  {label:<44} REFUSED: different lengths ({len(a)} vs {len(b)} bytes)"); sys.exit(2)
+if len(a) < 16 or a[:4] != b"GLKD" or b[:4] != b"GLKD":
+    print(f"  {label:<44} REFUSED: not a GLKD logit dump"); sys.exit(2)
+_, _, rows, V = struct.unpack("<4I", a[:16])
+_, _, rows_b, V_b = struct.unpack("<4I", b[:16])
+if (rows, V) != (rows_b, V_b) or rows < 1 or V < 1:
+    print(f"  {label:<44} REFUSED: shapes {rows}x{V} vs {rows_b}x{V_b}"); sys.exit(2)
 if a == b:
-    print(f"  {label:<44} BIT-IDENTICAL ({n} floats)"); sys.exit(0)
-dot = na = nb = 0.0; mx = 0.0
-for i in range(n):
-    x = fa[i]; y = fb[i]
-    dot += x*y; na += x*x; nb += y*y
-    d = abs(x-y)
-    if d > mx: mx = d
-cos = dot / math.sqrt(na*nb) if na > 0 and nb > 0 else float("nan")
-if rows:
-    agree = sum(1 for r in range(rows)
-                if max(range(V), key=lambda j: fa[r*V+j]) == max(range(V), key=lambda j: fb[r*V+j]))
-    print(f"  {label:<44} cosine={cos:.8f} max_abs={mx:.6g} argmax {agree}/{rows} positions agree")
-else:
-    print(f"  {label:<44} cosine={cos:.8f} max_abs={mx:.6g} (row count not a multiple of {V}; no argmax)")
-sys.exit(0 if cos >= 0.9999 else 1)
+    print(f"  {label:<44} BIT-IDENTICAL ({rows} x {V})"); sys.exit(0)
+fa = array.array('f'); fa.frombytes(a[16:16 + rows*V*4])
+fb = array.array('f'); fb.frombytes(b[16:16 + rows*V*4])
+if len(fa) != rows*V:
+    print(f"  {label:<44} REFUSED: {len(fa)} floats, header says {rows}x{V}"); sys.exit(2)
+mx = max(map(abs, map(sub, fa, fb)))
+agree = 0
+for r in range(rows):
+    ra = fa[r*V:(r+1)*V]; rb = fb[r*V:(r+1)*V]
+    if ra.index(max(ra)) == rb.index(max(rb)): agree += 1
+la = fa[(rows-1)*V:]; lb = fb[(rows-1)*V:]
+dot = sum(map(mul, la, lb))
+na = math.sqrt(sum(map(mul, la, la))); nb = math.sqrt(sum(map(mul, lb, lb)))
+cos = dot / (na * nb) if na > 0 and nb > 0 else float("nan")
+print(f"  {label:<44} last-token cosine={cos:.8f} max_abs={mx:.6g} "
+      f"argmax {agree}/{rows} positions agree")
+sys.exit(0 if (cos >= 0.9999 and agree == rows) else 1)
 PY
 }
 
@@ -368,6 +404,7 @@ run_arm() {   # run_arm <arm-label> <stream 0|1>
   export OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close
   export COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695
   export COLI_VK_SHADERS="$CAND_SHADERS"
+  export COLI_USAGE_PATH="$HIST"      # frozen copy: both arms preload the same tier
   if [ "$stream" = 1 ]; then export COLI_PREFILL_STREAM=1
   else unset COLI_PREFILL_STREAM; fi
   unset GLM53_PREFILL_CHUNK          # B's chunk default comes from the knob itself

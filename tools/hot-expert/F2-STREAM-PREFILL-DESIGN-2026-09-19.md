@@ -220,10 +220,19 @@ addition is not associative, so every token that is not in the first chunk
 gets a reassociated 9-term sum (shared expert + 8 routed). Tokens 0..127 are
 bit-identical; the rest are not.
 
-The magnitude is one reassociation of nine same-sign-ish terms, i.e. ~1e-7
+~~The magnitude is one reassociation of nine same-sign-ish terms, i.e. ~1e-7
 relative — far below §G15's clamp effect — but it is not zero and the argmax
-can flip on a near-tie, so it gets its own oracle line and its own row, and
-**the default stays 128.**
+can flip on a near-tie.~~
+
+**That sentence was wrong and the oracle said so (record §F2b, O4).** Per token
+the error *is* one reassociation of nine terms, but it feeds the next layer and
+the next position, and it compounds: at 1 064 tokens the chunk change is
+invisible (`teacher_forcing` identical, max_abs 1.9e-3), and at **6 327 tokens
+it moves 205 of 6 327 argmaxes (3.24 %), max_abs 7.24, cosine 0.995** — *more*
+than the swiglu-clamp gap that streaming itself brings. The depth a
+reassociation is checked at is load-bearing; a shallow check here would have
+reported "free". It gets its own oracle line and its own row, and **the default
+stays 128.**
 
 Consequence for the item: `COLI_PREFILL_STREAM=1` raises the *effective
 default* chunk to 512 (still overridable by `GLM53_PREFILL_CHUNK`), and

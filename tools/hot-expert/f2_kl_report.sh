@@ -82,6 +82,10 @@ kl_line "C3 clamp+stream@512 vs @128 (deep)" \
         "$OUT/deep_dump_clamp_s128.f32" "$OUT/deep_dump_clamp_s512.f32" 0
 
 echo
+if [ "${F2_KL_LEGACY:-0}" != 1 ]; then
+  echo "--- the UNCLAMPED rows this replaces are already in the record; set"
+  echo "---     F2_KL_LEGACY=1 to recompute them (a few minutes each)."
+else
 echo "--- for the record, the UNCLAMPED rows this replaces (recomputed only if"
 echo "---     the dumps are still there; these are what failed the bar)"
 for t in "O2 stream+chunk512 vs off (deep):deep_dump_off.f32:deep_dump_on.f32" \
@@ -91,6 +95,7 @@ for t in "O2 stream+chunk512 vs off (deep):deep_dump_off.f32:deep_dump_on.f32" \
   [ -s "$OUT/$r" ] && [ -s "$OUT/$c" ] && kl_line "$lbl" "$OUT/$r" "$OUT/$c" 0 || \
     echo "  $lbl  SKIPPED (dump gone)"
 done
+fi
 
 echo
 echo "=== f2_kl_report: $fails gated line(s) failed $(date -Is)"

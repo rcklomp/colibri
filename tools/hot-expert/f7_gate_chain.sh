@@ -26,9 +26,10 @@
 #          deep AND shallow. This is the knob-is-inert proof and a HARD GATE.
 #   O2  GLM53_MLA_ATTN_GPU=1 vs knob off, SAME binary, through kl_compare.py
 #       -> mean KL < 0.0284 AND top-1 >= 99.0 % over every position, deep AND
-#          shallow. The shallow packet is the one that exercises the DENSE
-#          selection regime (seen < width = 2051), where every row attends to
-#          the whole prefix and `used` is at its structural maximum.
+#          shallow. The dense-selection regime (seen <= width = 2051, every
+#          row attending to the whole prefix) is the first four chunks of ANY
+#          run at chunk 512, so both packets exercise it; the shallow one is
+#          there because it is mostly that regime rather than a tail of it.
 #   Both arms of both comparisons carry the SERVED configuration:
 #   GLM53_VK_SWIGLU_CLAMP=1 COLI_PREFILL_STREAM=1 GLM53_PREFILL_CHUNK=512.
 #
@@ -340,31 +341,17 @@ gate_compare "O2 teacher_forcing (deep, gpu vs off)"    "$OUT/deep_gpu.out"    "
 o2_tf=$?
 gate_compare "O2 teacher_forcing (shallow, gpu vs off)" "$OUT/shallow_gpu.out" "$OUT/shallow_off.out" '^teacher_forcing'
 o2_tf_sh=$?
-echo "--- O2 KL bar: mean KL < 0.0284 AND top-1 >= 99.0 %"
-python3 "$KL" "O2 deep (off || gpu)"    "$OUT/deep_dump_off.f32"    "$OUT/deep_dump_gpu.f32"    | tee "$OUT/${TAG}_kl_deep.txt"
-o2_kl=${PIPESTATUS[0]}
-python3 "$KL" "O2 shallow (off || gpu)" "$OUT/shallow_dump_off.f32" "$OUT/shallow_dump_gpu.f32" | tee "$OUT/${TAG}_kl_shallow.txt"
-o2_kl_sh=${PIPESTATUS[0]}
-python3 - "$OUT/${TAG}_kl_deep.txt" "$OUT/${TAG}_kl_shallow.txt" <<'PY'
-import re, sys
-bar_kl, bar_t1 = 0.0284, 99.0
-bad = 0
-for path in sys.argv[1:]:
-    txt = open(path).read()
-    if "REFUSED" in txt:
-        print(f"  {path}: REFUSED -- an empty comparison is not a pass"); bad = 1; continue
-    m = re.search(r"mean KL[^0-9\-]*([0-9.eE+\-]+)", txt)
-    t = re.search(r"top-1[^0-9]*([0-9.]+)\s*%", txt)
-    if not m or not t:
-        print(f"  {path}: could not read mean KL / top-1 -- REFUSING"); bad = 1; continue
-    kl, t1 = float(m.group(1)), float(t.group(1))
-    ok = kl < bar_kl and t1 >= bar_t1
-    print(f"  {path.split('/')[-1]:<28} mean KL={kl:.6g} (bar <{bar_kl})  top-1={t1:.2f}% "
-          f"(bar >={bar_t1}%)  {'MET' if ok else 'NOT MET'}")
-    if not ok: bad = 1
-sys.exit(bad)
-PY
-o2_bar=$?
+# The KL passes are MINUTES TO AN HOUR of pure Python per comparison (a 9 115
+# position dump is 1.4 G floats a side) and they need no engine, no GPU and no
+# lock. Running them here once cost 40+ minutes of gateway outage before the
+# run was killed to get the rig back -- so, exactly as f2_kl_report.sh does,
+# they are NOT run inside the lock. The chain stops after the arms; the bar is
+# read afterwards by f7_kl_report.sh with the gateway up.
+o2_kl=0; o2_kl_sh=0; o2_bar=0
+echo "--- O2 KL bar (mean KL < 0.0284 AND top-1 >= 99.0 %): NOT run here."
+echo "    The dumps are on disk. With the gateway back up, run:"
+echo "      $HERE/f7_kl_report.sh $OUT"
+echo "    and do not call phase 1 passed until it prints MET on both packets."
 
 echo "--- prefill wall seconds, the deep arms"
 for sfx in deep_off deep_pristine deep_gpu; do
@@ -380,16 +367,11 @@ if [ "$o1_tf" != 0 ] || [ "$o1_dump" != 0 ] || [ "$o1_tf_sh" != 0 ] || [ "$o1_du
   echo "FATAL: O1 failed -- GLM53_MLA_ATTN_GPU unset is NOT inert. Stopping before the ladder."
   oracle_rc=1
 fi
-if [ "$o2_kl" = 2 ] || [ "$o2_kl_sh" = 2 ]; then
-  echo "FATAL: O2 REFUSED (a dump was missing or empty) -- an empty comparison is not a pass."
-  oracle_rc=1
-fi
-if [ "$o2_bar" != 0 ]; then
-  echo "FATAL: O2 did not clear the KL bar. The knob does not ship. Stopping before the ladder."
-  oracle_rc=1
-fi
+for d in deep_dump_off deep_dump_gpu shallow_dump_off shallow_dump_gpu; do
+  [ -s "$OUT/$d.f32" ] || { echo "FATAL: $OUT/$d.f32 missing or empty -- f7_kl_report.sh has nothing to read"; oracle_rc=1; }
+done
 [ "$oracle_rc" = 0 ] || exit 1
-echo "=== phase 1 PASS"
+echo "=== phase 1 ARMS DONE (O1 passed; the KL bar is f7_kl_report.sh's, out of the lock)"
 fi
 
 [ "${F7_ORACLE_ONLY:-0}" = 1 ] && { echo "=== F7_ORACLE_ONLY=1, stopping after phase 1"; exit 0; }

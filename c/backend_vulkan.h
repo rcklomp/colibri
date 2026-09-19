@@ -194,6 +194,32 @@ int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const f
                               float *out, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale, int Dout);
 
+/* F2: a per-device RING of expert-sized weight slots, for experts that are not
+ * tier-resident and are streamed in for the chunk that needs them. Allocated out
+ * of the VRAM the tier's count cap leaves unused; the tier itself is untouched.
+ * A slot's three tensors are ordinary ColiVkTensor handles, so the existing
+ * coli_vk_expert_group_issue/2/3 path drives a streamed expert exactly like a
+ * resident one. Design: tools/hot-expert/F2-STREAM-PREFILL-DESIGN-2026-09-19.md.
+ *
+ * `dev` is the engine's device number: 0, 2 or 3.
+ * _init returns the number of slots it actually got (a PARTIAL ring is valid;
+ * 0 means "no ring on this device", which the caller schedules around). Calling
+ * it twice with the same shape returns the existing count, with a different
+ * shape returns 0.
+ * _fill is safe to call concurrently for DISTINCT (dev, slot) pairs -- it is a
+ * memcpy into mapped, write-combined VRAM and touches no Vulkan object. The
+ * caller must not refill a slot whose submit is still in flight. */
+int    coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs);
+int    coli_vk_ring_slots(int dev);
+size_t coli_vk_ring_bytes(int dev);
+size_t coli_vk_ring_slot_bytes(int dev);
+int    coli_vk_ring_tensors(int dev, int slot, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d);
+int    coli_vk_ring_fill(int dev, int slot,
+                         const void *gw, const float *gsc,
+                         const void *uw, const float *usc,
+                         const void *dw, const float *dsc);
+void   coli_vk_ring_free(void);
+
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 

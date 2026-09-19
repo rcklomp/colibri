@@ -2081,6 +2081,193 @@ int coli_vk_expert_group3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
     return coli_vk_expert_group_take3(y);
 }
 
+/* ==================== F2: the streamed-expert ring ==============================
+ * FRANKEN-ENGINE-PLAN-2026-09-15.md item F2, design note
+ * tools/hot-expert/F2-STREAM-PREFILL-DESIGN-2026-09-19.md.
+ *
+ * A ring is a fixed set of expert-sized weight slots on ONE device, allocated
+ * once out of the VRAM the tier's count cap leaves unused, and refilled from
+ * host memory as a prefill chunk walks its non-resident experts. A slot's three
+ * tensors are ordinary ColiVkTensor handles, so the existing
+ * coli_vk_expert_group_issue* path drives them with no change at all; the only
+ * new thing here is "allocate without uploading" and "overwrite in place".
+ *
+ * Why a plain memcpy and no staging buffer or vkCmdCopyBuffer: the memory type
+ * pick_memtype() chooses for weights is HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL
+ * (ReBAR write-combined VRAM), which is what upload_tensor already writes the
+ * resident tier into. The fill IS the upload. The staging-ring measurement that
+ * preceded this reached 38.6 GB/s aggregate on three cards with two legs; this
+ * path removes one of them, and tools/hot-expert/f2_ring_probe.c measures what
+ * it costs instead of assuming.
+ *
+ * Thread safety: coli_vk_ring_fill on DISTINCT (dev, slot) pairs is safe to call
+ * concurrently -- it only memcpys into disjoint mapped ranges and touches no
+ * Vulkan object. Two threads must not fill the SAME slot, and no slot may be
+ * refilled while a submit that reads it is in flight; both are the caller's
+ * contract and both are what the wave schedule in the design note enforces.
+ *
+ * Nothing in the existing engine paths calls any of this. It is opt-in from
+ * glm53.c behind COLI_PREFILL_STREAM and unreferenced by qwen38/qwen38-vk. */
+
+typedef struct {
+    ColiVkTensor *g, *u, *d;
+    uint8_t *gw, *uw, *dw;          /* mapped weight planes */
+    float   *gsc, *usc, *dsc;       /* mapped scale planes */
+} VkRingSlot;
+
+static struct VkRing {
+    int slots, fmt, D, I, gs;
+    size_t gu_wbytes, dn_wbytes;    /* per-tensor weight bytes (padded) */
+    size_t gu_rb, dn_rb;            /* host row bytes */
+    size_t gu_stride, dn_stride;    /* device row stride */
+    size_t gu_sfl, dn_sfl;          /* scale float counts */
+    size_t bytes;                   /* total device bytes held */
+    VkRingSlot *s;
+} g_ring[3];
+
+/* dev is the ENGINE's device number (0, 2, 3) -> internal 0, 1, 2. */
+static int ring_ix(int dev) { return dev == 0 ? 0 : dev == 2 ? 1 : dev == 3 ? 2 : -1; }
+
+static int ring_alloc_tensor(int ix, ColiVkTensor **out, void **wptr, void **sptr,
+                             int fmt, int I, int O, int gs) {
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
+    t->dev = ix;
+    t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
+    size_t sfl = scale_floats(fmt, I, O, gs);
+    int ok = ix == 0 ? arena_suballoc(t->wbytes, &t->wbuf, wptr)
+           : ix == 1 ? arena_suballoc_d2(t->wbytes, &t->wbuf, wptr)
+                     : arena_suballoc_d3(t->wbytes, &t->wbuf, wptr);
+    if (!ok) { free(t); return 0; }
+    memset(*wptr, 0, t->wbytes);          /* the padding bytes, once and for all */
+    ok = ix == 0 ? arena_suballoc(sfl * sizeof(float), &t->sbuf, sptr)
+       : ix == 1 ? arena_suballoc_d2(sfl * sizeof(float), &t->sbuf, sptr)
+                 : arena_suballoc_d3(sfl * sizeof(float), &t->sbuf, sptr);
+    if (!ok) { free(t); return 0; }
+    memset(*sptr, 0, sfl * sizeof(float));
+    *out = t;
+    return 1;
+}
+
+int coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || slots < 1 || D < 1 || I < 1) return 0;
+    if (ix == 0 && !G.ready) return 0;
+    if (ix == 1 && !G2.ready) return 0;
+    if (ix == 2 && !G3.ready) return 0;
+    struct VkRing *r = &g_ring[ix];
+    if (r->s) return (r->fmt == fmt && r->D == D && r->I == I) ? r->slots : 0;
+    /* Only the formats upload_tensor accepts, and only the word-aligned grouped
+     * case the expert tier actually uses; anything else falls back to the CPU. */
+    if (!(fmt == 1 || fmt == 2 || fmt == 8 || (fmt == 4 && gs >= 8 && gs % 8 == 0))) return 0;
+    r->s = calloc((size_t)slots, sizeof(VkRingSlot));
+    if (!r->s) return 0;
+    r->fmt = fmt; r->D = D; r->I = I; r->gs = gs;
+    r->gu_stride = (size_t)rowwords(fmt, D) * 4;          /* gate/up: O = I rows of D */
+    r->dn_stride = (size_t)rowwords(fmt, I) * 4;          /* down:    O = D rows of I */
+    r->gu_rb = (fmt == 1 || fmt == 8) ? (size_t)D : (size_t)(D + 1) / 2;
+    r->dn_rb = (fmt == 1 || fmt == 8) ? (size_t)I : (size_t)(I + 1) / 2;
+    r->gu_sfl = scale_floats(fmt, D, I, gs);
+    r->dn_sfl = scale_floats(fmt, I, D, gs);
+    r->gu_wbytes = r->gu_stride * (size_t)I;
+    r->dn_wbytes = r->dn_stride * (size_t)D;
+    for (int i = 0; i < slots; i++) {
+        VkRingSlot *sl = &r->s[i];
+        void *wp, *sp;
+        /* A partial ring is a valid configuration, not an error: the caller
+         * reads the count back and schedules its waves against it. */
+        if (!ring_alloc_tensor(ix, &sl->g, &wp, &sp, fmt, D, I, gs)) break;
+        sl->gw = wp; sl->gsc = sp;
+        if (!ring_alloc_tensor(ix, &sl->u, &wp, &sp, fmt, D, I, gs)) break;
+        sl->uw = wp; sl->usc = sp;
+        if (!ring_alloc_tensor(ix, &sl->d, &wp, &sp, fmt, I, D, gs)) break;
+        sl->dw = wp; sl->dsc = sp;
+        r->bytes += 2 * (r->gu_wbytes + r->gu_sfl * 4) + r->dn_wbytes + r->dn_sfl * 4;
+        r->slots = i + 1;
+    }
+    return r->slots;
+}
+
+int coli_vk_ring_slots(int dev) {
+    const int ix = ring_ix(dev);
+    return ix < 0 ? 0 : g_ring[ix].slots;
+}
+
+size_t coli_vk_ring_bytes(int dev) {
+    const int ix = ring_ix(dev);
+    return ix < 0 ? 0 : g_ring[ix].bytes;
+}
+
+/* Bytes one fill moves, for the probe's and the engine's own accounting. */
+size_t coli_vk_ring_slot_bytes(int dev) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || !g_ring[ix].slots) return 0;
+    struct VkRing *r = &g_ring[ix];
+    return 2 * (r->gu_wbytes + r->gu_sfl * 4) + r->dn_wbytes + r->dn_sfl * 4;
+}
+
+int coli_vk_ring_tensors(int dev, int slot, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || slot < 0 || slot >= g_ring[ix].slots) return 0;
+    VkRingSlot *sl = &g_ring[ix].s[slot];
+    if (!sl->d) return 0;
+    if (g) *g = sl->g;
+    if (u) *u = sl->u;
+    if (d) *d = sl->d;
+    return 1;
+}
+
+/* One expert into one slot. The six source pointers are the engine's mapped
+ * shard views (glm53.c expert_mats -> Mat.q4 / Mat.s), in the same layout
+ * upload_tensor reads. Returns 0 if the slot does not exist. */
+int coli_vk_ring_fill(int dev, int slot,
+                      const void *gw, const float *gsc,
+                      const void *uw, const float *usc,
+                      const void *dw, const float *dsc) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || slot < 0 || slot >= g_ring[ix].slots) return 0;
+    struct VkRing *r = &g_ring[ix];
+    VkRingSlot *sl = &r->s[slot];
+    if (!sl->d) return 0;
+    /* The engine's int4-g64 experts have rowWords*4 == host row bytes exactly
+     * (4096 and 2048 columns), so this is three flat copies, not three row
+     * loops; the loop is kept for shapes where the device row is padded. */
+    if (r->gu_stride == r->gu_rb) {
+        memcpy(sl->gw, gw, r->gu_wbytes);
+        memcpy(sl->uw, uw, r->gu_wbytes);
+    } else {
+        for (int o = 0; o < r->I; o++) {
+            memcpy(sl->gw + (size_t)o * r->gu_stride, (const uint8_t *)gw + (size_t)o * r->gu_rb, r->gu_rb);
+            memcpy(sl->uw + (size_t)o * r->gu_stride, (const uint8_t *)uw + (size_t)o * r->gu_rb, r->gu_rb);
+        }
+    }
+    if (r->dn_stride == r->dn_rb) {
+        memcpy(sl->dw, dw, r->dn_wbytes);
+    } else {
+        for (int o = 0; o < r->D; o++)
+            memcpy(sl->dw + (size_t)o * r->dn_stride, (const uint8_t *)dw + (size_t)o * r->dn_rb, r->dn_rb);
+    }
+    memcpy(sl->gsc, gsc, r->gu_sfl * sizeof(float));
+    memcpy(sl->usc, usc, r->gu_sfl * sizeof(float));
+    memcpy(sl->dsc, dsc, r->dn_sfl * sizeof(float));
+    return 1;
+}
+
+void coli_vk_ring_free(void) {
+    for (int ix = 0; ix < 3; ix++) {
+        struct VkRing *r = &g_ring[ix];
+        for (int i = 0; i < r->slots; i++) {
+            /* The buffers are arena sub-allocations: the arena is torn down by
+             * coli_vk_shutdown, so only the handles and the structs go here. */
+            free(r->s[i].g); free(r->s[i].u); free(r->s[i].d);
+        }
+        free(r->s);
+        memset(r, 0, sizeof(*r));
+    }
+}
+
 /* ---- MLA absorb attention core -------------------------------------------------
  * The KV latent (L, [rows,K]) and rope (R, [rows,Rd]) caches live in persistent
  * per-layer device buffers, appended row-by-row as tokens decode (the host stays

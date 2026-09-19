@@ -27,8 +27,14 @@
 #          (the union is built in first-appearance order over the whole chunk,
 #          so a token's 8 routed contributions are summed in a different order
 #          when the chunk boundary moves); reported, not gated.
-# Both a short and a >= 4000-token prompt for O1 and O4; the deep prompt for
-# O2/O3 (a short prompt is one chunk and exercises nothing).
+# O1 runs at both depths, O2 and O4 at the deep one (>= 4000 tokens), O3 at
+# the shallow one -- its all-CPU reference costs roughly 9x the MoE bucket and
+# a deep O3 is an hour of gateway outage that proves nothing the shallow one
+# does not (the shallow packet is still several chunks at chunk 512).
+#
+# Packet sizes: F2_DEEP_CHARS (24000, ~5000 tokens) and F2_SHALLOW_CHARS
+# (6000). Shrink both for a smoke run that only proves the chain and the
+# engine start.
 #
 # Phase 2, LADDER -- A,B,B,A on ONE binary, A = knob off, B = knob on,
 # COLI_TIMERS=1 on every arm, verdict through gate_lib.sh.
@@ -181,13 +187,14 @@ assert_glm_resident "pre" || { echo "FATAL: GLM not >=90% resident before the ch
 
 DEEP_PACKET="$OUT/${TAG}_deep_packet.txt"
 SHALLOW_PACKET="$OUT/${TAG}_shallow_packet.txt"
-python3 - "$F2_ROOT/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md" "$DEEP_PACKET" "$SHALLOW_PACKET" <<'PY'
+python3 - "$F2_ROOT/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md" "$DEEP_PACKET" "$SHALLOW_PACKET" \
+        "${F2_DEEP_CHARS:-24000}" "${F2_SHALLOW_CHARS:-6000}" <<'PY'
 import sys
-src, deep, shallow = sys.argv[1:4]
+src, deep, shallow, dn, sn = sys.argv[1:6]
 text = open(src, encoding="utf-8").read()
 q = "\n\nContinue summarising the notes above in a few sentences, without repeating what you already said."
-open(deep, "w").write(text[:24000] + q)
-open(shallow, "w").write(text[:6000] + q)
+open(deep, "w").write(text[:int(dn)] + q)
+open(shallow, "w").write(text[:int(sn)] + q)
 PY
 [ -s "$DEEP_PACKET" ] || { echo "FATAL: could not build the deep oracle packet"; exit 1; }
 
@@ -286,17 +293,27 @@ else
   logit_diff "O1 logit dump (shallow)" "$OUT/shallow_dump_pristine.f32" "$OUT/shallow_dump_off.f32"; o1_dump_sh=1
 fi
 
-echo "--- O2/O3: streaming on, against knob-off and against the unclamped all-CPU reference"
+echo "--- O2: streaming on vs knob off, at the deep prompt"
 run_oracle on  "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
-    "COLI_PREFILL_STREAM=1" "GLM53_PREFILL_CHUNK=$B_CHUNK" "COLI_TIMERS=1" || exit 1
-run_oracle cpu2 "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
-    "GLM53_EXPERTS_CPU=2" "GLM53_PREFILL_CHUNK=$B_CHUNK" || exit 1
+    "COLI_PREFILL_STREAM=1" "COLI_TIMERS=1" || exit 1
 gate_compare "O2 teacher_forcing (on vs off)" "$OUT/deep_on.out" "$OUT/deep_off.out" '^teacher_forcing'
 o2_tf=$?
 logit_diff "O2 logits (on vs off)"  "$OUT/deep_dump_off.f32"  "$OUT/deep_dump_on.f32"; o2_lg=$?
-gate_compare "O3 teacher_forcing (on vs EXPERTS_CPU=2)" "$OUT/deep_on.out" "$OUT/deep_cpu2.out" '^teacher_forcing'
+
+# O3 runs at the SHALLOW depth on purpose. GLM53_EXPERTS_CPU=2 forces all eight
+# routed experts per token per layer onto the CPU where today only ~10.7 % go,
+# which costs roughly 9x the MoE bucket -- a deep O3 is an hour of gateway
+# outage on its own and proves nothing a shallow one does not. The shallow
+# packet is still several chunks at chunk 512, so the ring, the waves and the
+# accumulate order are all exercised; O2 above carries the depth.
+echo "--- O3: streaming on vs the UNCLAMPED all-CPU reference (placement only), shallow"
+run_oracle on   "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+    "COLI_PREFILL_STREAM=1" "COLI_TIMERS=1" || exit 1
+run_oracle cpu2 "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+    "GLM53_EXPERTS_CPU=2" "GLM53_PREFILL_CHUNK=$B_CHUNK" || exit 1
+gate_compare "O3 teacher_forcing (on vs EXPERTS_CPU=2)" "$OUT/shallow_on.out" "$OUT/shallow_cpu2.out" '^teacher_forcing'
 o3_tf=$?
-logit_diff "O3 logits (on vs EXPERTS_CPU=2)" "$OUT/deep_dump_cpu2.f32" "$OUT/deep_dump_on.f32"; o3_lg=$?
+logit_diff "O3 logits (on vs EXPERTS_CPU=2)" "$OUT/shallow_dump_cpu2.f32" "$OUT/shallow_dump_on.f32"; o3_lg=$?
 
 echo "--- O4: chunk $B_CHUNK with streaming OFF, against the default chunk"
 run_oracle chunk "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
@@ -305,8 +322,12 @@ gate_compare "O4 teacher_forcing (chunk vs default)" "$OUT/deep_chunk.out" "$OUT
 o4_tf=$?
 logit_diff "O4 logits (chunk vs default)" "$OUT/deep_dump_off.f32" "$OUT/deep_dump_chunk.f32"; o4_lg=$?
 
-echo "--- streamed-expert accounting from the knob-on run (COLI_TIMERS=1)"
-grep -E 'moe split|\[STREAM\]|\[PROF\] eg=' "$OUT/deep_on.err" | tail -6 || echo "(none)"
+echo "--- streamed-expert accounting, knob ON then knob OFF (COLI_TIMERS=1 on the ON run)"
+grep -E 'moe split|\[STREAM\]|\[PROF\] eg=|prefill ring' "$OUT/deep_on.err" | tail -8 || echo "(none)"
+echo "--- prefill wall time, all four deep arms (GLM53_VERBOSE 'prefill N token' + the run's own timing)"
+for sidep in off pristine on chunk; do
+  printf '  %-9s %s\n' "$sidep" "$(grep -E 'prefill [0-9]+ token' "$OUT/deep_${sidep}.err" | tail -1)"
+done
 
 echo "=== oracle summary"
 echo "  O1 (knob off == pristine, HARD GATE): tf_deep=$o1_tf dump_deep=$o1_dump tf_shallow=$o1_tf_sh dump_shallow=$o1_dump_sh"

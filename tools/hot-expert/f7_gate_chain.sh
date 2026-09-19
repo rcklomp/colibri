@@ -39,6 +39,17 @@
 #   F7_PROBE_ONLY=1     phase 0 only, then stop
 #   F7_ORACLE_ONLY=1    phases 0-1, then stop
 #   F7_LADDER_ONLY=1    skip phases 0-1 and run only the A,B,B,A ladder
+#   F7_REF64_ONLY=1     skip the probe and the ladder; after the usual
+#                       stop/warm/frozen-histogram preamble, run ONE arm per
+#                       packet with GLM53_MLA_ATTN_REF64=1 (GPU knob unset),
+#                       same served config as the other oracle arms, writing
+#                       shallow_dump_ref64.f32 (and deep_dump_ref64.f32 if
+#                       F7_REF64_DEEP=1) into $OUT. Reuses the newest existing
+#                       *_shallow_packet.txt / *_deep_packet.txt already in
+#                       $OUT instead of generating a new one -- refuses if
+#                       none is there. No KL comparison runs here (read the
+#                       R1/R2 rows with f7_kl_report.sh, gateway back up).
+#   F7_REF64_DEEP=1     with F7_REF64_ONLY=1, also run the deep packet
 #   F7_STEPS=...        ladder steps. Default is the SHORT rung "1024,1024,2048"
 #                       (directional only). The gate's own rung is
 #                       "1024,1024,2048,4096,8192" (to 18 439) and is
@@ -188,7 +199,7 @@ precheck "after-stop"
 # ======================================================================
 # Phase 0: the microbenchmark.
 # ======================================================================
-if [ "${F7_LADDER_ONLY:-0}" != 1 ]; then
+if [ "${F7_LADDER_ONLY:-0}" != 1 ] && [ "${F7_REF64_ONLY:-0}" != 1 ]; then
   echo "=== phase 0: microbenchmark $(date -Is)"
   echo "--- VRAM preflight (>= 1 GiB free on card0 -- the gateway is down)"
   used=$(VRAM 0); total=$(VRAM_TOTAL 0)
@@ -240,8 +251,28 @@ echo "--- frozen usage histogram: $HIST ($(stat -c %s "$HIST") bytes)"
 
 DEEP_PACKET="$OUT/${TAG}_deep_packet.txt"
 SHALLOW_PACKET="$OUT/${TAG}_shallow_packet.txt"
-python3 - "$F7_ROOT/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md" "$DEEP_PACKET" "$SHALLOW_PACKET" \
-        "${F7_DEEP_CHARS:-30000}" "${F7_SHALLOW_CHARS:-9000}" <<'PY'
+if [ "${F7_REF64_ONLY:-0}" = 1 ]; then
+  # Reuse the SAME packets shallow_dump_off.f32 / deep_dump_off.f32 were made
+  # from -- do not regenerate, so the ref64 dump lines up with the existing
+  # off/gpu dumps position-for-position.
+  echo "--- F7_REF64_ONLY=1: reusing the newest existing packets in $OUT (not regenerating)"
+  SHALLOW_PACKET=$(ls -t "$OUT"/*_shallow_packet.txt 2>/dev/null | head -1)
+  DEEP_PACKET=$(ls -t "$OUT"/*_deep_packet.txt 2>/dev/null | head -1)
+  [ -n "$SHALLOW_PACKET" ] && [ -s "$SHALLOW_PACKET" ] || {
+    echo "FATAL: F7_REF64_ONLY=1 needs an existing *_shallow_packet.txt in $OUT -- none found, refusing to regenerate"
+    exit 1
+  }
+  echo "    shallow packet: $SHALLOW_PACKET"
+  if [ "${F7_REF64_DEEP:-0}" = 1 ]; then
+    [ -n "$DEEP_PACKET" ] && [ -s "$DEEP_PACKET" ] || {
+      echo "FATAL: F7_REF64_DEEP=1 needs an existing *_deep_packet.txt in $OUT -- none found, refusing to regenerate"
+      exit 1
+    }
+    echo "    deep packet:    $DEEP_PACKET"
+  fi
+else
+  python3 - "$F7_ROOT/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md" "$DEEP_PACKET" "$SHALLOW_PACKET" \
+          "${F7_DEEP_CHARS:-30000}" "${F7_SHALLOW_CHARS:-9000}" <<'PY'
 import sys
 src, deep, shallow, dn, sn = sys.argv[1:6]
 text = open(src, encoding="utf-8").read()
@@ -249,7 +280,8 @@ q = "\n\nContinue summarising the notes above in a few sentences, without repeat
 open(deep, "w").write(text[:int(dn)] + q)
 open(shallow, "w").write(text[:int(sn)] + q)
 PY
-[ -s "$DEEP_PACKET" ] || { echo "FATAL: could not build the deep oracle packet"; exit 1; }
+  [ -s "$DEEP_PACKET" ] || { echo "FATAL: could not build the deep oracle packet"; exit 1; }
+fi
 
 # run_oracle <side> <bin> <shaders> <packet> <outtag> [extra env assignments...]
 # The base env is the SERVED configuration (clamp + streaming + chunk 512), so
@@ -273,7 +305,7 @@ run_oracle() {
     export COLI_USAGE_PATH="$HIST"
     export GLM53_VERBOSE=1
     export GLM53_LOGIT_DUMP_ALL="$OUT/${outtag}_dump_${side}.f32"
-    unset COLI_TIMERS GLM53_EXPERTS_CPU GLM53_MLA_ATTN_GPU GLM53_MLA_ATTN_SB
+    unset COLI_TIMERS GLM53_EXPERTS_CPU GLM53_MLA_ATTN_GPU GLM53_MLA_ATTN_SB GLM53_MLA_ATTN_REF64
     for kv in "$@"; do export "${kv?}"; done
     "$bin" --model "$GLM_SNAP" --prompt "$(cat "$packet")" --logits --greedy 0
   ) > "$OUT/${outtag}_${side}.out" 2> "$OUT/${outtag}_${side}.err"
@@ -288,6 +320,26 @@ run_oracle() {
   fi
   return $rc
 }
+
+if [ "${F7_REF64_ONLY:-0}" = 1 ]; then
+  echo "=== F7_REF64_ONLY: float64 reference arm(s) $(date -Is)"
+  echo "--- GLM53_MLA_ATTN_REF64=1, GPU knob unset, same served config as the other oracle arms"
+  t0=$(date +%s)
+  run_oracle ref64 "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow "GLM53_MLA_ATTN_REF64=1" || exit 1
+  t1=$(date +%s)
+  echo "=== ref64 shallow arm wall: $((t1 - t0))s"
+  [ -s "$OUT/shallow_dump_ref64.f32" ] || { echo "FATAL: shallow_dump_ref64.f32 missing after the ref64 arm"; exit 1; }
+  if [ "${F7_REF64_DEEP:-0}" = 1 ]; then
+    t0=$(date +%s)
+    run_oracle ref64 "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep "GLM53_MLA_ATTN_REF64=1" || exit 1
+    t1=$(date +%s)
+    echo "=== ref64 deep arm wall: $((t1 - t0))s"
+    [ -s "$OUT/deep_dump_ref64.f32" ] || { echo "FATAL: deep_dump_ref64.f32 missing after the ref64 arm"; exit 1; }
+  fi
+  echo "=== F7_REF64_ONLY done -- dumps on disk, no KL run inside the lock."
+  echo "    With the gateway back up: $HERE/f7_kl_report.sh $OUT (reads R1/R2)"
+  exit 0
+fi
 
 oracle_rc=0
 if [ "${F7_LADDER_ONLY:-0}" = 1 ]; then

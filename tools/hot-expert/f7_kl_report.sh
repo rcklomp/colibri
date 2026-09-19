@@ -28,6 +28,28 @@ for pkt in shallow deep; do          # shallow first: it is the cheap one
   [ "${PIPESTATUS[0]}" = 2 ] && rc=1
 done
 
+# R1/R2: which side (CPU fp32 "off" or GPU) is closer to the float64
+# reference core (GLM53_MLA_ATTN_REF64=1)? Oracle-only, not part of the O2
+# pass/fail bar above -- informational, run only when the ref64 dump exists
+# (f7_gate_chain.sh F7_REF64_ONLY=1).
+for pkt in shallow deep; do
+  r="$OUT/${pkt}_dump_ref64.f32"
+  off="$OUT/${pkt}_dump_off.f32"; gpu="$OUT/${pkt}_dump_gpu.f32"
+  [ -s "$r" ] || continue
+  if [ -s "$off" ]; then
+    echo "--- $pkt R1: $(stat -c %s "$r") vs $(stat -c %s "$off") bytes"
+    nice -n 19 python3 "$KL" "R1 $pkt (ref64 || off)" "$r" "$off" | tee "$OUT/kl_${pkt}_r1.txt"
+  else
+    echo "  $pkt R1: REFUSED -- missing dump ($r / $off)"
+  fi
+  if [ -s "$gpu" ]; then
+    echo "--- $pkt R2: $(stat -c %s "$r") vs $(stat -c %s "$gpu") bytes"
+    nice -n 19 python3 "$KL" "R2 $pkt (ref64 || gpu)" "$r" "$gpu" | tee "$OUT/kl_${pkt}_r2.txt"
+  else
+    echo "  $pkt R2: REFUSED -- missing dump ($r / $gpu)"
+  fi
+done
+
 python3 - "$OUT" <<'PY'
 import re, sys, os
 out = sys.argv[1]

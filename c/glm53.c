@@ -1825,6 +1825,99 @@ static int mla_attn_gpu_sb(void) {
     return v;
 }
 
+/* F7 numerics arbitration: neither the CPU fp32 path (glm_lane_dots / the
+ * scalar dot below round each product to float and add up to `width` of
+ * them in sequence) nor the GPU's 32-wide K-tiled fma is the exact
+ * arithmetic -- this is. GLM53_MLA_ATTN_REF64=1 recomputes the score/softmax/
+ * pool core of mla_layer in double, for the SAME selected slots in the SAME
+ * order as every other path (chosen[i], skipping at < 0 || at >= seen), and
+ * casts the pooled result down to float only at the very end, right before
+ * the EXISTING mv_rows(...)/mv(...) projections -- those, and everything
+ * upstream of the core (the absorb pass, the indexer), are untouched.
+ * Oracle only: no attempt is made to make this fast, only correct. It takes
+ * precedence over headvec/blocked pooling and over GLM53_MLA_ATTN_GPU (if
+ * both are set, REF64 wins) and, for simplicity, applies to every call of
+ * the core, prefill and decode alike -- unlike the GPU knob, it is not
+ * gated on tokens > 1. Unset (the default), the branch below is not
+ * entered and behaviour is unchanged. */
+static int g_mla_attn_ref64 = -1;
+static int mla_attn_ref64_on(void) {
+    if (g_mla_attn_ref64 < 0) {
+        const char *e = getenv("GLM53_MLA_ATTN_REF64");
+        g_mla_attn_ref64 = (e && atoi(e)) ? 1 : 0;
+        if (g_mla_attn_ref64)
+            fprintf(stderr, "[MLA] attention core: float64 reference (oracle only)\n");
+    }
+    return g_mla_attn_ref64;
+}
+
+/* Per-thread double scratch, nthreads x L (pooled) and nthreads x width
+ * (score) -- the same per-thread-pool shape as pooled_pool/score_pool
+ * below, and for the same reason (P5b.1/G4): a shared slice would corrupt
+ * every head's softmax while still emitting a plausible token. */
+static void mla_attn_ref64_core(const Cfg *c, const GLayer *l, int tokens, int seen, int width,
+                                const int *selected, const float *absorbed, const float *latent,
+                                float *out) {
+    const int H = c->n_heads, QK = c->qk_nope, V = c->v_head, L = c->kv_lora;
+    const double scale = 1.0 / sqrt((double)QK);
+    const int nthreads_mla = coli_kda_threads();
+    float *context = malloc((size_t)H * V * sizeof(float));
+    double *pooled_pool = malloc((size_t)nthreads_mla * L * sizeof(double));
+    double *score_pool = malloc((size_t)nthreads_mla * width * sizeof(double));
+    float *pooledf_pool = malloc((size_t)nthreads_mla * L * sizeof(float));
+    if (!context || !pooled_pool || !score_pool || !pooledf_pool) {
+        fprintf(stderr, "OOM nell'attenzione MLA (ref64)\n"); exit(1);
+    }
+    for (int t = 0; t < tokens; t++) {
+        const int *chosen = selected + (size_t)t * width;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int h = 0; h < H; h++) {
+#ifdef _OPENMP
+            double *pooled = pooled_pool + (size_t)omp_get_thread_num() * L;
+            double *score = score_pool + (size_t)omp_get_thread_num() * width;
+            float *pooledf = pooledf_pool + (size_t)omp_get_thread_num() * L;
+#else
+            double *pooled = pooled_pool;
+            double *score = score_pool;
+            float *pooledf = pooledf_pool;
+#endif
+            const float *q = absorbed + ((size_t)t * H + h) * L;
+            double top = -HUGE_VAL;
+            int used = 0;
+            for (int i = 0; i < width; i++) {
+                const int at = chosen[i];
+                if (at < 0 || at >= seen) continue;
+                const float *c_j = latent + (size_t)at * L;
+                double dot = 0.0;
+                for (int d = 0; d < L; d++) dot += (double)q[d] * (double)c_j[d];
+                score[used] = dot * scale;
+                if (score[used] > top) top = score[used];
+                used++;
+            }
+            float *result = context + (size_t)h * V;
+            memset(result, 0, (size_t)V * sizeof(float));
+            if (!used) continue;
+            double total = 0.0;
+            for (int i = 0; i < used; i++) { score[i] = exp(score[i] - top); total += score[i]; }
+            for (int d = 0; d < L; d++) pooled[d] = 0.0;
+            int seen_slot = 0;
+            for (int i = 0; i < width; i++) {
+                const int at = chosen[i];
+                if (at < 0 || at >= seen) continue;
+                const double weight = score[seen_slot++] / total;
+                const float *c_j = latent + (size_t)at * L;
+                for (int d = 0; d < L; d++) pooled[d] += weight * (double)c_j[d];
+            }
+            for (int d = 0; d < L; d++) pooledf[d] = (float)pooled[d];
+            mv_rows(result, &l->kvb_v, pooledf, h * V, V);
+        }
+        mv(out + (size_t)t * c->hidden, &l->o, context);
+    }
+    free(pooledf_pool); free(score_pool); free(pooled_pool); free(context);
+}
+
 #ifdef COLI_VULKAN
 static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen, int width,
                             const int *selected, const float *absorbed, const float *latent,
@@ -2003,6 +2096,15 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
     if (optime_on()) { g_mt_index += optime_now() - _tm1; }
     const double _tm2 = optime_on() ? optime_now() : 0.0;
+    /* F7 numerics arbitration: REF64 wins over everything else below,
+     * including the GPU knob -- see mla_attn_ref64_on()'s comment. */
+    if (mla_attn_ref64_on()) {
+        mla_attn_ref64_core(c, l, tokens, seen, width, selected, absorbed, latent, out);
+        if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+        free(selected); free(valid); free(head_w);
+        free(iq); free(absorbed); free(queries); free(qa);
+        return;
+    }
 #ifdef COLI_VULKAN
     /* F7: the whole chunk's core on the GPU. Prefill only; anything at all that
      * does not work falls through to the CPU nest below. */

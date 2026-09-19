@@ -39,13 +39,18 @@
 > against the ≤ 737 s the gate allows — a 6 % margin, and a projection.
 > (4) **Two things the run found that the plan did not expect.** The chunk
 > change that rides in on the knob (128 → 512) is worth only **3 %** of the
-> speed at 6.3k (466.6 s at chunk 128 against 451.8 at 512, both streamed) while
-> costing **3.24 % of the argmaxes** — more numerics than the streaming itself
-> — because chunk 512 saves 60.2 s in the MoE and gives 46.7 s of it back in the
-> KDA and the attention core. **`coli_vk_kda_step_rows` (P5.2) costs 2.05× per
+> speed at 6.3k (466.6 s at chunk 128 against 451.8 at 512, both streamed),
+> because chunk 512 saves 60.2 s in the MoE and gives 46.7 s of it back in the
+> KDA and the attention core: **`coli_vk_kda_step_rows` (P5.2) costs 2.05× per
 > token at S=512 than at S=128**; fixing that would take F2 from 1.62× to ≈1.77×
 > at 6.3k and is a small, well-defined item. And `mla.attn` is 5.9 % worse at
 > chunk 512, which F7 should know before it assumes bigger batches are better.
+> The chunk costs **nothing** numerically on top of the streaming, which took a
+> third oracle arm to establish and reversed the first reading: streaming at the
+> DEFAULT chunk moves 5.02 % of the argmaxes and streaming at 512 moves 4.95 %,
+> against the chunk's own 3.24 % — comparable nudges to the same near-ties, not
+> perturbations that add. So chunk 512 stays, for a different reason than the
+> design gave it.
 > (5) The streamed path inherits the §G13 swiglu-clamp gap and gives it more of
 > the model's calls; F2 deliberately did not clamp only the streamed shader
 > (that would make an expert's numerics depend on which side of the ring it

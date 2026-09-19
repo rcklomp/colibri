@@ -224,7 +224,9 @@ bit-identical; the rest are not.
 relative — far below §G15's clamp effect — but it is not zero and the argmax
 can flip on a near-tie.~~
 
-**That sentence was wrong and the oracle said so (record §F2b, O4).** Per token
+**That sentence was wrong and the oracle said so (record §F2b, O4) — though not
+in the way the first reading of O2/O4 suggested; see §F2b's O5 row for the
+correction.** Per token
 the error *is* one reassociation of nine terms, but it feeds the next layer and
 the next position, and it compounds: at 1 064 tokens the chunk change is
 invisible (`teacher_forcing` identical, max_abs 1.9e-3), and at **6 327 tokens

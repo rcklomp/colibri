@@ -2648,12 +2648,33 @@ static int experts_cpu_on(void) {
 static void **g_vkreg; static uint64_t *g_eusage;
 static int g_vk_E, g_vk_NL, g_vk_budget, g_vk_n;
 static double g_t_eg, g_t_cpu; static long g_n_eg, g_n_eg_disp, g_n_cpu, g_n_devloss;
+/* F1 step 0: eg CONTAINS the deferred-CPU time (ffn_moe_run_deferred_cpu runs
+ * in the gap between issuing the resident groups' fences and waiting on
+ * them), so g_t_eg alone cannot say whether the CPU-computed non-resident
+ * experts are on decode's critical path. Split the same window three ways:
+ * issue (the three coli_vk_expert_group_issue/issue2/issue3 calls' own wall
+ * time, which only submits work), cpu_in (the deferred-CPU call's
+ * contribution to g_t_cpu, measured ONLY while it runs inside this window)
+ * and take (the coli_vk_expert_group_take/take2/take3 fence waits left
+ * AFTER the CPU work is already done). g_n_eg_win counts every window this
+ * call entered
+ * (success or fail); g_n_eg_cpu0/g_t_eg_take_cpu0 are the subset with zero
+ * deferred CPU experts, i.e. GPU-alone take time -- the reference the other
+ * windows' take time is read against. Timers only: nothing here changes
+ * what is computed or in what order. */
+static double g_t_eg_issue, g_t_eg_cpu, g_t_eg_take, g_t_eg_take_cpu0;
+static long g_n_eg_win, g_n_eg_cpu0;
 static int g_vk_budget2 = 0, g_vk_reg_n2 = 0;
 static int g_vk_budget3 = 0, g_vk_reg_n3 = 0;
 static double prof_now_s(void) { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); return (double)_ts.tv_sec + (double)_ts.tv_nsec / 1e9; }
 __attribute__((destructor)) static void prof_print(void) {
     fprintf(stderr, "[PROF] eg=%.3fs(disp=%ld experts=%ld) cpu=%.3fs(n=%ld) devloss=%ld\n",
             g_t_eg, g_n_eg_disp, g_n_eg, g_t_cpu, g_n_cpu, g_n_devloss);
+    if (g_n_eg_win)
+        fprintf(stderr, "[PROF] eg split: issue=%.3fs cpu_in=%.3fs take=%.3fs | "
+                        "windows=%ld cpu0_windows=%ld take_cpu0=%.3fs\n",
+                g_t_eg_issue, g_t_eg_cpu, g_t_eg_take,
+                g_n_eg_win, g_n_eg_cpu0, g_t_eg_take_cpu0);
     fprintf(stderr, "[PROF] mmap serve=%ld copy=%ld | binds gpu=%ld cpu=%ld (contig=%ld split=%ld)\n",
             g_map_serve, g_map_copy, g_n_bind_gpu, g_n_bind_cpu,
             g_n_bind_contig, g_n_bind_split);
@@ -3776,6 +3797,12 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 #ifdef COLI_VULKAN
     if (g_vk_ready && (nvk0 > 0 || nvk1 > 0 || nvk2 > 0)) {
         double _te0 = prof_now_s();
+        g_n_eg_win++;
+        /* F1 step 0: local sums for this one window; folded into the
+         * g_t_eg_* globals at the window's end below, alongside g_t_eg
+         * itself, so a failed window (ok=0, no g_n_eg_disp++) still counts
+         * its issue/cpu/take time -- the same convention g_t_eg already uses. */
+        double _teg_issue_l = 0.0, _teg_cpu_l = 0.0, _teg_take_l = 0.0;
         float *yk0 = (nvk0 > 0) ? malloc((size_t)vtot0 * c->hidden * sizeof(float)) : NULL;
         float *yk1 = (nvk1 > 0) ? malloc((size_t)vtot1 * c->hidden * sizeof(float)) : NULL;
         float *yk2 = (nvk2 > 0) ? malloc((size_t)vtot2 * c->hidden * sizeof(float)) : NULL;
@@ -3800,20 +3827,26 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             int n0 = 0, n1 = 0, n2 = 0, issued0 = 0, issued1 = 0, issued2 = 0;
             if (q0 < nvk0) {
                 n0 = nvk0 - q0; if (n0 > 64) n0 = 64;
+                double _ti0 = prof_now_s();
                 issued0 = coli_vk_expert_group_issue(vg0 + q0, vu0 + q0, vd0 + q0, vrows0 + q0, n0,
                                                      xk0 + (size_t)base0 * c->hidden);
+                _teg_issue_l += prof_now_s() - _ti0;
                 if (!issued0) fail = 1;
             }
             if (q1 < nvk1) {
                 n1 = nvk1 - q1; if (n1 > 64) n1 = 64;
+                double _ti1 = prof_now_s();
                 issued1 = coli_vk_expert_group_issue2(vg1 + q1, vu1 + q1, vd1 + q1, vrows1 + q1, n1,
                                                       xk1 + (size_t)base1 * c->hidden);
+                _teg_issue_l += prof_now_s() - _ti1;
                 if (!issued1) fail = 1;
             }
             if (q2 < nvk2) {
                 n2 = nvk2 - q2; if (n2 > 64) n2 = 64;
+                double _ti2 = prof_now_s();
                 issued2 = coli_vk_expert_group_issue3(vg2 + q2, vu2 + q2, vd2 + q2, vrows2 + q2, n2,
                                                       xk2 + (size_t)base2 * c->hidden);
+                _teg_issue_l += prof_now_s() - _ti2;
                 if (!issued2) fail = 1;
             }
             /* G9: the three devices' fences are now signalled but not yet
@@ -3835,24 +3868,38 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                     st_prefilled = 1;
                 }
             } else if (first_round && can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
+                /* F1 step 0: the deferred-CPU call's OWN contribution to
+                 * g_t_cpu, isolated by reading it before and after -- this is
+                 * the "cpu_in" half of the split, measured only while it runs
+                 * inside the eg window (can_stream is false whenever this
+                 * branch is taken: streaming's own first_round hook above
+                 * fills the ring instead of calling this). */
+                double _gtcpu0 = g_t_cpu;
                 ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
                                          chosen, weight, tokens, topk, x, c->hidden,
                                          rlimit, sg, su, tmp, out, &cpu_rows, NULL);
+                _teg_cpu_l += g_t_cpu - _gtcpu0;
                 cpu_deferred_done = 1;
             }
             first_round = 0;
             if (issued0) {
+                double _tt0 = prof_now_s();
                 if (!coli_vk_expert_group_take(yk0 + (size_t)base0 * c->hidden)) fail = 1;
+                _teg_take_l += prof_now_s() - _tt0;
                 int rs = 0; for (int w = 0; w < n0; w++) rs += vrows0[q0 + w];
                 base0 += rs; q0 += n0;
             } else if (n0 > 0) q0 = nvk0;
             if (issued1) {
+                double _tt1 = prof_now_s();
                 if (!coli_vk_expert_group_take2(yk1 + (size_t)base1 * c->hidden)) fail = 1;
+                _teg_take_l += prof_now_s() - _tt1;
                 int rs = 0; for (int w = 0; w < n1; w++) rs += vrows1[q1 + w];
                 base1 += rs; q1 += n1;
             } else if (n1 > 0) q1 = nvk1;
             if (issued2) {
+                double _tt2 = prof_now_s();
                 if (!coli_vk_expert_group_take3(yk2 + (size_t)base2 * c->hidden)) fail = 1;
+                _teg_take_l += prof_now_s() - _tt2;
                 int rs = 0; for (int w = 0; w < n2; w++) rs += vrows2[q2 + w];
                 base2 += rs; q2 += n2;
             } else if (n2 > 0) q2 = nvk2;
@@ -3880,6 +3927,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             g_n_eg_disp++;
         } else { g_n_devloss++; }
         g_t_eg += prof_now_s() - _te0;
+        g_t_eg_issue += _teg_issue_l;
+        g_t_eg_cpu   += _teg_cpu_l;
+        g_t_eg_take  += _teg_take_l;
+        if (n_cpu_deferred == 0) { g_n_eg_cpu0++; g_t_eg_take_cpu0 += _teg_take_l; }
         free(yk0); free(yk1); free(yk2);
     }
     /* F2: the streamed waves. Every resident group has been issued AND joined
@@ -4373,6 +4424,9 @@ static void optime_reset(void) {
     g_map_serve = g_map_copy = 0;
 #ifdef COLI_VULKAN
     g_t_eg = g_t_cpu = 0.0; g_n_eg = g_n_eg_disp = g_n_cpu = g_n_devloss = 0;
+    /* F1 step 0: the eg/cpu/take split describes the same window. */
+    g_t_eg_issue = g_t_eg_cpu = g_t_eg_take = g_t_eg_take_cpu0 = 0.0;
+    g_n_eg_win = g_n_eg_cpu0 = 0;
     /* F2's [STREAM] line describes the same window as the rest of the table. */
     g_st_fill_s = g_st_gpu_s = 0.0;
     g_st_experts = g_st_waves = g_st_calls = g_st_nonres = g_st_cpu_fallback = g_st_pf_calls = 0;
@@ -4418,6 +4472,15 @@ static void optime_report(const char *tag) {
             g_on_router ? 1e3 * g_ot_router / g_on_router : 0.0,
             g_on_router ? 1e3 * g_ot_shared / g_on_router : 0.0);
 #ifdef COLI_VULKAN
+    /* F1 step 0: same split as the [PROF] destructor line, but scoped to this
+     * request's window (optime_reset() at the request boundary), so a
+     * per-request decode window can be read without waiting for the process
+     * to exit. */
+    if (g_n_eg_win)
+        fprintf(stderr, "%s eg split: issue=%.3fs cpu_in=%.3fs take=%.3fs | "
+                        "windows=%ld cpu0_windows=%ld take_cpu0=%.3fs\n",
+                tag, g_t_eg_issue, g_t_eg_cpu, g_t_eg_take,
+                g_n_eg_win, g_n_eg_cpu0, g_t_eg_take_cpu0);
     /* F2. `nonres` is the count of DISTINCT non-resident experts summed over
      * every prefill layer-chunk, in BOTH arms -- it is what the streamed bytes
      * are proportional to and the design note could only bracket it. The rest

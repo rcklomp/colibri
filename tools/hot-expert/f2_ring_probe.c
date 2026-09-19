@@ -43,6 +43,25 @@
  *
  *   f2_ring_probe <shard_dir> <qmatmul.spv> [slots] [min_seconds] [reps] [where]
  *       where: 0 = vram only, 1 = host only, 2 = both (default)
+ *
+ * F1_DECODE_PROBE=1 (env, checked before the sweeps above): the falsifier
+ * for FRANKEN-ENGINE-PLAN item F1 (record sec F1-STEP0). F1's whole
+ * question is a batch-1 latency this file's existing sweeps do not answer
+ * (they measure sustained bandwidth over >= 1 s of back-to-back waves, not
+ * one window's wall latency from "routing known" to "outputs on host"). At
+ * k = 1, 2, 3, 4, 6 experts per window, two device splits (round-robin
+ * across dev0/dev2/dev3, and all k on dev2, the card with its own PCIe
+ * link), >= F1_DECODE_WINDOWS (default 2000) independent windows, each a
+ * fresh random expert per slot from the same page-cache-resident pool
+ * shard_open() already built (>= 2 GB, printed as INFO pool_gb=) so nothing
+ * is CPU-cache-hot across windows: fill (parallel over OMP threads) + submit
+ * (issue) + compute-and-readback (take), timed separately and as one total.
+ * Compared, in the probe's own output, against record sec F1-STEP0's
+ * measured CPU cost: 1.747 ms/window at 3.12 experts/window. Env:
+ * F1_DECODE_KS="1,2,3,4,6", F1_DECODE_WINDOWS=2000, F1_DECODE_WHERE=1 (host
+ * ring, matching F2's shipped placement -- record sec F2a: a CPU write into
+ * ReBAR VRAM is 16.3 GB/s on three cards against 58.6 for a host-RAM ring
+ * the GPU reads over PCIe).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -83,6 +102,24 @@ static int cmpd(const void *a, const void *b) {
     return x < y ? -1 : x > y ? 1 : 0;
 }
 static double median(double *v, int n) { qsort(v, n, sizeof(double), cmpd); return v[n / 2]; }
+/* v must already be sorted ascending (nearest-rank on a linear interpolation
+ * between the two bracketing samples -- fine for n in the thousands). */
+static double percentile_sorted(const double *v, int n, double p) {
+    if (n <= 0) return 0.0;
+    if (n == 1) return v[0];
+    double idx = p * (n - 1);
+    int lo = (int)idx; int hi = lo + 1 < n ? lo + 1 : lo;
+    double frac = idx - lo;
+    return v[lo] + (v[hi] - v[lo]) * frac;
+}
+/* "1,2,3,4,6" -> out[]={1,2,3,4,6}, returns count (capped at cap). */
+static int parse_int_list(const char *s, int *out, int cap) {
+    char buf[256]; int n = 0;
+    strncpy(buf, s, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+    for (char *tok = strtok(buf, ","); tok && n < cap; tok = strtok(NULL, ","))
+        out[n++] = atoi(tok);
+    return n;
+}
 
 /* ---- the shard pool: every .safetensors in the dir, mmap'd read-only ---- */
 #define MAX_SHARDS 128
@@ -302,6 +339,170 @@ static int run_where(int where, int slots, double mins, int reps, int has2, int 
     return 0;
 }
 
+#define F1_MAX_K 16
+
+/* least-squares fit of ms = a + b*k over the (k, median_ms) points collected
+ * for one split -- b is the marginal ms/expert, a is what is left at k=0,
+ * i.e. the fixed per-window overhead (fence wait, command buffer record,
+ * dispatch) the ring API charges no matter how many experts ride along.
+ * Two points give an exact line; more than two average out window-to-window
+ * jitter in the underlying medians. Prints the fit AND says outright when
+ * the fixed term dominates over the range actually tested -- the "read the
+ * ring API's per-wave overhead honestly" instruction, not left to whoever
+ * reads the ROW lines afterward. */
+static void print_linear_fit(const char *label, const double *ks, const double *ms, int n) {
+    if (n < 2) return;
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (int i = 0; i < n; i++) { sx += ks[i]; sy += ms[i]; sxx += ks[i] * ks[i]; sxy += ks[i] * ms[i]; }
+    const double denom = n * sxx - sx * sx;
+    if (denom == 0.0) { printf("INFO f1decode %s: fit refused (all k identical)\n", label); return; }
+    const double b = (n * sxy - sx * sy) / denom;   /* ms per extra expert */
+    const double a = (sy - b * sx) / n;              /* ms at k=0: the fixed part */
+    const double kmax = ks[n - 1];
+    const double fixed_share = a / (a + b * kmax) * 100.0;
+    printf("INFO f1decode %s: linear fit ms ~= %.4f + %.4f*k (fixed=%.4f ms/window, "
+           "marginal=%.4f ms/expert) -- fixed is %.1f%% of the total at k=%.0f%s\n",
+           label, a, b, a, b, fixed_share, kmax,
+           fixed_share > 50.0 ? " -- FIXED-COST DOMINATED" : "");
+}
+
+/* F1's falsifier (record sec F1-STEP0, plan rev 20 task B): at batch 1, what
+ * does an on-demand streamed miss cost end to end -- fill, submit, compute,
+ * readback -- per window, against the 1.747 ms/window the CPU path pays
+ * today at ~3.12 experts/window? See the file header comment
+ * (F1_DECODE_PROBE) for the full design. Runs AFTER shard_open() and the
+ * device inits in main(), so g_blk/g_nblk (the >= 2 GB pool) already exist. */
+static int run_f1_decode_probe(int has2, int has3) {
+    const char *ks_env = getenv("F1_DECODE_KS");
+    int ks[F1_MAX_K];
+    const int nk = parse_int_list(ks_env ? ks_env : "1,2,3,4,6", ks, F1_MAX_K);
+    const int windows = getenv("F1_DECODE_WINDOWS") ? atoi(getenv("F1_DECODE_WINDOWS")) : 2000;
+    const int where = getenv("F1_DECODE_WHERE") ? atoi(getenv("F1_DECODE_WHERE")) : 1;
+    const int slots_per_dev = 8;   /* >= max k tested here, headroom for split=alldev2 */
+
+    printf("INFO f1decode ks=%s windows=%d where=%s slots_per_dev=%d\n",
+           ks_env ? ks_env : "1,2,3,4,6", windows, WHERE_NAME[where], slots_per_dev);
+    printf("INFO f1decode reference: CPU path today = 1.747 ms/window at "
+           "k~3.12 experts/window (record sec F1-STEP0, req 8, 18669-token decode, "
+           "chain f1s009191720)\n");
+
+    const int devs[3] = {0, 2, 3};
+    int got[3] = {0, 0, 0};
+    got[0] = coli_vk_ring_init(devs[0], slots_per_dev, FMT, DIM_D, DIM_I, GS, where);
+    if (has2) got[1] = coli_vk_ring_init(devs[1], slots_per_dev, FMT, DIM_D, DIM_I, GS, where);
+    if (has3) got[2] = coli_vk_ring_init(devs[2], slots_per_dev, FMT, DIM_D, DIM_I, GS, where);
+    for (int k = 0; k < 3; k++)
+        printf("INFO f1decode ring dev%d slots=%d\n", devs[k], got[k]);
+    if (got[0] < 1) { fprintf(stderr, "FATAL f1decode: no ring on dev0\n"); coli_vk_ring_free(); return 2; }
+
+    float *x = malloc((size_t)F1_MAX_K * DIM_D * sizeof(float));
+    float *y = malloc((size_t)F1_MAX_K * DIM_D * sizeof(float));
+    if (!x || !y) { fprintf(stderr, "OOM\n"); return 2; }
+    for (int i = 0; i < F1_MAX_K * DIM_D; i++)
+        x[i] = (float)((i * 2654435761u) % 1000) / 1000.0f - 0.5f;
+    int rowsbuf[F1_MAX_K]; for (int i = 0; i < F1_MAX_K; i++) rowsbuf[i] = 1;   /* S = 1 row/expert */
+
+    for (int splitmode = 0; splitmode < 2; splitmode++) {
+        const char *splitname = splitmode == 0 ? "roundrobin" : "alldev2";
+        if (splitmode == 1 && got[1] < 1) {
+            printf("WARN f1decode split=alldev2: no dev2 ring, skipping\n");
+            continue;
+        }
+        double fit_k[F1_MAX_K], fit_ms[F1_MAX_K]; int fit_n = 0;
+
+        for (int ik = 0; ik < nk; ik++) {
+            const int k = ks[ik];
+            if (k < 1 || k > F1_MAX_K) { fprintf(stderr, "f1decode: k=%d out of range, skipping\n", k); continue; }
+
+            /* the (dev, slot) assignment for this k/split is the same every
+             * window -- only the block (which expert) is re-rolled per
+             * window -- so build it once. */
+            int adev[F1_MAX_K], aslot[F1_MAX_K];
+            int cnt[3] = {0, 0, 0};
+            if (splitmode == 0) {
+                for (int i = 0; i < k; i++) {
+                    int d = i % 3, tries = 0;
+                    while (got[d] < 1 && tries < 3) { d = (d + 1) % 3; tries++; }
+                    adev[i] = d; aslot[i] = cnt[d]++;
+                }
+            } else {
+                for (int i = 0; i < k; i++) { adev[i] = 1; aslot[i] = i; cnt[1]++; }
+            }
+            int maxcnt = cnt[0]; if (cnt[1] > maxcnt) maxcnt = cnt[1]; if (cnt[2] > maxcnt) maxcnt = cnt[2];
+            if (maxcnt > slots_per_dev) {
+                printf("WARN f1decode split=%s k=%d: needs %d slots on one device, have %d -- skipping\n",
+                       splitname, k, maxcnt, slots_per_dev);
+                continue;
+            }
+
+            double *tot = malloc((size_t)windows * sizeof(double));
+            double *fil = malloc((size_t)windows * sizeof(double));
+            double *sub = malloc((size_t)windows * sizeof(double));
+            double *cmp = malloc((size_t)windows * sizeof(double));
+            if (!tot || !fil || !sub || !cmp) { fprintf(stderr, "OOM\n"); return 2; }
+
+            Task tasks[F1_MAX_K];
+            ColiVkTensor *g0[F1_MAX_K], *u0[F1_MAX_K], *d0[F1_MAX_K];
+            ColiVkTensor *g1[F1_MAX_K], *u1[F1_MAX_K], *d1[F1_MAX_K];
+            ColiVkTensor *g2[F1_MAX_K], *u2[F1_MAX_K], *d2[F1_MAX_K];
+
+            for (int w = 0; w < windows; w++) {
+                int n0 = 0, n1 = 0, n2 = 0;
+                for (int i = 0; i < k; i++) {
+                    tasks[i].dev = devs[adev[i]]; tasks[i].slot = aslot[i]; tasks[i].blk = rnd() % g_nblk;
+                    if (adev[i] == 0) n0++; else if (adev[i] == 1) n1++; else n2++;
+                }
+
+                const double t0 = now_s();
+                fill_tasks(tasks, k);                              /* fill: 8 OMP threads, random blocks */
+                const double t1 = now_s();
+
+                int i0 = 0, i1 = 0, i2 = 0;
+                if (n0) { for (int s = 0; s < n0; s++) coli_vk_ring_tensors(devs[0], s, &g0[s], &u0[s], &d0[s]);
+                          i0 = coli_vk_expert_group_issue(g0, u0, d0, rowsbuf, n0, x); }
+                if (n1) { for (int s = 0; s < n1; s++) coli_vk_ring_tensors(devs[1], s, &g1[s], &u1[s], &d1[s]);
+                          i1 = coli_vk_expert_group_issue2(g1, u1, d1, rowsbuf, n1, x); }
+                if (n2) { for (int s = 0; s < n2; s++) coli_vk_ring_tensors(devs[2], s, &g2[s], &u2[s], &d2[s]);
+                          i2 = coli_vk_expert_group_issue3(g2, u2, d2, rowsbuf, n2, x); }
+                const double t2 = now_s();                          /* submit: issue only, no wait */
+
+                if (i0) coli_vk_expert_group_take(y);
+                if (i1) coli_vk_expert_group_take2(y);
+                if (i2) coli_vk_expert_group_take3(y);
+                const double t3 = now_s();                          /* compute+readback: take blocks on the fence */
+
+                fil[w] = (t1 - t0) * 1e3;
+                sub[w] = (t2 - t1) * 1e3;
+                cmp[w] = (t3 - t2) * 1e3;
+                tot[w] = (t3 - t0) * 1e3;
+            }
+
+            qsort(tot, windows, sizeof(double), cmpd);
+            qsort(fil, windows, sizeof(double), cmpd);
+            qsort(sub, windows, sizeof(double), cmpd);
+            qsort(cmp, windows, sizeof(double), cmpd);
+            double mean_tot = 0; for (int w = 0; w < windows; w++) mean_tot += tot[w]; mean_tot /= windows;
+
+            printf("ROW kind=f1decode split=%s k=%d windows=%d "
+                   "total_ms_median=%.4f total_ms_p90=%.4f total_ms_mean=%.4f "
+                   "fill_ms_median=%.4f submit_ms_median=%.4f compute_ms_median=%.4f "
+                   "vs_cpu_ms=1.747\n",
+                   splitname, k, windows,
+                   tot[windows / 2], percentile_sorted(tot, windows, 0.90), mean_tot,
+                   fil[windows / 2], sub[windows / 2], cmp[windows / 2]);
+
+            if (fit_n < F1_MAX_K) { fit_k[fit_n] = (double)k; fit_ms[fit_n] = tot[windows / 2]; fit_n++; }
+            free(tot); free(fil); free(sub); free(cmp);
+        }
+        char lbl[64]; snprintf(lbl, sizeof(lbl), "split=%s", splitname);
+        print_linear_fit(lbl, fit_k, fit_ms, fit_n);
+    }
+
+    free(x); free(y);
+    coli_vk_ring_free();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "/home/ronald/models/GLM-5.3-Flash-colibri-int4-g64";
     const char *spv = argc > 2 ? argv[2] : "/home/ronald/src/colibri/c/shaders/qmatmul.spv";
@@ -432,6 +633,16 @@ int main(int argc, char **argv) {
         coli_vk_shutdown();
         printf("INFO done (clamp-check)\n");
         return 0;
+    }
+
+    /* F1's falsifier (record sec F1-STEP0, plan rev 20 task B) -- mutually
+     * exclusive with F2_CLAMP_CHECK above and with the wsel sweeps below;
+     * neither existing mode is touched. */
+    if (getenv("F1_DECODE_PROBE")) {
+        int rc = run_f1_decode_probe(has2, has3);
+        coli_vk_shutdown();
+        printf("INFO done (f1decode)\n");
+        return rc;
     }
 
     if (wsel == 0 || wsel == 2) run_where(0, slots, mins, reps, has2, has3);

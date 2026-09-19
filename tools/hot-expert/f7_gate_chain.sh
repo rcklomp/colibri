@@ -306,7 +306,7 @@ run_oracle() {
     export COLI_USAGE_PATH="$HIST"
     export GLM53_VERBOSE=1
     export GLM53_LOGIT_DUMP_ALL="$OUT/${outtag}_dump_${side}.f32"
-    unset COLI_TIMERS GLM53_EXPERTS_CPU GLM53_MLA_ATTN_GPU GLM53_MLA_ATTN_SB GLM53_MLA_ATTN_REF64
+    unset COLI_TIMERS GLM53_EXPERTS_CPU GLM53_MLA_ATTN_GPU GLM53_MLA_ATTN_SB GLM53_MLA_ATTN_REF64 GLM53_MLA_ATTN_JITTER
     for kv in "$@"; do export "${kv?}"; done
     "$bin" --model "$GLM_SNAP" --prompt "$(cat "$packet")" --logits --greedy 0
   ) > "$OUT/${outtag}_${side}.out" 2> "$OUT/${outtag}_${side}.err"
@@ -326,13 +326,13 @@ if [ "${F7_REF64_ONLY:-0}" = 1 ]; then
   echo "=== F7_REF64_ONLY: float64 reference arm(s) $(date -Is)"
   echo "--- GLM53_MLA_ATTN_REF64=1, GPU knob unset, same served config as the other oracle arms"
   t0=$(date +%s)
-  run_oracle ref64 "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow "GLM53_MLA_ATTN_REF64=1" || exit 1
+  run_oracle "${F7_REF64_SIDE:-ref64}" "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow "${F7_REF64_KNOB:-GLM53_MLA_ATTN_REF64=1}" || exit 1
   t1=$(date +%s)
   echo "=== ref64 shallow arm wall: $((t1 - t0))s"
   [ -s "$OUT/shallow_dump_ref64.f32" ] || { echo "FATAL: shallow_dump_ref64.f32 missing after the ref64 arm"; exit 1; }
   if [ "${F7_REF64_DEEP:-0}" = 1 ]; then
     t0=$(date +%s)
-    run_oracle ref64 "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep "GLM53_MLA_ATTN_REF64=1" || exit 1
+    run_oracle "${F7_REF64_SIDE:-ref64}" "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep "${F7_REF64_KNOB:-GLM53_MLA_ATTN_REF64=1}" || exit 1
     t1=$(date +%s)
     echo "=== ref64 deep arm wall: $((t1 - t0))s"
     [ -s "$OUT/deep_dump_ref64.f32" ] || { echo "FATAL: deep_dump_ref64.f32 missing after the ref64 arm"; exit 1; }

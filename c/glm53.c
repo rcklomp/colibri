@@ -2035,6 +2035,27 @@ static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen,
 }
 #endif
 
+
+/* F7 arbitration (oracle only): GLM53_MLA_ATTN_JITTER=<eps> multiplies every
+ * value of the CPU attention core's context by (1 + eps*r), r a deterministic
+ * hash in [-1,1] of (row position, index). It answers one question: how far
+ * does the model's output move when the attention core is perturbed at fp32
+ * rounding level (eps ~ 3e-7) and nothing else changes? Unset: not entered. */
+static double g_mla_jitter = -1.0;
+static double mla_jitter_eps(void) {
+    if (g_mla_jitter < 0.0) { const char *v = getenv("GLM53_MLA_ATTN_JITTER"); g_mla_jitter = v ? atof(v) : 0.0; if (g_mla_jitter < 0.0) g_mla_jitter = 0.0;
+        if (g_mla_jitter > 0.0) fprintf(stderr, "[MLA] attention core: jitter eps=%g (oracle only)\n", g_mla_jitter); }
+    return g_mla_jitter;
+}
+static void mla_jitter_apply(float *context, int n, int at) {
+    const double eps = mla_jitter_eps();
+    if (eps <= 0.0) return;
+    for (int i = 0; i < n; i++) {
+        uint32_t h = (uint32_t)at * 2654435761u ^ (uint32_t)i * 40503u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+        const double r = (double)(h & 0xFFFFFF) / 8388607.5 - 1.0;
+        context[i] = (float)((double)context[i] * (1.0 + eps * r));
+    }
+}
 static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
@@ -2324,7 +2345,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                         mv_rows(context + (size_t)h * V, &l->kvb_v,
                                 pooled_all + (size_t)h * L, h * V, V);
                 }
-                mv(out + (size_t)t * c->hidden, &l->o, context);
+                mla_jitter_apply(context, H * V, base + t); mv(out + (size_t)t * c->hidden, &l->o, context);
                 continue;
             }
 #ifdef _OPENMP
@@ -2356,7 +2377,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 }
                 mv_rows(result, &l->kvb_v, pooled, h * V, V);
             }
-            mv(out + (size_t)t * c->hidden, &l->o, context);
+            mla_jitter_apply(context, H * V, base + t); mv(out + (size_t)t * c->hidden, &l->o, context);
             if (g_mla_dumpctx)
                 memcpy(g_mla_dumpctx + (size_t)t * H * V, context, (size_t)H * V * sizeof(float));
             continue;
@@ -2409,7 +2430,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             }
             mv_rows(result, &l->kvb_v, pooled, h * V, V);
         }
-        mv(out + (size_t)t * c->hidden, &l->o, context);
+        mla_jitter_apply(context, H * V, base + t); mv(out + (size_t)t * c->hidden, &l->o, context);
     }
     if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
     if (dump_path && g_mla_dumpctx) {

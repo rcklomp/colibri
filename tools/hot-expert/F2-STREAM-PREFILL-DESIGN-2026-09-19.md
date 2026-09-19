@@ -51,7 +51,25 @@ the 1 695 count cap already leaves unused (§1).
 
 ---
 
-## 1. Where the ring's VRAM comes from
+## 1. Where the ring lives (amended 2026-09-19 after the microbenchmark)
+
+**The ring is in HOST memory and costs no VRAM at all.** This section was
+written the other way round — a 48-slot ring per card carved out of the VRAM
+the 1 695 cap leaves unused — and the microbenchmark refuted it before a line
+of engine code was written. The measurement is in §4b; the short version is
+that a CPU `memcpy` into ReBAR write-combined VRAM runs at 11.9–13.1 GB/s per
+card and 16.3 GB/s on three, while the same `memcpy` into cached DRAM runs at
+48.0–58.4 GB/s per card and 58.6 GB/s on three — and the GPU reading that DRAM
+over PCIe costs 52 GB/s, which more than pays the difference back. End to end
+one wave of 144 experts (2.04 GB) takes **74.3 ms with the ring in host RAM
+against 102.6 ms with it in VRAM**.
+
+So the VRAM accounting below is no longer a constraint on the item. It is kept
+because it is the evidence for why the VRAM ring was tried at all (it fits,
+comfortably), and because it is the thing a future reader will want when F1
+asks the same question at batch 1.
+
+### 1.1 The VRAM the ring would have used, and did not
 
 Live read, 2026-09-19 07:14 UTC, gateway up, from
 `/sys/class/drm/card*/device/mem_info_vram_{total,used}` (no engine run):
@@ -77,25 +95,33 @@ memory out of it does not evict a single tier expert and does not change
 routing. What it *does* reduce is the headroom the reserve exists to protect,
 so the ring is sized conservatively and is allocated **after** the preload.
 
-**Ring size: 48 slots per card, default, knob `COLI_PREFILL_RING_SLOTS`.**
-48 × 14.16 MB = **680 MB per card, 2.04 GB across the three.** That leaves
-865 MB free on dev2/dev3 and 1.87 GB on dev0 for the expert-group scratches,
-which grow with the chunk (`eg_x/eg_h/eg_y`, `c/backend_vulkan.c:1243-1245`:
-`total*D*4 + total*I*4 + total*D*4` = 40 KB per packed row; at chunk 512 a
-device holding a third of 4 096 row-expert pairs needs ~55 MB, worst case
-167 MB if it held all of them). The ring allocates once at first streamed
-prefill and is never resized; `coli_vk_ring_init` returns 0 on any device
-whose budget cannot take it and that device is then simply not used for
-streaming (its share goes to the others) — a partial ring is a valid config,
-not an error.
+The probe confirmed a 48-slot VRAM ring fits: 0.683 GB per card, leaving
+0.86 GB free on dev2/dev3 and 1.87 GB on dev0, with the gateway up and the
+tier untouched. It is simply slower than putting the same ring in DRAM.
 
-48 is chosen so that the common layer needs **one wave on each card**:
-177.6 non-resident experts per layer spread over three cards by link share
-(§2) is 86/46/46, and the worst layer (220) is 106/57/57. One wave needs
-`ceil(106/48) = 3` on dev2 in the worst layer and 2 in the mean layer — see
-§2 for the balanced-wave scheme that keeps every card busy in every wave.
-It is also under the backend's hard `count <= 64` per submit
-(`c/backend_vulkan.c:1221`).
+### 1.2 What the ring actually costs
+
+**Two banks of `COLI_PREFILL_RING_SLOTS` (default 32) slots per card, in host
+RAM**: 64 slots × 14.16 MB = 0.91 GB per card, **2.72 GB across the three**,
+out of 241 GB MemAvailable with a 183 GB model in the page cache. VRAM cost:
+zero, so the tier, the G6 reserve and the 1 695 caps are untouched by
+construction, not by arithmetic. The only real cost is page cache: 2.72 GB of
+the ~58 GB of slack above the model.
+
+Two banks, not one, because the fill and the compute now use **different
+resources** — CPU stores into DRAM against GPU DMA reads out of DRAM — so wave
+w+1's fill can run while wave w's dispatch is in flight. With a VRAM ring both
+legs were the same PCIe write path and overlapping bought nothing; that is why
+the first draft of §2.3 said not to bother, and why it is now wrong.
+
+32 slots per bank is chosen against the measured non-resident counts (§2.1):
+the mean layer at chunk 512 needs 73.5–163 distinct non-resident experts,
+which over three cards by link share is 25–54 each — one wave in the
+histogram case, two in the upper-bound case, so the double buffering is
+exercised either way. It is also under the backend's hard `count <= 64` per
+submit (`c/backend_vulkan.c:1221`). `coli_vk_ring_init` returns however many
+slots it got; a device with none is simply not used for streaming and its
+share goes to the others.
 
 ---
 
@@ -160,15 +186,20 @@ A layer whose non-resident set exceeds `ring*3` therefore simply pays a second
 pass over the *same* ring slots, which is correct because a slot is refilled
 only after the submit that read it has been joined.
 
-**Overlap.** The one overlap taken in v1 is free and already has a hook: the
-resident groups are issued first, and `ffn_moe`'s existing G9 gap between
-issue and take (`c/glm53.c:3531-3545`, today used to run the deferred CPU
-experts) fills ring wave 0 while the resident dispatches are in flight. No
-double-buffering *inside* the ring: that would halve the usable slots to buy
-an overlap worth ~2 % (compute is projected at 0.08–0.25 ms/token against
-2.2–4.9 ms/token of streaming, §4). If the microbenchmark says compute is not
-that small, the ring splits into two halves and this paragraph is wrong —
-which is why the microbenchmark runs before the engine is touched.
+**Overlap (rewritten after §4b).** Two overlaps, both taken:
+
+1. Wave 0's fill runs in the gap G9 already opened between issuing the
+   resident groups and joining them (`c/glm53.c`, the `first_round` hook that
+   today runs the deferred CPU experts). A ring fill is a `memcpy` into mapped
+   host memory and touches no Vulkan object, so it is safe with three groups
+   in flight.
+2. Wave w+1's fill runs while wave w is in flight, alternating banks. With the
+   ring in host RAM this is worth real time, not 2 %: the fill is 58.6 GB/s of
+   CPU stores to DRAM and the dispatch is 52 GB/s of GPU reads from DRAM, and
+   serially they measured 27.4 GB/s. The ceiling of the overlap is DRAM
+   bandwidth (91.6 GB/s read, §PCIE-STREAM) shared between the two, so the
+   gain is real but under 2×; the projection below uses the **serial** 27.4
+   GB/s and treats anything better as margin.
 
 ---
 
@@ -203,69 +234,106 @@ see how much of the gate is chunk and how much is streaming.
 
 ---
 
-## 4. Projected cost, against the gate
+## 4a. The microbenchmark (measured 2026-09-19, the number the item lives on)
+
+`tools/hot-expert/f2_ring_probe.c` through `f2_ring_probe_chain.sh`
+(`run_chain.sh`, rig lock only, gateway up and idle before and after, 8 threads
+pinned, tag `f2rp_09190737`, output `~/bench/f2_ring_out/f2rp_09190737.txt`).
+It links `c/backend_vulkan.c` and calls `coli_vk_ring_*` and
+`coli_vk_expert_group_issue/2/3` — the code the engine runs, not a model of it.
+48 slots per card, three cards, 144 experts = 2.04 GB per wave, real GLM shapes,
+source bytes read from the served model's shards at fixed-seed random offsets.
+GB = 1e9.
+
+| | ring in ReBAR VRAM | ring in host RAM |
+|---|---:|---:|
+| fill, dev0 alone | 11.938 | 47.969 |
+| fill, dev2 alone | 12.699 | 58.396 |
+| fill, dev3 alone | 13.116 | 58.434 |
+| **fill, three cards** | **16.260** | **58.565** |
+| compute only, 1 row/expert (ms) | 2.513 | 38.937 |
+| compute only, 3 rows/expert (ms) | 2.961 | 39.428 |
+| compute only, 6 rows/expert (ms) | 4.864 | 39.973 |
+| compute only, 12 rows/expert (ms) | 10.206 | 51.944 |
+| **wave = fill + compute, 3 rows (ms)** | **103.718** | **74.687** |
+| wave, effective GB/s | 19.65 | **27.29** |
+
+Three things this settles.
+
+1. **A CPU store into write-combined VRAM is not a GPU DMA read over PCIe.**
+   §PCIE-STREAM's 61–62 GB/s and F0b's 59.9–63.3 GB/s are the GPU pulling; the
+   CPU pushing over the same link manages 16.3 GB/s on three cards. The
+   design's §1 was built on the wrong one of those and is corrected above.
+2. **The host ring wins end to end by 1.39×** (74.7 ms vs 103.7 ms per wave)
+   *and* costs no VRAM. Its compute leg is 39 ms — the shader reading 2.04 GB
+   of host memory over PCIe at 52.4 GB/s — which is 16× the VRAM-resident
+   compute but is paid back twice over by the fill.
+3. **Compute is flat in rows up to 6 and only then starts to grow** (38.9 →
+   40.0 → 51.9 ms at 1 → 6 → 12 rows). The schedule gives a streamed expert
+   2.7–6.0 rows in a 512-row chunk, i.e. exactly the flat part: the streamed
+   experts are weight-bandwidth-bound, not arithmetic-bound, and adding rows
+   to a chunk is close to free for them. That is the second reason the chunk
+   wants to be large.
+
+The serial wave rate **27.4 GB/s** is what §4b projects with. The engine
+double-buffers (§2.3), whose ceiling is the two legs' own rates (58.6 and
+52.4) capped by DRAM bandwidth (91.6 GB/s read, §PCIE-STREAM); anything the
+overlap buys is margin, not assumed.
+
+---
+
+## 4b. Projected cost, against the gate
 
 Baseline, record §RP-F6a, the 18 439-token ladder turn on the served binary
 (`15462dc2093b8ad0`): **136.4 ms per new token**, of which `ffn_moe` 69.8
 (51 %), `mla.attn` 28.4, `mla.index` 13.4, `kda` 13.2, `hc+norm` 4.8,
-`mla.proj` 3.7, `ffn_dense` 3.1. TTFT for the turn 1 179.4 s over 8 853 new
+`mla.proj` 3.7, `ffn_dense` 3.1. TTFT for that turn 1 179.4 s over 8 853 new
 tokens. At depth 0 (turn 1, ctx 1 287): 106 ms/token, moe 61 %, TTFT 136.5 s.
 
-**Streaming cost at S=512**, from §F2-STEP0's measured 38.637 GB/s aggregate:
+**Streamed cost at S=512**, bytes from §2.1, rate from §4a (27.4 GB/s serial,
+fill and compute both inside it):
 
 | | histogram model | upper bound |
 |---|---:|---:|
-| bytes/token | 85.4 MB | 189.5 MB |
-| ms/token streamed | **2.21** | **4.90** |
+| bytes/token, 18k turn | 85.4 MB | 189.5 MB |
+| **ms/token streamed** | **3.12** | **6.92** |
+| bytes/token, turn 1 (1 287 tokens = 3 chunks) | 101.9 MB | 226 MB |
+| **ms/token streamed, turn 1** | **3.72** | **8.25** |
 
-(The record's 6.22 ms/token used the plan's 123 GB/chunk, i.e. "every
-non-resident expert, every chunk". Both models here are at or below it.)
-
-**GPU compute on the streamed experts.** Per layer-chunk at S=512 the streamed
-set is 73–163 experts producing 0.1066 × 512 × 8 = 437 row-expert pairs
-(2.7–6.0 rows per expert). The kernel is weight-bandwidth-bound: it reads
-73–163 × 14.16 MB = 1.03–2.31 GB of VRAM per layer-chunk, split over three
-cards at ~900 GB/s each → 0.38–0.86 ms per layer-chunk at peak, 42 layers →
-16–36 ms per chunk = **0.031–0.070 ms/token at peak, 0.08–0.25 ms/token at a
-realistic 30–40 % of peak.** This is the number the microbenchmark
-(`tools/hot-expert/f2_ring_probe.c`) measures rather than assumes; it is the
-single assumption that, if wrong by 50×, kills the item.
-
-**Fixed per-wave overhead**: 1–2 waves per layer-chunk, each three
-`issue`/`take` pairs; at ~1 ms of fence/submit per wave that is 42–84 ms per
-512-row chunk = **0.08–0.16 ms/token**.
-
-**Projected 18k token** (everything but `ffn_moe` unchanged; `ffn_moe` becomes
-stream + compute + wave overhead + the resident groups and shared expert it
-already contains, which the `moe split: router= shared=` line will size):
+**Projected 18k token** — everything but `ffn_moe` unchanged; `ffn_moe` becomes
+the streamed cost plus the part of today's 69.8 that is *not* the non-resident
+CPU path (the resident-tier dispatch, the shared expert, the router and the
+host accumulate), carried at an assumed 5 ms/token:
 
 | | ms/token | × vs 136.4 |
 |---|---:|---:|
-| upper-bound stream, realistic compute (4.90 + 0.25 + 0.16 + 5 residual) | **77.1** | 1.77× |
-| histogram stream, realistic compute (2.21 + 0.25 + 0.16 + 5 residual) | **74.2** | 1.84× |
+| upper-bound bytes (6.92 + 5 residual) | **78.5** | **1.74×** |
+| histogram bytes (3.12 + 5 residual) | **74.7** | **1.83×** |
 | gate | ≤ 85.25 | 1.60× |
 
-"5 residual" is the part of today's 69.8 that is *not* the non-resident CPU
-path — the resident-tier dispatch, the shared expert, the router, and the host
-accumulate — held at its present value. The margin against the gate is
-**8–11 ms/token**, i.e. the item passes only if that residual is under ~13
-ms/token. §RP-F6a's follow-up rows put `ffn_moe` at 2.9–3.0 ms/call in a
-decode-shaped window where the non-resident path is also active, so a 5
-ms/token residual in a 512-row chunk is plausible but **unproven**, and it is
-the second thing the oracle run measures (`moe split` + `[PROF] eg=/cpu=`).
+**Projected turn 1** (106 − 64.7 + streamed + 3 residual):
 
-**Turn 1** (106 ms/token, moe 61 %): 106 − 64.7 + (2.2…4.9 + 0.3 + 3) =
-**43.8–46.5 ms/token → 2.28–2.42×**, against the 2.0× gate. Turn 1 has 1 287
-tokens = 3 chunks of 512, so the saturation argument is weaker there (S=512 is
-where the distinct-count curve has just flattened); the upper-bound column is
-the one to believe.
+| | ms/token | × vs 106 |
+|---|---:|---:|
+| upper-bound bytes | **52.6** | **2.02×** |
+| histogram bytes | **48.0** | **2.21×** |
+| gate | ≤ 53.0 | 2.00× |
 
-**Verdict of this note: the gate can be met, but not with room to spare, and
-it is met only if (a) the streamed-expert GPU compute is ≤ ~1 ms/token and
-(b) the non-CPU residual of `ffn_moe` is ≤ ~13 ms/token.** Both are measured
-before the engine is touched (a: the microbenchmark; b: a `COLI_TIMERS=1`
-read of the served binary). If either fails, F2 is reported as not meeting its
-gate and this note says so rather than being tuned.
+**Verdict of this note.** The 1.6× bar at 18k has 7–11 ms/token of margin and
+should be met. **The 2.0× bar on turn 1 does not: at the pessimistic end of
+the non-resident-count bracket the projection is 2.02×, which is inside the
+noise of a single ladder arm.** That is stated here, before the run, so that a
+turn-1 miss is read as the projection having said so rather than as a surprise.
+Both numbers depend on two quantities this note could only bracket or assume:
+
+* **the distinct non-resident count per layer-chunk** (73.5 vs 163, a 2.2×
+  spread) — now counted by the engine under `COLI_TIMERS=1` and reported on
+  the `[STREAM]` line in both arms;
+* **the non-CPU residual of `ffn_moe`** (assumed 5 ms/token at 18k, 3 at
+  turn 1) — read from the `moe split: router= shared=` line and `[PROF] eg=`.
+
+If the ladder contradicts the projection, the contradiction goes in the record
+and the item stops there. It is not tuned until it agrees.
 
 ---
 

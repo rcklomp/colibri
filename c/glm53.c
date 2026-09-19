@@ -3019,6 +3019,14 @@ static int st_issue(StWave *w, const int *seid, const int *chosen, const float *
                                       &g_st_d[w->bank][k][i])) return 0;
         }
     }
+    /* The readback buffers are grown BEFORE anything is submitted: a failure
+     * after a submit would leave that device's single in-flight slot stuck
+     * (coli_vk_expert_group_take's precondition) for the rest of the run. */
+    for (int k = 0; k < 3; k++) {
+        if (!w->n[k] || !w->total[k]) continue;
+        if (!st_grow((void **)&g_st_yk[k], &g_st_ycap[k],
+                     (size_t)w->total[k] * hidden * sizeof(float))) return 0;
+    }
     const double t0 = optime_on() ? optime_now() : 0.0;
     for (int k = 0; k < 3; k++) {
         if (!w->n[k] || !w->total[k]) continue;
@@ -3042,9 +3050,6 @@ static void st_take(StWave *w, unsigned char *served, float *out, int hidden) {
     const double t0 = optime_on() ? optime_now() : 0.0;
     for (int k = 0; k < 3; k++) {
         if (!w->issued[k]) continue;
-        if (!st_grow((void **)&g_st_yk[k], &g_st_ycap[k], (size_t)w->total[k] * hidden * sizeof(float))) {
-            w->issued[k] = 0; continue;
-        }
         int ok = k == 0 ? coli_vk_expert_group_take(g_st_yk[0])
                : k == 1 ? coli_vk_expert_group_take2(g_st_yk[1])
                         : coli_vk_expert_group_take3(g_st_yk[2]);

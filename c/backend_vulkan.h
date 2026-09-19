@@ -181,10 +181,6 @@ int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc
  * positions, already compacted by the caller; ctx_out is [S][H*V] on the host and
  * the caller still does the o-projection. Requires H == 64 and L a multiple of 64
  * (<= 512). Returns 0 -> caller falls back to CPU for this call. */
-/* Forces the per-row matmul pipeline (bit-identical per row to S=1 calls)
- * instead of P4's tiled one, for as long as it is on. Scoped around a single
- * batched call that replaces a run of per-row ones; see backend_vulkan.c. */
-void coli_vk_tile_suspend(int on);
 int  coli_vk_mla_attn_ready(void);
 int  coli_vk_mla_attn(ColiVkTensor **vp, const void *vw, const float *vsc, int vfmt, int vgs,
                       float *ctx_out, const float *absorbed, const float *latent,

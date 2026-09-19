@@ -412,20 +412,8 @@ static int vk_tile_env(void) {
 #define VK_TILE_R 8
 /* rows -> workgroup rows for the tiled pipeline */
 #define VK_TILES(S) ((uint32_t)(((S) + VK_TILE_R - 1) / VK_TILE_R))
-/* F7: a caller that is REPLACING a run of S separate S=1 matmuls needs the
- * per-row pipeline, not P4's tiled one. qmatmul.comp gives row s the same
- * arithmetic for any S -- s is gl_WorkGroupID.y, `staged` depends only on I,
- * and the o/wi walk depends only on I, O, rowWords, gs and the grid's x
- * extent (O+7)/8 -- so a batched call on it is bit-identical per row to the
- * S=1 calls it replaces. qmatmul_tile.comp holds R=8 rows per subgroup and
- * accumulates in a different order, so it is NOT. Suspending the tile choice
- * around one call is how a batching change stays a batching change. */
-static int g_tile_suspend = 0;
-void coli_vk_tile_suspend(int on) { g_tile_suspend = on ? 1 : 0; }
-
 static inline int vk_tile_ok4(VkPipeline tile, int fmt, int S, int I) {
     /* P4c: the tiled shaders read x as vec4 and whole packed words */
-    if (g_tile_suspend) return 0;
     return tile != VK_NULL_HANDLE && S > 1 && (fmt == 1 || fmt == 4) && (I % 8) == 0;
 }
 

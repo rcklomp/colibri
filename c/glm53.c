@@ -1962,18 +1962,9 @@ static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen,
                                     ctx_all, absorbed, latent, slot, used,
                                     tokens, H, L, V, width, seen, mla_attn_gpu_sb(),
                                     1.0f / sqrtf((float)c->qk_nope));
-    /* One submit instead of 512, and bit-identical per row to the `tokens`
-     * separate mv() calls the CPU path makes -- but ONLY on the per-row
-     * pipeline. mv_rows_s at S = 512 otherwise picks P4's tiled kernel, which
-     * accumulates in a different order; that, and not the attention shaders,
-     * was F7's whole numerics gap (record §F7, the replay probe exonerates the
-     * core at ratio 1.0 against float64). coli_vk_tile_suspend keeps the
-     * batching and drops the kernel swap. */
-    if (ok) {
-        coli_vk_tile_suspend(1);
-        mv_rows_s(out, &l->o, ctx_all, tokens);
-        coli_vk_tile_suspend(0);
-    }
+    /* P2's mv_rows_s: per row bit-identical to the `tokens` separate mv() calls
+     * the CPU path makes, one submit instead of 512. */
+    if (ok) mv_rows_s(out, &l->o, ctx_all, tokens);
     free(ctx_all); free(used); free(slot);
     return ok;
 }

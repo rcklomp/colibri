@@ -340,9 +340,25 @@ int main(int argc, char **argv) {
         const int devs[3] = {0, 2, 3};
         int ok = coli_vk_ring_init(0, 2, FMT, DIM_D, DIM_I, GS, 1);
         if (ok < 1) { printf("WARN clamp-check: no ring on dev0\n"); coli_vk_shutdown(); return 2; }
-        Task t = {0, 0, 0};
-        t.dev = devs[0]; t.slot = 0; t.blk = rnd() % g_nblk;
-        fill_tasks(&t, 1);
+        /* The bandwidth sweeps above feed the shaders raw shard bytes for BOTH
+         * the weights and the scale planes, which is fine for timing and
+         * useless for numerics: reinterpreted as f32 those bytes are mostly
+         * huge or NaN, the kernel returns NaN, and every |difference| compares
+         * false so a broken clamp would read as "no difference". (That is
+         * exactly what the first run of this check printed.) Here the int4
+         * WEIGHT nibbles stay real shard bytes and the scales are synthetic
+         * and sane -- 0.1, chosen so the pre-activation lands around +-25 and
+         * the model's real limit of 10 actually binds. */
+        const size_t sfl = (size_t)DIM_I * (DIM_D / GS);   /* == DIM_D * (DIM_I/GS) */
+        float *sc = malloc(sfl * sizeof(float));
+        if (!sc) { printf("WARN clamp-check: OOM\n"); return 2; }
+        for (size_t i = 0; i < sfl; i++) sc[i] = 0.1f;
+        {
+            const uint8_t *gw, *uw, *dw; const float *gs_, *us_, *ds_;
+            block_planes(rnd() % g_nblk, &gw, &gs_, &uw, &us_, &dw, &ds_);
+            (void)gs_; (void)us_; (void)ds_;
+            coli_vk_ring_fill(devs[0], 0, gw, sc, uw, sc, dw, sc);
+        }
         for (int ri = 0; ri < 2; ri++) {
             const int R = ri ? 8 : 1;
             float *x = malloc((size_t)R * DIM_D * sizeof(float));
@@ -367,19 +383,25 @@ int main(int argc, char **argv) {
             printf("INFO clamp-check rows=%d take0=%d take1=%d take2=%d devs_clamped=%d/%d "
                    "g=%p ring_where=%d\n", R, i0, i1, i2, n1, n2, (void *)g, coli_vk_ring_where(0));
             double m01 = 0, m02 = 0, ref = 0;
+            long bad = 0;
             for (int i = 0; i < R * DIM_D; i++) {
+                if (!isfinite(y0[i]) || !isfinite(y1[i]) || !isfinite(y2[i])) { bad++; continue; }
                 double a = fabs((double)y0[i] - y1[i]); if (a > m01) m01 = a;
                 double b = fabs((double)y0[i] - y2[i]); if (b > m02) m02 = b;
                 double r = fabs((double)y0[i]);         if (r > ref) ref = r;
             }
-            printf("ROW kind=clamp-check rows=%d pipeline=%s max|y_unclamped-y_limit1e30|=%.6g "
-                   "max|y_unclamped-y_limit10|=%.6g max|y_unclamped|=%.6g verdict=%s\n",
-                   R, R > 1 ? "tiled" : "per-row", m01, m02, ref,
-                   (m01 == 0.0 && m02 > 0.0) ? "PASS"
+            printf("ROW kind=clamp-check rows=%d pipeline=%s nonfinite=%ld/%d "
+                   "max|y_unclamped-y_limit1e30|=%.6g max|y_unclamped-y_limit10|=%.6g "
+                   "max|y_unclamped|=%.6g verdict=%s\n",
+                   R, R > 1 ? "tiled" : "per-row", bad, R * DIM_D, m01, m02, ref,
+                   bad ? "FAIL(non-finite outputs)"
+                   : ref == 0.0 ? "FAIL(all-zero output -- the check proves nothing)"
+                   : (m01 == 0.0 && m02 > 0.0) ? "PASS"
                    : (m01 != 0.0) ? "FAIL(huge-limit not inert)"
                                   : "FAIL(limit 10 changed nothing)");
             free(x); free(y0); free(y1); free(y2);
         }
+        free(sc);
         coli_vk_ring_free();
         coli_vk_shutdown();
         printf("INFO done (clamp-check)\n");

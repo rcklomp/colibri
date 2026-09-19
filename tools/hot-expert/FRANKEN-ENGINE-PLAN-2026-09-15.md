@@ -14,6 +14,44 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 15 (2026-09-18 01:45 CEST, 2026-09-17 23:45 UTC) — the night's
+> results, one incident, and the order changed.** (1) **F6 design** (Opus,
+> `F6-INDEXER-DESIGN-2026-09-18.md`, merged): the DSA indexer is not a
+> numerics problem — its score pass is a single-threaded scalar loop and its
+> top-512 is a `wanted × pools` greedy scan (`c/sparse_index.h` ~275–298,
+> verified), so **F6a = OpenMP over the pools + an exact heap top-k, bit-
+> identical, a Sonnet item**, projected 25.0 → 3.3 ms per MLA call at 18.6k
+> and decode 2.21 → 3.9 tok/s (ceiling 4.42). Corrections the design forced:
+> §X3 step 0's 26 % lower bound is withdrawn (the follow-up prompt was 20
+> tokens, so the indexer is 54 % of the 18k decode token, firmly); the
+> attention core is flat with depth (the 2 051 width cap holds); coarser
+> pooling is impossible (the pool compressor is a trained `[4][128]` tensor);
+> X2's 564-token KL packet sits below the dense threshold and cannot gate
+> any indexer change; and **F2's "113.9 ms/token" was the whole prefill
+> token, not the expert part** — at 18k a prefill row is ≈ 168 ms indexer +
+> 67 ms experts, so F6a is the first prefill lever too and F2's arithmetic
+> is re-based after it. **F6a is implemented** (`perf/f6a-index-parallel`,
+> bf6afd0, unit test 4 000 randomised trials, `GLM53_INDEX_SCALAR=1` restores
+> the old path); its gate chain (oracle on a ≥ 4k-token prompt with logits
+> bit-identical, then A,B,B,A to 9.5k with `COLI_TIMERS=1`) is queued on the
+> rig and has not run — see (3). (2) **F2 step 0** (record §F2-STEP0/0b): the
+> CPU fill alone reaches 59 GB/s at 8 threads, but fill overlapped with the
+> GPU read sustains only **38.6 GB/s on three cards** (DRAM traffic triples or
+> the handshake dominates — undecided, the number stands): streamed experts
+> cost **6.22 ms/token**, not 3.9, still 18× under today's CPU path. The
+> no-copy alternative (anonymous RAM imported into Vulkan, read in place)
+> imports fine at 96 GiB but its bandwidth collapses with region size (35 →
+> 10.7 GB/s from 8 to 64 GiB): rejected; F2 is built on the copy pipeline.
+> (3) **Incident:** the 96 GiB import probe, killed at its budget, left one
+> thread in uninterruptible sleep in amdgpu's userptr teardown
+> (`mmu_interval_read_begin`), ~96 GiB pinned (MemAvailable 228 → 139 GiB),
+> holding the rig lock through its parent chain. The gateway serves (its
+> page cache is partly evicted; the first requests after this pay faults).
+> **Owner action: reboot the rig**; the watchdog restarts the gateway, and
+> the queued F6a chain launches itself if the lock frees before 08:00 UTC.
+> Order now: F6a gate → re-profile (`COLI_TIMERS=1` A arm at 18k, 75 min) →
+> F2 re-based on that profile → F1 → F5; F3 when a model is named.
+>
 > **Rev 14 (2026-09-17 22:45 CEST, 20:45 UTC) — F0 PASS, F4 answered; §8.3
 > amended.** F0 (record §VK-STREAM): on RADV's dedicated transfer family
 > (SDMA) three cards stream 27 GB/s — the falsifier — but on the backend's own

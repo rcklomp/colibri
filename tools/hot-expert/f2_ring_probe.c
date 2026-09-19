@@ -353,13 +353,19 @@ int main(int argc, char **argv) {
             ColiVkTensor *g = NULL, *u = NULL, *d = NULL;
             coli_vk_ring_tensors(0, 0, &g, &u, &d);
             for (int i = 0; i < R * DIM_D; i++) x[i] = (float)((i * 2654435761u) % 2000) / 1000.0f - 1.0f;
+            int i0 = 0, i1 = 0, i2 = 0, n1 = 0, n2 = 0;
             coli_vk_set_swiglu_limit(0.0f);
-            if (coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x)) coli_vk_expert_group_take(y0);
-            coli_vk_set_swiglu_limit(1e30f);
-            if (coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x)) coli_vk_expert_group_take(y1);
-            coli_vk_set_swiglu_limit(10.0f);
-            if (coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x)) coli_vk_expert_group_take(y2);
+            i0 = coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x);
+            if (i0) i0 = coli_vk_expert_group_take(y0);
+            n1 = coli_vk_set_swiglu_limit(1e30f);
+            i1 = coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x);
+            if (i1) i1 = coli_vk_expert_group_take(y1);
+            n2 = coli_vk_set_swiglu_limit(10.0f);
+            i2 = coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x);
+            if (i2) i2 = coli_vk_expert_group_take(y2);
             coli_vk_set_swiglu_limit(0.0f);
+            printf("INFO clamp-check rows=%d take0=%d take1=%d take2=%d devs_clamped=%d/%d "
+                   "g=%p ring_where=%d\n", R, i0, i1, i2, n1, n2, (void *)g, coli_vk_ring_where(0));
             double m01 = 0, m02 = 0, ref = 0;
             for (int i = 0; i < R * DIM_D; i++) {
                 double a = fabs((double)y0[i] - y1[i]); if (a > m01) m01 = a;

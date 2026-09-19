@@ -42,6 +42,9 @@
 # Knobs:
 #   F2_REUSE_ORACLE=1   skip phase 1 (phase 2 separately launchable)
 #   F2_ORACLE_ONLY=1    run phase 1 and stop
+#   F2_LADDER_ONLY=1    skip phase 1 entirely and run only the A,B,B,A ladder
+#                       (this is how the multi-hour 18k rung is launched after
+#                       the oracle has already passed on a shorter one)
 #   F2_STEPS=...        ladder steps. Default is the SHORT rung to ~4.5k
 #                       ("1024,1024,2048"), which is a directional A,B,B,A in
 #                       well under an hour. The gate's own rung is
@@ -356,7 +359,25 @@ run_oracle chunk "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
     "GLM53_PREFILL_CHUNK=$B_CHUNK" || exit 1
 gate_compare "O4 teacher_forcing (chunk vs default)" "$OUT/deep_chunk.out" "$OUT/deep_off.out" '^teacher_forcing'
 o4_tf=$?
-logit_diff "O4 logits (chunk vs default)" "$OUT/deep_dump_off.f32" "$OUT/deep_dump_chunk.f32"; o4_lg=$?
+if [ "${F2_SKIP_DIFFS:-0}" = 1 ]; then o4_lg=0; echo "  O4 logits: SKIPPED (F2_SKIP_DIFFS=1)"
+else logit_diff "O4 logits (chunk vs default)" "$OUT/deep_dump_off.f32" "$OUT/deep_dump_chunk.f32"; o4_lg=$?; fi
+
+# O5 completes the 2x2 that O2 and O4 open. O2 turns BOTH knobs (stream on AND
+# chunk 512) and O4 turns only the chunk; the cell that is missing is streaming
+# at the DEFAULT chunk, and it is the cell that decides whether F2 can ship
+# without the chunk's reassociation. Shallow, because it is a speed question:
+# the numerics of streaming alone are already O3's answer.
+echo "--- O5: streaming ON at the DEFAULT chunk 128 (the missing 2x2 cell), shallow"
+run_oracle stream128 "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+    "COLI_PREFILL_STREAM=1" "GLM53_PREFILL_CHUNK=128" "COLI_TIMERS=1" || exit 1
+gate_compare "O5 teacher_forcing (stream@128 vs off)" "$OUT/shallow_stream128.out" "$OUT/shallow_off.out" '^teacher_forcing'
+o5_tf=$?
+echo "--- the 2x2, shallow packet, prefill wall seconds"
+for cell in off:"chunk 128, CPU" chunk:"chunk 512, CPU" stream128:"chunk 128, streamed" on:"chunk 512, streamed"; do
+  sfx=${cell%%:*}; lbl=${cell#*:}
+  printf '  %-22s %s\n' "$lbl" "$(grep -a -o 'prefill [0-9]* token in [0-9.]*s' "$OUT/shallow_${sfx}.err" 2>/dev/null | tail -1)"
+done
+grep -aE '\[STREAM\]' "$OUT/shallow_stream128.err" | tail -1 || true
 
 echo "--- streamed-expert accounting, knob ON then knob OFF (COLI_TIMERS=1 on the ON run)"
 grep -E 'moe split|\[STREAM\]|\[PROF\] eg=|prefill ring' "$OUT/deep_on.err" | tail -8 || echo "(none)"
@@ -370,6 +391,7 @@ echo "  O1 (knob off == pristine, HARD GATE): tf_deep=$o1_tf dump_deep=$o1_dump 
 echo "  O2 (on vs off, reported):             tf=$o2_tf logits=$o2_lg"
 echo "  O3 (on vs EXPERTS_CPU=2, GATED):      tf=$o3_tf logits=$o3_lg"
 echo "  O4 (chunk alone, reported):           tf=$o4_tf logits=$o4_lg"
+echo "  O5 (stream@128, reported):            tf=$o5_tf"
 if [ "$o1_tf" != 0 ] || [ "$o1_dump" != 0 ] || [ "$o1_tf_sh" != 0 ] || [ "$o1_dump_sh" != 0 ]; then
   echo "FATAL: O1 failed -- COLI_PREFILL_STREAM=0 is NOT inert. Stopping before the ladder."
   oracle_rc=1

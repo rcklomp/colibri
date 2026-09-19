@@ -50,6 +50,14 @@ for pkt in shallow deep; do
   fi
 done
 
+# R3: the per-row-o arm (F7_O_PERROW=1). R3 vs R2 isolates the batched
+# o-projection from the attention core with nothing else moving.
+if [ -s "$OUT/shallow_dump_gpuo.f32" ] && [ -s "$OUT/shallow_dump_ref64.f32" ]; then
+  echo "--- shallow R3 (ref64 || gpu, o-projection per row)"
+  nice -n 19 python3 "$KL" "R3 shallow (ref64 || gpuo)" \
+      "$OUT/shallow_dump_ref64.f32" "$OUT/shallow_dump_gpuo.f32" | tee "$OUT/kl_shallow_r3.txt"
+fi
+
 python3 - "$OUT" <<'PY'
 import re, sys, os
 out = sys.argv[1]

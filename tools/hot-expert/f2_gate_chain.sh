@@ -51,6 +51,10 @@
 #                       "1024,1024,2048,4096,8192" (to 18k) and is MULTI-HOUR:
 #                       pass it explicitly.
 #   F2_CHUNK=512        the chunk the B arm uses (A always uses the default)
+#   F2_LADDER_CLAMP=0   take GLM53_VK_SWIGLU_CLAMP out of BOTH ladder arms.
+#                       Default is 1: the clamp is a correctness fix that is
+#                       not F2's, and having it on one side only would measure
+#                       the clamp instead of the streaming.
 #
 # Launch ONLY through run_chain.sh (it takes the rig lock):
 #   setsid nohup ~/src/colibri-f2/tools/hot-expert/run_chain.sh \
@@ -125,6 +129,7 @@ wait_no_engine() {
 start_gateway() {
   env -u COLI_CKPT_DIR -u GLM53_PREFIX_CKPT -u GLM53_MAXT -u COLI_TIMERS \
       -u COLI_PREFILL_STREAM -u GLM53_PREFILL_CHUNK -u GLM53_EXPERTS_CPU \
+      -u GLM53_VK_SWIGLU_CLAMP \
       -u GLM53_LOGIT_DUMP_ALL -u COLI_PREFILL_RING_SLOTS \
       SKIP_WARM=1 setsid nohup ~/start_glm53.sh >> "$GLOG" 2>&1 < /dev/null &
   for _ in $(seq 1 120); do
@@ -493,7 +498,7 @@ run_arm() {   # run_arm <arm-label> <stream 0|1>
   local arm=$1 stream=$2
   local json="$OUT/${TAG}_${arm}.jsonl" elog="$OUT/${TAG}_${arm}_engine.log" \
         console="$OUT/${TAG}_${arm}_console.log" rc
-  echo "=== arm $arm (COLI_PREFILL_STREAM=$stream) $(date -Is)"
+  echo "=== arm $arm (COLI_PREFILL_STREAM=$stream clamp=${F2_LADDER_CLAMP:-1} chunk=$([ "$stream" = 1 ] && echo "$B_CHUNK" || echo default)) $(date -Is)"
   precheck "$arm-pre"
   warm_glm
   assert_glm_resident "$arm-pre" || { echo "FATAL: $arm residency < 90% before engine start"; return 1; }
@@ -507,9 +512,20 @@ run_arm() {   # run_arm <arm-label> <stream 0|1>
   export COLI_VK_EXPERTS2=1695 COLI_VK_EXPERTS3=1695
   export COLI_VK_SHADERS="$CAND_SHADERS"
   export COLI_USAGE_PATH="$HIST"      # frozen copy: both arms preload the same tier
-  if [ "$stream" = 1 ]; then export COLI_PREFILL_STREAM=1
-  else unset COLI_PREFILL_STREAM; fi
-  unset GLM53_PREFILL_CHUNK          # B's chunk default comes from the knob itself
+  # The swiglu clamp goes in BOTH arms (F2_LADDER_CLAMP=0 to take it out):
+  # it is a correctness fix that is not F2's, and leaving it on one side would
+  # measure the clamp instead of the streaming. Record §F2i: it costs +0.3 %.
+  if [ "${F2_LADDER_CLAMP:-1}" = 1 ]; then export GLM53_VK_SWIGLU_CLAMP=1
+  else unset GLM53_VK_SWIGLU_CLAMP; fi
+  # Step 2c: streaming no longer moves the chunk, so the B arm sets it itself.
+  # A keeps the engine default, which is what the record's A rows were taken at.
+  if [ "$stream" = 1 ]; then
+    export COLI_PREFILL_STREAM=1
+    export GLM53_PREFILL_CHUNK="$B_CHUNK"
+  else
+    unset COLI_PREFILL_STREAM
+    unset GLM53_PREFILL_CHUNK
+  fi
 
   python3 "$HERE/context_ladder.py" \
       --engine "$CAND_BIN" \
@@ -520,6 +536,7 @@ run_arm() {   # run_arm <arm-label> <stream 0|1>
   rc=${PIPESTATUS[0]}
   echo "=== arm $arm exit=$rc json=$json engine_log=$elog"
   unset GLM53_MAXT GLM53_PREFIX_CKPT COLI_CKPT_DIR COLI_TIMERS COLI_PREFILL_STREAM
+  unset GLM53_PREFILL_CHUNK GLM53_VK_SWIGLU_CLAMP
   wait_no_engine || rc=1
   return $rc
 }

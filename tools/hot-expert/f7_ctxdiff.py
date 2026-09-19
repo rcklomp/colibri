@@ -34,6 +34,7 @@ def main(a, b):
     T, H, V, base = ma["tokens"], ma["H"], ma["V"], ma["base"]
     print("chunk base=%d tokens=%d H=%d V=%d seen=%d" % (base, T, H, V, ma["seen"]))
     worst, wrow, whead = 0.0, -1, -1
+    rels = []
     nz = 0
     for t in range(T):
         o = t * H * V
@@ -45,11 +46,16 @@ def main(a, b):
             if d > mx: mx, hw = d, i // V
         rel = mx / mref if mref else 0.0
         if mx: nz += 1
+        rels.append(rel)
         if rel > worst: worst, wrow, whead = rel, base + t, hw
         if t < 4 or rel > 1e-4 or (t % 64 == 0):
             print("  t=%-6d maxabs=%.4e rel=%.4e head=%d" % (base + t, mx, rel, hw))
+    rels.sort()
     print("WORST rel=%.4e at row %d head %d ; rows differing at all: %d/%d"
           % (worst, wrow, whead, nz, T))
+    print("STATS rel p50=%.4e p90=%.4e p99=%.4e max=%.4e   (p50 is the honest one: a"
+          " per-row max is dominated by near-degenerate softmax ties)"
+          % (rels[T // 2], rels[int(T * 0.9)], rels[int(T * 0.99)], rels[-1]))
 
 if __name__ == "__main__":
     main(sys.argv[1], sys.argv[2])

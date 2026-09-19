@@ -2801,6 +2801,268 @@ static void vk_preload_tier(GModel *m) {
     free(cand); if (tmp.own) free(tmp.own);
     fprintf(stderr, "[VK] preload: %d heat-ranked experts resident (of %d candidates)\n", loaded, (int)n);
 }
+
+/* ===================== F2: streamed non-resident experts ====================
+ * FRANKEN-ENGINE-PLAN-2026-09-15.md item F2, design note
+ * tools/hot-expert/F2-STREAM-PREFILL-DESIGN-2026-09-19.md.
+ *
+ * In PREFILL only (tokens > 1), and only behind COLI_PREFILL_STREAM=1, the
+ * experts this chunk needs that the tier does not hold are copied into a
+ * per-device ring of expert-sized slots and run through the same
+ * coli_vk_expert_group_issue/2/3 path the resident ones use, instead of down
+ * the CPU int4 path. Decode is untouched (that is F1).
+ *
+ * The ring lives in HOST memory, not VRAM, and that is a measured choice, not
+ * a convenience: tools/hot-expert/f2_ring_probe.c at the engine's real shapes,
+ * 2026-09-19, 48 slots per card, three cards, 144 experts (2.04 GB) per wave --
+ *
+ *   ring in ReBAR VRAM  (CPU writes VRAM, shader reads VRAM)
+ *       fill 11.9 / 12.7 / 13.1 GB/s per card, 16.3 GB/s on three
+ *       wave (fill + compute) 102.6-104.8 ms  =  19.5-19.9 GB/s
+ *   ring in host RAM    (CPU writes DRAM, shader reads it over PCIe)
+ *       fill 48.0 / 58.4 / 58.4 GB/s per card, 58.6 GB/s on three
+ *       wave (fill + compute)  74.3-75.2 ms  =  27.1-27.4 GB/s
+ *
+ * CPU stores into write-combined VRAM are 3.6x slower than the same stores
+ * into cached DRAM, and the GPU reading host memory over PCIe (52 GB/s here)
+ * more than pays that back. The host ring also costs no VRAM at all, so it
+ * does not touch the tier, the G6 reserve, or the 1695 caps.
+ *
+ * Two banks per device, alternating: the fill of wave w+1 runs while wave w's
+ * dispatch is in flight, and the fill of wave 0 runs inside the gap G9 already
+ * opened between issuing the resident groups and joining them. The two legs
+ * use different resources (CPU-to-DRAM stores vs GPU DMA reads), which is why
+ * the overlap is worth having here and was not worth having with a VRAM ring. */
+#ifdef COLI_VULKAN
+static const int    g_ring_devno[3] = {0, 2, 3};
+/* Link shares from the record: dev2's upstream link is its own (18.67 GB/s),
+ * dev0 and dev3 share one (9.96/9.99 GB/s each). Assign in that ratio so all
+ * three finish a wave together. */
+static const double g_ring_share[3] = {0.259, 0.483, 0.259};
+static int g_ring_bank[3];            /* slots per bank, per device (0 = no ring) */
+static int g_ring_state = -1;         /* -1 not tried, 0 unavailable, 1 ready */
+static double g_st_fill_s, g_st_gpu_s;
+static long   g_st_experts, g_st_waves, g_st_calls, g_st_nonres, g_st_cpu_fallback, g_st_pf_calls;
+
+static int stream_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("COLI_PREFILL_STREAM"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
+
+static int stream_ring_init(const Cfg *c) {
+    if (g_ring_state >= 0) return g_ring_state;
+    g_ring_state = 0;
+    if (!g_vk_ready || !stream_on()) return 0;
+    int per_bank = 32;
+    { const char *e = getenv("COLI_PREFILL_RING_SLOTS");
+      if (e) { int v = atoi(e); if (v >= 1 && v <= 64) per_bank = v; } }
+    int where = 1;                      /* host RAM; 0 = ReBAR VRAM, measured slower */
+    { const char *e = getenv("COLI_PREFILL_RING_WHERE"); if (e) where = atoi(e) ? 1 : 0; }
+    int total = 0;
+    for (int k = 0; k < 3; k++) {
+        if (k == 1 && !coli_vk_dev2_available()) continue;
+        if (k == 2 && !coli_vk_dev3_available()) continue;
+        const int got = coli_vk_ring_init(g_ring_devno[k], per_bank * 2, 4,
+                                          c->hidden, c->moe_inter, 64, where);
+        g_ring_bank[k] = got / 2;       /* two banks; an odd slot is unused */
+        total += g_ring_bank[k];
+        fprintf(stderr, "[VK] prefill ring dev%d: %d slots x 2 banks, %.2f GB in %s\n",
+                g_ring_devno[k], g_ring_bank[k],
+                (double)coli_vk_ring_bytes(g_ring_devno[k]) / 1e9,
+                coli_vk_ring_where(g_ring_devno[k]) ? "host RAM" : "VRAM");
+    }
+    if (!total) { fprintf(stderr, "[VK] prefill ring: none allocated, streaming stays off\n"); return 0; }
+    g_ring_state = 1;
+    return 1;
+}
+
+/* Per-wave scratch, grown in place: ffn_layer is called one layer at a time
+ * from one thread, so a file-static scratch is safe and saves a 2-3 MB
+ * malloc/free per device per wave (42 layers x ~17 chunks x ~2 waves). */
+static float *g_st_xk[2][3], *g_st_yk[3];
+static size_t g_st_xcap[2][3], g_st_ycap[3];
+static int    *g_st_rows[2][3], *g_st_tok[2][3];
+static float  *g_st_wt[2][3];
+static int     g_st_ecap[2][3];
+static ColiVkTensor *g_st_g[2][3][64], *g_st_u[2][3][64], *g_st_d[2][3][64];
+
+static int st_grow(void **p, size_t *cap, size_t want) {
+    if (*cap >= want) return 1;
+    void *n = realloc(*p, want);
+    if (!n) return 0;
+    *p = n; *cap = want; return 1;
+}
+
+/* One wave: which streamed experts go to which device, their rows, and the
+ * packed activations. Built by st_plan, filled by st_fill, run by st_run. */
+typedef struct {
+    int bank;
+    int n[3];            /* experts on dev0 / dev2 / dev3 */
+    int first[3];        /* index into the streamed list of this device's first expert */
+    int idx[3][64];      /* streamed-list index of each of this device's experts */
+    int total[3];        /* packed rows */
+    int issued[3];
+    int count;
+} StWave;
+
+static int st_plan(StWave *w, int bank, int from, int n_stream) {
+    memset(w, 0, sizeof(*w));
+    w->bank = bank;
+    int cap = 0;
+    for (int k = 0; k < 3; k++) cap += g_ring_bank[k];
+    if (cap < 1) return 0;
+    int want = n_stream - from;
+    if (want < 1) return 0;
+    if (want > cap) want = cap;
+    double sw = 0.0;
+    for (int k = 0; k < 3; k++) if (g_ring_bank[k]) sw += g_ring_share[k];
+    int placed = 0;
+    for (int k = 0; k < 3; k++) {
+        if (!g_ring_bank[k]) continue;
+        int t = (int)((double)want * g_ring_share[k] / sw);
+        if (t > g_ring_bank[k]) t = g_ring_bank[k];
+        w->n[k] = t; placed += t;
+    }
+    /* the remainder, dev2 first (its link is its own) */
+    const int order[3] = {1, 0, 2};
+    while (placed < want) {
+        int moved = 0;
+        for (int q = 0; q < 3 && placed < want; q++) {
+            const int k = order[q];
+            if (w->n[k] < g_ring_bank[k]) { w->n[k]++; placed++; moved = 1; }
+        }
+        if (!moved) break;
+    }
+    int at = from;
+    for (int k = 0; k < 3; k++) {
+        w->first[k] = at;
+        for (int i = 0; i < w->n[k]; i++) w->idx[k][i] = at++;
+    }
+    w->count = placed;
+    return placed;
+}
+
+/* Copy this wave's experts into their ring slots. One flat OpenMP loop over
+ * all three devices' slots: the 8 physical cores drive all three links at
+ * once, which is the configuration the probe measured at 58.6 GB/s. */
+static void st_fill(const StWave *w, const Mat *sg, const Mat *su, const Mat *sd) {
+    int flat_dev[192], flat_slot[192], flat_e[192], nf = 0;
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < w->n[k]; i++) {
+            flat_dev[nf] = g_ring_devno[k];
+            flat_slot[nf] = w->bank * g_ring_bank[k] + i;
+            flat_e[nf] = w->idx[k][i];
+            nf++;
+        }
+    const double t0 = optime_on() ? optime_now() : 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int i = 0; i < nf; i++) {
+        const int e = flat_e[i];
+        coli_vk_ring_fill(flat_dev[i], flat_slot[i],
+                          sg[e].q4, sg[e].s, su[e].q4, su[e].s, sd[e].q4, sd[e].s);
+    }
+    if (optime_on()) g_st_fill_s += optime_now() - t0;
+}
+
+/* Gather this wave's rows, issue every device, and return. The caller joins
+ * with st_take after filling the NEXT wave. */
+static int st_issue(StWave *w, const int *seid, const int *chosen, const float *weight,
+                    int tokens, int topk, const float *x, int hidden) {
+    for (int k = 0; k < 3; k++) {
+        w->issued[k] = 0;
+        if (!w->n[k]) continue;
+        /* tok/wt hold one entry per PACKED ROW; a wave's rows can never exceed
+         * tokens * (experts in this wave) <= tokens * 64. */
+        if (g_st_ecap[w->bank][k] < tokens) {
+            int *nr_ = realloc(g_st_rows[w->bank][k], 64 * sizeof(int));
+            int *nt_ = realloc(g_st_tok[w->bank][k], (size_t)tokens * 64 * sizeof(int));
+            float *nw_ = realloc(g_st_wt[w->bank][k], (size_t)tokens * 64 * sizeof(float));
+            if (!nr_ || !nt_ || !nw_) return 0;
+            g_st_rows[w->bank][k] = nr_; g_st_tok[w->bank][k] = nt_; g_st_wt[w->bank][k] = nw_;
+            g_st_ecap[w->bank][k] = tokens;
+        }
+        /* count the rows first so the packed buffer is sized exactly */
+        int tot = 0;
+        for (int i = 0; i < w->n[k]; i++) {
+            const int eid = seid[w->idx[k][i]];
+            int nr = 0;
+            for (int t = 0; t < tokens; t++)
+                for (int q = 0; q < topk; q++)
+                    if (chosen[(size_t)t * topk + q] == eid) { nr++; break; }
+            g_st_rows[w->bank][k][i] = nr; tot += nr;
+        }
+        w->total[k] = tot;
+        if (!tot) continue;
+        if (!st_grow((void **)&g_st_xk[w->bank][k], &g_st_xcap[w->bank][k],
+                     (size_t)tot * hidden * sizeof(float))) return 0;
+        int at = 0;
+        for (int i = 0; i < w->n[k]; i++) {
+            const int eid = seid[w->idx[k][i]];
+            for (int t = 0; t < tokens; t++) {
+                float scale = 0.0f;
+                for (int q = 0; q < topk; q++)
+                    if (chosen[(size_t)t * topk + q] == eid) { scale = weight[(size_t)t * topk + q]; break; }
+                if (scale == 0.0f) continue;
+                memcpy(g_st_xk[w->bank][k] + (size_t)at * hidden,
+                       x + (size_t)t * hidden, (size_t)hidden * sizeof(float));
+                g_st_tok[w->bank][k][at] = t; g_st_wt[w->bank][k][at] = scale; at++;
+            }
+            if (!coli_vk_ring_tensors(g_ring_devno[k], w->bank * g_ring_bank[k] + i,
+                                      &g_st_g[w->bank][k][i], &g_st_u[w->bank][k][i],
+                                      &g_st_d[w->bank][k][i])) return 0;
+        }
+    }
+    /* The readback buffers are grown BEFORE anything is submitted: a failure
+     * after a submit would leave that device's single in-flight slot stuck
+     * (coli_vk_expert_group_take's precondition) for the rest of the run. */
+    for (int k = 0; k < 3; k++) {
+        if (!w->n[k] || !w->total[k]) continue;
+        if (!st_grow((void **)&g_st_yk[k], &g_st_ycap[k],
+                     (size_t)w->total[k] * hidden * sizeof(float))) return 0;
+    }
+    const double t0 = optime_on() ? optime_now() : 0.0;
+    for (int k = 0; k < 3; k++) {
+        if (!w->n[k] || !w->total[k]) continue;
+        int ok = 0;
+        if (k == 0) ok = coli_vk_expert_group_issue(g_st_g[w->bank][0], g_st_u[w->bank][0], g_st_d[w->bank][0],
+                                                    g_st_rows[w->bank][0], w->n[0], g_st_xk[w->bank][0]);
+        else if (k == 1) ok = coli_vk_expert_group_issue2(g_st_g[w->bank][1], g_st_u[w->bank][1], g_st_d[w->bank][1],
+                                                          g_st_rows[w->bank][1], w->n[1], g_st_xk[w->bank][1]);
+        else ok = coli_vk_expert_group_issue3(g_st_g[w->bank][2], g_st_u[w->bank][2], g_st_d[w->bank][2],
+                                              g_st_rows[w->bank][2], w->n[2], g_st_xk[w->bank][2]);
+        w->issued[k] = ok;
+    }
+    if (optime_on()) g_st_gpu_s += optime_now() - t0;
+    return 1;
+}
+
+/* Join this wave and accumulate, dev0 then dev2 then dev3 -- the same device
+ * order the resident path accumulates in. `served` marks the experts that
+ * really ran on the GPU; the rest go back to the CPU. */
+static void st_take(StWave *w, unsigned char *served, float *out, int hidden) {
+    const double t0 = optime_on() ? optime_now() : 0.0;
+    for (int k = 0; k < 3; k++) {
+        if (!w->issued[k]) continue;
+        int ok = k == 0 ? coli_vk_expert_group_take(g_st_yk[0])
+               : k == 1 ? coli_vk_expert_group_take2(g_st_yk[1])
+                        : coli_vk_expert_group_take3(g_st_yk[2]);
+        if (!ok) { w->issued[k] = 0; g_n_devloss++; continue; }
+        for (int r = 0; r < w->total[k]; r++) {
+            float *os = out + (size_t)g_st_tok[w->bank][k][r] * hidden;
+            const float wgt = g_st_wt[w->bank][k][r];
+            const float *src = g_st_yk[k] + (size_t)r * hidden;
+            for (int d = 0; d < hidden; d++) os[d] += wgt * src[d];
+        }
+        for (int i = 0; i < w->n[k]; i++) served[w->idx[k][i]] = 1;
+        g_st_experts += w->n[k];
+    }
+    if (optime_on()) g_st_gpu_s += optime_now() - t0;
+    g_st_waves++;
+}
+#endif  /* COLI_VULKAN */
 /* pure-CPU expert MLP (bypasses mv/Vulkan for non-resident experts)
  *
  * G11: the three matmuls used to be three separate `#pragma omp parallel for`
@@ -3088,8 +3350,11 @@ static void ffn_moe_run_deferred_cpu(const Mat *cpu_gate, const Mat *cpu_up, con
                                      const int *chosen, const float *weight, int tokens, int topk,
                                      const float *x, int hidden, float limit,
                                      float *sg, float *su, float *tmp, float *out,
-                                     const CpuRows *cr) {
+                                     const CpuRows *cr, const unsigned char *skip) {
     for (int j = 0; j < n_cpu_deferred; j++) {
+        /* F2: `skip` marks the experts a streamed wave already ran on the GPU.
+         * NULL (every caller before F2, and the knob-off path) means none. */
+        if (skip && skip[j]) continue;
         const int eid = cpu_eid[j];
         if (cr && cr->xr && mlp3_cpu_rows_ok(&cpu_gate[j], &cpu_up[j], &cpu_down[j])) {
             cpu_expert_rows(cr, eid, chosen, weight, tokens, topk, x, hidden,
@@ -3369,6 +3634,23 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         cpu_down = malloc((size_t)maxres * sizeof(Mat));
         cpu_eid  = malloc((size_t)maxres * sizeof(int));
     }
+    /* F2: in PREFILL only, and only with COLI_PREFILL_STREAM=1, the experts
+     * the tier does not hold are collected here instead of being deferred to
+     * the CPU, and streamed through the ring after the resident groups. The
+     * SAME Mat triples are kept, so any expert the ring or a submit could not
+     * serve falls straight back onto the CPU path with nothing lost. */
+    const int can_stream = can_defer && tokens > 1 && !experts_cpu_on()
+                           && stream_on() && stream_ring_init(c);
+    if (optime_on() && tokens > 1) g_st_pf_calls++;
+    unsigned char *st_served = NULL;
+    StWave stw[2];
+    int st_prefilled = 0, st_filled_upto = 0;
+    if (can_stream) {
+        st_served = calloc((size_t)maxres, 1);
+        if (!st_served) { fprintf(stderr, "OOM sullo streaming degli esperti\n"); exit(1); }
+        memset(stw, 0, sizeof(stw));
+        g_st_calls++;
+    }
 #endif
     for (int base = 0; base < n_union; base += block) {
         const int here = base + block <= n_union ? block : n_union - base;
@@ -3447,6 +3729,12 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                     g_n_eg++;
                     continue;
                 }
+                /* F2 / instrumentation: how many DISTINCT non-resident experts
+                 * this layer-chunk needs. The design note brackets it at 55-82
+                 * (chunk 128) and 74-163 (chunk 512) from the usage histogram;
+                 * the spread is the item's largest input, so the engine counts
+                 * it instead of the note guessing. Timers only, both arms. */
+                if (optime_on() && tokens > 1) g_st_nonres++;
                 if (can_defer) {
                     cpu_gate[n_cpu_deferred] = gate;
                     cpu_up[n_cpu_deferred] = up;
@@ -3536,10 +3824,20 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
              * own success: an issue failure elsewhere doesn't change that
              * these still have to run, and a device that DID issue is still
              * in flight regardless. */
-            if (first_round && can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
+            /* F2: with streaming on there is no CPU expert work to put in this
+             * gap -- what goes here instead is the FILL of the first streamed
+             * wave, which is pure memcpy into mapped host memory and touches no
+             * Vulkan object, so it is safe while three groups are in flight. */
+            if (first_round && can_stream && n_cpu_deferred > 0 && !st_prefilled) {
+                if (st_plan(&stw[0], 0, 0, n_cpu_deferred) > 0) {
+                    st_fill(&stw[0], cpu_gate, cpu_up, cpu_down);
+                    st_filled_upto = stw[0].count;
+                    st_prefilled = 1;
+                }
+            } else if (first_round && can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
                 ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
                                          chosen, weight, tokens, topk, x, c->hidden,
-                                         rlimit, sg, su, tmp, out, &cpu_rows);
+                                         rlimit, sg, su, tmp, out, &cpu_rows, NULL);
                 cpu_deferred_done = 1;
             }
             first_round = 0;
@@ -3584,6 +3882,41 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         g_t_eg += prof_now_s() - _te0;
         free(yk0); free(yk1); free(yk2);
     }
+    /* F2: the streamed waves. Every resident group has been issued AND joined
+     * by here, so the three devices' single in-flight slots are free. Wave 0
+     * may already be filled (the G9 gap above); each wave is issued, the NEXT
+     * wave's fill runs while it is in flight -- different resource, CPU stores
+     * to DRAM against GPU reads over PCIe -- and then it is joined. */
+    if (can_stream && n_cpu_deferred > 0) {
+        if (!st_prefilled) {
+            if (st_plan(&stw[0], 0, 0, n_cpu_deferred) > 0) {
+                st_fill(&stw[0], cpu_gate, cpu_up, cpu_down);
+                st_filled_upto = stw[0].count;
+                st_prefilled = 1;
+            }
+        }
+        int cur = 0;
+        while (st_prefilled && stw[cur].count > 0) {
+            st_issue(&stw[cur], cpu_eid, chosen, weight, tokens, topk, x, c->hidden);
+            const int nxt = cur ^ 1;
+            memset(&stw[nxt], 0, sizeof(stw[nxt]));
+            if (st_filled_upto < n_cpu_deferred &&
+                st_plan(&stw[nxt], nxt, st_filled_upto, n_cpu_deferred) > 0) {
+                st_fill(&stw[nxt], cpu_gate, cpu_up, cpu_down);
+                st_filled_upto += stw[nxt].count;
+            }
+            st_take(&stw[cur], st_served, out, c->hidden);
+            cur = nxt;
+        }
+        /* Whatever the ring could not serve -- a device with no ring, a failed
+         * submit, an expert past the last wave -- runs on the CPU exactly as
+         * it does with the knob off. Nothing is silently dropped. */
+        ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
+                                 chosen, weight, tokens, topk, x, c->hidden,
+                                 rlimit, sg, su, tmp, out, &cpu_rows, st_served);
+        for (int j = 0; j < n_cpu_deferred; j++) if (!st_served[j]) g_st_cpu_fallback++;
+        cpu_deferred_done = 1;
+    }
     if (can_defer && n_cpu_deferred > 0 && !cpu_deferred_done) {
         /* Nothing was GPU-resident this layer (nvk0=nvk1=nvk2=0, so the
          * dispatch block above was never entered and the while loop's
@@ -3591,8 +3924,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
          * still have to run. */
         ffn_moe_run_deferred_cpu(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
                                  chosen, weight, tokens, topk, x, c->hidden,
-                                 rlimit, sg, su, tmp, out, &cpu_rows);
+                                 rlimit, sg, su, tmp, out, &cpu_rows, NULL);
     }
+    free(st_served);
     free(cpu_gate); free(cpu_up); free(cpu_down); free(cpu_eid);
 #endif
     free(to_read); free(slot_of); free(union_ids);
@@ -3803,6 +4137,28 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                                                   m->c.conv_k);
                     free(is_kda);
                 }
+            }
+            /* Step 2a: GLM53_VK_SWIGLU_CLAMP=1 gives the routed-expert GPU
+             * kernels the clamp the CPU path has always applied (§G13/§G15:
+             * without it the model's output depends on which experts happen to
+             * be tier-resident, and F2 hands the unclamped kernel another
+             * ~11 % of the calls). Resident AND streamed experts alike. Set
+             * BEFORE the preload only because that is where the model's
+             * swiglu_limit is known and nothing has dispatched yet; the
+             * pipelines it builds are separate objects and the unclamped ones
+             * are left exactly as they are.
+             *
+             * If the knob is set and the clamped .spv files are missing, the
+             * engine STOPS: silently running unclamped is the bug this fixes. */
+            if (getenv("GLM53_VK_SWIGLU_CLAMP") && atoi(getenv("GLM53_VK_SWIGLU_CLAMP")) != 0) {
+                const int nd = coli_vk_set_swiglu_limit(m->c.swiglu_limit);
+                if (nd < 1) {
+                    fprintf(stderr, "GLM53_VK_SWIGLU_CLAMP=1 ma i pipeline clampati non si "
+                                    "costruiscono (qmatmul_gate_up_clamp.spv in %s?)\n", spv);
+                    exit(1);
+                }
+                fprintf(stderr, "[VK] swiglu clamp sugli esperti instradati: limite %.1f su %d device\n",
+                        m->c.swiglu_limit, nd);
             }
             vk_preload_tier(m);
         }
@@ -4017,6 +4373,9 @@ static void optime_reset(void) {
     g_map_serve = g_map_copy = 0;
 #ifdef COLI_VULKAN
     g_t_eg = g_t_cpu = 0.0; g_n_eg = g_n_eg_disp = g_n_cpu = g_n_devloss = 0;
+    /* F2's [STREAM] line describes the same window as the rest of the table. */
+    g_st_fill_s = g_st_gpu_s = 0.0;
+    g_st_experts = g_st_waves = g_st_calls = g_st_nonres = g_st_cpu_fallback = g_st_pf_calls = 0;
 #endif
 }
 /* F4 (record sec X3 step 0): the body of the report, parameterised on the
@@ -4058,6 +4417,19 @@ static void optime_report(const char *tag) {
             tag, g_ot_router, g_ot_shared, g_on_router,
             g_on_router ? 1e3 * g_ot_router / g_on_router : 0.0,
             g_on_router ? 1e3 * g_ot_shared / g_on_router : 0.0);
+#ifdef COLI_VULKAN
+    /* F2. `nonres` is the count of DISTINCT non-resident experts summed over
+     * every prefill layer-chunk, in BOTH arms -- it is what the streamed bytes
+     * are proportional to and the design note could only bracket it. The rest
+     * is zero unless COLI_PREFILL_STREAM=1. */
+    if (g_st_nonres || g_st_calls)
+        fprintf(stderr, "%s [STREAM] nonres_distinct=%ld over %ld prefill moe calls (%.1f/call) | "
+                        "streamed: calls=%ld waves=%ld experts=%ld cpu_fallback=%ld "
+                        "fill=%.3fs gpu=%.3fs\n",
+                tag, g_st_nonres, g_st_pf_calls, g_st_pf_calls ? (double)g_st_nonres / g_st_pf_calls : 0.0,
+                g_st_calls, g_st_waves, g_st_experts, g_st_cpu_fallback,
+                g_st_fill_s, g_st_gpu_s);
+#endif
 }
 /* F4: one table per completed serve-mode request, tagged with a request
  * counter and that request's context length -- a cumulative table over a
@@ -4492,6 +4864,14 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                               ServeCancel *cancel) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
+    /* F2 step 2c: COLI_PREFILL_STREAM does NOT touch the chunk. It used to
+     * raise the effective default to 512, because streaming's bytes per token
+     * fall as 1/S; that conflated two knobs with two different numerics
+     * (record §F2f: the chunk alone moves 3.24 % of the argmaxes at 6.3k and
+     * is worth 3 % of the speed) in one env var. They are separate now:
+     * streaming is a placement change, GLM53_PREFILL_CHUNK is a batching
+     * change that predates it, and the ladder decides the chunk on its own
+     * evidence. */
     int chunk = setting ? atoi(setting) : 128;
     if (chunk < 1) chunk = 1;
     if (chunk > n) chunk = n;

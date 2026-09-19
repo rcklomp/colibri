@@ -64,6 +64,15 @@ static struct {
      * VK_NULL_HANDLE when the shader is absent or COLI_VK_TILE=0. Used only
      * for S > 1 and fmt 1/4 -- decode never sees them. */
     VkShaderModule shader_t, shader_gu_t; VkPipeline pipe_t, pipe_gu_t; int tile_on;
+    /* Step 2a: the swiglu-CLAMPED twins of pipe_gu / pipe_gu_t, on their OWN
+     * pipeline layout (seven push constants instead of six). Built only when
+     * coli_vk_set_swiglu_limit() is given a positive limit; until then every
+     * handle here is VK_NULL_HANDLE, swiglu_limit is 0, and the expert-group
+     * path binds exactly the pipeline, layout and 24 push-constant bytes it
+     * always did -- which is what makes the knob provably inert for glm53 and
+     * literally inert for qwen38-vk. */
+    VkShaderModule sh_gu_c, sh_gu_tc; VkPipelineLayout plyt_gu_c;
+    VkPipeline pipe_gu_c, pipe_gu_tc; float swiglu_limit; char spv[512];
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
@@ -139,6 +148,10 @@ static struct {
 } G;
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
+/* Step 2a: struct PC plus the swiglu limit. The first six fields are PC's,
+ * in PC's order, so pushing sizeof(struct PC) bytes out of a PCL is
+ * byte-identical to pushing a PC -- the unclamped path does exactly that. */
+struct PCL { int fmt, S, I, O, rowWords, gs; float limit; };
 struct PCN { int S, D; float eps; };
 /* P5.2: `tok` selects this dispatch's slice of the chunk's qkv/gate/beta/out.
  * Every single-token caller leaves it 0 and gets the indices it always had. */
@@ -823,6 +836,9 @@ int coli_vk_init(const char *spv_path) {
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
 
     vkts_setup(0, G.phys, G.dev, G.qfam);
+    /* Step 2a: remember where the shaders came from, so the clamped gate_up
+     * twins can be loaded later without re-plumbing the path. */
+    snprintf(G.spv, sizeof(G.spv), "%s", spv_path);
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
@@ -1277,12 +1293,20 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     {
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok4(G.pipe_gu_t, fmt, rows[c], D) ? G.pipe_gu_t : G.pipe_gu;
+            /* Step 2a: with a positive swiglu limit this binds the CLAMPED
+             * twin and its own 28-byte layout; with limit 0 -- the default,
+             * and always for qwen38-vk -- `cl` is 0 and every argument below
+             * is byte-for-byte the one this loop always passed. */
+            const int cl = (G.swiglu_limit > 0.0f && G.pipe_gu_c != VK_NULL_HANDLE);
+            VkPipeline tile = cl ? G.pipe_gu_tc : G.pipe_gu_t;
+            VkPipelineLayout guL = cl ? G.plyt_gu_c : G.plyt_gu;
+            VkPipeline want = vk_tile_ok4(tile, fmt, rows[c], D) ? tile : (cl ? G.pipe_gu_c : G.pipe_gu);
             if (want != cur) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
-            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
-            vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), want == G.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            struct PCL pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, G.swiglu_limit};
+            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, guL, 0, 1, &G.eg_gu[c], 0, NULL);
+            vkCmdPushConstants(G.eg_cmd, guL, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               cl ? sizeof(struct PCL) : sizeof(struct PC), &pc);
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), want == tile ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
             if (vkts >= 2) vkts_mark(0, G.eg_cmd, (uint32_t)(3 + c));
         }
     }
@@ -1369,6 +1393,15 @@ static struct {
     VkDescriptorSetLayout dsl, dsl_gu; VkPipelineLayout plyt, plyt_gu;
     VkPipeline pipe, pipe_gu;
     VkShaderModule sh_qmm_t, sh_gu_t; VkPipeline pipe_t, pipe_gu_t;   /* P4 tiles */
+    /* Step 2a: the swiglu-CLAMPED twins of pipe_gu / pipe_gu_t, on their OWN
+     * pipeline layout (seven push constants instead of six). Built only when
+     * coli_vk_set_swiglu_limit() is given a positive limit; until then every
+     * handle here is VK_NULL_HANDLE, swiglu_limit is 0, and the expert-group
+     * path binds exactly the pipeline, layout and 24 push-constant bytes it
+     * always did -- which is what makes the knob provably inert for glm53 and
+     * literally inert for qwen38-vk. */
+    VkShaderModule sh_gu_c, sh_gu_tc; VkPipelineLayout plyt_gu_c;
+    VkPipeline pipe_gu_c, pipe_gu_tc; float swiglu_limit; char spv[512];
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
@@ -1558,6 +1591,9 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G2.dev, &fi, NULL, &G2.fence), "d2 fence");
     vkts_setup(1, G2.phys, G2.dev, G2.qfam);
+    /* Step 2a: remember where the shaders came from, so the clamped gate_up
+     * twins can be loaded later without re-plumbing the path. */
+    snprintf(G2.spv, sizeof(G2.spv), "%s", spv_path);
     G2.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G2.phys, &p);
     fprintf(stderr, "[VK] dev2 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
@@ -1652,12 +1688,20 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok4(G2.pipe_gu_t, fmt, rows[c], D) ? G2.pipe_gu_t : G2.pipe_gu;
+            /* Step 2a: with a positive swiglu limit this binds the CLAMPED
+             * twin and its own 28-byte layout; with limit 0 -- the default,
+             * and always for qwen38-vk -- `cl` is 0 and every argument below
+             * is byte-for-byte the one this loop always passed. */
+            const int cl = (G2.swiglu_limit > 0.0f && G2.pipe_gu_c != VK_NULL_HANDLE);
+            VkPipeline tile = cl ? G2.pipe_gu_tc : G2.pipe_gu_t;
+            VkPipelineLayout guL = cl ? G2.plyt_gu_c : G2.plyt_gu;
+            VkPipeline want = vk_tile_ok4(tile, fmt, rows[c], D) ? tile : (cl ? G2.pipe_gu_c : G2.pipe_gu);
             if (want != cur) { vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
-            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-            vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
-            vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), want == G2.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            struct PCL pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, G2.swiglu_limit};
+            vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, guL, 0, 1, &G2.gu[c], 0, NULL);
+            vkCmdPushConstants(G2.cmd, guL, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               cl ? sizeof(struct PCL) : sizeof(struct PC), &pc);
+            vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), want == tile ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
             if (vkts >= 2) vkts_mark(1, G2.cmd, (uint32_t)(3 + c));
         }
     }
@@ -1733,6 +1777,15 @@ static struct {
     VkDescriptorSetLayout dsl, dsl_gu; VkPipelineLayout plyt, plyt_gu;
     VkPipeline pipe, pipe_gu;
     VkShaderModule sh_qmm_t, sh_gu_t; VkPipeline pipe_t, pipe_gu_t;   /* P4 tiles */
+    /* Step 2a: the swiglu-CLAMPED twins of pipe_gu / pipe_gu_t, on their OWN
+     * pipeline layout (seven push constants instead of six). Built only when
+     * coli_vk_set_swiglu_limit() is given a positive limit; until then every
+     * handle here is VK_NULL_HANDLE, swiglu_limit is 0, and the expert-group
+     * path binds exactly the pipeline, layout and 24 push-constant bytes it
+     * always did -- which is what makes the knob provably inert for glm53 and
+     * literally inert for qwen38-vk. */
+    VkShaderModule sh_gu_c, sh_gu_tc; VkPipelineLayout plyt_gu_c;
+    VkPipeline pipe_gu_c, pipe_gu_tc; float swiglu_limit; char spv[512];
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
@@ -1923,6 +1976,9 @@ int coli_vk_init_dev3(const char *spv_path, int devidx) {
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G3.dev, &fi, NULL, &G3.fence), "d3 fence");
     vkts_setup(2, G3.phys, G3.dev, G3.qfam);
+    /* Step 2a: remember where the shaders came from, so the clamped gate_up
+     * twins can be loaded later without re-plumbing the path. */
+    snprintf(G3.spv, sizeof(G3.spv), "%s", spv_path);
     G3.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G3.phys, &p);
     fprintf(stderr, "[VK] dev3 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
@@ -2016,12 +2072,20 @@ static int eg3_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     {   /* P4: tiled pipeline for experts with more than one row */
         VkPipeline cur = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            VkPipeline want = vk_tile_ok4(G3.pipe_gu_t, fmt, rows[c], D) ? G3.pipe_gu_t : G3.pipe_gu;
+            /* Step 2a: with a positive swiglu limit this binds the CLAMPED
+             * twin and its own 28-byte layout; with limit 0 -- the default,
+             * and always for qwen38-vk -- `cl` is 0 and every argument below
+             * is byte-for-byte the one this loop always passed. */
+            const int cl = (G3.swiglu_limit > 0.0f && G3.pipe_gu_c != VK_NULL_HANDLE);
+            VkPipeline tile = cl ? G3.pipe_gu_tc : G3.pipe_gu_t;
+            VkPipelineLayout guL = cl ? G3.plyt_gu_c : G3.plyt_gu;
+            VkPipeline want = vk_tile_ok4(tile, fmt, rows[c], D) ? tile : (cl ? G3.pipe_gu_c : G3.pipe_gu);
             if (want != cur) { vkCmdBindPipeline(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); cur = want; }
-            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-            vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G3.plyt_gu, 0, 1, &G3.gu[c], 0, NULL);
-            vkCmdPushConstants(G3.cmd, G3.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(G3.cmd, (uint32_t)((I + 7) / 8), want == G3.pipe_gu_t ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
+            struct PCL pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, G3.swiglu_limit};
+            vkCmdBindDescriptorSets(G3.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, guL, 0, 1, &G3.gu[c], 0, NULL);
+            vkCmdPushConstants(G3.cmd, guL, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               cl ? sizeof(struct PCL) : sizeof(struct PC), &pc);
+            vkCmdDispatch(G3.cmd, (uint32_t)((I + 7) / 8), want == tile ? VK_TILES(rows[c]) : (uint32_t)rows[c], 1);
             if (vkts >= 2) vkts_mark(2, G3.cmd, (uint32_t)(3 + c));
         }
     }
@@ -2079,6 +2143,347 @@ int coli_vk_expert_group3(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
     if (G3.inflight) return 0;
     if (!eg3_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
     return coli_vk_expert_group_take3(y);
+}
+
+/* ============ Step 2a: the swiglu clamp on the routed-expert kernels ==========
+ * GLM-5.3 applies a clamped SwiGLU to its routed experts on the CPU path and
+ * this backend did not (record §G13/§G15): the fused gate+up kernel computed
+ * silu(gate)*up with no bound, so which experts happened to be tier-resident
+ * changed the model's output. F2 makes that worse, because it moves another
+ * ~11 % of the routed calls onto this kernel.
+ *
+ * The fix is opt-in and is built so that "off" is not a promise but a fact:
+ * the clamped kernels are a SECOND SPIR-V module (the same .comp compiled with
+ * -DSWIGLU_CLAMP) on a SECOND pipeline layout, and nothing is loaded, built or
+ * bound until coli_vk_set_swiglu_limit() is called with limit > 0. With the
+ * knob unset the expert-group path binds the same pipeline, the same layout
+ * and the same 24 push-constant bytes it always did -- so qwen38-vk, which
+ * drives the very same expert-group path and never sets a limit, is not merely
+ * numerically unaffected but literally unchanged.
+ *
+ * Returns the number of devices that got clamped pipelines. 0 with a positive
+ * limit means the .spv files are missing: the caller must then refuse to run
+ * clamped rather than silently run unclamped. */
+static VkPipelineLayout clamp_layout(VkDevice dev, VkDescriptorSetLayout dsl) {
+    VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                               .offset = 0, .size = (uint32_t)sizeof(struct PCL)};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &dsl,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+    VkPipelineLayout out = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(dev, &pli, NULL, &out) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return out;
+}
+
+int coli_vk_set_swiglu_limit(float limit) {
+    int built = 0;
+    struct Slot { int ready; VkDevice dev; const char *spv; VkDescriptorSetLayout dsl;
+                  VkPipeline base_tile;
+                  VkShaderModule *sh_c, *sh_tc; VkPipelineLayout *plyt_c;
+                  VkPipeline *pipe_c, *pipe_tc; float *lim; };
+    struct Slot sl[3] = {
+        {G.ready,  G.dev,  G.spv,  G.dsl_gu, G.pipe_gu_t,
+         &G.sh_gu_c,  &G.sh_gu_tc,  &G.plyt_gu_c,  &G.pipe_gu_c,  &G.pipe_gu_tc,  &G.swiglu_limit},
+        {G2.ready, G2.dev, G2.spv, G2.dsl_gu, G2.pipe_gu_t,
+         &G2.sh_gu_c, &G2.sh_gu_tc, &G2.plyt_gu_c, &G2.pipe_gu_c, &G2.pipe_gu_tc, &G2.swiglu_limit},
+        {G3.ready, G3.dev, G3.spv, G3.dsl_gu, G3.pipe_gu_t,
+         &G3.sh_gu_c, &G3.sh_gu_tc, &G3.plyt_gu_c, &G3.pipe_gu_c, &G3.pipe_gu_tc, &G3.swiglu_limit},
+    };
+    for (int i = 0; i < 3; i++) {
+        if (!sl[i].ready) continue;
+        if (limit <= 0.0f) { *sl[i].lim = 0.0f; continue; }
+        if (!*sl[i].pipe_c) {
+            char p1[512], p2[512];
+            derive_sibling(sl[i].spv, "_gate_up_clamp.spv", p1, sizeof(p1));
+            derive_sibling(sl[i].spv, "_gate_up_tile_clamp.spv", p2, sizeof(p2));
+            *sl[i].sh_c = load_spv(sl[i].dev, p1);
+            if (!*sl[i].sh_c) { fprintf(stderr, "[VK] swiglu clamp: %s missing\n", p1); continue; }
+            *sl[i].plyt_c = clamp_layout(sl[i].dev, sl[i].dsl);
+            if (!*sl[i].plyt_c) continue;
+            *sl[i].pipe_c = build_pipeline_on(sl[i].dev, *sl[i].sh_c, *sl[i].plyt_c);
+            if (!*sl[i].pipe_c) continue;
+            /* The tiled twin only if the unclamped tile is in use at all, so
+             * COLI_VK_TILE=0 keeps meaning what it means. */
+            if (sl[i].base_tile) {
+                *sl[i].sh_tc = load_spv(sl[i].dev, p2);
+                if (*sl[i].sh_tc) *sl[i].pipe_tc = build_pipeline_on(sl[i].dev, *sl[i].sh_tc, *sl[i].plyt_c);
+            }
+        }
+        *sl[i].lim = limit;
+        built++;
+    }
+    return built;
+}
+
+float coli_vk_swiglu_limit(void) { return G.swiglu_limit; }
+
+/* ==================== F2: the streamed-expert ring ==============================
+ * FRANKEN-ENGINE-PLAN-2026-09-15.md item F2, design note
+ * tools/hot-expert/F2-STREAM-PREFILL-DESIGN-2026-09-19.md.
+ *
+ * A ring is a fixed set of expert-sized weight slots on ONE device, allocated
+ * once out of the VRAM the tier's count cap leaves unused, and refilled from
+ * host memory as a prefill chunk walks its non-resident experts. A slot's three
+ * tensors are ordinary ColiVkTensor handles, so the existing
+ * coli_vk_expert_group_issue* path drives them with no change at all; the only
+ * new thing here is "allocate without uploading" and "overwrite in place".
+ *
+ * Why a plain memcpy and no staging buffer or vkCmdCopyBuffer: the memory type
+ * pick_memtype() chooses for weights is HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL
+ * (ReBAR write-combined VRAM), which is what upload_tensor already writes the
+ * resident tier into. The fill IS the upload. The staging-ring measurement that
+ * preceded this reached 38.6 GB/s aggregate on three cards with two legs; this
+ * path removes one of them, and tools/hot-expert/f2_ring_probe.c measures what
+ * it costs instead of assuming.
+ *
+ * Thread safety: coli_vk_ring_fill on DISTINCT (dev, slot) pairs is safe to call
+ * concurrently -- it only memcpys into disjoint mapped ranges and touches no
+ * Vulkan object. Two threads must not fill the SAME slot, and no slot may be
+ * refilled while a submit that reads it is in flight; both are the caller's
+ * contract and both are what the wave schedule in the design note enforces.
+ *
+ * Nothing in the existing engine paths calls any of this. It is opt-in from
+ * glm53.c behind COLI_PREFILL_STREAM and unreferenced by qwen38/qwen38-vk. */
+
+typedef struct {
+    ColiVkTensor *g, *u, *d;
+    uint8_t *gw, *uw, *dw;          /* mapped weight planes */
+    float   *gsc, *usc, *dsc;       /* mapped scale planes */
+} VkRingSlot;
+
+static struct VkRing {
+    int slots, fmt, D, I, gs, where;
+    size_t gu_wbytes, dn_wbytes;    /* per-tensor weight bytes (padded) */
+    size_t gu_rb, dn_rb;            /* host row bytes */
+    size_t gu_stride, dn_stride;    /* device row stride */
+    size_t gu_sfl, dn_sfl;          /* scale float counts */
+    size_t bytes;                   /* total bytes held */
+    VkDeviceMemory mem;             /* one allocation for the whole ring */
+    uint8_t *base;
+    VkRingSlot *s;
+} g_ring[3];
+
+/* dev is the ENGINE's device number (0, 2, 3) -> internal 0, 1, 2. */
+static int ring_ix(int dev) { return dev == 0 ? 0 : dev == 2 ? 1 : dev == 3 ? 2 : -1; }
+static VkDevice ring_dev(int ix) { return ix == 0 ? G.dev : ix == 1 ? G2.dev : G3.dev; }
+static VkPhysicalDevice ring_phys(int ix) { return ix == 0 ? G.phys : ix == 1 ? G2.phys : G3.phys; }
+
+/* COLI_VK_RING_WHERE / the `where` argument: 0 = the same
+ * HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL memory (ReBAR write-combined VRAM)
+ * upload_tensor puts the resident tier in -- the CPU writes over PCIe and the
+ * shader then reads local VRAM. 1 = HOST_VISIBLE|HOST_COHERENT and NOT
+ * DEVICE_LOCAL (system RAM through the GTT heap) -- the CPU writes cached DRAM
+ * and the SHADER reads over PCIe instead. Which one is faster is not
+ * obvious and is not assumed: see tools/hot-expert/f2_ring_probe.c, which
+ * measures both at the engine's real shapes. */
+static int ring_memtype(int ix, int where, uint32_t bits) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(ring_phys(ix), &m);
+    int best = -1;
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        if (!(bits & (1u << i))) continue;
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+            !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) continue;
+        const int devlocal = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        if (where == 0 && devlocal) return (int)i;
+        if (where == 1 && !devlocal && !(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
+        if (best < 0) best = (int)i;
+    }
+    return best;   /* nothing matched exactly -- any host-visible type beats failing */
+}
+
+static int ring_mk_buffer(int ix, size_t bytes, size_t *off, VkBuffer *buf, void **ptr) {
+    struct VkRing *r = &g_ring[ix];
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(ring_dev(ix), &bi, NULL, buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(ring_dev(ix), *buf, &req);
+    size_t align = req.alignment ? req.alignment : 256;
+    size_t at = (*off + align - 1) & ~(align - 1);
+    if (at + req.size > r->bytes) { vkDestroyBuffer(ring_dev(ix), *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    if (vkBindBufferMemory(ring_dev(ix), *buf, r->mem, at) != VK_SUCCESS) {
+        vkDestroyBuffer(ring_dev(ix), *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
+    }
+    *ptr = r->base + at;
+    *off = at + req.size;
+    return 1;
+}
+
+static int ring_alloc_tensor(int ix, ColiVkTensor **out, size_t *off, void **wptr, void **sptr,
+                             int fmt, int I, int O, int gs) {
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
+    t->dev = ix;
+    t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
+    size_t sfl = scale_floats(fmt, I, O, gs);
+    if (!ring_mk_buffer(ix, t->wbytes, off, &t->wbuf, wptr)) { free(t); return 0; }
+    memset(*wptr, 0, t->wbytes);          /* the padding bytes, once and for all */
+    if (!ring_mk_buffer(ix, sfl * sizeof(float), off, &t->sbuf, sptr)) {
+        vkDestroyBuffer(ring_dev(ix), t->wbuf, NULL); free(t); return 0;
+    }
+    memset(*sptr, 0, sfl * sizeof(float));
+    *out = t;
+    return 1;
+}
+
+int coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs, int where) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || slots < 1 || D < 1 || I < 1) return 0;
+    if (ix == 0 && !G.ready) return 0;
+    if (ix == 1 && !G2.ready) return 0;
+    if (ix == 2 && !G3.ready) return 0;
+    struct VkRing *r = &g_ring[ix];
+    if (r->s) return (r->fmt == fmt && r->D == D && r->I == I && r->where == where) ? r->slots : 0;
+    /* Only the formats upload_tensor accepts, and only the word-aligned grouped
+     * case the expert tier actually uses; anything else falls back to the CPU. */
+    if (!(fmt == 1 || fmt == 2 || fmt == 8 || (fmt == 4 && gs >= 8 && gs % 8 == 0))) return 0;
+    r->fmt = fmt; r->D = D; r->I = I; r->gs = gs; r->where = where;
+    r->gu_stride = (size_t)rowwords(fmt, D) * 4;          /* gate/up: O = I rows of D */
+    r->dn_stride = (size_t)rowwords(fmt, I) * 4;          /* down:    O = D rows of I */
+    r->gu_rb = (fmt == 1 || fmt == 8) ? (size_t)D : (size_t)(D + 1) / 2;
+    r->dn_rb = (fmt == 1 || fmt == 8) ? (size_t)I : (size_t)(I + 1) / 2;
+    r->gu_sfl = scale_floats(fmt, D, I, gs);
+    r->dn_sfl = scale_floats(fmt, I, D, gs);
+    r->gu_wbytes = r->gu_stride * (size_t)I;
+    r->dn_wbytes = r->dn_stride * (size_t)D;
+
+    /* One allocation for the whole ring, with 64 KiB of slack per slot for the
+     * six buffers' binding alignment. */
+    const size_t per = 2 * (r->gu_wbytes + r->gu_sfl * 4) + r->dn_wbytes + r->dn_sfl * 4 + 65536;
+    r->bytes = per * (size_t)slots;
+    /* memoryTypeBits of a representative storage buffer on this device. */
+    uint32_t bits = ~0u;
+    { VkBuffer probe = VK_NULL_HANDLE;
+      VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+          .size = r->gu_wbytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+      if (vkCreateBuffer(ring_dev(ix), &bi, NULL, &probe) == VK_SUCCESS) {
+          VkMemoryRequirements req; vkGetBufferMemoryRequirements(ring_dev(ix), probe, &req);
+          bits = req.memoryTypeBits;
+          vkDestroyBuffer(ring_dev(ix), probe, NULL);
+      } }
+    const int mt = ring_memtype(ix, where, bits);
+    if (mt < 0) { r->bytes = 0; return 0; }
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = r->bytes, .memoryTypeIndex = (uint32_t)mt};
+    if (vkAllocateMemory(ring_dev(ix), &ai, NULL, &r->mem) != VK_SUCCESS ||
+        vkMapMemory(ring_dev(ix), r->mem, 0, r->bytes, 0, (void **)&r->base) != VK_SUCCESS) {
+        if (r->mem) vkFreeMemory(ring_dev(ix), r->mem, NULL);
+        r->mem = VK_NULL_HANDLE; r->bytes = 0; return 0;
+    }
+    r->s = calloc((size_t)slots, sizeof(VkRingSlot));
+    if (!r->s) { vkFreeMemory(ring_dev(ix), r->mem, NULL); r->mem = VK_NULL_HANDLE; r->bytes = 0; return 0; }
+    size_t off = 0;
+    for (int i = 0; i < slots; i++) {
+        VkRingSlot *sl = &r->s[i];
+        void *wp, *sp;
+        /* A partial ring is a valid configuration, not an error: the caller
+         * reads the count back and schedules its waves against it. */
+        if (!ring_alloc_tensor(ix, &sl->g, &off, &wp, &sp, fmt, D, I, gs)) break;
+        sl->gw = wp; sl->gsc = sp;
+        if (!ring_alloc_tensor(ix, &sl->u, &off, &wp, &sp, fmt, D, I, gs)) break;
+        sl->uw = wp; sl->usc = sp;
+        if (!ring_alloc_tensor(ix, &sl->d, &off, &wp, &sp, fmt, I, D, gs)) break;
+        sl->dw = wp; sl->dsc = sp;
+        r->slots = i + 1;
+    }
+    return r->slots;
+}
+
+/* 0 = ReBAR VRAM, 1 = host RAM read over PCIe by the shader. */
+int coli_vk_ring_where(int dev) {
+    const int ix = ring_ix(dev);
+    return ix < 0 ? -1 : g_ring[ix].where;
+}
+
+int coli_vk_ring_slots(int dev) {
+    const int ix = ring_ix(dev);
+    return ix < 0 ? 0 : g_ring[ix].slots;
+}
+
+size_t coli_vk_ring_bytes(int dev) {
+    const int ix = ring_ix(dev);
+    return ix < 0 ? 0 : g_ring[ix].bytes;
+}
+
+/* Bytes one fill moves, for the probe's and the engine's own accounting. */
+size_t coli_vk_ring_slot_bytes(int dev) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || !g_ring[ix].slots) return 0;
+    struct VkRing *r = &g_ring[ix];
+    return 2 * (r->gu_wbytes + r->gu_sfl * 4) + r->dn_wbytes + r->dn_sfl * 4;
+}
+
+int coli_vk_ring_tensors(int dev, int slot, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || slot < 0 || slot >= g_ring[ix].slots) return 0;
+    VkRingSlot *sl = &g_ring[ix].s[slot];
+    if (!sl->d) return 0;
+    if (g) *g = sl->g;
+    if (u) *u = sl->u;
+    if (d) *d = sl->d;
+    return 1;
+}
+
+/* One expert into one slot. The six source pointers are the engine's mapped
+ * shard views (glm53.c expert_mats -> Mat.q4 / Mat.s), in the same layout
+ * upload_tensor reads. Returns 0 if the slot does not exist. */
+int coli_vk_ring_fill(int dev, int slot,
+                      const void *gw, const float *gsc,
+                      const void *uw, const float *usc,
+                      const void *dw, const float *dsc) {
+    const int ix = ring_ix(dev);
+    if (ix < 0 || slot < 0 || slot >= g_ring[ix].slots) return 0;
+    struct VkRing *r = &g_ring[ix];
+    VkRingSlot *sl = &r->s[slot];
+    if (!sl->d) return 0;
+    /* The engine's int4-g64 experts have rowWords*4 == host row bytes exactly
+     * (4096 and 2048 columns), so this is three flat copies, not three row
+     * loops; the loop is kept for shapes where the device row is padded. */
+    if (r->gu_stride == r->gu_rb) {
+        memcpy(sl->gw, gw, r->gu_wbytes);
+        memcpy(sl->uw, uw, r->gu_wbytes);
+    } else {
+        for (int o = 0; o < r->I; o++) {
+            memcpy(sl->gw + (size_t)o * r->gu_stride, (const uint8_t *)gw + (size_t)o * r->gu_rb, r->gu_rb);
+            memcpy(sl->uw + (size_t)o * r->gu_stride, (const uint8_t *)uw + (size_t)o * r->gu_rb, r->gu_rb);
+        }
+    }
+    if (r->dn_stride == r->dn_rb) {
+        memcpy(sl->dw, dw, r->dn_wbytes);
+    } else {
+        for (int o = 0; o < r->D; o++)
+            memcpy(sl->dw + (size_t)o * r->dn_stride, (const uint8_t *)dw + (size_t)o * r->dn_rb, r->dn_rb);
+    }
+    memcpy(sl->gsc, gsc, r->gu_sfl * sizeof(float));
+    memcpy(sl->usc, usc, r->gu_sfl * sizeof(float));
+    memcpy(sl->dsc, dsc, r->dn_sfl * sizeof(float));
+    return 1;
+}
+
+void coli_vk_ring_free(void) {
+    for (int ix = 0; ix < 3; ix++) {
+        struct VkRing *r = &g_ring[ix];
+        if (!r->s) { memset(r, 0, sizeof(*r)); continue; }
+        VkDevice dv = ring_dev(ix);
+        for (int i = 0; i < r->slots; i++) {
+            ColiVkTensor *t[3] = {r->s[i].g, r->s[i].u, r->s[i].d};
+            for (int q = 0; q < 3; q++) {
+                if (!t[q]) continue;
+                if (t[q]->wbuf) vkDestroyBuffer(dv, t[q]->wbuf, NULL);
+                if (t[q]->sbuf) vkDestroyBuffer(dv, t[q]->sbuf, NULL);
+                free(t[q]);
+            }
+        }
+        free(r->s);
+        if (r->mem) { vkUnmapMemory(dv, r->mem); vkFreeMemory(dv, r->mem, NULL); }
+        memset(r, 0, sizeof(*r));
+    }
 }
 
 /* ---- MLA absorb attention core -------------------------------------------------

@@ -95,16 +95,36 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `[MAP] 59 file mappati (st_map_shard_range), esperti mappabili 12096/12096`;
   `majflt` per request stays 0 and `[MAP] … copy=0` — if either moves, the
   mapping is the first suspect.
-- **GLM-5.3's routed-expert GPU kernel skips the swiglu clamp.**
+- **GLM-5.3's routed-expert GPU kernel skipped the swiglu clamp until
+  2026-09-19; the fix is a KNOB and the gateway sets it.**
   `c/shaders/qmatmul_gate_up.comp` computes `silu(gate)*up` with no bound;
-  the CPU path applies `swiglu_limit=10.0`. Noted without a number in §G13,
-  measured while gating G15 (2026-09-11, record §G15): forcing routed
-  experts onto the CPU (`GLM53_EXPERTS_CPU=1`, same int4 weights, placement
-  only) changes 6 of 42 and 8 of 1232 `teacher_forcing` predictions and the
-  long-prompt argmax versus the normal GPU/CPU split. **GLM-5.3's output
-  today depends on which experts happen to be tier-resident**, not only on
-  the weights and the prompt. A correctness gap, not a speed one; not fixed,
-  not this item's scope, next real item on this engine.
+  the CPU path applies `swiglu_limit=10.0`. `GLM53_VK_SWIGLU_CLAMP=1` binds
+  a second pair of SPIR-V modules (`qmatmul_gate_up_clamp.spv`,
+  `qmatmul_gate_up_tile_clamp.spv`, same source with `-DSWIGLU_CLAMP`) on
+  all three devices; unset, the engine is bit-identical to the old one and
+  the unclamped modules are byte-identical (so `qwen38-vk` is untouched).
+  Measured (record §F2 step 2): against the clamped all-CPU reference
+  (`GLM53_EXPERTS_CPU=1`) top-1 agreement 91.95 % → 98.84 %, mean KL
+  0.0233 → 0.00143; cost +0.3 %. **A direct engine run without the knob is
+  the OLD numerics** — output then depends on which experts are
+  tier-resident (6 of 42 and 8 of 1232 `teacher_forcing` predictions,
+  §G15). Every gate from here on runs both arms with the clamp on, as
+  `f2_gate_chain.sh` does, or says that it did not. The remaining 1.2 % vs
+  the all-CPU reference is placement (summation order), not the clamp.
+- **Prefill streams non-resident experts to the cards (F2, in service
+  2026-09-19).** `COLI_PREFILL_STREAM=1`: per MoE layer the chunk's
+  non-resident experts are copied into a HOST-RAM ring (two banks of 32
+  slots per card, 2.72 GB, zero VRAM — a ring in ReBAR VRAM filled at 16
+  GB/s against 58.6) and run on the GPU tile kernels; the CPU int4 path is
+  the knob-off default. It does not touch `GLM53_PREFILL_CHUNK` (default
+  128; the gateway serves 512, worth 1.12×). Gate (record §F2-LADDER):
+  turn 1 136.8 → 67.6 s (2.03×), the 18 439-token turn 1 174.8 → 672.6 s
+  (1.75×), stream on vs off under the clamp mean KL 3.5e-05 / top-1
+  99.89 %. After it the 18k prefill token is 79.2 ms and **attention
+  (`mla.attn`, 27.6 ms, 35 %) is the largest prefill bucket**, the indexer
+  second (13.4 ms, 17 %). Chunk size alone changes numerics (128 vs 512
+  under the clamp: KL 3.7e-04, top-1 99.68 %); the cause is not pinned
+  (indexer and tile threshold ruled out, record §F2k).
 - **One benchmark at a time, across sessions as well as inside one.** The rig
   serialises measurements. Parallel sessions or subagents may edit and build
   concurrently; only one may run an engine. Check `pgrep -x glm53`,
@@ -131,8 +151,10 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   its own — so 256 was the ceiling on every reply the box had ever produced, and
   a tool-calling turn spent it opening a `<tool_call>` box it could never close,
   which is why the owner's chat returned nothing at all. `accept_live.sh` check 5
-  exists to catch a recurrence and runs in the daily canary too), `--kv-slots 4`
-  and `COLI_KDA_GPU=2`
+  exists to catch a recurrence and runs in the daily canary too), `--kv-slots 4`,
+  **`GLM53_VK_SWIGLU_CLAMP=1 COLI_PREFILL_STREAM=1 GLM53_PREFILL_CHUNK=512`
+  (F2, 2026-09-19; prefix checkpoints from before that date were set aside,
+  they carry the unclamped numerics)** and `COLI_KDA_GPU=2`
   (P6b, 2026-09-07: each slot has its own KDA device state, pool allocated
   before the expert preload — dev0 holds 1 248 experts instead of 1 296),
   `GLM53_PREFIX_CKPT=1` and `COLI_PREFIX_PIN=1` (P7: prefix checkpoints under
@@ -159,7 +181,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   follow-up tasks stay off. Its 24-tool block (~4 000 tokens) is
   checkpointed (`CKPT hit prefix=4011` in the server log): a new
   conversation answers in ~20 s, a follow-up turn in ~2 s; a changed tool
-  set pays one cold prefill (~10 min) and is captured again. The server
+  set pays one cold prefill (~4.5 min since F2, 274 s measured 2026-09-19; ~10 min before) and is captured again. The server
   caches presets: after a `webui.db` edit call `GET /api/models`. Drive its
   backend from inside the container (PyJWT token from `WEBUI_SECRET_KEY`;
   never `import open_webui` in a side process, it runs the migrations); the
@@ -239,7 +261,8 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   track, `glm53.p2`, `glm53.p4base`, `glm53.p4c_base`, `glm53.p6base`,
   `glm53.p7base` = pre-P7, `glm53.p6bbase` = P7, `glm53.p6b`, `glm53.rp4`,
   `glm53.p5` (+ `shaders_p5`), `glm53.devmerge` (+ `shaders_devmerge`) = the
-  binary in service since 2026-09-08 01:00); each gate's pristine is the
+  binary in service from 2026-09-08 01:00, `glm53.f6abase`, `glm53.f2base` =
+  F6a `15462dc2`, `glm53.f2` = `5c01246c`, in service since 2026-09-19 16:02 UTC); each gate's pristine is the
   binary in service before the item. **Every gate runs with
   `GLM53_PREFIX_CKPT=0` and a private `COLI_CKPT_DIR`**: two gates nearly
   passed for the wrong reason because the candidate restored a checkpoint

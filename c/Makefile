@@ -626,7 +626,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_tile.spv shaders/qmatmul_gate_up_tile.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/kda_step.spv shaders/kda_decay.spv shaders/kda_headnorm.spv
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_tile.spv shaders/qmatmul_gate_up_tile.spv shaders/qmatmul_gate_up_clamp.spv shaders/qmatmul_gate_up_tile_clamp.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/kda_step.spv shaders/kda_decay.spv shaders/kda_headnorm.spv
 endif
 
 all: colibri$(EXE)
@@ -735,6 +735,20 @@ backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+
+# The swiglu-CLAMPED variants of the two fused gate+up kernels: same source,
+# compiled a second time with -DSWIGLU_CLAMP, which adds GLM-5.3's clamp and a
+# seventh push constant for the limit. Explicit rules, so the pattern rule
+# above still produces the unclamped .spv byte-for-byte unchanged; the engine
+# loads these only when coli_vk_set_swiglu_limit() is given a positive limit
+# (GLM53_VK_SWIGLU_CLAMP=1), and never binds them otherwise.
+shaders/qmatmul_gate_up_clamp.spv: shaders/qmatmul_gate_up.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DSWIGLU_CLAMP $< -o $@
+
+shaders/qmatmul_gate_up_tile_clamp.spv: shaders/qmatmul_gate_up_tile.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DSWIGLU_CLAMP $< -o $@
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config

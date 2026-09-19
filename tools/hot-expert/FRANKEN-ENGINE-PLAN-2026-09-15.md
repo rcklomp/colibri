@@ -14,6 +14,116 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 19 (2026-09-19 18:15 CEST, 16:15 UTC) — F2 IS GATED PASS on the full
+> 18k ladder. Both bars met; the order moves on.** Record §F2-LADDER. Chain
+> tag `f209191332`, rc=0, `accept_live` PASS, one binary `5c01246cdea888dc`,
+> A = clamp on / stream off / chunk 128, B = clamp on / stream on / chunk 512
+> (the clamp in BOTH arms, so the A/B measures the streaming and not the
+> clamp; A1 reproduces §RP-F6a's unclamped A arm to within 0.4 %).
+> **Turn 1 136.8 → 67.6 s = 2.03× (bar 2.0, MET). The 18 439-token turn
+> 1 174.8 → 672.6 s = 1.75× (bar 1.6, MET)**, both SEPARATED by
+> `gate_ab_verdict` (−50.5 % and −42.6 % conservative). Cold prefill to 18 439
+> tokens 37.5 → 21.1 min. Decode at full depth 4.30 → 4.33 tok/s (+0.7 %
+> conservative, separated); follow-up TTFT −14.8 to −16.6 %. **One decode row
+> goes the wrong way: turn 4 (ctx 9 459) separates AGAINST B by 4.5 %**, the
+> only place a prefill-only change slowed decode, and F1 should start there.
+> X2's KL bar was met with the clamp on before the run (C2 mean KL 3.48e-05,
+> top-1 99.89 %) and knob-off is bit-identical to the served pristine.
+> **The prefill token at 18k is now 79.2 ms, and the shape has inverted:
+> `ffn_moe` 69.5 → 16.0 ms/token (51 % → 20 %), and the largest bucket is the
+> MLA attention core at 27.6 ms/token (34.9 %), the second the DSA indexer at
+> 13.4 (17.0 %).** So **F7 is re-based and is the next prefill item** — its own
+> 28.4 → ≤ 8 ms/token target would take the 18k token to ~59.4, another 1.33×
+> — and the indexer is back to second place without having got slower (F6a
+> left it at 13.4 ms/token and it is still 13.4; only the denominator shrank).
+> The projection check: rev 18 projected 80.0 ms/token and 1.71×, measured
+> 79.16 and 1.75×, and the two component errors nearly cancelled (`ffn_moe`
+> came in above the projection, `kda` below it). Beside it and unchanged:
+> llama.cpp does this turn in 108 s; F2 closes the gap from 10.9× to 6.2×, it
+> does not close it. **Order now: F1 step 0 (the eg/cpu overlap split) → F1 →
+> F7 → F5; F3 when a model is named.** Putting the candidate in service is a
+> separate step and is not recorded here.
+>
+> **Rev 18 (2026-09-19 15:45 CEST, 13:45 UTC) — F2 failed X2's KL bar, the
+> cause was the swiglu clamp, the clamp is fixed behind a knob, and F2 now
+> passes at 99.89 %.** Record §F2g–§F2k. (1) **The missing gate line.** X2's KL
+> bar (mean KL < 0.0284 AND top-1 >= 99.0 %) is part of the §8.3 F2 row and
+> rev 17 did not apply it. On the same dumps: streaming **fails at top-1
+> 94.97–95.05 %** while the mean KL passes with room. (2) **Step 2a, the
+> clamp.** `qmatmul_gate_up.comp` and its tiled twin now carry GLM-5.3's
+> clamped SwiGLU, transcribed from `swiglu_clamped` (one-sided on gate,
+> two-sided on up), behind `GLM53_VK_SWIGLU_CLAMP=1` and applying to resident
+> and streamed experts alike. Off is a fact, not a promise: the clamped kernels
+> are a second SPIR-V module on a second pipeline layout, built only when a
+> positive limit is set, and the unclamped `.spv` files are **byte-identical**
+> to the served tree's — so **qwen38-vk is literally unchanged** and owes no
+> oracle. The kernel was proved model-free in one minute (huge limit reproduces
+> the unclamped kernel exactly; limit 10 does not) before any gateway window
+> was spent. Cost: +0.3 %. (3) **With the clamp on, F2's KL gate passes:
+> mean KL 3.48e-05, top-1 99.89 % (6 320/6 327)** — 354× better than the
+> unclamped line. The clamp itself is worth 91.95 % → 98.84 % top-1 against a
+> clamped all-CPU reference, i.e. it cuts the §G13 placement-dependence from
+> 8.05 % of argmaxes to 1.16 %; **the SERVED engine fails that bar at 91.95 %
+> today.** Measured against the served binary, clamp-alone, clamp+stream@128
+> and clamp+stream@512 are the same number (top-1 93.49 / 93.54 / 93.52 %):
+> **once the clamp is on, F2 is numerically free, and what ships is the fix.**
+> (4) **Step 2c**: streaming no longer moves the prefill chunk. Within one
+> chain the chunk is worth 1.12× (509.6 → 453.7 s), not rev 17's 3 % — that
+> figure compared two chains and this session measured 6.1 % run-to-run spread
+> on the identical quantity. **Recommendation: serve at chunk 512**, because
+> turn 1's 2.0× bar was met by 1 % and chunk 128 is ~12 % slower, and because
+> the numerics reason for 128 evaporated with the clamp. (5) **Why the chunk
+> changes numerics at all**: the indexer is ruled out by reading (`last <= q`
+> is per-query and implies `complete[p]`) and the tile threshold by measurement
+> (tiled and per-row kernels agree bit for bit on the same row); what is left
+> is the union-order accumulation into `out[]`. The MLA absorb's reduction and
+> the down projection's tile threshold were not examined. (6) **Still open: the
+> 18k ladder**, now to be run with the clamp on in BOTH arms.
+>
+> **Rev 17 (2026-09-19 13:00 CEST, 11:00 UTC) — F2 is implemented, its oracle
+> passes, and its short ladder meets BOTH gate bars; the 18k rung is queued and
+> is the only thing left.** Record §F2. (1) **The design was refuted by its own
+> microbenchmark before a line of engine code was written**: a CPU `memcpy` into
+> ReBAR write-combined VRAM reaches 16.3 GB/s on three cards, against 58.6 GB/s
+> into cached DRAM, so the ring lives in HOST memory and the shader reads it
+> over PCIe — 74.7 ms per 144-expert wave against 102.6, and **zero VRAM**, so
+> the tier, the G6 reserve and the 1 695 caps are untouched by construction.
+> A CPU store over PCIe is not a GPU DMA read over PCIe; §PCIE-STREAM's 61 GB/s
+> was the second of those. (2) **Oracle**: knob-off is bit-identical to the
+> served binary at 2 061 and 6 327 tokens (3.92 GB of every-position logits,
+> `cmp`-clean); knob-on against the UNCLAMPED all-CPU reference
+> (`GLM53_EXPERTS_CPU=2`) is `teacher_forcing` IDENTICAL with cosine 0.99999998
+> and argmax agreeing on 2 061/2 061 positions — **the streamed kernel is
+> right**, and separately at an empty tier, i.e. 100 % of experts streamed, it
+> is identical too. (3) **Short ladder A,B,B,A, one binary**: turn 1
+> 136.6 → 67.5 s = **2.02×** (bar 2.0×, MET — and turn 1 here IS the gate's own
+> turn 1, ctx 1 287, reproducing §RP-F6a's 136.5 s to 0.4 %), deepest turn of
+> the short rung (5 112) 281.3 → 156.7 s = **1.80×**, decode not dropped,
+> follow-up TTFT −17 %, `accept_live` PASS. **The 18k rung is NOT run** (a
+> multi-hour outage) and is handed back ready to launch; the arithmetic from the
+> measured buckets projects 136.4 → 80.0 ms/token = **1.71×**, TTFT ≈ 690 s
+> against the ≤ 737 s the gate allows — a 6 % margin, and a projection.
+> (4) **Two things the run found that the plan did not expect.** The chunk
+> change that rides in on the knob (128 → 512) is worth only **3 %** of the
+> speed at 6.3k (466.6 s at chunk 128 against 451.8 at 512, both streamed),
+> because chunk 512 saves 60.2 s in the MoE and gives 46.7 s of it back in the
+> KDA and the attention core: **`coli_vk_kda_step_rows` (P5.2) costs 2.05× per
+> token at S=512 than at S=128**; fixing that would take F2 from 1.62× to ≈1.77×
+> at 6.3k and is a small, well-defined item. And `mla.attn` is 5.9 % worse at
+> chunk 512, which F7 should know before it assumes bigger batches are better.
+> The chunk costs **nothing** numerically on top of the streaming, which took a
+> third oracle arm to establish and reversed the first reading: streaming at the
+> DEFAULT chunk moves 5.02 % of the argmaxes and streaming at 512 moves 4.95 %,
+> against the chunk's own 3.24 % — comparable nudges to the same near-ties, not
+> perturbations that add. So chunk 512 stays, for a different reason than the
+> design gave it.
+> (5) The streamed path inherits the §G13 swiglu-clamp gap and gives it more of
+> the model's calls; F2 deliberately did not clamp only the streamed shader
+> (that would make an expert's numerics depend on which side of the ring it
+> landed — a second §G13, not a fix). **The clamp is now the item that gates
+> making F2 the default.** Order unchanged otherwise: F2's 18k rung → F1 step 0
+> → F1 → F7 → F5.
+>
 > **Rev 16 (2026-09-19 09:15 CEST, 07:15 UTC) — F6a is in service, the
 > re-profile is done, and F2's gate is re-based because its old one cannot be
 > met by any expert-side item.** (1) **F6a**: gated PASS and serving since
@@ -817,7 +927,7 @@ same model is the order-of-magnitude gap, and it is a prefill gap.
 | id | item | expected (projected, derivation shown) | gate | tier / effort |
 |---|---|---|---|---|
 | **F0 — DONE 2026-09-17, PASS (rev 14)** | **Vulkan host→device stream rate.** §PCIE-STREAM measured HIP. Colibri is Vulkan/RADV; measure `vkCmdCopyBuffer` from host-visible memory and from a mapped page-cache buffer, 14 MiB blocks, 1/2/3 cards concurrent, same probe shape (`tools/hot-expert/rome_vkbench.c` has the device setup) | ≥ 50 GB/s aggregate on three cards if RADV's upload path matches HIP's; **falsifier:** < 40 GB/s → F2 streams through HIP (the container) or a HIP upload helper, and D-3 leaves the parked list | ROW lines as §PCIE-STREAM; under the lock, gateway up | Sonnet, 1 day |
-| **F2** | **Chunked batched prefill with expert streaming.** Prefill in chunks of S rows (512 default, knob); per MoE layer, group the chunk's rows by expert (Q9 step 1's grouping exists); resident experts run on their tier as today; each **non-resident** expert is copied once per chunk into a per-card ring buffer (dev2 first — its link is its own; dev0/dev3 share ~33 GB/s) and run through `qmatmul_gate_up_tile.spv` / `qmatmul_tile.spv` on that card; the CPU int4 path stays as `COLI_PREFILL_STREAM=0`. | non-resident set ≈ 8 706 experts × 14.16 MB = 123 GB per chunk; at 61 GB/s = 2.0 s per 512 rows ≈ **3.9 ms/token** for the streamed experts, vs 113.9 ms/token today (fit, §1); with GPU tile compute and the attention/indexer prefill unchanged, 18k prefill projected **≈ 70–130 s** (vs 2 561 s measured, 108 s on llama.cpp). Chunk 2 048 rows: 9 chunks, ~1.1 s/1k tokens of streaming | `prefill_gate.sh` (oracle: `teacher_forcing` identical, last-token logits vs pristine), X2's KL bar, then the H2 ladder A,B,B,A vs today's A rows; ~~≥ 10× on the 18k ladder-turn TTFT~~ **re-based rev 16 (record §RP-F6a: ceiling 1.87×): ≥ 1.6× on the 18k ladder-turn TTFT and ≥ 2.0× on turn 1** or the item is rejected; the row beside llama.cpp's 108 s is reported either way | Opus, 2–3 weeks; after F0 |
+| **F2 — DONE 2026-09-19, GATED PASS (rev 19).** Turn 1 136.8 → 67.6 s = **2.03×** (bar 2.0); 18 439-token turn 1 174.8 → 672.6 s = **1.75×** (bar 1.6); both SEPARATED. Cold 18k prefill 37.5 → 21.1 min. Decode 4.30 → 4.33 tok/s at full depth. X2 KL with the step-2a clamp: mean KL 3.48e-05, top-1 99.89 %. Knob-off bit-identical to the served pristine. Record §F2, §F2-LADDER | **Chunked batched prefill with expert streaming.** Prefill in chunks of S rows (512 default, knob); per MoE layer, group the chunk's rows by expert (Q9 step 1's grouping exists); resident experts run on their tier as today; each **non-resident** expert is copied once per chunk into a per-card ring buffer (dev2 first — its link is its own; dev0/dev3 share ~33 GB/s) and run through `qmatmul_gate_up_tile.spv` / `qmatmul_tile.spv` on that card; the CPU int4 path stays as `COLI_PREFILL_STREAM=0`. | non-resident set ≈ 8 706 experts × 14.16 MB = 123 GB per chunk; at 61 GB/s = 2.0 s per 512 rows ≈ **3.9 ms/token** for the streamed experts, vs 113.9 ms/token today (fit, §1); with GPU tile compute and the attention/indexer prefill unchanged, 18k prefill projected **≈ 70–130 s** (vs 2 561 s measured, 108 s on llama.cpp). Chunk 2 048 rows: 9 chunks, ~1.1 s/1k tokens of streaming | `prefill_gate.sh` (oracle: `teacher_forcing` identical, last-token logits vs pristine), X2's KL bar, then the H2 ladder A,B,B,A vs today's A rows; ~~≥ 10× on the 18k ladder-turn TTFT~~ **re-based rev 16 (record §RP-F6a: ceiling 1.87×): ≥ 1.6× on the 18k ladder-turn TTFT and ≥ 2.0× on turn 1** or the item is rejected; the row beside llama.cpp's 108 s is reported either way — **turn 1 MET at 2.02× and the short rung's deepest turn (5 112) at 1.80×, record §F2d; the 18k rung is the only bar left and projects 1.71×** | Opus, 2–3 weeks; after F0 |
 | **F4 — DONE 2026-09-17, ANSWERED (rev 14): the DSA indexer** | **Attribute the 205 ms/token depth growth on GLM.** The zero-cost route: close the engine's stdin in `ttft_serve.EngineDriver.close()` (not in `openai_server.Engine.close()`) so `optime_print` runs; one A-arm ladder with `COLI_TIMERS=1` then carries the table. Fallback: the 1 h 45 m CLI chain in record §X3 step 0 | which bucket grows: attention core, DSA indexer, KV read, or dense/submit. **This decides the decode item:** ≥ 30 % attention+indexer → X3 (stricter selection, knob-gated, X2 bar); KV-read-bound → a KV layout/placement item; neither → the base token is the target (submit overhead, dense stream) | the `[OPTIME]` table at 2.7k and 18.4k in the record, both arms | Sonnet (fix + one arm, ~2 h rig) then Opus (interpretation) |
 | **F1** | **Streamed decode misses** (the 21 %): same ring buffer as F2, at batch 1, prefetch next layer's misses while this layer computes; CPU path becomes the fallback knob. Frees the 8 cores for dense/indexer work | ≤ 45 ms/token on GLM (≤ 19 % at 2.7k, ≤ 10 % at 18k) — real but small on this model; on a ≤ 60 GB model with a partial tier it is the whole miss cost. **Sequenced after F2** (shares its code) and after F4 (which may make it the wrong item) | X2's KL bar, text identical, A,B,B,A on the ladder; verdict through `gate_ab_verdict` | Opus, 1–2 weeks |
 | **F3** | **Three-card residency for any model that fits** (regime B): extend V1's Vulkan tier from one card to three (heat-ranked, per-device budget, `COLI_VK_DEV0/2/3`), attention/KV on dev0, tiers on all three, so a ≤ 60 GB int4 GLM-class model is 100 % resident with P7/P9 checkpoints and slots intact | the measured resident regime: 75 tok/s class at 18k (gpt-oss, layer-split; Colibri's number **unknown** until run — the submit-model ceiling of §3 branch 3 was withdrawn but not replaced by a measurement) | tier line asserts 100 % residency; A,B,B,A vs llama.cpp resident on the same GGUF-equivalent weights; the greedy-text agreement count of H2b | Opus, 1–2 weeks; **only when the owner names the model** |

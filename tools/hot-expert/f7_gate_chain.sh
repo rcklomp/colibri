@@ -365,7 +365,9 @@ PY
       "GLM53_MLA_ATTN_DUMP=$DUMP" "GLM53_MLA_ATTN_DUMP_ROW=${F7_DEFECT_ROW:-1420}" \
       "GLM53_MLA_ATTN_DUMP_N=${F7_DEFECT_N:-11}" || exit 1
   grep -a 'F7 chunk dump' "$OUT/defect_dumprun.err" || { echo "FATAL: no chunk was dumped"; exit 1; }
-  ls -l "$DUMP".* | head -20
+  set -- "$DUMP".*
+  [ -s "$1" ] || { echo "FATAL: no $DUMP.<n> files -- is the ENGINE rebuilt at this commit?"; exit 1; }
+  echo "--- $# dump file(s):"; ls -l "$@" | head -20
 
   echo "--- build f7_attn_probe"
   gcc -O2 -fopenmp -DCOLI_VULKAN "$HERE/f7_attn_probe.c" "$F7_ROOT/c/backend_vulkan.c" \

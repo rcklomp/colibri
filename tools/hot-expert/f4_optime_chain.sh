@@ -245,6 +245,20 @@ stop_gateway || exit 1
 warm_glm
 assert_glm_resident "pre" || { echo "FATAL: GLM not >=90% resident before the chain"; exit 1; }
 
+# ---- F4_PROFILE_ONLY=1: the re-profile after a landed item ----------------
+# Launched from ~/src/colibri itself, candidate == pristine == the binary in
+# service, so the oracle is vacuous and the smoke's [OPTIME] feature is
+# already proven. Run only the timed A arm (same steps, same env) and leave
+# through the same exit trap (re-warm, restart, accept_live.sh).
+if [ "${F4_PROFILE_ONLY:-0}" = 1 ]; then
+  echo "=== F4_PROFILE_ONLY=1: skipping oracle and smoke; A arm on $CAND_BIN ($(sha256sum "$CAND_BIN" | cut -c1-16))"
+  run_A "${F4_ARM:-RP}" "$CAND_BIN" "$F4_ROOT/c/shaders" || exit 1
+  precheck "post-A"
+  assert_vram_free "post-A" || exit 1
+  echo "=== f4_optime_chain (profile only) body done $(date -Is)"
+  exit 0
+fi
+
 # ---- oracle (COLI_TIMERS unset): candidate vs the served pristine ---------
 echo "=== oracle $(date -Is)"
 PACKET=$(cat "$HERE/x2_packet_450.txt")

@@ -2652,11 +2652,12 @@ static double g_t_eg, g_t_cpu; static long g_n_eg, g_n_eg_disp, g_n_cpu, g_n_dev
  * in the gap between issuing the resident groups' fences and waiting on
  * them), so g_t_eg alone cannot say whether the CPU-computed non-resident
  * experts are on decode's critical path. Split the same window three ways:
- * issue (the three coli_vk_expert_group_issue*/2/3 calls' own wall time,
- * which only submits work), cpu_in (the deferred-CPU call's contribution to
- * g_t_cpu, measured ONLY while it runs inside this window) and take (the
- * coli_vk_expert_group_take*/2/3 fence waits left AFTER the CPU work is
- * already done). g_n_eg_win counts every window this call entered
+ * issue (the three coli_vk_expert_group_issue/issue2/issue3 calls' own wall
+ * time, which only submits work), cpu_in (the deferred-CPU call's
+ * contribution to g_t_cpu, measured ONLY while it runs inside this window)
+ * and take (the coli_vk_expert_group_take/take2/take3 fence waits left
+ * AFTER the CPU work is already done). g_n_eg_win counts every window this
+ * call entered
  * (success or fail); g_n_eg_cpu0/g_t_eg_take_cpu0 are the subset with zero
  * deferred CPU experts, i.e. GPU-alone take time -- the reference the other
  * windows' take time is read against. Timers only: nothing here changes

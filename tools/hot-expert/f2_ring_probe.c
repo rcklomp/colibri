@@ -55,6 +55,7 @@
 #include <dirent.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <math.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -321,6 +322,63 @@ int main(int argc, char **argv) {
 #ifdef _OPENMP
     printf("INFO omp_max_threads=%d\n", omp_get_max_threads());
 #endif
+
+    /* Step 2a: a model-free check of the CLAMPED gate_up kernels, so a broken
+     * pipeline, layout or push-constant block is found in a minute here
+     * instead of an hour into a gateway outage.
+     *
+     * Two properties, neither of which needs a CPU dequant reference:
+     *   (a) the clamped pipeline with an enormous limit must reproduce the
+     *       unclamped one -- same SPIR-V source, same expression, the clamp
+     *       never binds. This is what proves the second pipeline, its layout
+     *       and its seventh push constant are all wired correctly.
+     *   (b) the clamped pipeline at the model's real limit (10.0) must
+     *       actually change the result -- otherwise the knob is a no-op and
+     *       would pass (a) while doing nothing.
+     * Both the per-row (R=1) and the tiled (R=8) pipeline are exercised. */
+    if (getenv("F2_CLAMP_CHECK")) {
+        const int devs[3] = {0, 2, 3};
+        int ok = coli_vk_ring_init(0, 2, FMT, DIM_D, DIM_I, GS, 1);
+        if (ok < 1) { printf("WARN clamp-check: no ring on dev0\n"); coli_vk_shutdown(); return 2; }
+        Task t = {0, 0, 0};
+        t.dev = devs[0]; t.slot = 0; t.blk = rnd() % g_nblk;
+        fill_tasks(&t, 1);
+        for (int ri = 0; ri < 2; ri++) {
+            const int R = ri ? 8 : 1;
+            float *x = malloc((size_t)R * DIM_D * sizeof(float));
+            float *y0 = calloc((size_t)R * DIM_D, sizeof(float));
+            float *y1 = calloc((size_t)R * DIM_D, sizeof(float));
+            float *y2 = calloc((size_t)R * DIM_D, sizeof(float));
+            int rows[1] = {R};
+            ColiVkTensor *g = NULL, *u = NULL, *d = NULL;
+            coli_vk_ring_tensors(0, 0, &g, &u, &d);
+            for (int i = 0; i < R * DIM_D; i++) x[i] = (float)((i * 2654435761u) % 2000) / 1000.0f - 1.0f;
+            coli_vk_set_swiglu_limit(0.0f);
+            if (coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x)) coli_vk_expert_group_take(y0);
+            coli_vk_set_swiglu_limit(1e30f);
+            if (coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x)) coli_vk_expert_group_take(y1);
+            coli_vk_set_swiglu_limit(10.0f);
+            if (coli_vk_expert_group_issue(&g, &u, &d, rows, 1, x)) coli_vk_expert_group_take(y2);
+            coli_vk_set_swiglu_limit(0.0f);
+            double m01 = 0, m02 = 0, ref = 0;
+            for (int i = 0; i < R * DIM_D; i++) {
+                double a = fabs((double)y0[i] - y1[i]); if (a > m01) m01 = a;
+                double b = fabs((double)y0[i] - y2[i]); if (b > m02) m02 = b;
+                double r = fabs((double)y0[i]);         if (r > ref) ref = r;
+            }
+            printf("ROW kind=clamp-check rows=%d pipeline=%s max|y_unclamped-y_limit1e30|=%.6g "
+                   "max|y_unclamped-y_limit10|=%.6g max|y_unclamped|=%.6g verdict=%s\n",
+                   R, R > 1 ? "tiled" : "per-row", m01, m02, ref,
+                   (m01 == 0.0 && m02 > 0.0) ? "PASS"
+                   : (m01 != 0.0) ? "FAIL(huge-limit not inert)"
+                                  : "FAIL(limit 10 changed nothing)");
+            free(x); free(y0); free(y1); free(y2);
+        }
+        coli_vk_ring_free();
+        coli_vk_shutdown();
+        printf("INFO done (clamp-check)\n");
+        return 0;
+    }
 
     if (wsel == 0 || wsel == 2) run_where(0, slots, mins, reps, has2, has3);
     if (wsel == 1 || wsel == 2) run_where(1, slots, mins, reps, has2, has3);

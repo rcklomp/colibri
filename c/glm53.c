@@ -2128,14 +2128,22 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     }
 #endif
     /* F7 defect hunt: arm the one-shot chunk dump (CPU path only, see above). */
-    static int dump_done = 0;
-    const char *dump_path = dump_done ? NULL : getenv("GLM53_MLA_ATTN_DUMP");
+    static int dump_n = 0;
+    const char *dump_env = getenv("GLM53_MLA_ATTN_DUMP");
+    const char *dump_nmax_s = getenv("GLM53_MLA_ATTN_DUMP_N");
+    const int dump_nmax = dump_nmax_s ? atoi(dump_nmax_s) : 1;
+    char dump_buf[512];
+    const char *dump_path = (dump_env && dump_n < dump_nmax) ? dump_env : NULL;
     if (dump_path) {
         const char *rs = getenv("GLM53_MLA_ATTN_DUMP_ROW");
         const int want = rs ? atoi(rs) : 1420;
         if (!(tokens > 1 && base <= want && want < base + tokens)) dump_path = NULL;
     }
     if (dump_path) {
+        /* one file per matching CALL, so N = 11 captures every DSA layer of the
+         * same chunk and a defect that lives in one layer cannot hide */
+        snprintf(dump_buf, sizeof dump_buf, "%s.%d", dump_env, dump_n);
+        dump_path = dump_buf;
         g_mla_dumpctx = malloc((size_t)tokens * H * V * sizeof(float));
         if (!g_mla_dumpctx) dump_path = NULL;
     }
@@ -2353,7 +2361,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             fclose(f);
             fprintf(stderr, "[MLA] F7 chunk dump -> %s (tokens=%d base=%d seen=%d width=%d)\n",
                     dump_path, tokens, base, seen, width);
-            dump_done = 1;
+            dump_n++;
         }
         free(g_mla_dumpctx); g_mla_dumpctx = NULL;
     }

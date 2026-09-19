@@ -362,10 +362,10 @@ open(out, "w").write(text[:int(n)] + "\n\nSummarise the notes above in one sente
 PY
   DUMP="$OUT/${TAG}_chunk.bin"
   run_oracle dumprun "$CAND_BIN" "$CAND_SHADERS" "$DPKT" defect \
-      "GLM53_MLA_ATTN_DUMP=$DUMP" "GLM53_MLA_ATTN_DUMP_ROW=${F7_DEFECT_ROW:-1420}" || exit 1
+      "GLM53_MLA_ATTN_DUMP=$DUMP" "GLM53_MLA_ATTN_DUMP_ROW=${F7_DEFECT_ROW:-1420}" \
+      "GLM53_MLA_ATTN_DUMP_N=${F7_DEFECT_N:-11}" || exit 1
   grep -a 'F7 chunk dump' "$OUT/defect_dumprun.err" || { echo "FATAL: no chunk was dumped"; exit 1; }
-  [ -s "$DUMP" ] || { echo "FATAL: $DUMP empty"; exit 1; }
-  echo "--- dump: $(stat -c %s "$DUMP") bytes"
+  ls -l "$DUMP".* | head -20
 
   echo "--- build f7_attn_probe"
   gcc -O2 -fopenmp -DCOLI_VULKAN "$HERE/f7_attn_probe.c" "$F7_ROOT/c/backend_vulkan.c" \
@@ -373,14 +373,18 @@ PY
       || { echo "FATAL: probe build failed"; cat "$OUT/${TAG}_probe_build.log"; exit 1; }
 
   RP="$OUT/${TAG}_replay.txt"
-  env OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close \
-      COLI_VK_SHADERS="$CAND_SHADERS" F7_REPLAY="$DUMP" \
-      F7_REPLAY_ROWS="${F7_REPLAY_ROWS:-24}" F7_REPLAY_FOCUS="${F7_DEFECT_ROW:-1420}" \
-      "$PROBE" "$CAND_SHADERS" > "$RP" 2>&1
-  rc=$?
-  echo "replay rc=$rc -> $RP"
-  grep -E '^(RROW|ROW|INFO|WARN) ' "$RP"
-  [ "$rc" -eq 0 ] || { echo "FATAL: replay exited non-zero"; tail -20 "$RP"; exit 1; }
+  : > "$RP"
+  for f in "$DUMP".*; do
+    echo "=== replay $f" >> "$RP"
+    env OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close \
+        COLI_VK_SHADERS="$CAND_SHADERS" F7_REPLAY="$f" \
+        F7_REPLAY_ROWS="${F7_REPLAY_ROWS:-8}" F7_REPLAY_FOCUS="${F7_DEFECT_ROW:-1420}" \
+        "$PROBE" "$CAND_SHADERS" >> "$RP" 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "FATAL: replay of $f exited $rc"; tail -20 "$RP"; exit 1; }
+  done
+  echo "replay done -> $RP"
+  grep -E '^(=== replay|RROW|ROW |WARN) ' "$RP"
   echo "=== defect hunt done $(date -Is)"
   exit 0
 fi

@@ -245,15 +245,64 @@ static int replay_main(const char *path, const char *shaders) {
     }
     printf("INFO replay gpu call %.1f ms (sb=%d)\n", now_ms() - t0, sb);
 
-    const int nrows = getenv("F7_REPLAY_ROWS") ? atoi(getenv("F7_REPLAY_ROWS")) : 24;
+    /* Triage over EVERY row first, GPU against the engine's own CPU fp32 -- no
+     * float64 needed, so it is cheap enough to cover all 512 rows and all 64
+     * heads and catch a rare bad row that a 25-row sample would miss. The
+     * float64 reference then runs only on the worst rows. */
+    const int nall = r.tokens * r.nh * r.nv;
+    (void)nall;
+    double *rowrel = malloc((size_t)r.tokens * sizeof(double));
+    int *rowhead = malloc((size_t)r.tokens * sizeof(int));
+    double sumrel = 0, maxrel = 0; int maxrow = -1;
+    for (int t = 0; t < r.tokens; t++) {
+        double mc = 0, mg = 0; int hw = -1;
+        for (int i = 0; i < r.nh * r.nv; i++) {
+            const double a = r.cpuctx[(size_t)t * r.nh * r.nv + i];
+            const double b = gpuctx[(size_t)t * r.nh * r.nv + i];
+            if (fabs(a) > mc) mc = fabs(a);
+            const double e = fabs(a - b);
+            if (e > mg) { mg = e; hw = i / r.nv; }
+        }
+        rowrel[t] = mg / (mc > 0 ? mc : 1); rowhead[t] = hw;
+        sumrel += rowrel[t];
+        if (rowrel[t] > maxrel) { maxrel = rowrel[t]; maxrow = t; }
+    }
+    {   /* p50 / p99 of the per-row relative gap */
+        double *srt = malloc((size_t)r.tokens * sizeof(double));
+        memcpy(srt, rowrel, (size_t)r.tokens * sizeof(double));
+        for (int i = 1; i < r.tokens; i++) {          /* insertion sort, 512 rows */
+            double v = srt[i]; int j = i - 1;
+            while (j >= 0 && srt[j] > v) { srt[j + 1] = srt[j]; j--; }
+            srt[j + 1] = v;
+        }
+        printf("ROW triage gpu-vs-cpu over ALL %d rows: mean=%.3e p50=%.3e p99=%.3e max=%.3e "
+               "(row %d, head %d)\n", r.tokens, sumrel / r.tokens, srt[r.tokens / 2],
+               srt[(int)(r.tokens * 0.99)], maxrel, r.base + maxrow, maxrow >= 0 ? rowhead[maxrow] : -1);
+        free(srt);
+    }
+
+    /* float64 on the worst rows the triage found, plus the focus row. */
+    const int nworst = getenv("F7_REPLAY_ROWS") ? atoi(getenv("F7_REPLAY_ROWS")) : 8;
     const int focus = getenv("F7_REPLAY_FOCUS") ? atoi(getenv("F7_REPLAY_FOCUS")) : 1420;
+    int *pick = malloc((size_t)(nworst + 1) * sizeof(int));
+    int npick = 0;
+    for (int k = 0; k < nworst; k++) {
+        int best = -1;
+        for (int t = 0; t < r.tokens; t++) {
+            int dup = 0;
+            for (int j = 0; j < npick; j++) if (pick[j] == t) dup = 1;
+            if (!dup && (best < 0 || rowrel[t] > rowrel[best])) best = t;
+        }
+        if (best >= 0) pick[npick++] = best;
+    }
+    if (focus - r.base >= 0 && focus - r.base < r.tokens) pick[npick++] = focus - r.base;
+
     double *ctx64 = malloc((size_t)r.nh * r.nv * sizeof(double));
     double wc_cpu = 0, wc_gpu = 0;
     int wr_cpu = -1, wr_gpu = -1;
-    printf("INFO per-row context error vs float64 (rel = maxabs / max|ref64| of that row)\n");
-    for (int k = 0; k <= nrows; k++) {
-        int t = (k == nrows) ? focus - r.base : (int)((long)k * r.tokens / nrows);
-        if (t < 0 || t >= r.tokens) continue;
+    printf("INFO per-row context error vs float64 on the worst rows (rel = maxabs / max|ref64|)\n");
+    for (int k = 0; k < npick; k++) {
+        const int t = pick[k];
         replay_ref64(&r, t, slot + (size_t)t * r.width, used[t], ctx64);
         double mref = 0, mc = 0, mg = 0; int hc = -1, hg = -1;
         for (int i = 0; i < r.nh * r.nv; i++) {
@@ -267,12 +316,11 @@ static int replay_main(const char *path, const char *shaders) {
         const double rc = mc / (mref > 0 ? mref : 1), rg = mg / (mref > 0 ? mref : 1);
         if (rc > wc_cpu) { wc_cpu = rc; wr_cpu = r.base + t; }
         if (rg > wc_gpu) { wc_gpu = rg; wr_gpu = r.base + t; }
-        printf("RROW t=%-6d used=%-5d ref_max=%.4e | cpu_abs=%.3e cpu_rel=%.3e h=%-3d "
-               "| gpu_abs=%.3e gpu_rel=%.3e h=%-3d | gpu/cpu=%.1f%s\n",
-               r.base + t, used[t], mref, mc, rc, hc, mg, rg, hg,
+        printf("RROW t=%-6d used=%-5d ref_max=%.4e | cpu_rel=%.3e h=%-3d | gpu_rel=%.3e h=%-3d "
+               "| gpu/cpu=%.2f%s\n", r.base + t, used[t], mref, rc, hc, rg, hg,
                rc > 0 ? rg / rc : 0.0, (r.base + t == focus) ? "   <- focus" : "");
     }
-    printf("ROW replay worst_rel cpu=%.3e (t=%d) gpu=%.3e (t=%d) ratio=%.1f\n",
+    printf("ROW replay worst_rel_vs_ref64 cpu=%.3e (t=%d) gpu=%.3e (t=%d) ratio=%.2f\n",
            wc_cpu, wr_cpu, wc_gpu, wr_gpu, wc_cpu > 0 ? wc_gpu / wc_cpu : 0.0);
     printf("INFO done\n");
     return 0;

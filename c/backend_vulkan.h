@@ -207,9 +207,17 @@ int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const f
  * it twice with the same shape returns the existing count, with a different
  * shape returns 0.
  * _fill is safe to call concurrently for DISTINCT (dev, slot) pairs -- it is a
- * memcpy into mapped, write-combined VRAM and touches no Vulkan object. The
- * caller must not refill a slot whose submit is still in flight. */
-int    coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs);
+ * memcpy into mapped memory and touches no Vulkan object. The caller must not
+ * refill a slot whose submit is still in flight.
+ *
+ * `where` 0 = the same HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL memory (ReBAR
+ * write-combined VRAM) the resident tier lives in: the CPU writes over PCIe and
+ * the shader reads local VRAM. 1 = HOST_VISIBLE|HOST_COHERENT and NOT
+ * DEVICE_LOCAL (system RAM): the CPU writes cached DRAM and the SHADER reads
+ * over PCIe. Which is faster is measured, not assumed --
+ * tools/hot-expert/f2_ring_probe.c reports both. */
+int    coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs, int where);
+int    coli_vk_ring_where(int dev);
 int    coli_vk_ring_slots(int dev);
 size_t coli_vk_ring_bytes(int dev);
 size_t coli_vk_ring_slot_bytes(int dev);

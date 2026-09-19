@@ -69,7 +69,7 @@ PROBE_OUT="$OUT/${TAG}.txt"
 env OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json \
     COLI_VK_SHADERS="$ROOT/c/shaders" \
-    "$PROBE" "$SHARD_DIR" "$SPV" "$SLOTS" "$SECS" "$REPS" > "$PROBE_OUT" 2>&1
+    "$PROBE" "$SHARD_DIR" "$SPV" "$SLOTS" "$SECS" "$REPS" "${F2_WHERE:-2}" > "$PROBE_OUT" 2>&1
 rc=$?
 echo "probe rc=$rc -> $PROBE_OUT"
 if [ "$rc" -ne 0 ]; then echo "FATAL: probe exited non-zero"; cat "$PROBE_OUT"; exit 1; fi

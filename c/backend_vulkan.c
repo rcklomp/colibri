@@ -2116,19 +2116,67 @@ typedef struct {
 } VkRingSlot;
 
 static struct VkRing {
-    int slots, fmt, D, I, gs;
+    int slots, fmt, D, I, gs, where;
     size_t gu_wbytes, dn_wbytes;    /* per-tensor weight bytes (padded) */
     size_t gu_rb, dn_rb;            /* host row bytes */
     size_t gu_stride, dn_stride;    /* device row stride */
     size_t gu_sfl, dn_sfl;          /* scale float counts */
-    size_t bytes;                   /* total device bytes held */
+    size_t bytes;                   /* total bytes held */
+    VkDeviceMemory mem;             /* one allocation for the whole ring */
+    uint8_t *base;
     VkRingSlot *s;
 } g_ring[3];
 
 /* dev is the ENGINE's device number (0, 2, 3) -> internal 0, 1, 2. */
 static int ring_ix(int dev) { return dev == 0 ? 0 : dev == 2 ? 1 : dev == 3 ? 2 : -1; }
+static VkDevice ring_dev(int ix) { return ix == 0 ? G.dev : ix == 1 ? G2.dev : G3.dev; }
+static VkPhysicalDevice ring_phys(int ix) { return ix == 0 ? G.phys : ix == 1 ? G2.phys : G3.phys; }
 
-static int ring_alloc_tensor(int ix, ColiVkTensor **out, void **wptr, void **sptr,
+/* COLI_VK_RING_WHERE / the `where` argument: 0 = the same
+ * HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL memory (ReBAR write-combined VRAM)
+ * upload_tensor puts the resident tier in -- the CPU writes over PCIe and the
+ * shader then reads local VRAM. 1 = HOST_VISIBLE|HOST_COHERENT and NOT
+ * DEVICE_LOCAL (system RAM through the GTT heap) -- the CPU writes cached DRAM
+ * and the SHADER reads over PCIe instead. Which one is faster is not
+ * obvious and is not assumed: see tools/hot-expert/f2_ring_probe.c, which
+ * measures both at the engine's real shapes. */
+static int ring_memtype(int ix, int where, uint32_t bits) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(ring_phys(ix), &m);
+    int best = -1;
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        if (!(bits & (1u << i))) continue;
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+            !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) continue;
+        const int devlocal = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        if (where == 0 && devlocal) return (int)i;
+        if (where == 1 && !devlocal && !(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
+        if (best < 0) best = (int)i;
+    }
+    return best;   /* nothing matched exactly -- any host-visible type beats failing */
+}
+
+static int ring_mk_buffer(int ix, size_t bytes, size_t *off, VkBuffer *buf, void **ptr) {
+    struct VkRing *r = &g_ring[ix];
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(ring_dev(ix), &bi, NULL, buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(ring_dev(ix), *buf, &req);
+    size_t align = req.alignment ? req.alignment : 256;
+    size_t at = (*off + align - 1) & ~(align - 1);
+    if (at + req.size > r->bytes) { vkDestroyBuffer(ring_dev(ix), *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    if (vkBindBufferMemory(ring_dev(ix), *buf, r->mem, at) != VK_SUCCESS) {
+        vkDestroyBuffer(ring_dev(ix), *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
+    }
+    *ptr = r->base + at;
+    *off = at + req.size;
+    return 1;
+}
+
+static int ring_alloc_tensor(int ix, ColiVkTensor **out, size_t *off, void **wptr, void **sptr,
                              int fmt, int I, int O, int gs) {
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
@@ -2137,34 +2185,28 @@ static int ring_alloc_tensor(int ix, ColiVkTensor **out, void **wptr, void **spt
     t->dev = ix;
     t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
     size_t sfl = scale_floats(fmt, I, O, gs);
-    int ok = ix == 0 ? arena_suballoc(t->wbytes, &t->wbuf, wptr)
-           : ix == 1 ? arena_suballoc_d2(t->wbytes, &t->wbuf, wptr)
-                     : arena_suballoc_d3(t->wbytes, &t->wbuf, wptr);
-    if (!ok) { free(t); return 0; }
+    if (!ring_mk_buffer(ix, t->wbytes, off, &t->wbuf, wptr)) { free(t); return 0; }
     memset(*wptr, 0, t->wbytes);          /* the padding bytes, once and for all */
-    ok = ix == 0 ? arena_suballoc(sfl * sizeof(float), &t->sbuf, sptr)
-       : ix == 1 ? arena_suballoc_d2(sfl * sizeof(float), &t->sbuf, sptr)
-                 : arena_suballoc_d3(sfl * sizeof(float), &t->sbuf, sptr);
-    if (!ok) { free(t); return 0; }
+    if (!ring_mk_buffer(ix, sfl * sizeof(float), off, &t->sbuf, sptr)) {
+        vkDestroyBuffer(ring_dev(ix), t->wbuf, NULL); free(t); return 0;
+    }
     memset(*sptr, 0, sfl * sizeof(float));
     *out = t;
     return 1;
 }
 
-int coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs) {
+int coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs, int where) {
     const int ix = ring_ix(dev);
     if (ix < 0 || slots < 1 || D < 1 || I < 1) return 0;
     if (ix == 0 && !G.ready) return 0;
     if (ix == 1 && !G2.ready) return 0;
     if (ix == 2 && !G3.ready) return 0;
     struct VkRing *r = &g_ring[ix];
-    if (r->s) return (r->fmt == fmt && r->D == D && r->I == I) ? r->slots : 0;
+    if (r->s) return (r->fmt == fmt && r->D == D && r->I == I && r->where == where) ? r->slots : 0;
     /* Only the formats upload_tensor accepts, and only the word-aligned grouped
      * case the expert tier actually uses; anything else falls back to the CPU. */
     if (!(fmt == 1 || fmt == 2 || fmt == 8 || (fmt == 4 && gs >= 8 && gs % 8 == 0))) return 0;
-    r->s = calloc((size_t)slots, sizeof(VkRingSlot));
-    if (!r->s) return 0;
-    r->fmt = fmt; r->D = D; r->I = I; r->gs = gs;
+    r->fmt = fmt; r->D = D; r->I = I; r->gs = gs; r->where = where;
     r->gu_stride = (size_t)rowwords(fmt, D) * 4;          /* gate/up: O = I rows of D */
     r->dn_stride = (size_t)rowwords(fmt, I) * 4;          /* down:    O = D rows of I */
     r->gu_rb = (fmt == 1 || fmt == 8) ? (size_t)D : (size_t)(D + 1) / 2;
@@ -2173,21 +2215,54 @@ int coli_vk_ring_init(int dev, int slots, int fmt, int D, int I, int gs) {
     r->dn_sfl = scale_floats(fmt, I, D, gs);
     r->gu_wbytes = r->gu_stride * (size_t)I;
     r->dn_wbytes = r->dn_stride * (size_t)D;
+
+    /* One allocation for the whole ring, with 64 KiB of slack per slot for the
+     * six buffers' binding alignment. */
+    const size_t per = 2 * (r->gu_wbytes + r->gu_sfl * 4) + r->dn_wbytes + r->dn_sfl * 4 + 65536;
+    r->bytes = per * (size_t)slots;
+    /* memoryTypeBits of a representative storage buffer on this device. */
+    uint32_t bits = ~0u;
+    { VkBuffer probe = VK_NULL_HANDLE;
+      VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+          .size = r->gu_wbytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+      if (vkCreateBuffer(ring_dev(ix), &bi, NULL, &probe) == VK_SUCCESS) {
+          VkMemoryRequirements req; vkGetBufferMemoryRequirements(ring_dev(ix), probe, &req);
+          bits = req.memoryTypeBits;
+          vkDestroyBuffer(ring_dev(ix), probe, NULL);
+      } }
+    const int mt = ring_memtype(ix, where, bits);
+    if (mt < 0) { r->bytes = 0; return 0; }
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = r->bytes, .memoryTypeIndex = (uint32_t)mt};
+    if (vkAllocateMemory(ring_dev(ix), &ai, NULL, &r->mem) != VK_SUCCESS ||
+        vkMapMemory(ring_dev(ix), r->mem, 0, r->bytes, 0, (void **)&r->base) != VK_SUCCESS) {
+        if (r->mem) vkFreeMemory(ring_dev(ix), r->mem, NULL);
+        r->mem = VK_NULL_HANDLE; r->bytes = 0; return 0;
+    }
+    r->s = calloc((size_t)slots, sizeof(VkRingSlot));
+    if (!r->s) { vkFreeMemory(ring_dev(ix), r->mem, NULL); r->mem = VK_NULL_HANDLE; r->bytes = 0; return 0; }
+    size_t off = 0;
     for (int i = 0; i < slots; i++) {
         VkRingSlot *sl = &r->s[i];
         void *wp, *sp;
         /* A partial ring is a valid configuration, not an error: the caller
          * reads the count back and schedules its waves against it. */
-        if (!ring_alloc_tensor(ix, &sl->g, &wp, &sp, fmt, D, I, gs)) break;
+        if (!ring_alloc_tensor(ix, &sl->g, &off, &wp, &sp, fmt, D, I, gs)) break;
         sl->gw = wp; sl->gsc = sp;
-        if (!ring_alloc_tensor(ix, &sl->u, &wp, &sp, fmt, D, I, gs)) break;
+        if (!ring_alloc_tensor(ix, &sl->u, &off, &wp, &sp, fmt, D, I, gs)) break;
         sl->uw = wp; sl->usc = sp;
-        if (!ring_alloc_tensor(ix, &sl->d, &wp, &sp, fmt, I, D, gs)) break;
+        if (!ring_alloc_tensor(ix, &sl->d, &off, &wp, &sp, fmt, I, D, gs)) break;
         sl->dw = wp; sl->dsc = sp;
-        r->bytes += 2 * (r->gu_wbytes + r->gu_sfl * 4) + r->dn_wbytes + r->dn_sfl * 4;
         r->slots = i + 1;
     }
     return r->slots;
+}
+
+/* 0 = ReBAR VRAM, 1 = host RAM read over PCIe by the shader. */
+int coli_vk_ring_where(int dev) {
+    const int ix = ring_ix(dev);
+    return ix < 0 ? -1 : g_ring[ix].where;
 }
 
 int coli_vk_ring_slots(int dev) {
@@ -2258,12 +2333,19 @@ int coli_vk_ring_fill(int dev, int slot,
 void coli_vk_ring_free(void) {
     for (int ix = 0; ix < 3; ix++) {
         struct VkRing *r = &g_ring[ix];
+        if (!r->s) { memset(r, 0, sizeof(*r)); continue; }
+        VkDevice dv = ring_dev(ix);
         for (int i = 0; i < r->slots; i++) {
-            /* The buffers are arena sub-allocations: the arena is torn down by
-             * coli_vk_shutdown, so only the handles and the structs go here. */
-            free(r->s[i].g); free(r->s[i].u); free(r->s[i].d);
+            ColiVkTensor *t[3] = {r->s[i].g, r->s[i].u, r->s[i].d};
+            for (int q = 0; q < 3; q++) {
+                if (!t[q]) continue;
+                if (t[q]->wbuf) vkDestroyBuffer(dv, t[q]->wbuf, NULL);
+                if (t[q]->sbuf) vkDestroyBuffer(dv, t[q]->sbuf, NULL);
+                free(t[q]);
+            }
         }
         free(r->s);
+        if (r->mem) { vkUnmapMemory(dv, r->mem); vkFreeMemory(dv, r->mem, NULL); }
         memset(r, 0, sizeof(*r));
     }
 }

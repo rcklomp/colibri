@@ -7,17 +7,13 @@
  * streamed experts cost -- fill alone, compute alone, and the two in the
  * order the engine will run them -- per card and on three cards at once?
  *
- * Why it is not staging_fill_probe.c. That probe measured a two-leg pipeline:
- * CPU memcpy into a HOST_VISIBLE|HOST_COHERENT staging buffer, then a compute
- * shader reading that staging buffer over PCIe (38.6 GB/s aggregate, three
- * cards). The engine's weight path has only ONE leg: pick_memtype() picks
- * HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL (ReBAR write-combined VRAM) and
- * upload_tensor memcpys straight into it, so for a ring slot the fill IS the
- * upload and the shader then reads local VRAM at ~900 GB/s, not PCIe. That is
- * a different measurement and it may be faster or slower; assuming either way
- * is what this probe exists to avoid. It links c/backend_vulkan.c and calls
+ * Why it is not staging_fill_probe.c. That probe measured a two-leg pipeline of
+ * its own construction: CPU memcpy into a HOST_VISIBLE|HOST_COHERENT staging
+ * buffer, then a compute shader reading that staging buffer over PCIe (38.6
+ * GB/s aggregate, three cards). This one drives the ENGINE's own ring and the
+ * ENGINE's own expert-group dispatch -- it links c/backend_vulkan.c and calls
  * coli_vk_ring_* and coli_vk_expert_group_issue*, so what it times is the code
- * the engine will run, not a model of it.
+ * that will run, not a model of it.
  *
  * Shapes, from the served model's config.json (text_config): D (hidden) 4096,
  * I (moe_intermediate) 2048, int4 group-64 -> gate/up [2048,4096], down
@@ -37,7 +33,16 @@
  * facts. GB = 1e9 bytes throughout, matching every other probe in this
  * directory.
  *
- *   f2_ring_probe <shard_dir> <qmatmul.spv> [slots] [min_seconds] [reps]
+ * Run 1 (2026-09-19, `where=vram`) refuted the design's own assumption: a CPU
+ * memcpy into ReBAR write-combined VRAM reaches only 11.9-13.1 GB/s per card
+ * and 16.3 GB/s on three, against the 38.6 GB/s a staging ring reached. CPU
+ * stores over PCIe are not GPU DMA reads over PCIe. So the probe now sweeps
+ * BOTH placements -- `where=vram` (CPU writes VRAM, shader reads VRAM) and
+ * `where=host` (CPU writes cached DRAM, shader reads it over PCIe) -- and the
+ * engine takes whichever the rig says is faster.
+ *
+ *   f2_ring_probe <shard_dir> <qmatmul.spv> [slots] [min_seconds] [reps] [where]
+ *       where: 0 = vram only, 1 = host only, 2 = both (default)
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -155,46 +160,27 @@ static double fill_tasks(const Task *t, int n) {
     return now_s() - t0;
 }
 
-int main(int argc, char **argv) {
-    const char *dir = argc > 1 ? argv[1] : "/home/ronald/models/GLM-5.3-Flash-colibri-int4-g64";
-    const char *spv = argc > 2 ? argv[2] : "/home/ronald/src/colibri/c/shaders/qmatmul.spv";
-    const int slots  = argc > 3 ? atoi(argv[3]) : 48;
-    const double mins = argc > 4 ? atof(argv[4]) : 1.0;
-    const int reps   = argc > 5 ? atoi(argv[5]) : 5;
-    if (slots < 1 || slots > 64) { fprintf(stderr, "slots must be 1..64 (the submit cap)\n"); return 2; }
+static const char *WHERE_NAME[2] = {"vram", "host"};
 
-    if (!coli_vk_init(spv)) { fprintf(stderr, "coli_vk_init failed (%s)\n", spv); return 2; }
-    const int has2 = coli_vk_init_dev2(spv, -1);
-    const int has3 = coli_vk_init_dev3(spv, -1);
-    printf("INFO devices dev0=1 dev2=%d dev3=%d\n", has2, has3);
-    { double u, b;
-      if (coli_vk_mem_budget(&u, &b))  printf("INFO budget dev0 used=%.2f budget=%.2f free=%.2f GB\n", u, b, b - u);
-      if (has2 && coli_vk_mem_budget2(&u, &b)) printf("INFO budget dev2 used=%.2f budget=%.2f free=%.2f GB\n", u, b, b - u);
-      if (has3 && coli_vk_mem_budget3(&u, &b)) printf("INFO budget dev3 used=%.2f budget=%.2f free=%.2f GB\n", u, b, b - u); }
-
-    if (!shard_open(dir)) return 2;
-
+static int run_where(int where, int slots, double mins, int reps, int has2, int has3) {
+    const char *wn = WHERE_NAME[where];
     const int devs[3] = {0, 2, 3};
     int got[3] = {0, 0, 0};
     for (int k = 0; k < 3; k++) {
         if (k == 1 && !has2) continue;
         if (k == 2 && !has3) continue;
-        got[k] = coli_vk_ring_init(devs[k], slots, FMT, DIM_D, DIM_I, GS);
-        printf("INFO ring dev%d slots=%d bytes=%.3f GB slot_bytes=%zu\n",
-               devs[k], got[k], (double)coli_vk_ring_bytes(devs[k]) / 1e9,
+        got[k] = coli_vk_ring_init(devs[k], slots, FMT, DIM_D, DIM_I, GS, where);
+        printf("INFO ring where=%s dev%d slots=%d bytes=%.3f GB slot_bytes=%zu\n",
+               wn, devs[k], got[k], (double)coli_vk_ring_bytes(devs[k]) / 1e9,
                coli_vk_ring_slot_bytes(devs[k]));
         if (got[k] < slots)
-            printf("WARN ring dev%d got %d of %d slots -- VRAM short\n", devs[k], got[k], slots);
+            printf("WARN ring where=%s dev%d got %d of %d slots -- memory short\n", wn, devs[k], got[k], slots);
     }
     { double u, b;
-      if (coli_vk_mem_budget(&u, &b))  printf("INFO budget-after dev0 free=%.2f GB\n", b - u);
-      if (has2 && coli_vk_mem_budget2(&u, &b)) printf("INFO budget-after dev2 free=%.2f GB\n", b - u);
-      if (has3 && coli_vk_mem_budget3(&u, &b)) printf("INFO budget-after dev3 free=%.2f GB\n", b - u); }
-    if (!got[0]) { fprintf(stderr, "no ring on dev0, nothing to measure\n"); return 2; }
-
-#ifdef _OPENMP
-    printf("INFO omp_max_threads=%d\n", omp_get_max_threads());
-#endif
+      if (coli_vk_mem_budget(&u, &b))  printf("INFO budget-after where=%s dev0 free=%.2f GB\n", wn, b - u);
+      if (has2 && coli_vk_mem_budget2(&u, &b)) printf("INFO budget-after where=%s dev2 free=%.2f GB\n", wn, b - u);
+      if (has3 && coli_vk_mem_budget3(&u, &b)) printf("INFO budget-after where=%s dev3 free=%.2f GB\n", wn, b - u); }
+    if (!got[0]) { printf("WARN where=%s: no ring on dev0, skipping\n", wn); coli_vk_ring_free(); return 1; }
 
     /* -------- (a) FILL ONLY: one card at a time, then all three together ----- */
     for (int cfg = 0; cfg < 4; cfg++) {
@@ -225,9 +211,9 @@ int main(int argc, char **argv) {
         }
         double gbps = median(v, reps);
         if (cfg < 3)
-            printf("ROW kind=fill slots=%d cards=1 dev=dev%d gbps=%.3f\n", got[cfg], devs[cfg], gbps);
+            printf("ROW kind=fill where=%s slots=%d cards=1 dev=dev%d gbps=%.3f\n", wn, got[cfg], devs[cfg], gbps);
         else
-            printf("ROW kind=fill slots=%d cards=%d dev=all gbps=%.3f\n", ntask, nuse, gbps);
+            printf("ROW kind=fill where=%s slots=%d cards=%d dev=all gbps=%.3f\n", wn, ntask, nuse, gbps);
         free(t); free(v);
     }
 
@@ -273,8 +259,8 @@ int main(int argc, char **argv) {
             } while (acc < mins);
             v[r] = acc / it * 1e3;
         }
-        printf("ROW kind=compute slots=%d rows=%d cards=%d dev=all ms=%.3f\n",
-               slots, R, (got[0] > 0) + (got[1] > 0) + (got[2] > 0), median(v, reps));
+        printf("ROW kind=compute where=%s slots=%d rows=%d cards=%d dev=all ms=%.3f\n",
+               wn, slots, R, (got[0] > 0) + (got[1] > 0) + (got[2] > 0), median(v, reps));
 
         /* (c) the engine's order: fill a wave on every card, then issue+take. */
         Task *t = malloc((size_t)(3 * slots) * sizeof(Task));
@@ -304,13 +290,41 @@ int main(int argc, char **argv) {
         }
         { double ms = median(v, reps);
           int n = 0; for (int k = 0; k < 3; k++) n += got[k];
-          printf("ROW kind=wave slots=%d rows=%d cards=%d dev=all experts=%d ms=%.3f gbps=%.3f\n",
-                 slots, R, (got[0] > 0) + (got[1] > 0) + (got[2] > 0), n, ms,
+          printf("ROW kind=wave where=%s slots=%d rows=%d cards=%d dev=all experts=%d ms=%.3f gbps=%.3f\n",
+                 wn, slots, R, (got[0] > 0) + (got[1] > 0) + (got[2] > 0), n, ms,
                  (double)n * EXPERT_BYTES / (ms / 1e3) / 1e9); }
         free(t); free(v); free(x); free(y); free(rows); free(gt); free(ut); free(dt);
     }
 
     coli_vk_ring_free();
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *dir = argc > 1 ? argv[1] : "/home/ronald/models/GLM-5.3-Flash-colibri-int4-g64";
+    const char *spv = argc > 2 ? argv[2] : "/home/ronald/src/colibri/c/shaders/qmatmul.spv";
+    const int slots   = argc > 3 ? atoi(argv[3]) : 48;
+    const double mins = argc > 4 ? atof(argv[4]) : 1.0;
+    const int reps    = argc > 5 ? atoi(argv[5]) : 5;
+    const int wsel    = argc > 6 ? atoi(argv[6]) : 2;   /* 0=vram 1=host 2=both */
+    if (slots < 1 || slots > 64) { fprintf(stderr, "slots must be 1..64 (the submit cap)\n"); return 2; }
+
+    if (!coli_vk_init(spv)) { fprintf(stderr, "coli_vk_init failed (%s)\n", spv); return 2; }
+    const int has2 = coli_vk_init_dev2(spv, -1);
+    const int has3 = coli_vk_init_dev3(spv, -1);
+    printf("INFO devices dev0=1 dev2=%d dev3=%d\n", has2, has3);
+    { double u, b;
+      if (coli_vk_mem_budget(&u, &b))  printf("INFO budget dev0 used=%.2f budget=%.2f free=%.2f GB\n", u, b, b - u);
+      if (has2 && coli_vk_mem_budget2(&u, &b)) printf("INFO budget dev2 used=%.2f budget=%.2f free=%.2f GB\n", u, b, b - u);
+      if (has3 && coli_vk_mem_budget3(&u, &b)) printf("INFO budget dev3 used=%.2f budget=%.2f free=%.2f GB\n", u, b, b - u); }
+    if (!shard_open(dir)) return 2;
+#ifdef _OPENMP
+    printf("INFO omp_max_threads=%d\n", omp_get_max_threads());
+#endif
+
+    if (wsel == 0 || wsel == 2) run_where(0, slots, mins, reps, has2, has3);
+    if (wsel == 1 || wsel == 2) run_where(1, slots, mins, reps, has2, has3);
+
     coli_vk_shutdown();
     printf("INFO done\n");
     return 0;

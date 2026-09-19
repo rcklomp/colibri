@@ -69,11 +69,14 @@ dev2/dev3 are expert-tier-only contexts in this backend and get nothing.
    64×64 output tile per workgroup, 256 threads × (4 u × 4 h) registers,
    K-loop in 32-steps with a 64×32 LAT tile and a 64×32 Q tile in LDS
    (16 KB). Grid `ceil(2051/64)=33 × SB`.
-2. **softmax** — one workgroup (256) per (s, h): max over u, `exp`,
-   **`double` workgroup tree sum** (matching the CPU's `double total` in
-   precision, not in order; 2 051 fp64 adds per (s,h) is 0.02 ms/sub-batch
-   at RADV's 1/16 fp64 rate — free insurance), then in-place multiply by
-   1/total. Grid `SB × H`.
+2. **softmax** — one workgroup (256) per (s, h): max over u (the same set,
+   and max is exact, so this part is bit-identical), `exp`, a **float
+   workgroup tree sum**, then in-place divide. fp64 was the first choice and
+   is not available: the engine passes no `pEnabledFeatures`, so
+   `shaderFloat64` is off. A tree over ≤ 2 051 non-negative terms has a
+   relative error bound of ≈ log2(2051)·eps = 6.6e-7, which is orders of
+   magnitude under the score pass's own reordering error — it is not what
+   the KL bar will be measuring. Grid `SB × H`.
 3. **pool** — for each row s, `P[h][d] = Σ_u W[s][h][u]·LAT[slot[s][u]][d]`.
    64×64 tile, same register blocking, K-loop over the 2 051 slots in
    32-steps. Grid `(512/64=8) × SB`. The latent is read once per (row,
@@ -125,9 +128,9 @@ with `teacher_forcing` plus a full `GLM53_LOGIT_DUMP_ALL` dump.
 
 Knob-on changes summation order in score (K-tiled fma vs the CPU's
 `MLA_MULADD` rounded-product chain in ascending d), in pool (K-tiled vs
-ascending u), in the softmax total (fp64 tree vs fp64 sequential) and in
-`exp` (RADV vs glibc `expf`). The max-subtraction is kept and the max is
-over the same set, so it is bit-identical. Judged by the KL bar against
+ascending u), in the softmax total (float tree vs sequential `double`) and
+in `exp` (RADV vs glibc `expf`). The max-subtraction is kept and the max is
+over the same set, so that part is bit-identical. Judged by the KL bar against
 knob-off, same binary, clamp on in both: **mean KL < 0.0284 AND top-1
 ≥ 99.0 %** over every position (`kl_compare.py`), on the deep ~6.3k packet
 AND the shallow ~2k one (shallow exercises `used = seen`, the dense

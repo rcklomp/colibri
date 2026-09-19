@@ -403,6 +403,16 @@ if [ "${F7_GPU_ARMS_ONLY:-0}" = 1 ]; then
   done
   run_oracle gpu "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
       "GLM53_MLA_ATTN_GPU=1" "GLM53_MLA_ATTN_SB=$B_SB" "COLI_TIMERS=1" || exit 1
+  # F7_O_PERROW=1: a second shallow arm whose o-projection is `tokens` separate
+  # mv() calls -- literally the CPU path's own o -- so R3 vs R2 isolates the
+  # batched o from the attention core with nothing else moving.
+  if [ "${F7_O_PERROW:-0}" = 1 ]; then
+    run_oracle gpuo "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+        "GLM53_MLA_ATTN_GPU=1" "GLM53_MLA_ATTN_SB=$B_SB" "COLI_TIMERS=1" \
+        "GLM53_MLA_ATTN_O_PERROW=1" || exit 1
+  fi
+  echo "--- did the batched o-projection ever fall back to the CPU kernel?"
+  grep -a "fell back to the CPU kernel" "$OUT/shallow_gpu.err" || echo "  no (it stayed on the GPU)"
   if [ "${F7_GPU_ARMS_DEEP:-1}" = 1 ]; then
     run_oracle gpu "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
         "GLM53_MLA_ATTN_GPU=1" "GLM53_MLA_ATTN_SB=$B_SB" "COLI_TIMERS=1" || exit 1

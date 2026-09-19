@@ -1962,9 +1962,42 @@ static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen,
                                     ctx_all, absorbed, latent, slot, used,
                                     tokens, H, L, V, width, seen, mla_attn_gpu_sb(),
                                     1.0f / sqrtf((float)c->qk_nope));
-    /* P2's mv_rows_s: per row bit-identical to the `tokens` separate mv() calls
-     * the CPU path makes, one submit instead of 512. */
-    if (ok) mv_rows_s(out, &l->o, ctx_all, tokens);
+    /* The o-projection. The CPU path does `tokens` separate mv() calls; batching
+     * them is only legitimate if the batched call lands on the SAME kernel.
+     * mv_rows_s hides two ways it might not: P4's tiled pipeline is chosen for
+     * S > 1 (measured bit-identical here, record §F7), and coli_vk_matmul
+     * SILENTLY returns 0 -- falling back to the CPU int4 kernel, which is a
+     * different kernel entirely -- if its 33.5 MB S-row scratch cannot be
+     * reserved. That second one is invisible and is why this call is explicit
+     * and reports. GLM53_MLA_ATTN_O_PERROW=1 is the A/B: `tokens` separate
+     * mv() calls, i.e. literally what the CPU path does. */
+    if (ok) {
+        static int o_perrow = -1, warned = 0;
+        if (o_perrow < 0) {
+            const char *e = getenv("GLM53_MLA_ATTN_O_PERROW");
+            o_perrow = (e && atoi(e)) ? 1 : 0;
+        }
+        if (o_perrow) {
+            for (int t = 0; t < tokens; t++)
+                mv(out + (size_t)t * c->hidden, &l->o, ctx_all + (size_t)t * H * V);
+        } else {
+            Mat *om = (Mat *)&l->o;
+            int gok = 0;
+            if (g_vk_ready && (om->fmt == 1 || om->fmt == 4))
+                gok = coli_vk_matmul((ColiVkTensor **)&om->vk, out, ctx_all,
+                                     om->fmt == 4 ? (const void *)om->q4 : (const void *)om->q8,
+                                     om->s, om->fmt, tokens, om->columns, om->rows, om->gs);
+            if (!gok) {
+                if (!warned) {
+                    fprintf(stderr, "[MLA] F7: the batched o-projection fell back to the CPU "
+                                    "kernel (S=%d) -- that is a DIFFERENT kernel from the "
+                                    "per-row GPU one the CPU path uses\n", tokens);
+                    warned = 1;
+                }
+                mv_rows_s(out, &l->o, ctx_all, tokens);
+            }
+        }
+    }
     free(ctx_all); free(used); free(slot);
     return ok;
 }

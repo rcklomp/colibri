@@ -302,6 +302,74 @@ sys.exit(0 if (cos >= 0.9999 and agree == rows) else 1)
 PY
 }
 
+# ======================================================================
+# Phase 1c (F2_CLAMP_ONLY=1): the swiglu-clamp step. Runs ONLY the engine
+# arms and the cheap checks; the KL passes are minutes of pure Python per
+# comparison and need no engine, so they do NOT hold the rig lock -- run
+# tools/hot-expert/f2_kl_report.sh afterwards, with the gateway back up.
+#
+#   O1' knob OFF on the NEW binary vs the SERVED PRISTINE's existing dumps.
+#       Hard gate, and it must be re-proven here: every reuse below rests on
+#       it. The pristine itself is not re-run (its dumps are in $OUT and the
+#       binary has not changed); a missing dump is a REFUSAL, not a pass.
+#   C1  clamp on, stream off, vs GLM53_EXPERTS_CPU=1 -- the CLAMPED all-CPU
+#       reference. This is the clamp fix's own correctness line: both sides
+#       now clamp, so only placement and summation order are left.
+#   C2  clamp on: stream on at the DEFAULT chunk, vs stream off. F2's KL gate.
+#   C3  clamp on: stream at chunk 512 vs stream at chunk 128. Reported.
+if [ "${F2_CLAMP_ONLY:-0}" = 1 ]; then
+  echo "=== phase 1c: the swiglu clamp $(date -Is)"
+  for d in "$OUT/deep_dump_pristine.f32" "$OUT/shallow_dump_pristine.f32"; do
+    [ -s "$d" ] || { echo "FATAL: $d missing -- O1 cannot be re-proven by reuse"; exit 1; }
+  done
+
+  echo "--- O1': knob OFF on the NEW binary vs the served pristine's dumps"
+  run_oracle off "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET"    deep    || exit 1
+  run_oracle off "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow || exit 1
+  o1d=1; o1s=1
+  cmp -s "$OUT/deep_dump_off.f32"    "$OUT/deep_dump_pristine.f32"    && o1d=0
+  cmp -s "$OUT/shallow_dump_off.f32" "$OUT/shallow_dump_pristine.f32" && o1s=0
+  echo "  O1' logit dump (deep)    $([ $o1d = 0 ] && echo BIT-IDENTICAL || echo DIFFERS)"
+  echo "  O1' logit dump (shallow) $([ $o1s = 0 ] && echo BIT-IDENTICAL || echo DIFFERS)"
+  if [ "$o1d" != 0 ] || [ "$o1s" != 0 ]; then
+    echo "FATAL: the clamp knob is NOT inert when unset -- stopping."
+    exit 1
+  fi
+
+  echo "--- the clamped arms"
+  run_oracle clamp "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+      "GLM53_VK_SWIGLU_CLAMP=1" || exit 1
+  run_oracle cpu1  "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+      "GLM53_EXPERTS_CPU=1" || exit 1
+  run_oracle clamp      "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
+      "GLM53_VK_SWIGLU_CLAMP=1" || exit 1
+  run_oracle clamp_s128 "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
+      "GLM53_VK_SWIGLU_CLAMP=1" "COLI_PREFILL_STREAM=1" "COLI_TIMERS=1" || exit 1
+  run_oracle clamp_s512 "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
+      "GLM53_VK_SWIGLU_CLAMP=1" "COLI_PREFILL_STREAM=1" "GLM53_PREFILL_CHUNK=512" "COLI_TIMERS=1" || exit 1
+
+  echo "--- clamp arms: the clamp line must be present on every clamped arm"
+  for sfx in shallow_clamp shallow_cpu1 deep_clamp deep_clamp_s128 deep_clamp_s512; do
+    printf '  %-18s %s\n' "$sfx" "$(grep -a 'swiglu clamp' "$OUT/${sfx}.err" | tail -1)"
+  done
+
+  echo "--- teacher_forcing, the cheap half of each line"
+  gate_compare "C1 tf (clamp vs EXPERTS_CPU=1)"  "$OUT/shallow_clamp.out" "$OUT/shallow_cpu1.out" '^teacher_forcing'
+  gate_compare "C2 tf (clamp+stream@128 vs clamp)" "$OUT/deep_clamp_s128.out" "$OUT/deep_clamp.out" '^teacher_forcing'
+  gate_compare "C3 tf (clamp+stream@512 vs @128)"  "$OUT/deep_clamp_s512.out" "$OUT/deep_clamp_s128.out" '^teacher_forcing'
+
+  echo "--- prefill wall seconds, the clamped arms"
+  for sfx in deep_off deep_clamp deep_clamp_s128 deep_clamp_s512; do
+    printf '  %-18s %s\n' "$sfx" "$(grep -a -o 'prefill [0-9]* token in [0-9.]*s' "$OUT/${sfx}.err" | tail -1)"
+  done
+  grep -aE '\[STREAM\]' "$OUT/deep_clamp_s128.err" | tail -1 || true
+  grep -aE '\[STREAM\]' "$OUT/deep_clamp_s512.err" | tail -1 || true
+
+  echo "=== phase 1c body done. The KL lines need no engine and no lock:"
+  echo "===   $HERE/f2_kl_report.sh"
+  exit 0
+fi
+
 oracle_rc=0
 if [ "${F2_LADDER_ONLY:-0}" = 1 ]; then
   echo "=== phase 1 (oracle) SKIPPED: F2_LADDER_ONLY=1"

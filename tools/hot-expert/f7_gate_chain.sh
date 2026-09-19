@@ -199,7 +199,8 @@ precheck "after-stop"
 # ======================================================================
 # Phase 0: the microbenchmark.
 # ======================================================================
-if [ "${F7_LADDER_ONLY:-0}" != 1 ] && [ "${F7_REF64_ONLY:-0}" != 1 ]; then
+if [ "${F7_LADDER_ONLY:-0}" != 1 ] && [ "${F7_REF64_ONLY:-0}" != 1 ] \
+   && [ "${F7_DEFECT_ONLY:-0}" != 1 ] && [ "${F7_GPU_ARMS_ONLY:-0}" != 1 ]; then
   echo "=== phase 0: microbenchmark $(date -Is)"
   echo "--- VRAM preflight (>= 1 GiB free on card0 -- the gateway is down)"
   used=$(VRAM 0); total=$(VRAM_TOTAL 0)
@@ -338,6 +339,73 @@ if [ "${F7_REF64_ONLY:-0}" = 1 ]; then
   fi
   echo "=== F7_REF64_ONLY done -- dumps on disk, no KL run inside the lock."
   echo "    With the gateway back up: $HERE/f7_kl_report.sh $OUT (reads R1/R2)"
+  exit 0
+fi
+
+# ======================================================================
+# F7_DEFECT_ONLY=1: the defect hunt (2026-09-19, after Fable's float64
+# arbitration). One engine run on a SHORT packet with the CPU path and
+# GLM53_MLA_ATTN_DUMP writes the real layer-chunk containing row 1420; the
+# probe then replays that chunk through coli_vk_mla_attn and against a
+# float64 reference, per row and per head. Everything after the engine run
+# is seconds, and the whole thing is one gateway window.
+# ======================================================================
+if [ "${F7_DEFECT_ONLY:-0}" = 1 ]; then
+  echo "=== defect hunt $(date -Is)"
+  DPKT="$OUT/${TAG}_defect_packet.txt"
+  python3 - "$F7_ROOT/tools/hot-expert/ROME-3x7900XTX-2026-09-04.md" "$DPKT" \
+           "${F7_DEFECT_CHARS:-5200}" <<'PY'
+import sys
+src, out, n = sys.argv[1:4]
+text = open(src, encoding="utf-8").read()
+open(out, "w").write(text[:int(n)] + "\n\nSummarise the notes above in one sentence.")
+PY
+  DUMP="$OUT/${TAG}_chunk.bin"
+  run_oracle dumprun "$CAND_BIN" "$CAND_SHADERS" "$DPKT" defect \
+      "GLM53_MLA_ATTN_DUMP=$DUMP" "GLM53_MLA_ATTN_DUMP_ROW=${F7_DEFECT_ROW:-1420}" || exit 1
+  grep -a 'F7 chunk dump' "$OUT/defect_dumprun.err" || { echo "FATAL: no chunk was dumped"; exit 1; }
+  [ -s "$DUMP" ] || { echo "FATAL: $DUMP empty"; exit 1; }
+  echo "--- dump: $(stat -c %s "$DUMP") bytes"
+
+  echo "--- build f7_attn_probe"
+  gcc -O2 -fopenmp -DCOLI_VULKAN "$HERE/f7_attn_probe.c" "$F7_ROOT/c/backend_vulkan.c" \
+      -o "$PROBE" -lvulkan -lm > "$OUT/${TAG}_probe_build.log" 2>&1 \
+      || { echo "FATAL: probe build failed"; cat "$OUT/${TAG}_probe_build.log"; exit 1; }
+
+  RP="$OUT/${TAG}_replay.txt"
+  env OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close \
+      COLI_VK_SHADERS="$CAND_SHADERS" F7_REPLAY="$DUMP" \
+      F7_REPLAY_ROWS="${F7_REPLAY_ROWS:-24}" F7_REPLAY_FOCUS="${F7_DEFECT_ROW:-1420}" \
+      "$PROBE" "$CAND_SHADERS" > "$RP" 2>&1
+  rc=$?
+  echo "replay rc=$rc -> $RP"
+  grep -E '^(RROW|ROW|INFO|WARN) ' "$RP"
+  [ "$rc" -eq 0 ] || { echo "FATAL: replay exited non-zero"; tail -20 "$RP"; exit 1; }
+  echo "=== defect hunt done $(date -Is)"
+  exit 0
+fi
+
+# ======================================================================
+# F7_GPU_ARMS_ONLY=1: re-run ONLY the knob-on arms after a shader fix. The
+# off/pristine/ref64 dumps stand as long as the packets are unchanged, so
+# this is 130 s + 480 s of engine instead of a full phase 1.
+# ======================================================================
+if [ "${F7_GPU_ARMS_ONLY:-0}" = 1 ]; then
+  echo "=== gpu arms only $(date -Is)"
+  for d in shallow_dump_off shallow_dump_ref64 deep_dump_off deep_dump_ref64; do
+    [ -s "$OUT/$d.f32" ] || echo "WARN: $OUT/$d.f32 missing -- f7_kl_report.sh will refuse that line"
+  done
+  run_oracle gpu "$CAND_BIN" "$CAND_SHADERS" "$SHALLOW_PACKET" shallow \
+      "GLM53_MLA_ATTN_GPU=1" "GLM53_MLA_ATTN_SB=$B_SB" "COLI_TIMERS=1" || exit 1
+  if [ "${F7_GPU_ARMS_DEEP:-1}" = 1 ]; then
+    run_oracle gpu "$CAND_BIN" "$CAND_SHADERS" "$DEEP_PACKET" deep \
+        "GLM53_MLA_ATTN_GPU=1" "GLM53_MLA_ATTN_SB=$B_SB" "COLI_TIMERS=1" || exit 1
+  fi
+  for sfx in shallow_gpu deep_gpu; do
+    printf '  %-14s %s\n' "$sfx" "$(grep -a 'mla attn gpu (F7)' "$OUT/${sfx}.err" 2>/dev/null | tail -1)"
+    printf '  %-14s %s\n' "$sfx" "$(grep -a -o 'prefill [0-9]* token in [0-9.]*s' "$OUT/${sfx}.err" 2>/dev/null | tail -1)"
+  done
+  echo "=== gpu arms done. The KL bar is OUT of the lock: $HERE/f7_kl_report.sh $OUT"
   exit 0
 fi
 

@@ -107,6 +107,177 @@ static void ref_row(float *ctx, const float *absorbed_row, const float *lat,
     }
 }
 
+/* ---- F7_REPLAY: one REAL layer-chunk from the engine, against float64 -------
+ *
+ * The sweep above runs on random data whose softmax is nearly uniform (dots of
+ * ~1e-3), and Fable's float64 arbitration showed that hides the defect: the CPU
+ * fp32 path is within 1.7e-05 mean KL / 100 % top-1 of float64 on the shallow
+ * packet while the GPU path is ~160x further away. So this mode replays a chunk
+ * the ENGINE actually computed -- real absorbed queries, real latents, the real
+ * per-row `selected` lists and the real kvb_v -- written by
+ * GLM53_MLA_ATTN_DUMP, and compares `context` three ways:
+ *
+ *   engine CPU fp32 (in the file) vs float64   <- the yardstick
+ *   coli_vk_mla_attn (this run)     vs float64   <- the thing under test
+ *
+ * per ROW and per HEAD, not aggregated, so the answer is "from row X, head Y"
+ * and not "something is off". The float64 reference here is the same nest as
+ * glm53.c's GLM53_MLA_ATTN_REF64 arm, including the kvb_v value rows. */
+struct Replay {
+    int tokens, nh, nl, nv, width, seen, base, vfmt, vgs, vrows, vpacked, vng;
+    float scale;
+    float *absorbed, *latent, *cpuctx, *vsc;
+    int *selected;
+    uint8_t *vw;
+};
+
+static int replay_load(const char *path, struct Replay *r) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "replay: cannot open %s\n", path); return 0; }
+    int hdr[13];
+    if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != 0x50443746 || hdr[1] != 1) {
+        fprintf(stderr, "replay: bad header in %s\n", path); fclose(f); return 0; }
+    r->tokens = hdr[2]; r->nh = hdr[3]; r->nl = hdr[4]; r->nv = hdr[5];
+    r->width = hdr[6]; r->seen = hdr[7]; r->base = hdr[8];
+    r->vfmt = hdr[9]; r->vgs = hdr[10]; r->vrows = hdr[11]; r->vpacked = hdr[12];
+    if (fread(&r->vng, 4, 1, f) != 1 || fread(&r->scale, 4, 1, f) != 1) { fclose(f); return 0; }
+    size_t na = (size_t)r->tokens * r->nh * r->nl, nl = (size_t)r->seen * r->nl;
+    size_t ns = (size_t)r->tokens * r->width, nc = (size_t)r->tokens * r->nh * r->nv;
+    size_t nw = (size_t)r->vrows * r->vpacked, nsc = (size_t)r->vrows * r->vng;
+    r->absorbed = malloc(na * 4); r->latent = malloc(nl * 4);
+    r->selected = malloc(ns * 4); r->cpuctx = malloc(nc * 4);
+    r->vw = malloc(nw);           r->vsc = malloc(nsc * 4);
+    if (!r->absorbed || !r->latent || !r->selected || !r->cpuctx || !r->vw || !r->vsc) {
+        fprintf(stderr, "replay: OOM\n"); fclose(f); return 0; }
+    int ok = fread(r->absorbed, 4, na, f) == na && fread(r->latent, 4, nl, f) == nl
+          && fread(r->selected, 4, ns, f) == ns && fread(r->cpuctx, 4, nc, f) == nc
+          && fread(r->vw, 1, nw, f) == nw && fread(r->vsc, 4, nsc, f) == nsc;
+    fclose(f);
+    if (!ok) { fprintf(stderr, "replay: short read\n"); return 0; }
+    return 1;
+}
+
+/* float64 context for one row, all heads: the GLM53_MLA_ATTN_REF64 nest. */
+static void replay_ref64(const struct Replay *r, int t, const int *slot, int used, double *ctx64) {
+    const int nh = r->nh, nl = r->nl, nv = r->nv, gs = r->vgs, ng = r->vng, packed = r->vpacked;
+    const double scale = r->scale;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int h = 0; h < nh; h++) {
+        double *score = malloc((size_t)(used > 0 ? used : 1) * sizeof(double));
+        double *pooled = malloc((size_t)nl * sizeof(double));
+        const float *q = r->absorbed + ((size_t)t * nh + h) * nl;
+        double *res = ctx64 + (size_t)h * nv;
+        for (int v = 0; v < nv; v++) res[v] = 0.0;
+        if (used > 0 && score && pooled) {
+            double top = -HUGE_VAL;
+            for (int u = 0; u < used; u++) {
+                const float *cj = r->latent + (size_t)slot[u] * nl;
+                double dot = 0.0;
+                for (int d = 0; d < nl; d++) dot += (double)q[d] * (double)cj[d];
+                score[u] = dot * scale;
+                if (score[u] > top) top = score[u];
+            }
+            double total = 0.0;
+            for (int u = 0; u < used; u++) { score[u] = exp(score[u] - top); total += score[u]; }
+            for (int d = 0; d < nl; d++) pooled[d] = 0.0;
+            for (int u = 0; u < used; u++) {
+                const double w = score[u] / total;
+                const float *cj = r->latent + (size_t)slot[u] * nl;
+                for (int d = 0; d < nl; d++) pooled[d] += w * (double)cj[d];
+            }
+            for (int v = 0; v < nv; v++) {
+                const int row = h * nv + v;
+                const uint8_t *w = r->vw + (size_t)row * packed;
+                const float *sc = r->vsc + (size_t)row * ng;
+                double a = 0.0;
+                for (int g = 0; g < ng; g++) {
+                    double part = 0.0;
+                    for (int i = g * gs; i < (g + 1) * gs && i < nl; i++) {
+                        const uint8_t by = w[i >> 1];
+                        const int nib = (i & 1) ? (int)(by >> 4) : (int)(by & 0xF);
+                        part += pooled[i] * (double)(nib - 8);
+                    }
+                    a += part * (double)sc[g];
+                }
+                res[v] = a;
+            }
+        }
+        free(pooled); free(score);
+    }
+}
+
+static int replay_main(const char *path, const char *shaders) {
+    (void)shaders;
+    struct Replay r;
+    if (!replay_load(path, &r)) return 2;
+    printf("INFO replay %s: tokens=%d base=%d seen=%d width=%d H=%d L=%d V=%d fmt=%d gs=%d\n",
+           path, r.tokens, r.base, r.seen, r.width, r.nh, r.nl, r.nv, r.vfmt, r.vgs);
+
+    /* compact `selected` exactly as glm53.c's mla_attn_gpu_try does */
+    int *slot = malloc((size_t)r.tokens * r.width * sizeof(int));
+    int *used = malloc((size_t)r.tokens * sizeof(int));
+    for (int t = 0; t < r.tokens; t++) {
+        const int *ch = r.selected + (size_t)t * r.width;
+        int *d = slot + (size_t)t * r.width, n = 0;
+        for (int i = 0; i < r.width; i++) {
+            const int at = ch[i];
+            if (at < 0 || at >= r.seen) continue;
+            d[n++] = at;
+        }
+        used[t] = n;
+    }
+    printf("INFO used[]: first=%d last=%d  (dense regime iff used[t] == base+t+1)\n",
+           used[0], used[r.tokens - 1]);
+    int dense_ok = 1;
+    for (int t = 0; t < r.tokens; t++)
+        if (used[t] != r.base + t + 1 && r.base + t + 1 <= r.width) { dense_ok = 0; break; }
+    printf("INFO per-row causal used[] matches base+t+1 below width: %s\n", dense_ok ? "yes" : "NO");
+
+    float *gpuctx = malloc((size_t)r.tokens * r.nh * r.nv * sizeof(float));
+    ColiVkTensor *vt = NULL;
+    const int sb = getenv("GLM53_MLA_ATTN_SB") ? atoi(getenv("GLM53_MLA_ATTN_SB")) : 128;
+    const double t0 = now_ms();
+    if (!coli_vk_mla_attn(&vt, r.vw, r.vsc, r.vfmt, r.vgs, gpuctx, r.absorbed, r.latent,
+                          slot, used, r.tokens, r.nh, r.nl, r.nv, r.width, r.seen, sb, r.scale)) {
+        printf("WARN coli_vk_mla_attn returned 0 on the replay\n"); return 2;
+    }
+    printf("INFO replay gpu call %.1f ms (sb=%d)\n", now_ms() - t0, sb);
+
+    const int nrows = getenv("F7_REPLAY_ROWS") ? atoi(getenv("F7_REPLAY_ROWS")) : 24;
+    const int focus = getenv("F7_REPLAY_FOCUS") ? atoi(getenv("F7_REPLAY_FOCUS")) : 1420;
+    double *ctx64 = malloc((size_t)r.nh * r.nv * sizeof(double));
+    double wc_cpu = 0, wc_gpu = 0;
+    int wr_cpu = -1, wr_gpu = -1;
+    printf("INFO per-row context error vs float64 (rel = maxabs / max|ref64| of that row)\n");
+    for (int k = 0; k <= nrows; k++) {
+        int t = (k == nrows) ? focus - r.base : (int)((long)k * r.tokens / nrows);
+        if (t < 0 || t >= r.tokens) continue;
+        replay_ref64(&r, t, slot + (size_t)t * r.width, used[t], ctx64);
+        double mref = 0, mc = 0, mg = 0; int hc = -1, hg = -1;
+        for (int i = 0; i < r.nh * r.nv; i++) {
+            const double ref = ctx64[i];
+            if (fabs(ref) > mref) mref = fabs(ref);
+            const double ec = fabs(ref - (double)r.cpuctx[(size_t)t * r.nh * r.nv + i]);
+            const double eg = fabs(ref - (double)gpuctx[(size_t)t * r.nh * r.nv + i]);
+            if (ec > mc) { mc = ec; hc = i / r.nv; }
+            if (eg > mg) { mg = eg; hg = i / r.nv; }
+        }
+        const double rc = mc / (mref > 0 ? mref : 1), rg = mg / (mref > 0 ? mref : 1);
+        if (rc > wc_cpu) { wc_cpu = rc; wr_cpu = r.base + t; }
+        if (rg > wc_gpu) { wc_gpu = rg; wr_gpu = r.base + t; }
+        printf("RROW t=%-6d used=%-5d ref_max=%.4e | cpu_abs=%.3e cpu_rel=%.3e h=%-3d "
+               "| gpu_abs=%.3e gpu_rel=%.3e h=%-3d | gpu/cpu=%.1f%s\n",
+               r.base + t, used[t], mref, mc, rc, hc, mg, rg, hg,
+               rc > 0 ? rg / rc : 0.0, (r.base + t == focus) ? "   <- focus" : "");
+    }
+    printf("ROW replay worst_rel cpu=%.3e (t=%d) gpu=%.3e (t=%d) ratio=%.1f\n",
+           wc_cpu, wr_cpu, wc_gpu, wr_gpu, wc_cpu > 0 ? wc_gpu / wc_cpu : 0.0);
+    printf("INFO done\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <shaders_dir> [reps]\n", argv[0]); return 2; }
     char spv[512]; snprintf(spv, sizeof(spv), "%s/qmatmul.spv", argv[1]);
@@ -122,6 +293,8 @@ int main(int argc, char **argv) {
         printf("INFO dev0 heap used=%.2f GB budget=%.2f GB free=%.2f GB\n",
                used_gb, budget_gb, budget_gb - used_gb);
     printf("INFO shapes H=%d L=%d V=%d width=%d scale=1/sqrt(%d) gs=%d\n", H, L, V, WIDTH, QKN, GS);
+
+    if (getenv("F7_REPLAY")) return replay_main(getenv("F7_REPLAY"), argv[1]);
 
     /* kvb_v: raw int4-g64 nibbles, one f32 scale per (row, 64-group) */
     const int packed = L / 2, ng = L / GS, vrows = H * V;

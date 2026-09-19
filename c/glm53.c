@@ -1918,6 +1918,17 @@ static void mla_attn_ref64_core(const Cfg *c, const GLayer *l, int tokens, int s
     free(pooledf_pool); free(score_pool); free(pooled_pool); free(context);
 }
 
+/* F7 defect hunt (2026-09-19, after Fable's float64 arbitration): dump ONE real
+ * layer-chunk's inputs and the CPU fp32 `context` it produced, so the GPU core
+ * can be replayed against a float64 reference OUTSIDE the engine.
+ *
+ * GLM53_MLA_ATTN_DUMP=<path> with the GPU knob OFF writes the first call whose
+ * row window contains GLM53_MLA_ATTN_DUMP_ROW (default 1420, the first position
+ * at which the GPU and CPU logits disagree on both oracle packets) and then
+ * never writes again. Diagnostic only: nothing reads this in a served or gated
+ * run, and the pointer is NULL unless the env is set. */
+static float *g_mla_dumpctx = NULL;
+
 #ifdef COLI_VULKAN
 static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen, int width,
                             const int *selected, const float *absorbed, const float *latent,
@@ -2116,6 +2127,18 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         return;
     }
 #endif
+    /* F7 defect hunt: arm the one-shot chunk dump (CPU path only, see above). */
+    static int dump_done = 0;
+    const char *dump_path = dump_done ? NULL : getenv("GLM53_MLA_ATTN_DUMP");
+    if (dump_path) {
+        const char *rs = getenv("GLM53_MLA_ATTN_DUMP_ROW");
+        const int want = rs ? atoi(rs) : 1420;
+        if (!(tokens > 1 && base <= want && want < base + tokens)) dump_path = NULL;
+    }
+    if (dump_path) {
+        g_mla_dumpctx = malloc((size_t)tokens * H * V * sizeof(float));
+        if (!g_mla_dumpctx) dump_path = NULL;
+    }
     float *context = malloc((size_t)H * V * sizeof(float));
     /* score/pooled are the one thing 64 independent heads would share if run
      * concurrently -- each gets its own slice of a pool sized per thread,
@@ -2254,6 +2277,8 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 mv_rows(result, &l->kvb_v, pooled, h * V, V);
             }
             mv(out + (size_t)t * c->hidden, &l->o, context);
+            if (g_mla_dumpctx)
+                memcpy(g_mla_dumpctx + (size_t)t * H * V, context, (size_t)H * V * sizeof(float));
             continue;
         }
         /* Heads are independent: each reads its own absorbed[] query and
@@ -2307,6 +2332,31 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(out + (size_t)t * c->hidden, &l->o, context);
     }
     if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+    if (dump_path && g_mla_dumpctx) {
+        FILE *f = fopen(dump_path, "wb");
+        if (f) {
+            const Mat *vm = &l->kvb_v;
+            const int vpacked = (vm->columns + 1) / 2;
+            const int vng = vm->gs ? vm->columns / vm->gs : 1;
+            const int hdr[13] = { 0x50443746 /* "F7DP" */, 1, tokens, H, L, V, width, seen, base,
+                                  vm->fmt, vm->gs, vm->rows, vpacked };
+            const float sc_f = 1.0f / sqrtf((float)QK);
+            fwrite(hdr, sizeof hdr, 1, f);
+            fwrite(&vng, sizeof vng, 1, f);
+            fwrite(&sc_f, sizeof sc_f, 1, f);
+            fwrite(absorbed, sizeof(float), (size_t)tokens * H * L, f);
+            fwrite(latent,   sizeof(float), (size_t)seen * L, f);
+            fwrite(selected, sizeof(int),   (size_t)tokens * width, f);
+            fwrite(g_mla_dumpctx, sizeof(float), (size_t)tokens * H * V, f);
+            fwrite(vm->q4, 1, (size_t)vm->rows * vpacked, f);
+            fwrite(vm->s, sizeof(float), (size_t)vm->rows * vng, f);
+            fclose(f);
+            fprintf(stderr, "[MLA] F7 chunk dump -> %s (tokens=%d base=%d seen=%d width=%d)\n",
+                    dump_path, tokens, base, seen, width);
+            dump_done = 1;
+        }
+        free(g_mla_dumpctx); g_mla_dumpctx = NULL;
+    }
     free(slot_at); free(sc); free(qT);
     free(pool_all_raw); free(acc_raw);
     free(score_raw); free(pooled_raw);

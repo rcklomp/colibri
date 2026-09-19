@@ -361,9 +361,16 @@ text = open(src, encoding="utf-8").read()
 open(out, "w").write(text[:int(n)] + "\n\nSummarise the notes above in one sentence.")
 PY
   DUMP="$OUT/${TAG}_chunk.bin"
+  # F7_DEFECT_GPU=1: arm the dump on the KNOB-ON run, so the file holds the
+  # context the GPU path actually produced IN SITU. Diffing that against the
+  # CPU run's file for the same chunk separates "the core computed something
+  # different in the engine" from "the core is fine and the divergence is
+  # elsewhere" -- which a replay of the CPU run's inputs cannot do.
+  DGPU=""
+  [ "${F7_DEFECT_GPU:-0}" = 1 ] && DGPU="GLM53_MLA_ATTN_GPU=1"
   run_oracle dumprun "$CAND_BIN" "$CAND_SHADERS" "$DPKT" defect \
       "GLM53_MLA_ATTN_DUMP=$DUMP" "GLM53_MLA_ATTN_DUMP_ROW=${F7_DEFECT_ROW:-1420}" \
-      "GLM53_MLA_ATTN_DUMP_N=${F7_DEFECT_N:-11}" || exit 1
+      "GLM53_MLA_ATTN_DUMP_N=${F7_DEFECT_N:-11}" ${DGPU:+"$DGPU"} || exit 1
   grep -a 'F7 chunk dump' "$OUT/defect_dumprun.err" || { echo "FATAL: no chunk was dumped"; exit 1; }
   set -- "$DUMP".*
   [ -s "$1" ] || { echo "FATAL: no $DUMP.<n> files -- is the ENGINE rebuilt at this commit?"; exit 1; }
@@ -374,6 +381,10 @@ PY
       -o "$PROBE" -lvulkan -lm > "$OUT/${TAG}_probe_build.log" 2>&1 \
       || { echo "FATAL: probe build failed"; cat "$OUT/${TAG}_probe_build.log"; exit 1; }
 
+  if [ "${F7_DEFECT_REPLAY:-1}" != 1 ]; then
+    echo "=== dump only (F7_DEFECT_REPLAY=0); files above. defect hunt done $(date -Is)"
+    exit 0
+  fi
   RP="$OUT/${TAG}_replay.txt"
   : > "$RP"
   for f in "$DUMP".*; do

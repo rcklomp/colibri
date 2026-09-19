@@ -1929,6 +1929,36 @@ static void mla_attn_ref64_core(const Cfg *c, const GLayer *l, int tokens, int s
  * run, and the pointer is NULL unless the env is set. */
 static float *g_mla_dumpctx = NULL;
 
+/* Writes the armed chunk: shapes, the real absorbed queries, the real latent
+ * prefix, the real per-row `selected`, the `context` the path under test
+ * produced, and kvb_v. Called from BOTH paths -- the CPU nest fills
+ * g_mla_dumpctx per row, the GPU path copies its ctx_all in one go -- so the
+ * two files can be diffed row by row for the same chunk. */
+static void mla_dump_write(const char *path, const GLayer *l, int tokens, int H, int L,
+                           int V, int QK, int width, int seen, int base,
+                           const float *absorbed, const float *latent, const int *selected) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    const Mat *vm = &l->kvb_v;
+    const int vpacked = (vm->columns + 1) / 2;
+    const int vng = vm->gs ? vm->columns / vm->gs : 1;
+    const int hdr[13] = { 0x50443746 /* "F7DP" */, 1, tokens, H, L, V, width, seen, base,
+                          vm->fmt, vm->gs, vm->rows, vpacked };
+    const float sc_f = 1.0f / sqrtf((float)QK);
+    fwrite(hdr, sizeof hdr, 1, f);
+    fwrite(&vng, sizeof vng, 1, f);
+    fwrite(&sc_f, sizeof sc_f, 1, f);
+    fwrite(absorbed, sizeof(float), (size_t)tokens * H * L, f);
+    fwrite(latent,   sizeof(float), (size_t)seen * L, f);
+    fwrite(selected, sizeof(int),   (size_t)tokens * width, f);
+    fwrite(g_mla_dumpctx, sizeof(float), (size_t)tokens * H * V, f);
+    fwrite(vm->q4, 1, (size_t)vm->rows * vpacked, f);
+    fwrite(vm->s, sizeof(float), (size_t)vm->rows * vng, f);
+    fclose(f);
+    fprintf(stderr, "[MLA] F7 chunk dump -> %s (tokens=%d base=%d seen=%d width=%d)\n",
+            path, tokens, base, seen, width);
+}
+
 #ifdef COLI_VULKAN
 static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen, int width,
                             const int *selected, const float *absorbed, const float *latent,
@@ -1971,6 +2001,8 @@ static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen,
      * reserved. That second one is invisible and is why this call is explicit
      * and reports. GLM53_MLA_ATTN_O_PERROW=1 is the A/B: `tokens` separate
      * mv() calls, i.e. literally what the CPU path does. */
+    if (ok && g_mla_dumpctx)
+        memcpy(g_mla_dumpctx, ctx_all, (size_t)tokens * H * V * sizeof(float));
     if (ok) {
         static int o_perrow = -1, warned = 0;
         if (o_perrow < 0) {
@@ -2149,18 +2181,6 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         free(iq); free(absorbed); free(queries); free(qa);
         return;
     }
-#ifdef COLI_VULKAN
-    /* F7: the whole chunk's core on the GPU. Prefill only; anything at all that
-     * does not work falls through to the CPU nest below. */
-    if (mla_attn_gpu_on() && tokens > 1 &&
-        mla_attn_gpu_try(c, l, tokens, seen, width, selected, absorbed, latent, out)) {
-        if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
-        free(selected); free(valid); free(head_w);
-        free(iq); free(absorbed); free(queries); free(qa);
-        return;
-    }
-#endif
-    /* F7 defect hunt: arm the one-shot chunk dump (CPU path only, see above). */
     static int dump_n = 0;
     const char *dump_env = getenv("GLM53_MLA_ATTN_DUMP");
     const char *dump_nmax_s = getenv("GLM53_MLA_ATTN_DUMP_N");
@@ -2180,6 +2200,25 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         g_mla_dumpctx = malloc((size_t)tokens * H * V * sizeof(float));
         if (!g_mla_dumpctx) dump_path = NULL;
     }
+#ifdef COLI_VULKAN
+    /* F7: the whole chunk's core on the GPU. Prefill only; anything at all that
+     * does not work falls through to the CPU nest below. The dump is armed
+     * ABOVE this, so the knob-on run writes its own context for the same chunk
+     * and the two files can be diffed row by row. */
+    if (mla_attn_gpu_on() && tokens > 1 &&
+        mla_attn_gpu_try(c, l, tokens, seen, width, selected, absorbed, latent, out)) {
+        if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+        if (dump_path && g_mla_dumpctx) {
+            mla_dump_write(dump_path, l, tokens, H, L, V, QK, width, seen, base,
+                           absorbed, latent, selected);
+            dump_n++;
+        }
+        free(g_mla_dumpctx); g_mla_dumpctx = NULL;
+        free(selected); free(valid); free(head_w);
+        free(iq); free(absorbed); free(queries); free(qa);
+        return;
+    }
+#endif
     float *context = malloc((size_t)H * V * sizeof(float));
     /* score/pooled are the one thing 64 independent heads would share if run
      * concurrently -- each gets its own slice of a pool sized per thread,
@@ -2374,29 +2413,10 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     }
     if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
     if (dump_path && g_mla_dumpctx) {
-        FILE *f = fopen(dump_path, "wb");
-        if (f) {
-            const Mat *vm = &l->kvb_v;
-            const int vpacked = (vm->columns + 1) / 2;
-            const int vng = vm->gs ? vm->columns / vm->gs : 1;
-            const int hdr[13] = { 0x50443746 /* "F7DP" */, 1, tokens, H, L, V, width, seen, base,
-                                  vm->fmt, vm->gs, vm->rows, vpacked };
-            const float sc_f = 1.0f / sqrtf((float)QK);
-            fwrite(hdr, sizeof hdr, 1, f);
-            fwrite(&vng, sizeof vng, 1, f);
-            fwrite(&sc_f, sizeof sc_f, 1, f);
-            fwrite(absorbed, sizeof(float), (size_t)tokens * H * L, f);
-            fwrite(latent,   sizeof(float), (size_t)seen * L, f);
-            fwrite(selected, sizeof(int),   (size_t)tokens * width, f);
-            fwrite(g_mla_dumpctx, sizeof(float), (size_t)tokens * H * V, f);
-            fwrite(vm->q4, 1, (size_t)vm->rows * vpacked, f);
-            fwrite(vm->s, sizeof(float), (size_t)vm->rows * vng, f);
-            fclose(f);
-            fprintf(stderr, "[MLA] F7 chunk dump -> %s (tokens=%d base=%d seen=%d width=%d)\n",
-                    dump_path, tokens, base, seen, width);
-            dump_n++;
-        }
+        mla_dump_write(dump_path, l, tokens, H, L, V, QK, width, seen, base,
+                       absorbed, latent, selected);
         free(g_mla_dumpctx); g_mla_dumpctx = NULL;
+        dump_n++;
     }
     free(slot_at); free(sc); free(qT);
     free(pool_all_raw); free(acc_raw);

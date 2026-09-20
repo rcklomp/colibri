@@ -3733,16 +3733,20 @@ static int ffn_moe_run_deferred_cpu_one_team(const Mat *cpu_gate, const Mat *cpu
                                              const float *x, int hidden, float limit,
                                              float *sg, float *su, float *tmp, float *out,
                                              const unsigned char *skip) {
-    static _Thread_local float *escale = NULL; static _Thread_local int ecap = 0;
-    if (ecap < n_cpu_deferred) {
-        escale = realloc(escale, (size_t)n_cpu_deferred * sizeof(float));
-        if (!escale) { fprintf(stderr, "OOM nel MoE (one-team)\n"); exit(1); }
-        ecap = n_cpu_deferred;
-    }
+    /* NOT _Thread_local: this buffer is filled once, on the calling thread,
+     * before the #pragma omp parallel below spawns its team -- every worker
+     * thread must see the SAME array. A per-thread (_Thread_local) buffer
+     * would leave the spawned threads reading their own, never-populated
+     * copy (a real bug, caught by test_glm53_f8_moe_fuse's SIGSEGV before
+     * this comment existed). A plain heap allocation, freed before every
+     * return, keeps two concurrent requests on two different serving
+     * threads from sharing it, which a `static` buffer would not. */
+    float *escale = malloc((size_t)n_cpu_deferred * sizeof(float));
+    if (!escale) { fprintf(stderr, "OOM nel MoE (one-team)\n"); exit(1); }
     for (int j = 0; j < n_cpu_deferred; j++) {
         escale[j] = 0.0f;
         if (skip && skip[j]) continue;
-        if (!mlp3_cpu_rows_ok(&cpu_gate[j], &cpu_up[j], &cpu_down[j])) return 0;
+        if (!mlp3_cpu_rows_ok(&cpu_gate[j], &cpu_up[j], &cpu_down[j])) { free(escale); return 0; }
         const int eid = cpu_eid[j];
         float scale = 0.0f;
         for (int k = 0; k < topk; k++)
@@ -3799,6 +3803,7 @@ static int ffn_moe_run_deferred_cpu_one_team(const Mat *cpu_gate, const Mat *cpu
         }
     }
     g_t_cpu += prof_now_s() - _tc; g_n_cpu += n_done;
+    free(escale);
     return 1;
 }
 

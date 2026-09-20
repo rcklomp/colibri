@@ -14,6 +14,31 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 30 (2026-09-20, Sonnet) -- F10 step 0 done: reading + a CPU
+> microbenchmark, no engine touched.** Record §F10-STEP0. `kmv_rows` (the
+> eight KDA projections, `proj` in the split) runs on the GPU in the served
+> engine (P4c tiled `coli_vk_matmul`, weight reads amortised over 8 rows and
+> over the chunk), and the record's own chunk-128-vs-512 data already shows
+> it getting cheaper, not doubling, at the larger chunk -- **it is not the
+> item's lever.** The CPU recurrence kernel (`coli_kda_step`,
+> `delta_attention.h`) is real but memory-bound (~0.5 FLOPs/byte,
+> `f10_kda_bench.c` measured 0.30 ms/token at 8 threads on one layer's 4 MiB
+> state, 18.2/38.5/56/14.8 GB/s across the single/multilayer x 1/8-thread
+> cases), and its only known cliff (136 MiB state vs 128 MiB L3) is already
+> removed by the serving knob and not bit-identically fixable otherwise --
+> the microbenchmark reproduced that cliff's bimodality on its own, without
+> touching the engine. **The actual 2.05x S=512-vs-128 doubling (record
+> §F2f, ~37.7 s of KDA's 93.3 s) is entirely in the GPU dispatch path
+> (`coli_vk_kda_step_rows`: S sequential 64-workgroup dispatches serialised
+> by full memory barriers in one command buffer) -- "observed, not
+> diagnosed" per the record, and this item was scoped to not touch Vulkan.**
+> Next real step on this bucket is a GPU-side diagnostic chain
+> (per-dispatch/barrier timestamps, reusing the existing `VK_PROF`/
+> `VK_EXT_calibrated_timestamps` pattern) to learn whether the cost is
+> barrier drain, dispatch launch overhead, or GPU power-state cycling --
+> **Opus-tier** (profiling and its interpretation, on a new instrumentation
+> path), before any fix is designed. Not started.
+>
 > **Rev 29 (2026-09-20 14:20 CEST, 12:20 UTC) -- F9 re-scoped to F9a, F9a IS
 > GATED PASS AND IN SERVICE; the GPU indexer is not needed.** Record §F9a and
 > §F9a-VERDICT. Before spending Opus on a GPU indexer, Fable read the score

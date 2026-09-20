@@ -14,6 +14,27 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 25 (2026-09-20 08:00 CEST, 06:00 UTC) -- the profile after F7, F5
+> deferred, F8 started, F9 opened.** No rig time: the ladder's own B arm
+> (`f709200252_B1`, `[OPTIME req=6 ctx=18439]`, 482.8 s of layer time) is the
+> re-profile. **The 18k turn is now: `ffn_moe` 140.6 s (29 %), the DSA indexer
+> 119.1 s (25 %), KDA 93.7 s (19 %; proj 41.3 + step 33.8), hc+norm 48.5 s
+> (10 %), `mla.proj` 27.7, the attention core 26.5 (5 %; it was 35 %), dense
+> 25.1.** Decisions (Fable): (1) **F5 (MTP) is deferred, not run**: its own
+> precondition was "after F2/F1 change the verify block's cost"; F1 was
+> rejected and the probe shows a k = 2-6 row block is slower streamed than on
+> the CPU, so the verify block costs what it cost when Q9 killed MTP here.
+> Re-open only if F8 makes a CPU miss materially cheaper. (2) **F8 step 0
+> starts now** (Sonnet, a CPU microbenchmark, no gateway downtime): where the
+> 0.56 ms of a batch-1 CPU expert goes -- nine OpenMP fork/joins per window,
+> the int4 unpack, or memory bandwidth -- because those 73 ms per token are the
+> largest decode bucket and decode is what every reply waits for. (3) **F9 is
+> opened: the indexer's score pass in prefill, batched on the GPU the way F7
+> did the attention core** (25 % of the 18k turn, the largest prefill bucket
+> that is still a CPU loop; design first, after F8 step 0 reports, Opus only
+> for the shader). Order: **F8 step 0 -> F8 or F9 by its answer -> the other;
+> F3 when a model is named.**
+>
 > **Rev 24 (2026-09-20 07:30 CEST, 05:30 UTC) -- F7 IS GATED PASS AND IN
 > SERVICE.** Record §F7-VERDICT. Numerics arbitrated by a jitter arm: a random
 > fp32-rounding-sized perturbation of the CPU attention core moves the model as

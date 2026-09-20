@@ -95,8 +95,15 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   the next; bump the rev AND date in the prefill roadmap's title line or
   `doc_currency.sh` reports STALE; a landed F item needs a row in the plan's
   §8.3 table, which `doc_currency.sh` now checks.
-- Rig worktrees `~/src/colibri-f*` are per-item build trees; the served
-  shaders are `~/src/colibri/c/shaders`. The rig has no numpy.
+- **Per-item build trees on the rig are temporary: remove yours when the item
+  lands.** Make it a worktree of `~/src/colibri` (`git worktree add --detach
+  ~/src/colibri-<item> <branch>`), not a fresh clone (a clone is 100 MB, a
+  worktree 23), copy the gated binary to `~/bench/`, and after the merge run
+  `git worktree remove --force ~/src/colibri-<item>` and delete the sync
+  branch. On 2026-09-20 the owner found 37 of them in `~/src` (3 GB, left by
+  every session since 09-09, three by that day's) plus three in `~`; all were
+  merged and were removed. The served shaders are `~/src/colibri/c/shaders`.
+  The rig has no numpy.
 
 
 - EPYC 7F32 (8 cores / 16 threads, Zen 2, AVX2+FMA+F16C, no AVX-512),

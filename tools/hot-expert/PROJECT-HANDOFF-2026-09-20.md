@@ -26,6 +26,7 @@ during it. The facts behind that, so the next agent does not repeat them:
 | **Commissioned F3 step 2a on a projection instead of a measurement.** Plan rev 36 said "~27 tok/s by arithmetic"; the arithmetic assumed a GPU call gets cheaper when the work is smaller. It measured 22.4 tok/s, +2.0 % against a +20 % gate. The number that refutes the projection (0.25 ms per GPU round trip) was already in the session's own step-1 profile | 224k Sonnet tokens, two gateway stops (~20 min), for a negative result | **Step 0 is a measurement, never arithmetic.** A ten-minute microbenchmark of one `coli_vk_matmul` call at the two real shapes would have killed the item for free. `CLAUDE.md` and the older handoff both said this; it was skipped |
 | Ran two `accept_ui.sh` checks on top of each other (launched the second while the first hung on the dead engine) | both results void, ten more minutes | one acceptance run at a time, and look at why the first one hangs before starting another |
 | Plan revs 33 and 34 (previous session, same day) asserted two things nobody had checked: that 8-bit needed "a new int8 tier kernel" (the shaders already had it) and that "the per-op submit model" was what separated Colibri from hipFire (V1's own record said tier submits were 2 % of the token) | would have sent F3 to Opus for a kernel that existed | grep the code and the record before writing a claim into a plan |
+| Left build trees behind on the rig. Every session since 09-09 made a `~/src/colibri-<item>` clone or worktree per item and none removed them: 37 in `~/src` (3 GB) and three in `~`, three of them from that afternoon | the owner found his `~/src` buried in them | a worktree, not a clone; remove it and its sync branch when the item lands (`CLAUDE.md`). All 40 were merged work and were removed 2026-09-20 evening; the one uncommitted diff was saved to `~/bench/colibri-g5.uncommitted.diff` |
 | Long status messages and option lists when the owner had asked for one decision and the work | his time, and his patience | decide, do, report the number |
 
 **Spend that afternoon:** three Sonnet subagents, 777k tokens (step 0 208k,
@@ -307,8 +308,8 @@ No single prefill bucket exceeds 36 %, so no single item is worth more than
   (`f2_out`, `f7_out`, `f9a_out`, `f6a_out`, today's `f3s*_out` ~3 GB);
   deletable, keep the `*_engine.log` and `.jsonl`. Pre-F2 checkpoints
   `<model>/.coli_ckpt.pre-f2.*` (1.3 GB) deletable.
-- Rig worktrees `~/src/colibri-*` are small; `colibri-x2` holds stale shaders
-  and must not be used. Unmerged branches `perf/franken-d3`, `-h2b`, `-h4` are
+- The rig's per-item trees `~/src/colibri-*` were all removed on 2026-09-20
+  (see §0). Unmerged branches `perf/franken-d3`, `-h2b`, `-h4` are
   superseded; leave them.
 - `~/bench/gateway_watchdog.sh` is a **copy** of the repo file; redeploy by
   `cp` + `mv` after editing it.

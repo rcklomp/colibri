@@ -31,7 +31,16 @@
  *     conversion is int4-nibble-only; ported from the CUDA tier's own
  *     wfmt==1 stage() branch, qwen36_tier.c).
  *  E. dev2 named but not available: graceful fallback to the single
- *     mandatory device (dev3), not a hard failure. */
+ *     mandatory device (dev3), not a hard failure.
+ *  F. F3 step 2a (trunk placement, Q36_VK_TRUNK): knob off -> qt_place_of
+ *     returns QT_PLACE_CPU for lmhead/dnproj and the two _init entry points
+ *     are no-ops (no dev0 upload at all, exactly the pre-existing stub
+ *     behaviour); knob on -> qt_place_of returns dev0, qt_lmhead_init and
+ *     qt_dnproj_init upload through the SAME dev0 API glm53 already drives
+ *     its dense matrices through (coli_vk_tensor_ensure/coli_vk_matmul, no
+ *     suffix), with the fused DeltaNet shape (I=hidden, O=conv_dim+value_dim)
+ *     a real call site would build, and a failed GPU matmul falls back to
+ *     CPU (returns 0) and stays off for the rest of the run. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +76,10 @@ static void fake_vk_reset(void) {
     fake_vk_budget2_gb = fake_vk_budget3_gb = 4.0;
     fake_vk_used2_gb = fake_vk_used3_gb = 0.0;
     fake_vk_issue_hook = NULL;
+    fake_vk_uploads0 = 0; fake_vk_last_fmt0 = -1; fake_vk_last_bytes0 = 0;
+    fake_vk_captured0_len = 0; fake_vk_matmul_calls0 = 0; fake_vk_matmul_ok0 = 1;
+    fake_vk_last_S0 = fake_vk_last_I0 = fake_vk_last_O0 = 0;
+    unsetenv("Q36_VK_TRUNK");
 }
 
 /* Fills one synthetic expert's RAM-side bytes the way qwen36.c's slot would:
@@ -280,6 +293,76 @@ int main(void) {
               "E: tier must still come up on dev3 alone when dev2 is unavailable");
         check(G.ndev == 1 && G.phys[0] == 3,
               "E: an unavailable dev2 must fall back to dev3 only, not fail outright");
+        qt_shutdown();
+    }
+
+    /* ---- F: trunk placement (Q36_VK_TRUNK) -- off stays CPU, on uses dev0 ---- */
+    {
+        enum { NL = 3, NE = 4, HIDDEN = 64, CONV_DIM = 40, VALUE_DIM = 24 };
+        enum { OF = CONV_DIM + VALUE_DIM };   /* the fused qkv++z width a real call site builds */
+        int8_t qf[OF * HIDDEN]; float sf[OF];
+        int8_t qlm[HIDDEN * 200]; float slm[200];   /* pretend lm_head: I=HIDDEN, O=200 */
+        memset(qf, 7, sizeof qf); for (int i = 0; i < OF; i++) sf[i] = 1.0f;
+        memset(qlm, 9, sizeof qlm); for (int i = 0; i < 200; i++) slm[i] = 1.0f;
+        float x[HIDDEN]; for (int i = 0; i < HIDDEN; i++) x[i] = (float)i;
+        float y[OF];
+
+        /* F1: knob OFF (default) -- qt_place_of stays CPU, _init stays a no-op */
+        fake_vk_reset();
+        setenv("Q36_VULKAN", "1", 1);
+        setenv("COLI_VK_DEV2", "auto", 1);
+        setenv("COLI_VK_DEV3", "auto", 1);
+        unsetenv("Q36_VK_TRUNK");
+        check(qt_init(NL, NE, D, IH, NE, TOPK, 8, 1) == 1, "F1: tier did not come up");
+        check(qt_place_of("lmhead", 0) == QT_PLACE_CPU, "F1: lmhead must stay CPU with the knob off");
+        check(qt_place_of("dnproj", 1) == QT_PLACE_CPU, "F1: dnproj must stay CPU with the knob off");
+        check(qt_lmhead_init(qlm, slm, HIDDEN, 200) == 0, "F1: lmhead_init must no-op with the knob off");
+        check(qt_dnproj_init(1, qf, sf, HIDDEN, OF, 0) == 0, "F1: dnproj_init must no-op with the knob off");
+        check(fake_vk_uploads0 == 0, "F1: no dev0 upload must happen with the knob off");
+        check(qt_lmhead_matmul(y, x, HIDDEN, 200) == 0, "F1: lmhead_matmul must stay off (never initialised)");
+        check(qt_dnproj_matmul(1, y, x, HIDDEN, OF) == 0, "F1: dnproj_matmul must stay off (never initialised)");
+        check(fake_vk_matmul_calls0 == 0, "F1: no dev0 matmul must happen with the knob off");
+        qt_shutdown();
+
+        /* F2: knob ON -- dev0 upload + matmul, right shapes, fused DeltaNet
+         * width (conv_dim+value_dim) round-trips whole (no split needed: the
+         * real call site's qkvz buffer is laid out contiguously already). */
+        fake_vk_reset();
+        setenv("Q36_VULKAN", "1", 1);
+        setenv("COLI_VK_DEV2", "auto", 1);
+        setenv("COLI_VK_DEV3", "auto", 1);
+        setenv("Q36_VK_TRUNK", "1", 1);
+        check(qt_init(NL, NE, D, IH, NE, TOPK, 8, 1) == 1, "F2: tier did not come up");
+        check(qt_place_of("lmhead", 0) == 0, "F2: lmhead must resolve to dev0 with the knob on");
+        check(qt_place_of("dnproj", 1) == 0, "F2: dnproj must resolve to dev0 with the knob on");
+        check(qt_place_of("experts", 0) == QT_PLACE_CPU,
+              "F2: an unrelated component must not be swept onto dev0 too");
+        check(qt_lmhead_init(qlm, slm, HIDDEN, 200) == 1, "F2: lmhead_init should upload to dev0");
+        check(qt_dnproj_init(0, qf, sf, HIDDEN, OF, 0) == 1, "F2: dnproj_init layer 0 should upload to dev0");
+        check(qt_dnproj_init(2, qf, sf, HIDDEN, OF, 0) == 1, "F2: dnproj_init layer 2 should upload to dev0");
+        check(qt_dnproj_init(NL, qf, sf, HIDDEN, OF, 0) == 0, "F2: dnproj_init must refuse an out-of-range layer");
+        check(fake_vk_uploads0 == 3, "F2: three uploads to dev0 (lm_head + two DeltaNet layers)");
+        check(fake_vk_last_fmt0 == 1, "F2: trunk uploads must be row-wise int8 (fmt=1), same as the CPU dense-i8 path");
+
+        memset(y, 0, sizeof y);
+        check(qt_lmhead_matmul(y, x, HIDDEN, 200) == 1, "F2: lmhead_matmul should run on dev0");
+        check(fake_vk_last_S0 == 1 && fake_vk_last_I0 == HIDDEN && fake_vk_last_O0 == 200,
+              "F2: lmhead_matmul must dispatch S=1, I=hidden, O=vocab");
+        check(qt_dnproj_matmul(0, y, x, HIDDEN, OF) == 1, "F2: dnproj_matmul layer 0 should run on dev0");
+        check(fake_vk_last_I0 == HIDDEN && fake_vk_last_O0 == OF,
+              "F2: dnproj_matmul must dispatch the FUSED width (conv_dim+value_dim) in one call, not two");
+        check(qt_dnproj_matmul(1, y, x, HIDDEN, OF) == 0,
+              "F2: a layer never handed to qt_dnproj_init must stay off (layer 1 was skipped above)");
+        check(fake_vk_matmul_calls0 == 2, "F2: exactly one matmul per initialised bucket so far");
+
+        /* GPU failure mid-run: falls back to CPU (returns 0) and stays off */
+        fake_vk_matmul_ok0 = 0;
+        check(qt_lmhead_matmul(y, x, HIDDEN, 200) == 0, "F2: a failed GPU matmul must report failure");
+        check(G_lmh.on == 0, "F2: a failed GPU matmul must turn the bucket off for the rest of the run");
+        fake_vk_matmul_ok0 = 1;
+        check(qt_lmhead_matmul(y, x, HIDDEN, 200) == 0,
+              "F2: once turned off, lmhead_matmul must not silently retry the GPU");
+        qt_stats();
         qt_shutdown();
     }
 

@@ -398,6 +398,7 @@ and the CPU/GPU execution split.
 | `COLI_VK_EXPERTS3` | unset (budget only) | Cap dev3's resident expert count. |
 | `COLI_VK_EXPERTS2` | unset (budget only) | Cap dev2's resident expert count, independently of `COLI_VK_EXPERTS3` -- one device reaching its cap does not stop the other from filling its own share. |
 | `COLI_VK_TIER_RESERVE_GB` | `1.0` | VRAM to leave free on every active tier device (glm53's G6 rule). |
+| `Q36_VK_TRUNK` | `0` (off) | `qwen36-vk` with `Q36_VULKAN=1` (F3 step 2a): also place `lm_head` and every DeltaNet layer's fused `qkv++z` input projection on dev0 (idle otherwise -- experts live on dev2/dev3 only), through the same dev0 API (`coli_vk_matmul`/`coli_vk_tensor_ensure`) `glm53` already drives its own dense matrices through. Off, `qt_place_of`/`qt_lmhead_*`/`qt_dnproj_*` behave exactly as before this knob existed and the trunk stays on the CPU. Row-wise int8 (`fmt=1`), the same quantized bytes the CPU dense-i8 path uses -- a reassociation of the same products (AVX2 lanes vs the GPU's subgroup reduction), not a different computation. |
 
 ## Qwen3.8 engine (`qwen38`)
 

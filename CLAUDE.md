@@ -317,7 +317,12 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   only `COLI_VK_DEV3` set and `~/models/qwen36_i4_gs64` it is V1,
   bit-identical. The trunk runs on the CPU (71 % of a 47 ms token), dev0 is
   idle; no slots, no prefix checkpoints, `[timers]` prints in CLI mode only.
-  Gate binaries: `~/bench/qwen36-vk.v1`, `qwen36-vk.f3s1` = `1e0a0ad`.
+  `Q36_VK_TRUNK=1` (off by default) puts lm_head and the DeltaNet projections
+  on dev0: numerics at the floor but only +2.0 % decode, because a blocking
+  `coli_vk_matmul` costs ~0.3 ms whatever the matrix (record §F3-STEP2A) --
+  do not commission another piecemeal offload of this trunk.
+  Gate binaries: `~/bench/qwen36-vk.v1`, `qwen36-vk.f3s1` = `1e0a0ad`,
+  `qwen36-vk.f3s2a` = `971da73`.
 - Shared: `c/quant.h` (CPU kernels; `matmul_fp8` is Qwen-only in practice),
   `c/backend_vulkan.c`, `c/shaders/*.comp`. A shared-file change must
   rebuild and re-measure both engines.

@@ -13,6 +13,32 @@ commit body. Anything that is arithmetic and not a measurement says so.
 
 ---
 
+## 0. Read this first: what the last session got wrong, and what it cost the owner
+
+The owner's verdict on the session that wrote this file (Fable, 2026-09-20
+afternoon): too expensive for what it delivered. He hit his plan's usage limit
+during it. The facts behind that, so the next agent does not repeat them:
+
+| mistake | what it cost | what to do instead |
+|---|---|---|
+| **Broke the owner's daily service five times in one afternoon.** Every chain launched that day restarted the gateway, passed `accept_live`, and then its exit trap killed the engine it had just served. The pattern was copied from an older chain without reading its trap | ~1 hour of a gateway that answered 500 to every chat, in five windows, the longest 30 minutes. Found only at the very end, by `accept_ui.sh` | Read a chain's `on_exit` before launching it. **After any chain has fully exited, send one real chat request.** `/v1/models` = 200 and `pgrep -x glm53` both lie (a killed engine is a zombie and still matches) |
+| **The same outage had already happened on 2026-09-16** and was written down in `run_chain.sh` and the watchdog. The session did not check that the guard added then actually worked | the guard was blind both times | When a guard exists for a failure, test the guard against the failure, do not trust its comment |
+| **Commissioned F3 step 2a on a projection instead of a measurement.** Plan rev 36 said "~27 tok/s by arithmetic"; the arithmetic assumed a GPU call gets cheaper when the work is smaller. It measured 22.4 tok/s, +2.0 % against a +20 % gate. The number that refutes the projection (0.25 ms per GPU round trip) was already in the session's own step-1 profile | 224k Sonnet tokens, two gateway stops (~20 min), for a negative result | **Step 0 is a measurement, never arithmetic.** A ten-minute microbenchmark of one `coli_vk_matmul` call at the two real shapes would have killed the item for free. `CLAUDE.md` and the older handoff both said this; it was skipped |
+| Ran two `accept_ui.sh` checks on top of each other (launched the second while the first hung on the dead engine) | both results void, ten more minutes | one acceptance run at a time, and look at why the first one hangs before starting another |
+| Plan revs 33 and 34 (previous session, same day) asserted two things nobody had checked: that 8-bit needed "a new int8 tier kernel" (the shaders already had it) and that "the per-op submit model" was what separated Colibri from hipFire (V1's own record said tier submits were 2 % of the token) | would have sent F3 to Opus for a kernel that existed | grep the code and the record before writing a claim into a plan |
+| Long status messages and option lists when the owner had asked for one decision and the work | his time, and his patience | decide, do, report the number |
+
+**Spend that afternoon:** three Sonnet subagents, 777k tokens (step 0 208k,
+step 1 345k, step 2a 224k), plus the Fable orchestrator for about four hours
+(its own token count is not visible from inside the session; it was the larger
+part of the bill, and it is what ran the plan into its limit). **What it
+bought:** the finding that int4 costs real quality on Qwen3.6 (KL 0.0316, top-1
+92.96 %), the 8-bit model 100 % resident on two cards at int4's speed, a
+measured proof that piecemeal GPU offload of the trunk is worthless on this
+backend, and the fix for an outage pattern that had been live since 09-16.
+**What it did not buy:** any speed the owner can feel. GLM-5.3 is exactly as
+fast tonight as it was at noon.
+
 ## 1. What this project is
 
 A fork (`rcklomp/colibri`, canonical on Gitea, mirrored to GitHub) of

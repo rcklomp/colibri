@@ -57,6 +57,216 @@ static inline int coli_sparse_index_scalar_on(void) {
     return cached;
 }
 
+/* AVX2/FMA availability, checked BEFORE coli_sparse_index_lanes_on below so
+ * its default can depend on it (P5.1's own COLI_MLA_HEADVEC gate, glm53.c,
+ * is the same shape: no AVX2/FMA, no default-on). */
+#if defined(__AVX2__) && defined(__FMA__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define COLI_INDEX_HEADVEC 1
+#endif
+
+/* F9a: head-lane SIMD for the score pass's per-pool dot, ported from P5.1's
+ * MLA attention core (glm53.c's glm_transpose/glm_lane_dots). The per-pool,
+ * per-head dot `for d: dot += query[h][d] * pv[d]` below is exactly the
+ * shape P5.1 fixed: a scalar float reduction with a strictly sequential add
+ * chain (no -ffast-math, so the compiler may not reorder it), latency- not
+ * throughput-bound. The fix is the same: transpose the row's queries once to
+ * qT[d][h], then compute all heads' dots against one pool vector at a time,
+ * heads in the SIMD lanes, each lane still summing over d in ascending order
+ * with the SAME rounding as the scalar loop -- so every dot_h is
+ * bit-identical, and the ReLU / head_w / scale accumulation over h stays the
+ * untouched scalar loop it always was (its order is part of the score, and
+ * this does not vectorize it).
+ *
+ * Checked on the rig (objdump -d of this build's own
+ * coli_sparse_index_score_row, and a matching -O3 -march=native -fopenmp
+ * probe TU): the compiled scalar dot loop is NOT a bare sequential scalar
+ * chain -- GCC auto-vectorizes the eight products of a block with a single
+ * vmulps, but then adds those eight products back into the running scalar
+ * accumulator one at a time, in strict ascending order (vaddss, lane 0, 1,
+ * 2, ... 7), never vfmadd. That is bit-identical to the naive sequential
+ * `dot=0; for d: dot+=query[d]*pv[d]` with separate multiply and add and no
+ * FMA contraction -- multiplication is elementwise and rounds the same
+ * regardless of which instruction performs it, and the add order the
+ * compiler chose is exactly left-to-right. The lane kernel below reproduces
+ * that: a plain multiply-then-add per d, across all head lanes at once, with
+ * FMA contraction blocked by the same empty-asm trick P5.1 uses (needed
+ * because the compiler DOES contract a same-width intrinsic mul+add into
+ * vfmadd, unlike the shuffle-heavy auto-vectorized reduction above it does
+ * not contract).
+ *
+ * GLM53_INDEX_LANES=0 restores the scalar dot (read once, cached); default
+ * is on -- FOR GCC. The bit-identical claim above is about what GCC (the
+ * engine's only production compiler, `c/Makefile`'s CC=gcc) emits for this
+ * exact loop shape; it was checked once, not derived from a portable rule.
+ * A clang build of this same source was found, while writing this item, to
+ * contract the reference's OWN scalar dot into vfmadd in cases GCC does not
+ * (e.g. a short head count's remainder), which would silently break the
+ * match -- so the default requires both real GCC AND AVX2/FMA
+ * (COLI_INDEX_HEADVEC, defined just above), same as P5.1's own
+ * COLI_MLA_HEADVEC gate defaults off without AVX2/FMA (and the scalar tail
+ * this loop falls back to without AVX2 has the identical GCC-only FMA
+ * concern -- see COLI_IDX_MULADD_SCALAR below). The env var still forces it
+ * on for whoever explicitly wants that on another compiler or ISA (their
+ * choice to make, not this default's). GLM53_INDEX_SCALAR=1 (the original
+ * single-threaded O(wanted*pools) scan, F6a) never reaches this code at
+ * all, so it implies lanes off regardless. */
+static int g_coli_index_lanes_cached = -1;
+static inline int coli_sparse_index_lanes_on(void) {
+    if (g_coli_index_lanes_cached < 0) {
+        const char *e = getenv("GLM53_INDEX_LANES");
+#if defined(COLI_INDEX_HEADVEC) && defined(__GNUC__) && !defined(__clang__)
+        g_coli_index_lanes_cached = e ? atoi(e) : 1;
+#else
+        g_coli_index_lanes_cached = e ? atoi(e) : 0;
+#endif
+    }
+    return g_coli_index_lanes_cached;
+}
+
+/* Test hook only: force the cached decision directly, bypassing getenv, so
+ * one test process can flip the lane path on and off between calls (the
+ * env var is read once and cached, same as GLM53_INDEX_SCALAR's own
+ * cache -- a real process picks one mode for its life; a test comparing
+ * both needs to override that). Not used by the engine. */
+static inline void coli_sparse_index_lanes_set(int v) { g_coli_index_lanes_cached = v; }
+
+/* The lane kernel matches the reference dot bit-for-bit only where the
+ * reference's OWN compiled loop has no odd remainder: gcc vectorises the
+ * per-head dot 8-wide (no FMA, verified by objdump -- see the header
+ * comment above and the F9a record), then for `dim % 8` left over
+ * vectorises a further 4-wide block (again no FMA) if at least 4 remain,
+ * and finally falls to `vfmadd231ss`, ONE HEAD ELEMENT AT A TIME, for
+ * whatever is still left -- which happens exactly when `dim % 4 != 0`.
+ * The lane kernel never does that last step (every d it processes is a
+ * plain multiply-then-add, uniformly), so it would quietly stop matching
+ * for such a dim. GLM-5.3's index_head_dim is 128 (dim % 4 == 0, always
+ * clear of this), so this guard is a safety net for a dim this engine does
+ * not use today, not a correctness fix for one it does: it degrades to the
+ * scalar dot instead of drifting off it. */
+static inline int coli_sparse_index_lanes_usable(int dim) {
+    return coli_sparse_index_lanes_on() && dim % 4 == 0;
+}
+
+#ifdef COLI_INDEX_HEADVEC
+#define COLI_IDX_MULADD(acc, x, y) do { __m256 m_ = _mm256_mul_ps((x), (y)); \
+                                        __asm__("" : "+x"(m_)); \
+                                        (acc) = _mm256_add_ps((acc), m_); } while (0)
+#endif
+
+/* Scalar version of the same empty-asm trick, for the head-count tail
+ * below. `#pragma STDC FP_CONTRACT OFF` was tried first and does nothing on
+ * GCC -- GCC has never implemented it and says so (`warning: ignoring
+ * '#pragma STDC FP_CONTRACT'`), and its actual default for plain C is
+ * contraction ON: a standalone TU with exactly this tail's shape (checked
+ * on the rig, gcc -O3 -march=native -fopenmp) compiles `dot += a[d]*b[d]`
+ * into `vfmadd231ss`. The empty-asm barrier on the scalar product, same
+ * idea as COLI_IDX_MULADD, reliably blocks it there (0 vfmadd in that same
+ * probe once applied) and needs only SSE, so it holds without AVX2 too. */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#define COLI_IDX_MULADD_SCALAR(acc, x, y) do { float m_ = (x) * (y); \
+                                               __asm__("" : "+x"(m_)); \
+                                               (acc) = (acc) + m_; } while (0)
+#else
+#define COLI_IDX_MULADD_SCALAR(acc, x, y) do { (acc) = (acc) + (x) * (y); } while (0)
+#endif
+
+/* a[N][K] -> aT[K][N], 8x8 blocked -- verbatim shape of glm53.c's
+ * glm_transpose (P5.1), copied rather than shared because this header must
+ * stay self-contained (other engines and the unit tests include it
+ * directly). N = heads, K = dim; called once per row, not once per pool. */
+static inline void coli_index_transpose(float *aT, const float *a, int N, int K) {
+    const int nb = N & ~7, kb = K & ~7;
+    for (int n = 0; n < nb; n += 8)
+        for (int k = 0; k < kb; k += 8)
+            for (int nn = 0; nn < 8; nn++)
+                for (int kk = 0; kk < 8; kk++)
+                    aT[(size_t)(k + kk) * N + n + nn] = a[(size_t)(n + nn) * K + k + kk];
+    for (int n = 0; n < N; n++)
+        for (int k = (n < nb) ? kb : 0; k < K; k++)
+            aT[(size_t)k * N + n] = a[(size_t)n * K + k];
+}
+
+/* dst[h] = sum_d aT[d][h] * b[d], for all N=heads lanes at once, each lane
+ * accumulating over d in ascending order with the product rounded before it
+ * is added -- no scale multiply here (unlike glm_lane_dots): the score pass
+ * applies `head_w * dot * scale` in that exact left-to-right order after the
+ * ReLU test, and folding scale in here would change which multiply happens
+ * first. The 64- and 32-lane blocks are what break the add-chain latency;
+ * the 8-lane block and the scalar tail cover any head count. */
+static inline void coli_index_lane_dots(float *dst, const float *aT, const float *b,
+                                        int N, int K) {
+    const int H = N, L = K;
+    const float *qT = aT, *c_j = b;
+    int h = 0;
+#ifdef COLI_INDEX_HEADVEC
+    for (; h + 64 <= H; h += 64) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+        __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+        const float *p = qT + h;
+        for (int d = 0; d < L; d++, p += H) {
+            const __m256 b8 = _mm256_broadcast_ss(c_j + d);
+            COLI_IDX_MULADD(a0, b8, _mm256_loadu_ps(p));
+            COLI_IDX_MULADD(a1, b8, _mm256_loadu_ps(p + 8));
+            COLI_IDX_MULADD(a2, b8, _mm256_loadu_ps(p + 16));
+            COLI_IDX_MULADD(a3, b8, _mm256_loadu_ps(p + 24));
+            COLI_IDX_MULADD(a4, b8, _mm256_loadu_ps(p + 32));
+            COLI_IDX_MULADD(a5, b8, _mm256_loadu_ps(p + 40));
+            COLI_IDX_MULADD(a6, b8, _mm256_loadu_ps(p + 48));
+            COLI_IDX_MULADD(a7, b8, _mm256_loadu_ps(p + 56));
+        }
+        _mm256_storeu_ps(dst + h,      a0);
+        _mm256_storeu_ps(dst + h + 8,  a1);
+        _mm256_storeu_ps(dst + h + 16, a2);
+        _mm256_storeu_ps(dst + h + 24, a3);
+        _mm256_storeu_ps(dst + h + 32, a4);
+        _mm256_storeu_ps(dst + h + 40, a5);
+        _mm256_storeu_ps(dst + h + 48, a6);
+        _mm256_storeu_ps(dst + h + 56, a7);
+    }
+    for (; h + 32 <= H; h += 32) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        const float *p = qT + h;
+        for (int d = 0; d < L; d++, p += H) {
+            const __m256 b8 = _mm256_broadcast_ss(c_j + d);
+            COLI_IDX_MULADD(a0, b8, _mm256_loadu_ps(p));
+            COLI_IDX_MULADD(a1, b8, _mm256_loadu_ps(p + 8));
+            COLI_IDX_MULADD(a2, b8, _mm256_loadu_ps(p + 16));
+            COLI_IDX_MULADD(a3, b8, _mm256_loadu_ps(p + 24));
+        }
+        _mm256_storeu_ps(dst + h,      a0);
+        _mm256_storeu_ps(dst + h + 8,  a1);
+        _mm256_storeu_ps(dst + h + 16, a2);
+        _mm256_storeu_ps(dst + h + 24, a3);
+    }
+    for (; h + 8 <= H; h += 8) {
+        __m256 a0 = _mm256_setzero_ps();
+        const float *p = qT + h;
+        for (int d = 0; d < L; d++, p += H) {
+            const __m256 b8 = _mm256_broadcast_ss(c_j + d);
+            COLI_IDX_MULADD(a0, b8, _mm256_loadu_ps(p));
+        }
+        _mm256_storeu_ps(dst + h, a0);
+    }
+#endif
+    /* Portable tail for a head count not a multiple of 8 (and the whole dot,
+     * on a build without AVX2/FMA): plain per-d multiply-then-add, in the
+     * SAME order the reference computes, FMA contraction blocked by
+     * COLI_IDX_MULADD_SCALAR (see its own comment -- the pragma this used to
+     * say does the same thing does nothing at all on GCC). */
+    {
+        for (; h < H; h++) {
+            float dot = 0.0f;
+            for (int d = 0; d < L; d++)
+                COLI_IDX_MULADD_SCALAR(dot, qT[(size_t)d * H + h], c_j[d]);
+            dst[h] = dot;
+        }
+    }
+}
+
 /* A candidate pool for the top-`wanted` selection: its score and its own
  * pool index, so ties can still be broken to the lower index after the
  * score alone stops distinguishing two entries. */
@@ -144,6 +354,25 @@ static inline int coli_index_select_topk(int *row, const float *scores, int pool
 static inline void coli_sparse_index_score_row(float *scores, const float *pool_base,
         const float *queries, const float *head_w, const unsigned char *complete,
         int q, int q_from, int first, int pools, int heads, int dim, int pool, float scale) {
+    /* F9a: this row is fixed for the whole call, so its transpose is done
+     * ONCE here, not per pool -- every one of the (parallel) pool iterations
+     * below reads the same qT read-only. One dots[] scratch per thread
+     * (the parallel axis here is pools, not rows), 64-byte strided so two
+     * threads never share a cache line (P5b.1's false-sharing lesson). */
+    const int lanes = coli_sparse_index_lanes_usable(dim);
+    int nthreads = 1;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+#endif
+    const size_t dstride = (((size_t)heads * sizeof(float) + 63) / 64) * 64 / sizeof(float);
+    float *qT = NULL, *dots_pool = NULL;
+    if (lanes) {
+        qT = malloc((size_t)dim * heads * sizeof(float));
+        dots_pool = malloc((size_t)nthreads * dstride * sizeof(float));
+        if (qT && dots_pool)
+            coli_index_transpose(qT, queries + (size_t)(q - q_from) * heads * dim, heads, dim);
+        else { free(qT); free(dots_pool); qT = NULL; dots_pool = NULL; }
+    }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -152,15 +381,32 @@ static inline void coli_sparse_index_score_row(float *scores, const float *pool_
         if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
         const float *pv = pool_base + (size_t)p * dim;
         float score = 0.0f;
-        for (int h = 0; h < heads; h++) {
-            const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
-            float dot = 0.0f;
-            for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
-            if (dot > 0.0f)                                  /* ReLU */
-                score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+        if (qT) {
+#ifdef _OPENMP
+            const int tid = omp_get_thread_num();
+#else
+            const int tid = 0;
+#endif
+            float *dots = dots_pool + (size_t)tid * dstride;
+            coli_index_lane_dots(dots, qT, pv, heads, dim);
+            for (int h = 0; h < heads; h++) {
+                const float dot = dots[h];
+                if (dot > 0.0f)                              /* ReLU */
+                    score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+            }
+        } else {
+            for (int h = 0; h < heads; h++) {
+                const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
+                float dot = 0.0f;
+                for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
+                if (dot > 0.0f)                              /* ReLU */
+                    score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+            }
         }
         scores[p] = score;
     }
+    free(qT);
+    free(dots_pool);
 }
 
 /* The score pass and the top-`wanted` selection, shared by the plain and
@@ -246,14 +492,27 @@ static inline int coli_sparse_index_score_select(int *out, const float *pool_bas
     if (nthreads > 1 && rows >= nthreads) {
         /* Per-thread scratch, 64-byte aligned and cache-line strided
          * (P5b.1's false-sharing lesson) so two threads' buffers never
-         * share a line. */
+         * share a line. F9a: qt_pool/dots_pool are the same idea for the
+         * head-lane path -- allocated ONCE per call per thread here, not
+         * once per row: each thread re-transposes into its own qT slice at
+         * the start of every row it owns (dim*heads flops, once), then every
+         * one of that row's ~pools pool iterations does an O(heads) lane
+         * dot against it instead of an O(heads*dim) scalar one. */
         const size_t sstride = (((size_t)pools * sizeof(float) + 63) / 64) * 64 / sizeof(float);
         const size_t hstride = (((size_t)wanted * sizeof(coli_index_cand_t) + 63) / 64) * 64
                                 / sizeof(coli_index_cand_t);
+        const size_t qtstride = (((size_t)dim * heads * sizeof(float) + 63) / 64) * 64
+                                / sizeof(float);
+        const size_t dstride = (((size_t)heads * sizeof(float) + 63) / 64) * 64 / sizeof(float);
         float *scores_pool = malloc((size_t)nthreads * sstride * sizeof(float));
         coli_index_cand_t *heap_pool =
             malloc((size_t)nthreads * hstride * sizeof(coli_index_cand_t));
         if (!scores_pool || !heap_pool) { free(scores_pool); free(heap_pool); return -1; }
+        const int lanes = coli_sparse_index_lanes_usable(dim);
+        float *qt_pool = lanes ? malloc((size_t)nthreads * qtstride * sizeof(float)) : NULL;
+        float *dots_pool = lanes ? malloc((size_t)nthreads * dstride * sizeof(float)) : NULL;
+        const int lanes_ok = lanes && qt_pool && dots_pool;
+        if (lanes && !lanes_ok) { free(qt_pool); free(dots_pool); qt_pool = NULL; dots_pool = NULL; }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -265,20 +524,34 @@ static inline int coli_sparse_index_score_select(int *out, const float *pool_bas
 #endif
             float *scores = scores_pool + (size_t)tid * sstride;
             coli_index_cand_t *heap = heap_pool + (size_t)tid * hstride;
+            float *qT = lanes_ok ? qt_pool + (size_t)tid * qtstride : NULL;
+            float *dots = lanes_ok ? dots_pool + (size_t)tid * dstride : NULL;
             int *row = out + (size_t)(q - q_from) * width;
             for (int i = 0; i < width; i++) row[i] = -1;
             if (valid[q]) {
+                if (qT)
+                    coli_index_transpose(qT, queries + (size_t)(q - q_from) * heads * dim,
+                                         heads, dim);
                 for (int p = 0; p < pools; p++) {
                     const int last = first + (p + 1) * pool - 1;
                     if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
                     const float *pv = pool_base + (size_t)p * dim;
                     float score = 0.0f;
-                    for (int h = 0; h < heads; h++) {
-                        const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
-                        float dot = 0.0f;
-                        for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
-                        if (dot > 0.0f)
-                            score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+                    if (qT) {
+                        coli_index_lane_dots(dots, qT, pv, heads, dim);
+                        for (int h = 0; h < heads; h++) {
+                            const float dot = dots[h];
+                            if (dot > 0.0f)
+                                score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+                        }
+                    } else {
+                        for (int h = 0; h < heads; h++) {
+                            const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
+                            float dot = 0.0f;
+                            for (int d = 0; d < dim; d++) dot += query[d] * pv[d];
+                            if (dot > 0.0f)
+                                score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
+                        }
                     }
                     scores[p] = score;
                 }
@@ -294,7 +567,7 @@ static inline int coli_sparse_index_score_select(int *out, const float *pool_bas
                         row[topk + j] = tail_start + j;
             }
         }
-        free(scores_pool); free(heap_pool);
+        free(scores_pool); free(heap_pool); free(qt_pool); free(dots_pool);
         return 0;
     }
 

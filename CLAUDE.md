@@ -230,6 +230,20 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   A gate step must wait for its engine to die before the next one starts
   (`wait_no_engine()` in `p7_gate.sh`), or the chain's `cp` of the pristine
   fails with ETXTBSY and a failed candidate stays in service.
+- **A chain's exit trap must not kill `glm53` after the chain has restarted the
+  gateway, and "is the engine alive" must not be `pgrep -x glm53`.** On
+  2026-09-20 five F3 chains (pattern inherited from `v1_step2a_chain.sh`)
+  restarted the gateway, passed `accept_live`, then their `on_exit` ran
+  `pkill -9 -x glm53` on the engine they had just put in service: the server
+  stayed up, `/v1/models` said 200, every chat was a 500 "engine dispatcher
+  stopped" -- about an hour in total, found only by `accept_ui.sh`. The same
+  thing had happened on 2026-09-16 and the guards added then in
+  `run_chain.sh` and `gateway_watchdog.sh` were blind, because the killed
+  child is a ZOMBIE and `pgrep -x` matches zombies. Both now use
+  `ps -C glm53 -o stat= | grep -qv '^Z'`; the eleven chains kill `glm53` in
+  the trap only when they are about to restart the gateway. **After any chain,
+  send one real chat request (or run `accept_live.sh`) AFTER the chain has
+  fully exited -- the chain's own `accept_live` runs before its trap.**
 - **`pkill -f` over ssh matches the ssh command itself** if the pattern
   appears in it, and kills the session: always use the bracket form
   (`"openai_[s]erver.py"`, `"p7_[c]hain.sh"`). Never `scp` over a bash

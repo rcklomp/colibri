@@ -281,7 +281,9 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `glm53.p7base` = pre-P7, `glm53.p6bbase` = P7, `glm53.p6b`, `glm53.rp4`,
   `glm53.p5` (+ `shaders_p5`), `glm53.devmerge` (+ `shaders_devmerge`) = the
   binary in service from 2026-09-08 01:00, `glm53.f6abase`, `glm53.f2base` =
-  F6a `15462dc2`, `glm53.f2` = `5c01246c`, `glm53.f7` = `e87ae939`, `glm53.f8` = `93f0f681`, in service since 2026-09-20 08:54 UTC); each gate's pristine is the
+  F6a `15462dc2`, `glm53.f2` = `5c01246c`, `glm53.f7` = `e87ae939`, `glm53.f8` = `93f0f681`, `glm53.f9a` = `189fd945` (the indexer's head-lane score pass,
+  bit-identical, on by default, `GLM53_INDEX_LANES=0` restores the scalar dot), in
+  service since 2026-09-20 12:13 UTC); each gate's pristine is the
   binary in service before the item. **Every gate runs with
   `GLM53_PREFIX_CKPT=0` and a private `COLI_CKPT_DIR`**: two gates nearly
   passed for the wrong reason because the candidate restored a checkpoint

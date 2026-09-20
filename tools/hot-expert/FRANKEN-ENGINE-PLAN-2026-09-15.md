@@ -14,6 +14,24 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 29 (2026-09-20 14:20 CEST, 12:20 UTC) -- F9 re-scoped to F9a, F9a IS
+> GATED PASS AND IN SERVICE; the GPU indexer is not needed.** Record §F9a and
+> §F9a-VERDICT. Before spending Opus on a GPU indexer, Fable read the score
+> pass: a scalar float dot GCC cannot vectorise, the same disease P5.1 cured in
+> the attention core. F9a (Sonnet) puts the heads in the SIMD lanes,
+> bit-identical (teacher_forcing, text, the full 5.6 GB logit dump and 33 495
+> index rows all identical to the served binary): **the 18 439-token turn 455.0
+> -> 357.7 s (1.27x), decode at 18k 4.65 -> 5.04 tok/s (+8.3 %), follow-up
+> TTFT -20 %**; `index` in decode 2.26 -> 0.46 ms per call. Served `189fd945`
+> since 12:13 UTC. **F9 (the GPU version) is CLOSED without being built.**
+> Since 2026-09-18 the 18k turn has gone 1 174.8 -> 356.4 s (3.30x) and decode
+> at 18k 4.30 -> 5.04 tok/s. What is left on this model, by size: `ffn_moe` in
+> prefill (streaming-bound), KDA (chunk 512 made it cost ~2x per token -- a
+> Sonnet-sized look at `coli_vk_kda_step_rows` at S = 512 vs 128 is **F10**,
+> not started), the CPU misses in decode (~60 ms per token; a kernel redesign,
+> Opus, not opened). **F3 (a <= 60 GB model, VRAM-resident) remains the only
+> order-of-magnitude lever and waits on the owner naming the model.**
+>
 > **Rev 28 (2026-09-20 11:00 CEST, 09:00 UTC) -- F8 IS GATED PASS AND IN
 > SERVICE.** Record §F8. One OpenMP team per MoE layer (bit-identical in the
 > engine, dump-verified) plus the group-vector int4 row kernel in the batch-1

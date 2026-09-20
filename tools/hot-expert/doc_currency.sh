@@ -16,17 +16,33 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 RM=tools/hot-expert/ROADMAP-2026-09.md
 PF=tools/hot-expert/PREFILL-ROADMAP-2026-09.md
 RC=tools/hot-expert/ROME-3x7900XTX-2026-09-04.md
+PL=tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md   # the F items (added 2026-09-20)
 SINCE="${1:-2026-09-01}"
 fail=0
 
 echo "=== landed items since $SINCE vs the docs ==="
 # item ids out of merge subjects: "merge perf/q10-..." / "P11 gated" / "Q5 --" etc.
-ids=$(git log --merges --since="$SINCE" --format=%s | grep -oiE '\b(P|Q|G|C|RP)[0-9]+[a-z]?\b' | tr 'a-z' 'A-Z' | sort -u)
+ids=$(git log --merges --since="$SINCE" --format=%s | grep -oiE '\b(P|Q|G|C|RP|F)[0-9]+[a-z]?\b' | tr 'a-z' 'A-Z' | grep -vE '^F16C?$' | sort -u)
 for id in $ids; do
-  hits=$(grep -oiE "\b$id\b" "$RM" "$PF" "$RC" 2>/dev/null | wc -l | tr -d ' ')
+  hits=$(grep -oiE "\b$id\b" "$RM" "$PF" "$RC" "$PL" 2>/dev/null | wc -l | tr -d ' ')
   if [ "$hits" -eq 0 ]; then printf "  MISSING  %-5s landed, appears in NO doc\n" "$id"; fail=1
   else printf "  ok       %-5s (%s mentions)\n" "$id" "$hits"; fi
 done
+
+echo
+echo "=== Franken plan: every landed F item has a row in its item table ==="
+# Added 2026-09-20: the plan's rev log was current while its section 8.3 table
+# had stopped at F7 -- F8, F9a and F10 landed with no row, and nothing noticed,
+# because this script did not know F items existed.
+for id in $(echo "$ids" | grep -E '^F[0-9]+[A-Z]?$'); do
+  base=$(echo "$id" | sed -E 's/[A-Z]$//')       # F6A is carried by the F6 row
+  if grep -qiE "^\| \*\*($id|$base)\b" "$PL"; then printf "  ok       %-5s has a row\n" "$id"
+  else printf "  MISSING  %-5s landed, no row in the plan's item table\n" "$id"; fail=1; fi
+done
+rev_top=$(grep -oE '^> \*\*Rev [0-9]+' "$PL" | head -1 | grep -oE '[0-9]+')
+rev_max=$(grep -oE '^> \*\*Rev [0-9]+' "$PL" | grep -oE '[0-9]+' | sort -n | tail -1)
+if [ "${rev_top:-0}" != "${rev_max:-0}" ]; then echo "  STALE: the plan's top rev ($rev_top) is not its highest ($rev_max)"; fail=1
+else echo "  ok: plan top rev is $rev_top (look this up before writing the next one)"; fi
 
 echo
 echo "=== pointer freshness ==="
@@ -41,7 +57,7 @@ echo
 echo "=== 'next' pointers that name a finished item ==="
 for f in "$RM" "$PF"; do
   grep -oiE 'next item is [^.]{0,60}' "$f" 2>/dev/null | while read -r l; do
-    nid=$(echo "$l" | grep -oiE '\b(P|Q|G|C|RP)[0-9]+[a-z]?\b' | head -1 | tr 'a-z' 'A-Z')
+    nid=$(echo "$l" | grep -oiE '\b(P|Q|G|C|RP|F)[0-9]+[a-z]?\b' | head -1 | tr 'a-z' 'A-Z')
     [ -z "$nid" ] && continue
     if git log --merges --since="$SINCE" --format=%s | grep -qiE "\b$nid\b"; then
       echo "  SUSPECT  $(basename "$f"): '$l' -- but $nid appears in a merge subject (landed?)"

@@ -41,3 +41,35 @@ Procedure:
 Report what the gate says, in numbers. If the measured delta is zero or
 negative, say so plainly and leave the code behind the knob defaulting to
 the old behaviour; a rejected item recorded honestly is a valid outcome.
+
+## Franken track addendum (2026-09-20) — read before any F item
+
+The active track is `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md`
+(F items), with `tools/hot-expert/HANDOFF-2026-09-20.md` as its narrative and
+`tools/hot-expert/MEASURING.md` for its gate. Where this addendum and the
+procedure above disagree, the addendum wins for F items.
+
+- **You do not run or wait on rig jobs.** Build, edit, write the chain
+  script, run unit tests and CPU microbenchmarks; then report the branch,
+  the commit and the exact launch command. The orchestrating session launches
+  the chain through `run_chain.sh` and polls it. Never end your turn
+  "waiting for the rig". Never start an engine outside a chain, not even
+  with `--help`.
+- The gate is a chain copied from the newest one (`f9a_gate_chain.sh` for a
+  bit-identical change, `f7_gate_chain.sh` for one that moves numerics), not
+  `datapoint.py`: oracle by `cmp` on `teacher_forcing` and the logit dump,
+  both arms with `GLM53_VK_SWIGLU_CLAMP=1` and the served knobs, then the
+  context ladder A,B,B,A judged by `gate_ab_verdict`.
+- A kernel that reorders a float sum is judged against the jitter arm
+  (`GLM53_MLA_ATTN_JITTER=6e-7`), not a float64 reference. A synthetic probe
+  with near-uniform inputs cannot validate an attention kernel.
+- A scalar float reduction does not vectorise without fast-math. Put the
+  independent units (heads, rows) in the SIMD lanes so each sum keeps its
+  order and the result is bit-identical (`glm_lane_dots`, the lane kernel in
+  `c/sparse_index.h`). GCC ignores the `FP_CONTRACT` pragma; see the barrier
+  used there.
+- Docs: look up the plan's top `Rev N` before writing the next one; a landed
+  item gets a row in the plan's §8.3 table; bump the prefill roadmap's title
+  rev and date; run `tools/hot-expert/doc_currency.sh` before every commit.
+- Do not push. Report what was measured and what was not; say "not gated"
+  when it was not.

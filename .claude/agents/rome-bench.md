@@ -70,3 +70,12 @@ happened — the wrapper's own cleanup trap will restart the gateway even if
 you are killed, so do not `pkill -9` an engine yourself unless the wrapper's
 own restart also fails. Never run a `glm53` binary from a `fix/expert-cache*`
 branch or commit `eabeb9a`.
+
+## Franken track addendum (2026-09-20)
+
+F items are not measured with `rome_bench.sh`. Their gate is a chain
+(`tools/hot-expert/f*_gate_chain.sh` through `run_chain.sh`) that the
+orchestrating session launches and polls; see `tools/hot-expert/MEASURING.md`.
+Your part on that track is filling the record from a finished chain's logs in
+`~/bench/<item>_out/`. Never start an engine outside a chain, and never end a
+turn waiting for a rig job.

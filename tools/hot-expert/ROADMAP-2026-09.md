@@ -48,6 +48,9 @@ them — 16 of 1232 teacher-forced predictions change, cosine 0.878, item dead a
 its own first gate (record §G15).** Its by-product is now the open item on this
 engine: the routed-expert GPU kernel omits GLM-5.3's swiglu clamp, and that is
 worth 8 of 1232 teacher-forced predictions and the long-prompt argmax by itself.
+**(Closed 2026-09-19: `GLM53_VK_SWIGLU_CLAMP=1`, a knob the gateway sets —
+record §F2 step 2, `CLAUDE.md`. It was fixed on the Franken track, when F2's KL
+bar failed on it; it is no longer an open item.)**
 KDA remains solved-but-opt-in via G12.
 
 **Status 2026-09-06 — TRACK G IS FINALISED AND MERGED.** `perf/rome-cpu-path`
@@ -72,7 +75,7 @@ the A/B). **Track G is now fully closed: G0–G15 all resolved** — landed
 (G0–G14 except opt-in items), shipped opt-in (G12), correctly killed (G15),
 or done and on by default (G5) — **plus the swiglu-clamp gap G15's control
 run uncovered, which is the only open item this engine's decode path has
-left.** The track is clear for phase Q.
+left.** **(That gap was closed on 2026-09-19 by the clamp knob, see above.)** The track is clear for phase Q.
 RP3 found nothing to reorder and concluded the track was out of measurable
 items; **that conclusion was wrong and is corrected in 4f**. Two profiles exist
 because `COLI_KDA_GPU=2` ships off: **156.77 ms/token knob-off, 134.90
@@ -1042,6 +1045,12 @@ by guess; where a position is a judgment call rather than a number, it says so.
    separate Track G item (see below). Items #2–#5 were screened out
    (#2/#3 already exist under different names, #4/#5 don't apply or are
    refactor-only).
+   **POINTER, 2026-09-20: this roadmap is still finished, and the work moved.
+   Since 2026-09-16 the only active track is
+   `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` (items F0–F10; read its
+   highest `Rev N`), with the narrative in
+   `tools/hot-expert/HANDOFF-2026-09-20.md`. GLM decode at 18k depth went
+   2.27 → 5.04 tok/s there, which no row of this file records.**
    **NEXT, as of 2026-09-15 (night): NOTHING ON THIS ROADMAP.** Q9 step 0
    ran and the spec's own kill gate fired (`V*(4)/V*(1) = 2.668 ≥ 2.4`,
    `perf/q9-step0-verify-cost`, not merged, row above) — the MTP item is
@@ -1079,7 +1088,7 @@ by guess; where a position is a judgment call rather than a number, it says so.
    not a tail to finish." **The spec is now that deliberate opening.**
    *Superseded pointer, kept so the change is visible:* "NEXT, as of
    2026-09-12 evening: Q12 is PARKED (declined on expected value, not killed
-   — see its row), so the next item is Q9 (MTP): its chunk probe (step 1,
+   — see its row), so the next item [was] Q9 (MTP): its chunk probe (step 1,
    re-gated now that Q8 is dead) is the half-day gate on the track's largest
    remaining multiplier." **That probe has since been run and is DONE
    (2026-09-15); do not re-run it.** Q14's step 0 is DONE and its

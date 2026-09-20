@@ -20,6 +20,14 @@ the first of those. **This section calls the roadmaps "current by construction";
 that is a claim to verify, not to assume.**
 
 
+**Then, ahead of the numbered list:
+`tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` is the ACTIVE track
+since 2026-09-16 (items F0–F10), and until 2026-09-20 this list did not
+name it at all.** Read its highest `Rev N` for what is open, its §8.3 table
+   for the state of every item, and `tools/hot-expert/HANDOFF-2026-09-20.md`
+   for how the track got where it is: what was refuted, why each decision was
+   taken, the working method, what waits on the owner. The two roadmaps below
+   are both finished; they are history and rules, not a to-do list.
 0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` — the prefill /
    interactive-use track, opened 2026-09-06 when Open WebUI exposed that
    nothing had ever measured time-to-first-token. **Read the top of the
@@ -60,6 +68,32 @@ the owner's notes, not in this repo). The rig's working tree is
 editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 
 ## The machine and its traps
+
+**How a session drives the rig (learned F2–F10, 2026-09-19/20).**
+- Launch every rig job detached and logged:
+  `ssh -n -f rome 'setsid nohup <cmd> > ~/bench/<log> 2>&1 < /dev/null &'`,
+  then poll the log. A foreground ssh job dies with the connection, and the
+  connection does drop overnight.
+- **Subagents build, edit and write chains; they do not run or wait on rig
+  jobs.** A Sonnet agent told to run a 75-minute chain ends its turn "waiting"
+  and the result is lost. The orchestrating session launches the chain and
+  polls it. Say so in every brief, and forbid starting an engine outside a
+  chain — even `--help` initialises the GPUs.
+- Tier by cost (the owner is on a fixed plan and hits its limits): Haiku and
+  Sonnet for everything mechanical, Opus only for a real kernel or shader,
+  the orchestrator reads the hot loop itself before commissioning one — F9a
+  replaced an Opus GPU indexer with a Sonnet CPU change that way.
+- When a measurement contradicts an agent's explanation, build the arm that
+  can refute it before accepting either side (F7: a float64 arm refuted "the
+  CPU is the inaccurate one", a jitter arm then refuted "the kernel is
+  defective").
+- Doc bookkeeping that bites: look up the plan's top `Rev N` before writing
+  the next; bump the rev AND date in the prefill roadmap's title line or
+  `doc_currency.sh` reports STALE; a landed F item needs a row in the plan's
+  §8.3 table, which `doc_currency.sh` now checks.
+- Rig worktrees `~/src/colibri-f*` are per-item build trees; the served
+  shaders are `~/src/colibri/c/shaders`. The rig has no numpy.
+
 
 - EPYC 7F32 (8 cores / 16 threads, Zen 2, AVX2+FMA+F16C, no AVX-512),
   247 GiB RAM (MemTotal; **that is 265.6 GB** — this box's RAM is habitually quoted in GiB and labelled GB, and that exact confusion produced a real bug: PR #1321's budget formula subtracted a true-GB model size from a GiB total), three RX 7900 XTX on RADV/Vulkan (no hardware FP8), one NVMe.
@@ -140,6 +174,14 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   the summation order; it is not the yardstick for a reordered kernel, the
   jitter arm is. A synthetic probe with a near-uniform softmax cannot validate
   an attention kernel; replay real dumped inputs.
+- **`amd-smi` and `nvtop` number the cards differently, and both are right.**
+  `amd-smi` orders by PCI address (GPU 0 = 48:00.0, 1 = 83:00.0, 2 = 86:00.0)
+  and its summary temperature is the HOTSPOT; `nvtop` follows the DRM order
+  (card0 = 86:00.0, card1 = 83:00.0, card2 = 48:00.0) and shows the edge
+  temperature. The engine's dev0 appears to be 83:00.0 (inferred from VRAM use
+  and load, not confirmed). `amd-smi`'s process list is empty for a Vulkan
+  engine — it lists KFD (ROCm) processes only; `nvtop` shows `glm53`. Reading
+  either tool while a gate runs does not disturb the measurement.
 - **One benchmark at a time, across sessions as well as inside one.** The rig
   serialises measurements. Parallel sessions or subagents may edit and build
   concurrently; only one may run an engine. Check `pgrep -x glm53`,
@@ -336,7 +378,12 @@ answer that question from memory — run the script.**
 
 ## Git
 
-- Canonical remote is Gitea (`gitea`); GitHub is a mirror of it. The rig
+- Canonical remote is Gitea — on the Mac it is the remote named **`origin`**
+  (an older copy of this line called it `gitea`; no such remote exists), `fork`
+  is the GitHub mirror, `rome` is the rig's tree over ssh and `upstream` is
+  JustVugg's. Landing a gated item: `git push origin hot-expert-tier`, then
+  `git push rome hot-expert-tier:refs/heads/p0-sync`, then on the rig
+  `git merge --ff-only p0-sync && git branch -d p0-sync`. GitHub is a mirror of Gitea. The rig
   has no push credentials; push from the owner's Mac, which relays the branch.
 - One item, one branch or one commit series; commit message body = what was
   measured, in numbers, plus which oracle passed.
@@ -353,5 +400,9 @@ answer that question from memory — run the script.**
 Haiku 4.5: run campaigns, fill the record, apply a fully specified patch.
 Sonnet 5: port a pattern that already exists in the repo, knobs, harness,
 tests. Opus 5: kernels, shaders, profiling and its interpretation. Fable:
-the KDA decision after G3, the Q3 and Q4 designs, arbitration. Subagent
+the KDA decision after G3, the Q3 and Q4 designs, arbitration. On the Franken
+track (2026-09-19/20) the split that worked: Fable orchestrates, reads the
+hot loop, arbitrates numerics and writes the plan revs; Sonnet did F1's probe,
+F8, F9a and F10 step 0 end to end (~1.95M tokens); Opus was needed only for
+F2's ring and F7's shaders (~480k for F7). Subagent
 definitions for the first three live in `.claude/agents/`.

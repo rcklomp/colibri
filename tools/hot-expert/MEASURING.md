@@ -12,6 +12,7 @@ and still meaningless next to that track's own history.
 |---|---|---|---|
 | `ROADMAP-2026-09.md` (decode throughput, G/C/Q items) | rotating-prompt tok/s on short prompts (30-43 tok), persistent engine, no checkpoint/ledger | `tools/rome_bench.sh <engine> <config>` | No — spawns its own engine, stops the gateway for the duration (does this itself since 2026-09-10; do not hand-roll the stop/restart) |
 | `PREFILL-ROADMAP-2026-09.md` (TTFT / interactive use, P/RP items) | TTFT at 27/384/1230/3462 tokens, checkpoint reuse, ledger correctness | `tools/hot-expert/prefill_snapshot.sh [tag]` for a read-only snapshot of the SERVED binary; `ttft_serve.py --engine <bin>` (via `prefill_gate.sh`) to compare two binaries before one goes into service | Yes, snapshot mode — no stop needed |
+| `FRANKEN-ENGINE-PLAN-2026-09-15.md` (F items: long-context TTFT and decode AT DEPTH, since 2026-09-16) | the context ladder: TTFT of each turn up to the 18 439-token turn, decode tok/s at each depth, follow-up TTFT | a per-item chain `tools/hot-expert/f*_gate_chain.sh` launched through `run_chain.sh`; verdict by `gate_lib.sh` `gate_ab_verdict` on A,B,B,A arms of ONE binary (knob off / knob on); numerics by `kl_compare.py` on `GLM53_LOGIT_DUMP_ALL` dumps | Yes — the chain takes the rig lock, stops the gateway, and restarts it on every exit path (~75 min for a full 18k A,B,B,A) |
 
 ## `rome_bench.sh`'s headline number is half a disk benchmark (2026-09-10)
 
@@ -80,3 +81,28 @@ itself and stops/restarts the owner's gateway around the measurement;
 `python3 c/tools/datapoint.py` or `ttft_serve.py` directly for a number that
 is going in the record — go through the wrapper, or the same class of silent
 misconfiguration that produced the bad 2026-09-10 numbers will happen again.
+
+## The Franken track's gate, in one place (2026-09-20)
+
+Every F item from F2 on was gated the same way; copy the newest chain
+(`f9a_gate_chain.sh` for a bit-identical change, `f7_gate_chain.sh` for one
+that moves numerics) rather than writing a new shape.
+
+1. **Oracle, hard gate:** knob off must equal the previous served binary on
+   `teacher_forcing` and on the full logit dump, by `cmp`. Both arms run with
+   `GLM53_VK_SWIGLU_CLAMP=1` and with the served knobs, or say they did not.
+2. **Numerics, when the knob changes them:** `kl_compare.py` on the dumps, run
+   OUTSIDE the lock (it is minutes of pure Python; the rig has no numpy). A
+   kernel that reorders a float sum is judged against
+   `GLM53_MLA_ATTN_JITTER=6e-7` on the old path, not against a float64
+   reference: the float64 arm keeps the old summation order and therefore
+   always looks closer than any honest reordering can. `flip_margin.py` shows
+   whether the moved argmaxes were near-ties.
+3. **Timing:** the ladder, arms A,B,B,A, `gate_ab_verdict`; "NO VERDICT" when
+   arms overlap is a result, not a failure of the tool.
+4. **Known hole:** the ladder's prefill is streamed, so it runs no CPU expert;
+   a decode-only CPU change (F8) gets a vacuous KL report from it. Judge such
+   a change on greedy text, the unit test and the decode arms.
+5. **Serve** with a wrapper shaped like `f8_serve.sh` (adds a knob to
+   `~/start_glm53.sh` by writing a new inode) or `f9a_serve.sh` (binary only),
+   both of which end in `serve_candidate.sh`; then `accept_ui.sh` from the Mac.

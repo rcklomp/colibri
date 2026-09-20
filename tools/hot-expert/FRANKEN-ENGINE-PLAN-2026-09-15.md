@@ -14,6 +14,50 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 31 (2026-09-20 15:15 CEST, 13:15 UTC) -- F10 step 0 read by Fable:
+> KDA in prefill is a GPU dispatch-latency problem, and the item is parked for
+> the owner.** Record §F10-STEP0 corrected Fable's own brief: in service
+> (`COLI_KDA_GPU=2`) the eight projections AND the recurrence run on the GPU;
+> `coli_vk_kda_step_rows` records S sequential 64-workgroup dispatches, one per
+> token, each fenced by a memory barrier -- 0.111 ms per row per layer, 33.9 s
+> of the 357 s 18k turn, latency-bound, not compute-bound. The candidate fix is
+> to move the token loop INTO the shader (one dispatch per layer-chunk, each
+> head's invocation walking its S tokens in order: the per-head arithmetic and
+> order are unchanged, so it can be held to a bit-identical oracle): upper
+> bound ~30 s of 357 s (8 %) on long prompts, nothing for decode. That is a
+> shader change (Opus by this plan's tiers, ~200-300k tokens by F7's bill) for
+> a single-digit gain; **not started -- the owner decides whether it is worth
+> the tokens.** `proj` (40.8 s, eight GPU matmuls per layer-chunk) was not
+> examined further. Everything measured and cheap on this model has now been
+> taken: since 2026-09-18 the 18k turn went 1 174.8 -> 356.4 s and decode at
+> 18k 4.30 -> 5.04 tok/s. **F3 (a <= 60 GB VRAM-resident model) is the next
+> item of any size.**
+>
+> **Rev 30 (2026-09-20, Sonnet) -- F10 step 0 done: reading + a CPU
+> microbenchmark, no engine touched.** Record §F10-STEP0. `kmv_rows` (the
+> eight KDA projections, `proj` in the split) runs on the GPU in the served
+> engine (P4c tiled `coli_vk_matmul`, weight reads amortised over 8 rows and
+> over the chunk), and the record's own chunk-128-vs-512 data already shows
+> it getting cheaper, not doubling, at the larger chunk -- **it is not the
+> item's lever.** The CPU recurrence kernel (`coli_kda_step`,
+> `delta_attention.h`) is real but memory-bound (~0.5 FLOPs/byte,
+> `f10_kda_bench.c` measured 0.30 ms/token at 8 threads on one layer's 4 MiB
+> state, 18.2/38.5/56/14.8 GB/s across the single/multilayer x 1/8-thread
+> cases), and its only known cliff (136 MiB state vs 128 MiB L3) is already
+> removed by the serving knob and not bit-identically fixable otherwise --
+> the microbenchmark reproduced that cliff's bimodality on its own, without
+> touching the engine. **The actual 2.05x S=512-vs-128 doubling (record
+> §F2f, ~37.7 s of KDA's 93.3 s) is entirely in the GPU dispatch path
+> (`coli_vk_kda_step_rows`: S sequential 64-workgroup dispatches serialised
+> by full memory barriers in one command buffer) -- "observed, not
+> diagnosed" per the record, and this item was scoped to not touch Vulkan.**
+> Next real step on this bucket is a GPU-side diagnostic chain
+> (per-dispatch/barrier timestamps, reusing the existing `VK_PROF`/
+> `VK_EXT_calibrated_timestamps` pattern) to learn whether the cost is
+> barrier drain, dispatch launch overhead, or GPU power-state cycling --
+> **Opus-tier** (profiling and its interpretation, on a new instrumentation
+> path), before any fix is designed. Not started.
+>
 > **Rev 29 (2026-09-20 14:20 CEST, 12:20 UTC) -- F9 re-scoped to F9a, F9a IS
 > GATED PASS AND IN SERVICE; the GPU indexer is not needed.** Record §F9a and
 > §F9a-VERDICT. Before spending Opus on a GPU indexer, Fable read the score

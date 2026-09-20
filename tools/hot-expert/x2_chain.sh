@@ -90,7 +90,13 @@ stop_gateway() {
 on_exit() {
   rc=$?
   trap - EXIT INT TERM HUP
-  pkill -9 -x glm53 2>/dev/null || true
+  # Kill glm53 ONLY when the gateway is about to be restarted here. On the normal
+  # path the body has already restarted it (RESTART_GATEWAY=0) and that glm53 IS the
+  # owner's served engine: killing it left openai_server.py up with a defunct engine,
+  # /v1/models=200 and every chat a 500 "engine dispatcher stopped" (2026-09-20).
+  if [ "$RESTART_GATEWAY" = 1 ] || ! pgrep -f "openai_[s]erver.py" >/dev/null 2>&1; then
+    pkill -9 -x glm53 2>/dev/null || true
+  fi
   for _ in $(seq 1 20); do pgrep -x glm53 >/dev/null 2>&1 || break; sleep 1; done
   if [ "$RESTART_GATEWAY" = 1 ] || ! pgrep -f "openai_[s]erver.py" >/dev/null 2>&1; then
     start_gateway

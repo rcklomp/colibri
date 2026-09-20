@@ -29,7 +29,10 @@ code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $K
 # gone" is a dead gateway whatever the HTTP code says. The 180 s grace covers a fresh restart
 # that has not spawned its engine yet.
 srv=$(pgrep -f "openai_[s]erver.py" | head -1)
-if [ -n "$srv" ] && ! pgrep -x glm53 >/dev/null; then
+# A killed engine the server has not reaped is a ZOMBIE and `pgrep -x glm53` still matches it
+# (2026-09-20: 13 minutes of 500s with this check passing). Count only non-Z processes.
+engine_alive() { ps -C glm53 -o stat= 2>/dev/null | grep -qv "^Z"; }
+if [ -n "$srv" ] && ! engine_alive; then
   age=$(ps -o etimes= -p "$srv" 2>/dev/null | tr -d ' ')
   if [ "${age:-0}" -gt 180 ]; then
     say "gateway server alive (pid $srv, ${age}s) but its glm53 engine is GONE (/v1/models=$code) — restarting"

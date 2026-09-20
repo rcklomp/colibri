@@ -14,6 +14,35 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 28 (2026-09-20 11:00 CEST, 09:00 UTC) -- F8 IS GATED PASS AND IN
+> SERVICE.** Record §F8. One OpenMP team per MoE layer (bit-identical in the
+> engine, dump-verified) plus the group-vector int4 row kernel in the batch-1
+> CPU expert path: **decode +6.4 to +9.6 % conservative, SEPARATED at all
+> seven turns to 19.3k (4.270 -> 4.585 tok/s at the deepest)**, TTFT
+> unchanged, greedy text identical; `cpu_in` per window 1.868 -> 1.489 ms.
+> Served `93f0f681` since 08:54 UTC, `accept_live` and `accept_ui` PASS. The
+> CPU misses are still ~60 ms of the decode token and still the largest
+> decode bucket; what is left in that kernel is a redesign (several output
+> rows per nibble decode), an Opus item, not opened. **Open and NOT started,
+> both the owner's call: F9 (the indexer's prefill score pass on the GPU, 25 %
+> of the 18k turn, Opus for the shader) and F3 (a <= 60 GB model, fully
+> VRAM-resident -- the only order-of-magnitude lever left).**
+>
+> **Rev 27 (2026-09-20, Sonnet) -- F8 engine step BUILT, NOT GATED.**
+> `coli_i4_row_gv` (record §F8-STEP0) is in `c/quant.h`; `GLM53_I4_FAST=2`
+> wires it into `mlp3_cpu` and, as a new case not present in step 0, into
+> `mlp3_cpu_rows`' per-row tail, with `mlp3_cpu_rows_ok()` relaxed so `=2`
+> (unlike `=1`) does not fall back off the rows path. `GLM53_MOE_ONE_TEAM=1`
+> fuses a decode window's deferred CPU experts into one OpenMP team
+> (falls back to today's per-expert loop, unfused, if any expert in the
+> window is not rows-eligible). Both knobs default off, unchanged
+> branches when unset. Branch `perf/f8-cpu-expert-gv`; a new C test
+> (`tests/test_glm53_f8_moe_fuse`) checks the fusion is bit-identical to
+> knob-off and that `=2` differs from and stays within a tight relL2 of the
+> default kernel. `tools/hot-expert/f8_gate_chain.sh` (oracle + A,B,B,A
+> decode ladder, pristine `~/bench/glm53.f7`) is written but not launched —
+> **no in-engine number yet.** Next: run it.
+>
 > **Rev 26 (2026-09-20 09:15 CEST, 07:15 UTC) -- F8 step 0 ANSWERED (Sonnet,
 > record §F8-STEP0).** Three arbitration rounds on the same CPU
 > microbenchmark, no engine change, no gateway downtime. Round 1's near-

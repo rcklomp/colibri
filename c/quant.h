@@ -310,6 +310,81 @@ static inline float coli_i4_row_f4(const uint8_t *w, const float *scl,
     return a;
 }
 
+/* ---- F8 step 0 (record §F8-STEP0), round 3: "group-vector" combine ------
+ * coli_i4_row/coli_i4_row_f4 both reduce each 64-wide group to a scalar via
+ * hsum256 and then chain it into the row total with a scalar
+ * `fmaf(hsum,sc,a)` -- at gs=64 and I=4096 that is a 64-deep serial SCALAR
+ * dependency chain per row, on top of (and hidden worse than) the vector
+ * work; thread scaling on this box was measured near-linear 1->8
+ * (7.94-7.96x of 8x), the signature of a latency-bound reduction, and F8's
+ * own f4/f8 accumulator-count experiments were flat-to-worse once the row
+ * kernel runs inside the engine's own multi-row-per-thread structure
+ * (`f4` 1-team statistically flat against the fork/join baseline, `f8`
+ * ~16% WORSE) -- ruling out the within-group FMA chain as the lever here.
+ * coli_i4_row_gv changes only the END-OF-GROUP combine: each group's
+ * scaled partial sum stays a VECTOR (`fmadd(group_sum, scale_broadcast,
+ * tot_k)`), folded into one of two alternating running vector totals
+ * (`tot0` for even groups, `tot1` for odd, so consecutive groups do not
+ * serialise on each other either) with a single hsum256 at the very end of
+ * the row instead of one per group. Isolated bench (real GLM-5.3 expert
+ * shapes, 8 threads, one-OpenMP-team-per-window): 1.185-1.190 ms/window vs.
+ * 1.321-1.337 ms/window for the fork/join-fused coli_i4_row baseline
+ * (11-12% faster) and 1.486-1.492 ms/window for today's engine-shaped
+ * three-teams-per-window baseline (20-26% faster); relL2 of the full
+ * 3-stage expert output vs. the coli_i4_row baseline 3.3e-07, the same
+ * order as coli_i4_row_f4's own reassociation noise (2.8-3.0e-07) --
+ * summation order changes, nothing else. Additive: nothing in qwen38* or
+ * the immediate (tokens>1) glm53 path calls this; it is wired into
+ * glm53.c's decode-only (nr=1) row kernel selection under GLM53_I4_FAST=2.
+ * Scalar tail and non-AVX2 fallback match coli_i4_row's exactly (when
+ * __AVX2__ is not defined, i stays at base and the whole group runs through
+ * the scalar loop into a_tail). */
+static inline float coli_i4_row_gv(const uint8_t *w, const float *scl,
+                                   const float *xs, int I, int gs) {
+    const int ng = (I + gs - 1) / gs;
+    float a_tail = 0;
+#ifdef __AVX2__
+    __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
+    const __m128i m4 = _mm_set1_epi8(0x0F); const __m256i b8 = _mm256_set1_epi32(8);
+#endif
+    for (int g = 0; g < ng; g++) {
+        int base = g * gs, glen = gs; if (base + glen > I) glen = I - base;
+        float sc = scl[g];
+        int i = base;
+#ifdef __AVX2__
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        for (; i + 32 <= base + glen; i += 32) {
+            __m128i by = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
+            __m128i lo = _mm_and_si128(by, m4), hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+            __m128i n0 = _mm_unpacklo_epi8(lo, hi), n1 = _mm_unpackhi_epi8(lo, hi);
+            __m256 w0 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(n0), b8));
+            __m256 w1 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(n0, 8)), b8));
+            __m256 w2 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(n1), b8));
+            __m256 w3 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(n1, 8)), b8));
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i),      w0, a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 8),  w1, a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 16), w2, a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 24), w3, a3);
+        }
+        __m256 gsum = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        __m256 scv = _mm256_set1_ps(sc);
+        if ((g & 1) == 0) tot0 = _mm256_fmadd_ps(gsum, scv, tot0);
+        else              tot1 = _mm256_fmadd_ps(gsum, scv, tot1);
+#endif
+        for (; i < base + glen; i += 2) {
+            if (i + 1 < base + glen) { uint8_t byte = w[i >> 1];
+                a_tail += (xs[i] * (float)((int)(byte & 0xF) - 8) + xs[i + 1] * (float)((int)(byte >> 4) - 8)) * sc; }
+            else { uint8_t byte = w[i >> 1]; a_tail += xs[i] * (float)((int)(byte & 0xF) - 8) * sc; }
+        }
+    }
+#ifdef __AVX2__
+    return hsum256(_mm256_add_ps(tot0, tot1)) + a_tail;
+#else
+    return a_tail;
+#endif
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){

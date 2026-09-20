@@ -3456,6 +3456,22 @@ static int i4_fast_on(void) {
     if (g_i4_fast < 0) g_i4_fast = getenv("GLM53_I4_FAST") ? atoi(getenv("GLM53_I4_FAST")) : 0;
     return g_i4_fast;
 }
+/* F8 (record §F8-STEP0): GLM53_I4_FAST=2 selects coli_i4_row_gv (the
+ * group-vector combine, quant.h) everywhere =1 selects coli_i4_row_f4 --
+ * same class of change (reassociation only, relL2 ~3.3e-07), a different
+ * kernel. Any other nonzero value keeps today's f4 behaviour. */
+static inline int i4_fast_gv_on(void) { return i4_fast_on() == 2; }
+typedef float (*RowFn)(const uint8_t *, const float *, const float *, int, int);
+/* F8 (record §F8-STEP0): fuse a decode window's (tokens==1) deferred CPU
+ * experts into ONE OpenMP team instead of one team per expert -- measured
+ * bit-identical and ~10% faster in isolation (fork/join fusion alone, before
+ * the gv combine). See ffn_moe_run_deferred_cpu. */
+static int g_moe_one_team = -1;
+static int moe_one_team_on(void) {
+    if (g_moe_one_team < 0)
+        g_moe_one_team = getenv("GLM53_MOE_ONE_TEAM") ? atoi(getenv("GLM53_MOE_ONE_TEAM")) : 0;
+    return g_moe_one_team;
+}
 
 static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, const Mat *d, float limit, float *sg, float *su) {
     if (expert_split_on()) {
@@ -3493,6 +3509,7 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
         u->gs == g->gs && u->columns == Ig && u->rows == Og) {
         const int grb_ = (Ig + 1) / 2, gng_ = (Ig + g->gs - 1) / g->gs;
         const int drb_ = (Id + 1) / 2, dng_ = (Id + d->gs - 1) / d->gs;
+        const RowFn rowfn4 = i4_fast_gv_on() ? coli_i4_row_gv : coli_i4_row_f4;
 #ifdef _OPENMP
         #pragma omp parallel
 #endif
@@ -3502,11 +3519,11 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
 #endif
             for (int z = 0; z < 2 * Og; z++) {
                 if (z < Og)
-                    sg[z] = coli_i4_row_f4(g->q4 + (int64_t)z * grb_,
+                    sg[z] = rowfn4(g->q4 + (int64_t)z * grb_,
                                            g->s + (int64_t)z * gng_, x, Ig, g->gs);
                 else {
                     const int o = z - Og;
-                    su[o] = coli_i4_row_f4(u->q4 + (int64_t)o * grb_,
+                    su[o] = rowfn4(u->q4 + (int64_t)o * grb_,
                                            u->s + (int64_t)o * gng_, x, Ig, u->gs);
                 }
             }
@@ -3522,7 +3539,7 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
             #pragma omp for schedule(static)
 #endif
             for (int o = 0; o < Od; o++)
-                out[o] = coli_i4_row_f4(d->q4 + (int64_t)o * drb_,
+                out[o] = rowfn4(d->q4 + (int64_t)o * drb_,
                                         d->s + (int64_t)o * dng_, sg, Id, d->gs);
         }
         return;
@@ -3569,9 +3586,24 @@ static void mlp3_cpu(float *out, const float *x, const Mat *g, const Mat *u, con
  * Only the default path (fmt 4, no split, no I4_FAST) has a rows version;
  * the caller falls back to the per-row loop otherwise. sg/su: S * g->rows. */
 static int mlp3_cpu_rows_ok(const Mat *g, const Mat *u, const Mat *d) {
-    return !expert_split_on() && !i4_fast_on() &&
+    /* F8: GLM53_I4_FAST=1 (coli_i4_row_f4) still falls back to mlp3_cpu, as
+     * before -- that kernel was never wired into the rows path. =2
+     * (coli_i4_row_gv) is: mlp3_cpu_rows' per-row tail selects it itself. */
+    return !expert_split_on() && i4_fast_on() != 1 &&
            g->fmt == 4 && u->fmt == 4 && d->fmt == 4 &&
            u->columns == g->columns && u->rows == g->rows && u->gs == g->gs;
+}
+/* F8: mlp3_cpu_rows' per-row TAIL selector (S not a multiple of 4, so it
+ * misses the batched coli_i4_rows4 path above it). sim3 (G15 probe) takes
+ * priority, unchanged; otherwise GLM53_I4_FAST=2 routes the tail through
+ * coli_i4_row_gv, and everything else (including =1, which never reaches
+ * here per mlp3_cpu_rows_ok) through plain coli_i4_row. The batched
+ * i4_rows4_sel calls in mlp3_cpu_rows are untouched by this knob. */
+static inline float i4_row_tail_sel(int sim3, int gv_on, const uint8_t *w, const float *scl,
+                                    const float *xs, int I, int gs) {
+    if (sim3) return coli_i4_row_sim3(w, scl, xs, I, gs);
+    if (gv_on) return coli_i4_row_gv(w, scl, xs, I, gs);
+    return coli_i4_row(w, scl, xs, I, gs);
 }
 static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const Mat *u,
                           const Mat *d, float limit, float *sg, float *su) {
@@ -3580,6 +3612,7 @@ static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const
     const int drb = (Id + 1) / 2, dng = (Id + d->gs - 1) / d->gs;
     const int S4 = S & ~3;
     const int sim3 = i3_sim_on();      /* G15 probe; 0 in every shipped config */
+    const int gv_on = i4_fast_gv_on();
 #ifdef _OPENMP
     #pragma omp parallel
 #endif
@@ -3601,7 +3634,7 @@ static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const
                 dst[(size_t)(r + 2) * Og + o] = o4[2]; dst[(size_t)(r + 3) * Og + o] = o4[3];
             }
             for (; r < S; r++)
-                dst[(size_t)r * Og + o] = i4_row_sel(sim3, wr, sr, x + (int64_t)r * Ig, Ig, w->gs);
+                dst[(size_t)r * Og + o] = i4_row_tail_sel(sim3, gv_on, wr, sr, x + (int64_t)r * Ig, Ig, w->gs);
         }
 #ifdef _OPENMP
         #pragma omp for schedule(static)
@@ -3625,7 +3658,7 @@ static void mlp3_cpu_rows(float *out, const float *x, int S, const Mat *g, const
                 out[(size_t)(r + 2) * Od + o] = o4[2]; out[(size_t)(r + 3) * Od + o] = o4[3];
             }
             for (; r < S; r++)
-                out[(size_t)r * Od + o] = i4_row_sel(sim3, wr, sr, sg + (int64_t)r * Id, Id, d->gs);
+                out[(size_t)r * Od + o] = i4_row_tail_sel(sim3, gv_on, wr, sr, sg + (int64_t)r * Id, Id, d->gs);
         }
     }
 }
@@ -3682,12 +3715,114 @@ static int cpu_expert_rows(const CpuRows *cr, int eid, const int *chosen, const 
  * triples instead of the single (gate,up,down,eid) the classify loop had at
  * hand. Only ever called with experts collected while can_defer held (single
  * block, no eviction risk between classifying and running them). */
+/* F8: the tokens==1 body of GLM53_MOE_ONE_TEAM=1, split out only so
+ * ffn_moe_run_deferred_cpu can fall back to its own unfused loop below
+ * with a single `return` when hoisting is not applicable. Same per-row
+ * kernel calls (via i4_row_tail_sel, the same selector mlp3_cpu_rows' own
+ * tail uses), the same z/i/o order per expert, the same serial order over
+ * experts (plain C `for (j...)`, not an omp worksharing construct) and the
+ * same `dst[d] += scale * src[d]` accumulate as mlp3_cpu_rows +
+ * cpu_expert_rows -- only the team creation is hoisted from one spawn per
+ * expert to one spawn for the whole window. Returns 1 if it ran the whole
+ * window (including experts it found nothing to do for), 0 if any
+ * expert's Mat triple failed mlp3_cpu_rows_ok and the caller must fall
+ * back to its own loop for every expert in the window unfused. */
+static int ffn_moe_run_deferred_cpu_one_team(const Mat *cpu_gate, const Mat *cpu_up, const Mat *cpu_down,
+                                             const int *cpu_eid, int n_cpu_deferred,
+                                             const int *chosen, const float *weight, int topk,
+                                             const float *x, int hidden, float limit,
+                                             float *sg, float *su, float *tmp, float *out,
+                                             const unsigned char *skip) {
+    /* NOT _Thread_local: this buffer is filled once, on the calling thread,
+     * before the #pragma omp parallel below spawns its team -- every worker
+     * thread must see the SAME array. A per-thread (_Thread_local) buffer
+     * would leave the spawned threads reading their own, never-populated
+     * copy (a real bug, caught by test_glm53_f8_moe_fuse's SIGSEGV before
+     * this comment existed). A plain heap allocation, freed before every
+     * return, keeps two concurrent requests on two different serving
+     * threads from sharing it, which a `static` buffer would not. */
+    float *escale = malloc((size_t)n_cpu_deferred * sizeof(float));
+    if (!escale) { fprintf(stderr, "OOM nel MoE (one-team)\n"); exit(1); }
+    for (int j = 0; j < n_cpu_deferred; j++) {
+        escale[j] = 0.0f;
+        if (skip && skip[j]) continue;
+        if (!mlp3_cpu_rows_ok(&cpu_gate[j], &cpu_up[j], &cpu_down[j])) { free(escale); return 0; }
+        const int eid = cpu_eid[j];
+        float scale = 0.0f;
+        for (int k = 0; k < topk; k++)
+            if (chosen[k] == eid) { scale = weight[k]; break; }
+        escale[j] = scale;
+    }
+    const int sim3 = i3_sim_on();      /* G15 probe; 0 in every shipped config */
+    const int gv_on = i4_fast_gv_on();
+    double _tc = prof_now_s();
+    long n_done = 0;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        for (int j = 0; j < n_cpu_deferred; j++) {
+            if (skip && skip[j]) continue;
+            const float escale_j = escale[j];
+            if (escale_j == 0.0f) continue;
+            const Mat *g = &cpu_gate[j], *u = &cpu_up[j], *d = &cpu_down[j];
+            const int Ig = g->columns, Og = g->rows, Id = d->columns, Od = d->rows;
+            const int grb = (Ig + 1) / 2, gng = (Ig + g->gs - 1) / g->gs;
+            const int drb = (Id + 1) / 2, dng = (Id + d->gs - 1) / d->gs;
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int z = 0; z < 2 * Og; z++) {
+                const int o = z < Og ? z : z - Og;
+                const Mat *w = z < Og ? g : u;
+                float *dst = z < Og ? sg : su;
+                dst[o] = i4_row_tail_sel(sim3, gv_on, w->q4 + (int64_t)o * grb,
+                                         w->s + (int64_t)o * gng, x, Ig, w->gs);
+            }
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int i = 0; i < Og; i++) {
+                float gv = sg[i] > limit ? limit : sg[i];
+                float uv = su[i] < -limit ? -limit : (su[i] > limit ? limit : su[i]);
+                sg[i] = siluf_(gv) * uv;
+            }
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int o = 0; o < Od; o++)
+                tmp[o] = i4_row_tail_sel(sim3, gv_on, d->q4 + (int64_t)o * drb,
+                                         d->s + (int64_t)o * dng, sg, Id, d->gs);
+#ifdef _OPENMP
+            #pragma omp single
+#endif
+            {
+                for (int dd = 0; dd < hidden; dd++) out[dd] += escale_j * tmp[dd];
+                n_done++;
+            }
+        }
+    }
+    g_t_cpu += prof_now_s() - _tc; g_n_cpu += n_done;
+    free(escale);
+    return 1;
+}
+
 static void ffn_moe_run_deferred_cpu(const Mat *cpu_gate, const Mat *cpu_up, const Mat *cpu_down,
                                      const int *cpu_eid, int n_cpu_deferred,
                                      const int *chosen, const float *weight, int tokens, int topk,
                                      const float *x, int hidden, float limit,
                                      float *sg, float *su, float *tmp, float *out,
                                      const CpuRows *cr, const unsigned char *skip) {
+    /* F8 (record §F8-STEP0): GLM53_MOE_ONE_TEAM=1, decode only (tokens==1),
+     * rows path available and every expert's Mat triple eligible -- fuse
+     * the whole window into one OpenMP team. Any expert that is not
+     * rows-eligible falls the WHOLE window back to the loop below,
+     * unfused, exactly as it runs with the knob off. */
+    if (tokens == 1 && moe_one_team_on() && cr && cr->xr && n_cpu_deferred > 0 &&
+        ffn_moe_run_deferred_cpu_one_team(cpu_gate, cpu_up, cpu_down, cpu_eid, n_cpu_deferred,
+                                          chosen, weight, topk, x, hidden, limit,
+                                          sg, su, tmp, out, skip))
+        return;
     for (int j = 0; j < n_cpu_deferred; j++) {
         /* F2: `skip` marks the experts a streamed wave already ran on the GPU.
          * NULL (every caller before F2, and the knob-off path) means none. */

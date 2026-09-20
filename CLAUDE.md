@@ -168,7 +168,10 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   which is why the owner's chat returned nothing at all. `accept_live.sh` check 5
   exists to catch a recurrence and runs in the daily canary too), `--kv-slots 4`,
   **`GLM53_VK_SWIGLU_CLAMP=1 COLI_PREFILL_STREAM=1 GLM53_PREFILL_CHUNK=512`,
-  `GLM53_MLA_ATTN_GPU=1` (F7, 2026-09-20)
+  `GLM53_MLA_ATTN_GPU=1` (F7, 2026-09-20),
+  `GLM53_MOE_ONE_TEAM=1 GLM53_I4_FAST=2` (F8, 2026-09-20: the batch-1 CPU
+  expert path, decode +6.4 to +9.6 %; `I4_FAST=2` is a reassociating kernel,
+  so a direct engine run without it is NOT the served numerics)
   (F2, 2026-09-19; prefix checkpoints from before that date were set aside,
   they carry the unclamped numerics)** and `COLI_KDA_GPU=2`
   (P6b, 2026-09-07: each slot has its own KDA device state, pool allocated
@@ -278,7 +281,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `glm53.p7base` = pre-P7, `glm53.p6bbase` = P7, `glm53.p6b`, `glm53.rp4`,
   `glm53.p5` (+ `shaders_p5`), `glm53.devmerge` (+ `shaders_devmerge`) = the
   binary in service from 2026-09-08 01:00, `glm53.f6abase`, `glm53.f2base` =
-  F6a `15462dc2`, `glm53.f2` = `5c01246c`, `glm53.f7` = `e87ae939`, in service since 2026-09-20 05:24 UTC); each gate's pristine is the
+  F6a `15462dc2`, `glm53.f2` = `5c01246c`, `glm53.f7` = `e87ae939`, `glm53.f8` = `93f0f681`, in service since 2026-09-20 08:54 UTC); each gate's pristine is the
   binary in service before the item. **Every gate runs with
   `GLM53_PREFIX_CKPT=0` and a private `COLI_CKPT_DIR`**: two gates nearly
   passed for the wrong reason because the candidate restored a checkpoint

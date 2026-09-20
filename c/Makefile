@@ -1221,6 +1221,12 @@ tests/test_glm53_cancel_frames$(EXE): tests/test_glm53_cancel_frames.c glm53.c s
 tests/test_glm53_ckpt_touch$(EXE): tests/test_glm53_ckpt_touch.c glm53.c serve_poll.h st.h json.h compat.h quant.h tok.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+# F8: the decode-window CPU-expert fusion (GLM53_MOE_ONE_TEAM) and the
+# group-vector row kernel (GLM53_I4_FAST=2) -- random int4 experts, no
+# model, no Vulkan.
+tests/test_glm53_f8_moe_fuse$(EXE): tests/test_glm53_f8_moe_fuse.c glm53.c serve_poll.h st.h json.h compat.h quant.h tok.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c qwen38_vision.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -Wno-unused-function $< -o $@ $(LDFLAGS)
 

@@ -207,6 +207,159 @@ static void mlp3_window_fused(float *out3, const float *x, const Expert *e3, flo
     }
 }
 
+/* ================= F8 arbitration round: reassociating row kernels =====
+ * Fable's read of the first pass: perfectly linear 1->8 thread scaling is
+ * the signature of a LATENCY-bound serial reduction (coli_i4_row's single
+ * `acc` chained through `_mm256_fmadd_ps` inside each 64-wide group, 5-cycle
+ * Zen2 FMA latency), not of a bandwidth ceiling -- G14 (record) diagnosed
+ * and fixed exactly this with `coli_i4_row_f4` (4 independent accumulators,
+ * shipped as `GLM53_I4_FAST`, isolated 1.26-1.65x, in-engine 1.095x). Tested
+ * here at nr=1 (decode's own shape), engine structure, against the
+ * mlp3_like/mlp3_window_fused baseline. coli_i4_row_f4 itself is quant.h's,
+ * called directly (not copied) -- only the two callers below are new.
+ *
+ * coli_i4_row_f8: NOT a shipped kernel. A mechanical width-doubling of f4's
+ * own documented technique (8 independent accumulators instead of 4, one
+ * `_mm256_fmadd_ps` each per 64-wide group instead of two chained
+ * per accumulator) -- written here only to see whether f4 already captured
+ * most of the latency-hiding or whether more independent accumulators keep
+ * paying off. Bit-trick decode identical to f4's (same magic-number nibble
+ * unpack), so the only change from f4 is accumulator count / combine order
+ * -- reassociation noise only, same class of change as f4 itself. */
+static inline float coli_i4_row_f8(const uint8_t *w, const float *scl,
+                                   const float *xs, int I, int gs) {
+    float a = 0;
+    const int ng = (I + gs - 1) / gs;
+    for (int g = 0; g < ng; g++) {
+        int base = g * gs, glen = gs; if (base + glen > I) glen = I - base;
+        float sc = scl[g];
+        int i = base;
+#ifdef __AVX2__
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        const __m256i magic_i = _mm256_set1_epi32(0x4B000000);
+        const __m256  magic_f = _mm256_set1_ps(8388608.0f + 8.0f);
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+        __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+        for (; i + 64 <= base + glen; i += 64) {
+            __m128i by0 = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
+            __m128i by1 = _mm_loadu_si128((const __m128i *)(w + (i >> 1) + 16));
+            __m128i lo0 = _mm_and_si128(by0, m4), hi0 = _mm_and_si128(_mm_srli_epi16(by0, 4), m4);
+            __m128i lo1 = _mm_and_si128(by1, m4), hi1 = _mm_and_si128(_mm_srli_epi16(by1, 4), m4);
+            __m128i n0 = _mm_unpacklo_epi8(lo0, hi0), n1 = _mm_unpackhi_epi8(lo0, hi0);
+            __m128i n2 = _mm_unpacklo_epi8(lo1, hi1), n3 = _mm_unpackhi_epi8(lo1, hi1);
+            __m256 w0 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(n0), magic_i)), magic_f);
+            __m256 w1 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128(n0, 8)), magic_i)), magic_f);
+            __m256 w2 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(n1), magic_i)), magic_f);
+            __m256 w3 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128(n1, 8)), magic_i)), magic_f);
+            __m256 w4 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(n2), magic_i)), magic_f);
+            __m256 w5 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128(n2, 8)), magic_i)), magic_f);
+            __m256 w6 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(n3), magic_i)), magic_f);
+            __m256 w7 = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128(n3, 8)), magic_i)), magic_f);
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i),      w0, a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 8),  w1, a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 16), w2, a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 24), w3, a3);
+            a4 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 32), w4, a4);
+            a5 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 40), w5, a5);
+            a6 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 48), w6, a6);
+            a7 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 56), w7, a7);
+        }
+        __m256 acc = _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)),
+                                    _mm256_add_ps(_mm256_add_ps(a4, a5), _mm256_add_ps(a6, a7)));
+        a = fmaf(hsum256(acc), sc, a);
+#endif
+        for (; i < base + glen; i += 2) {
+            if (i + 1 < base + glen) { uint8_t byte = w[i >> 1];
+                a += (xs[i] * (float)((int)(byte & 0xF) - 8) + xs[i + 1] * (float)((int)(byte >> 4) - 8)) * sc; }
+            else { uint8_t byte = w[i >> 1]; a += xs[i] * (float)((int)(byte & 0xF) - 8) * sc; }
+        }
+    }
+    return a;
+}
+
+typedef float (*RowFn)(const uint8_t *, const float *, const float *, int, int);
+
+/* Generic single-expert path, same 3-stage/1-team structure as mlp3_like,
+ * parametrised on the row kernel -- used for f4/f8, never for coli_i4_row
+ * (mlp3_like stays the untouched, already-checked baseline). */
+static void mlp3_kern(float *out, const float *x, const Expert *e, float *sg, float *su, RowFn row) {
+    const int Ig = e->gate.I, Og = e->gate.O, Id = e->down.I, Od = e->down.O;
+    const int grb = (Ig + 1) / 2, gng = (Ig + e->gate.gs - 1) / e->gate.gs;
+    const int urb = (e->up.I + 1) / 2, ung = (e->up.I + e->up.gs - 1) / e->up.gs;
+    const int drb = (Id + 1) / 2, dng = (Id + e->down.gs - 1) / e->down.gs;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int z = 0; z < 2 * Og; z++) {
+            if (z < Og)
+                sg[z] = row(e->gate.q4 + (int64_t)z * grb, e->gate.s + (int64_t)z * gng, x, Ig, e->gate.gs);
+            else {
+                int o = z - Og;
+                su[o] = row(e->up.q4 + (int64_t)o * urb, e->up.s + (int64_t)o * ung, x, e->up.I, e->up.gs);
+            }
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < Og; i++) {
+            float gv = sg[i] > LIMIT ? LIMIT : sg[i];
+            float uv = su[i] < -LIMIT ? -LIMIT : (su[i] > LIMIT ? LIMIT : su[i]);
+            sg[i] = siluf_(gv) * uv;
+        }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int o = 0; o < Od; o++)
+            out[o] = row(e->down.q4 + (int64_t)o * drb, e->down.s + (int64_t)o * dng, sg, Id, e->down.gs);
+    }
+}
+
+/* Generic fused-window path (one team, 3 experts, same row kernel). */
+static void mlp3_window_fused_kern(float *out3, const float *x, const Expert *e3, float *sg3, float *su3, RowFn row) {
+    const int Og = INTER, Od = HIDDEN, Ig = HIDDEN, Id = INTER;
+    const int grb = (Ig + 1) / 2, gng = (Ig + GS - 1) / GS;
+    const int drb = (Id + 1) / 2, dng = (Id + GS - 1) / GS;
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        for (int w = 0; w < 3; w++) {
+            const Expert *e = &e3[w];
+            float *sg = sg3 + (size_t)w * Og, *su = su3 + (size_t)w * Og, *out = out3 + (size_t)w * Od;
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int z = 0; z < 2 * Og; z++) {
+                if (z < Og)
+                    sg[z] = row(e->gate.q4 + (int64_t)z * grb, e->gate.s + (int64_t)z * gng, x, Ig, GS);
+                else {
+                    int o = z - Og;
+                    su[o] = row(e->up.q4 + (int64_t)o * grb, e->up.s + (int64_t)o * gng, x, Ig, GS);
+                }
+            }
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int i = 0; i < Og; i++) {
+                float gv = sg[i] > LIMIT ? LIMIT : sg[i];
+                float uv = su[i] < -LIMIT ? -LIMIT : (su[i] > LIMIT ? LIMIT : su[i]);
+                sg[i] = siluf_(gv) * uv;
+            }
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int o = 0; o < Od; o++)
+                out[o] = row(e->down.q4 + (int64_t)o * drb, e->down.s + (int64_t)o * dng, sg, Id, GS);
+        }
+    }
+}
+
 /* ---------------------------------------------------------------------- */
 static int cmp_double(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
@@ -339,13 +492,31 @@ static double run_expert_parallel(const Expert *pool, int pool_n, int n_windows,
 /* ================= item 6: bandwidth ceiling, plain memcpy/sum ========= */
 /* Reads EVERY 8-byte word of a buffer once (no stride-skipping -- a sampled
  * touch measures TLB/page-walk cost on a huge stride, not bandwidth, and
- * would understate the true byte count by >100x). 8-way OMP split. */
+ * would understate the true byte count by >100x). 8-way OMP split.
+ *
+ * F8 arbitration: a single OpenMP `reduction(+:total)` accumulator gives
+ * each thread its own serial add chain over its slice -- a 1-cycle-latency
+ * integer add is not the FMA case (5-cycle latency on Zen2), but to remove
+ * ANY doubt that this row is itself measuring a latency-bound reduction
+ * rather than the memory system, it now unrolls 4 INDEPENDENT partial sums
+ * per thread (no accumulator sees two dependent adds back to back inside a
+ * cache line's worth of words) before the reduction combines them. */
 static uint64_t touch_all(const uint8_t *p, size_t n) {
     size_t nu64 = n / 8;
     const uint64_t *pu = (const uint64_t *)p;
+    long nu4 = (long)(nu64 / 4);
     uint64_t total = 0;
-    #pragma omp parallel for schedule(static) reduction(+:total)
-    for (long i = 0; i < (long)nu64; i++) total += pu[i];
+    #pragma omp parallel reduction(+:total)
+    {
+        uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        #pragma omp for schedule(static) nowait
+        for (long b = 0; b < nu4; b++) {
+            long i = b * 4;
+            s0 += pu[i]; s1 += pu[i + 1]; s2 += pu[i + 2]; s3 += pu[i + 3];
+        }
+        total += s0 + s1 + s2 + s3;
+    }
+    for (size_t i = (size_t)nu4 * 4; i < nu64; i++) total += pu[i];
     for (size_t i = nu64 * 8; i < n; i++) total += p[i];
     return total;
 }
@@ -539,6 +710,71 @@ int main(int argc, char **argv) {
         report("forkjoin_3_teams_per_window", ms_3team, n_windows, gmacs_win, gbytes_win);
         report("forkjoin_1_team_per_window", ms_1team, n_windows, gmacs_win, gbytes_win);
         free(ms_3team); free(ms_1team);
+    }
+
+    /* ================= item 7 (F8 arbitration): reassociating kernels ==== */
+    {
+        int a, b, c; pick3(pool_n, &a, &b, &c);
+        Expert e3[3] = {pool[a], pool[b], pool[c]};
+        float sg1[INTER], su1[INTER];
+        float out_base[HIDDEN], out_f4[HIDDEN], out_f8[HIDDEN];
+        mlp3_kern(out_base, x, &e3[0], sg1, su1, coli_i4_row);
+        mlp3_kern(out_f4, x, &e3[0], sg1, su1, coli_i4_row_f4);
+        mlp3_kern(out_f8, x, &e3[0], sg1, su1, coli_i4_row_f8);
+        double maxrel_f4 = 0, maxrel_f8 = 0;
+        for (int i = 0; i < HIDDEN; i++) {
+            double denom = fabs((double)out_base[i]) > 1e-12 ? fabs((double)out_base[i]) : 1e-12;
+            double r4 = fabs((double)out_f4[i] - (double)out_base[i]) / denom;
+            double r8 = fabs((double)out_f8[i] - (double)out_base[i]) / denom;
+            if (r4 > maxrel_f4) maxrel_f4 = r4;
+            if (r8 > maxrel_f8) maxrel_f8 = r8;
+        }
+        printf("INFO reassociation check (one expert, one row kernel each): coli_i4_row_f4 max_rel_diff=%.3e, coli_i4_row_f8 max_rel_diff=%.3e (both expect ~1e-7, G14's own figure for f4)\n",
+               maxrel_f4, maxrel_f8);
+
+        double *ms_f4 = malloc(sizeof(double) * n_windows);
+        double *ms_f4_fused = malloc(sizeof(double) * n_windows);
+        double *ms_f8 = malloc(sizeof(double) * n_windows);
+        double *ms_f8_fused = malloc(sizeof(double) * n_windows);
+        float out[HIDDEN], sg[INTER], su[INTER];
+        for (int w = 0; w < n_windows; w++) {
+            int p, q, r; pick3(pool_n, &p, &q, &r);
+            double t0 = now_ms();
+            mlp3_kern(out, x, &pool[p], sg, su, coli_i4_row_f4);
+            mlp3_kern(out, x, &pool[q], sg, su, coli_i4_row_f4);
+            mlp3_kern(out, x, &pool[r], sg, su, coli_i4_row_f4);
+            ms_f4[w] = now_ms() - t0;
+        }
+        float outF[3 * HIDDEN], sgF[3 * INTER], suF[3 * INTER];
+        for (int w = 0; w < n_windows; w++) {
+            int p, q, r; pick3(pool_n, &p, &q, &r);
+            Expert ew[3] = {pool[p], pool[q], pool[r]};
+            double t0 = now_ms();
+            mlp3_window_fused_kern(outF, x, ew, sgF, suF, coli_i4_row_f4);
+            ms_f4_fused[w] = now_ms() - t0;
+        }
+        for (int w = 0; w < n_windows; w++) {
+            int p, q, r; pick3(pool_n, &p, &q, &r);
+            double t0 = now_ms();
+            mlp3_kern(out, x, &pool[p], sg, su, coli_i4_row_f8);
+            mlp3_kern(out, x, &pool[q], sg, su, coli_i4_row_f8);
+            mlp3_kern(out, x, &pool[r], sg, su, coli_i4_row_f8);
+            ms_f8[w] = now_ms() - t0;
+        }
+        for (int w = 0; w < n_windows; w++) {
+            int p, q, r; pick3(pool_n, &p, &q, &r);
+            Expert ew[3] = {pool[p], pool[q], pool[r]};
+            double t0 = now_ms();
+            mlp3_window_fused_kern(outF, x, ew, sgF, suF, coli_i4_row_f8);
+            ms_f8_fused[w] = now_ms() - t0;
+        }
+        double gmacs_win = window_gmacs();
+        double gbytes_win = (double)ebytes * 3.0 / 1e9;
+        report("f4_3_teams_per_window", ms_f4, n_windows, gmacs_win, gbytes_win);
+        report("f4_1_team_per_window", ms_f4_fused, n_windows, gmacs_win, gbytes_win);
+        report("f8_3_teams_per_window", ms_f8, n_windows, gmacs_win, gbytes_win);
+        report("f8_1_team_per_window", ms_f8_fused, n_windows, gmacs_win, gbytes_win);
+        free(ms_f4); free(ms_f4_fused); free(ms_f8); free(ms_f8_fused);
     }
 
     /* ================= item 5: expert-parallel, disjoint groups ========= */

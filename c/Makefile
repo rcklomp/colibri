@@ -1761,6 +1761,16 @@ tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# F3 step 1: same fake-backend method as the CUDA tier's tests above
+# (tests/qwen36_fake_vk.h mirrors tests/qwen36_fake_cuda.h), proving the
+# Vulkan tier's port from V1's one fixed device to a small per-device array
+# (home(eid), per-device budget/planned/refused, issue-all-then-take-all
+# across devices) and its new row-wise int8 (fmt=1) acceptance -- without a
+# GPU, a Vulkan loader or the SPIR-V shaders. No VK_OBJ/VK_SPV: the fake
+# header defines every coli_vk_* symbol qwen36_tier_vk.c links against.
+tests/test_qwen36_tier_vk_multidev$(EXE): tests/test_qwen36_tier_vk_multidev.c tests/qwen36_fake_vk.h qwen36_tier_vk.c qwen36_tier.h backend_vulkan.h
+	$(CC) $(CFLAGS) -DQ36_VK_TIER $< -o $@ $(LDFLAGS)
+
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

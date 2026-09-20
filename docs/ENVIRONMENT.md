@@ -392,6 +392,12 @@ and the CPU/GPU execution split.
 | `QWEN_DENSE_BATCH` | `1` (on) | On AVX2/FMA, reuse each dense-int8 weight decode across two prompt rows. `=0` restores one GEMV call per row. Decode `S=1` is unchanged. |
 | `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
 | `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
+| `Q36_VULKAN` | `0` (off) | `qwen36-vk` build only (`-DQ36_VK_TIER`, `VK=1`): bring up the Vulkan VRAM expert tier (`c/qwen36_tier_vk.c`). Off, the binary is bit-identical to `qwen36`. Needs full RAM residency (`cache/layer == n_experts`) and either packed int4 with group scales (`fmt=4`) or row-wise int8 (`fmt=1`, `expert_gs` absent) -- anything else disables the tier and logs why. |
+| `COLI_VK_DEV3` | `auto` | `qwen36-vk` with `Q36_VULKAN=1`: which Vulkan device hosts the tier's MANDATORY device (an index, or `auto` = the best real GPU that is not device 0). Always tried; if unavailable the tier stays off. |
+| `COLI_VK_DEV2` | unset (off) | `qwen36-vk` with `Q36_VULKAN=1`: ADD a second, optional expert-only device (F3 step 1) -- unset keeps V1's single-device behaviour and numerics exactly. An index, or `auto`. Unavailable: a warning and the tier continues on `COLI_VK_DEV3` alone, not a hard failure. Experts split across the active devices by `eid % (number of active devices)`, not by heat or size. |
+| `COLI_VK_EXPERTS3` | unset (budget only) | Cap dev3's resident expert count. |
+| `COLI_VK_EXPERTS2` | unset (budget only) | Cap dev2's resident expert count, independently of `COLI_VK_EXPERTS3` -- one device reaching its cap does not stop the other from filling its own share. |
+| `COLI_VK_TIER_RESERVE_GB` | `1.0` | VRAM to leave free on every active tier device (glm53's G6 rule). |
 
 ## Qwen3.8 engine (`qwen38`)
 

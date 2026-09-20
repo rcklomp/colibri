@@ -165,7 +165,13 @@ fi
 
 resident_pct() {
   local dir="$1"
-  find "$dir" -maxdepth 1 -type f -name '*.safetensors' -print0 | xargs -0 cat > /dev/null 2>&1 || true
+  # Two passes: a page read once sits on the INACTIVE list and is reclaimed
+  # ahead of GLM's long-lived cache, so one cat of a 35 GB container under a
+  # full page cache evicts its own head (run f3s0kl09201409: 84.9 % after one
+  # pass, refused). The second read promotes the pages.
+  for _ in 1 2; do
+    find "$dir" -maxdepth 1 -type f -name '*.safetensors' -print0 | xargs -0 cat > /dev/null 2>&1 || true
+  done
   fincore --bytes --output FILE,SIZE,RES "$dir"/*.safetensors | python3 -c "
 import sys
 PAGE=4096; tot=res=0

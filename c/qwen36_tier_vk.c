@@ -1,41 +1,82 @@
-/* qwen36_tier_vk.c -- Vulkan VRAM expert tier for the qwen36 engine (V1).
+/* qwen36_tier_vk.c -- Vulkan VRAM expert tier for the qwen36 engine (V1, F3 step 1).
  *
  * The same qt_* contract qwen36_tier.c implements over CUDA, implemented over
  * the Vulkan backend instead, so qwen36.c's call sites do not move. Built only
  * into the separate `qwen36-vk` binary (-DQ36_VK_TIER, VK=1); `make qwen36`
  * stays CPU-only and links no Vulkan.
  *
+ * V1 (2026-09-16) shipped this file as ONE device (dev3 only, packed int4
+ * with gs64 group scales). F3 step 1 (2026-09-20) is a PORT, not a new
+ * design: it generalises the single fixed device to a small, per-device
+ * array -- home(eid), per-device budget/used/cap, planned/resident/refused
+ * counted per device -- exactly the shape qwen36_tier.c's CUDA tier already
+ * has and already tests (tests/test_qwen36_tier_multidev.c), adapted to
+ * Vulkan's fixed-name device API (coli_vk_*2/coli_vk_*3, not one function
+ * parameterised by device index) via a tiny two-way dispatch. It also stops
+ * refusing a row-wise int8 container (fmt=1, gs absent): F3 step 0
+ * (tools/hot-expert/F3-STEP0-2026-09-20.md) measured int4-gs64 costing
+ * quality against int8 (mean KL 0.0316, top-1 92.96% over 625 positions) and
+ * found the int8 tier needs no new shader -- qmatmul*.comp already carries
+ * fmt=1 -- only a second expert card, because int8's 32.34 GB does not fit
+ * the 24.75 GB budget of one.
+ *
  * Differences from the CUDA tier, deliberate and measured against this box:
  *
- *  - ONE device. Qwen3.6-35B-A3B's 40 x 256 int4-gs64 experts are ~18.6 GB
- *    packed, which fits on one 24 GB 7900 XTX with the 1.0 GB reserve glm53's
- *    G6 uses on its expert-only cards. So there is no device loop and no
- *    home(eid) hash: everything lands on the card COLI_VK_DEV3 names, which on
- *    this rig is Vulkan enumeration index 2 = PCI 0000:86:00.0 (record SQ13).
- *    The Vulkan expert-group API is three fixed functions (_issue/_issue2/
- *    _issue3), not one parameterised by device, so a device loop would have
- *    needed a dispatch table for no benefit here.
- *
- *  - NO uploader thread and NO LFRU eviction. A Vulkan "upload" is a memcpy
- *    into mapped device memory inside coli_vk_tensor_ensure3 -- there is no
- *    async copy engine to hide behind a background thread, and with the whole
- *    expert set resident there is nothing to evict. Dropping both removes the
- *    CUDA tier's staging queue, its victim-in-flight interlock and its
- *    heat-swap tick; what stays is the heat table (HEAT_FILE, same on-disk
- *    format) deciding the FILL ORDER, which is all it can decide when the
- *    budget holds everything. If the budget ever stops short, the experts past
- *    the stop run on the CPU for the life of the process and qt_stats says so.
- *
- *  - The int4 nibble XOR in the CUDA tier's stage() is KEPT, not dropped.
- *    See stage() below: both backends take OFFSET-BINARY nibbles at their
- *    upload API, and qwen36's RAM copy is two's-complement.
+ *  - AT MOST TWO devices, dev2 and dev3, not the CUDA tier's up to eight.
+ *    Qwen3.6-35B-A3B's expert set is at most 32.34 GB (row-wise int8; 18.12
+ *    GB packed int4-gs64), which the CUDA tier's own header arithmetic
+ *    (tools/hot-expert/F3-STEP0-2026-09-20.md Card 1) shows fits two 24 GB
+ *    7900 XTX with room to spare -- a third device buys nothing on capacity
+ *    and was not measured for anything else, so it is not wired here. dev0
+ *    (the card that also hosts the trunk: attention, DeltaNet, lm_head in a
+ *    future step) is DELIBERATELY EXCLUDED from the expert pool by default,
+ *    matching the plan's step-1/step-2 split -- but home()/the per-device
+ *    arrays below do not assume exactly two, so adding a third slot later is
+ *    the same kind of small extension this port itself is, not a redesign.
+ *  - dev2 is OPTIONAL and ADDITIVE (only tried when COLI_VK_DEV2 is set, the
+ *    same convention glm53 and qwen38-vk use); dev3 stays MANDATORY exactly
+ *    as V1 had it, so with only COLI_VK_DEV3 set (or unset -- it defaults to
+ *    auto) this file activates exactly one device and its numerics are V1's,
+ *    unchanged. This is the "default behaviour unchanged" requirement, not
+ *    an incidental property: home(eid) = eid % 1 = 0 for every expert, the
+ *    single-device budget/planning/issue code paths below are the same
+ *    arithmetic V1 ran, one iteration of a loop that used to be inline code.
+ *  - NO uploader thread and NO LFRU eviction, as V1. A Vulkan "upload" is a
+ *    memcpy into mapped device memory inside coli_vk_tensor_ensure2/3 -- no
+ *    async copy engine to hide behind a background thread -- and with the
+ *    whole expert set resident there is nothing to evict. Preload across two
+ *    devices runs SEQUENTIALLY, one device's budget filled from the heat
+ *    order before the next device is considered (qt_plan_fill below), which
+ *    is the pattern glm53's own preload uses for its three devices
+ *    (vk_preload_tier, c/glm53.c: dev0's loop runs to completion, then
+ *      dev2's, then dev3's -- device-level concurrency is a decode-time-only
+ *      property in this codebase, not a preload one).
+ *  - Row-wise int8 (fmt=1, expert_gs absent/0) is accepted, not refused: the
+ *    format check now branches on expert_is_int4 the way the CUDA tier's
+ *    qt_init already does (qwen36_tier.c, `if(G.wfmt==1 && expert_gs>0)`),
+ *    instead of hard-refusing anything that is not the gs64 int4 container.
+ *    Bytes-per-expert, the staging buffer size and the scale layout all
+ *    follow G.wfmt now (see stage() and qt_init below) instead of assuming
+ *    int4's D*Ih/2 packing everywhere.
+ *  - The int4 nibble XOR in the CUDA tier's stage() is KEPT for int4, exactly
+ *    as V1 had it, and is NOT applied to int8 (whole bytes, not nibbles --
+ *    XORing them would be corruption, the same distinction the CUDA tier's
+ *    own stage() draws between wfmt==1 and its int4 branch).
  *
  * Knobs (all off by default -- with Q36_VULKAN unset this file's qt_init
  * returns 0 and the engine is exactly the CPU engine):
  *   Q36_VULKAN=1               turn the tier on
- *   COLI_VK_DEV3=<idx>|auto    which Vulkan physical device hosts it (default auto)
- *   COLI_VK_EXPERTS3=<n>       cap the resident expert count (0/unset = budget only)
- *   COLI_VK_TIER_RESERVE_GB=<g> VRAM to leave free on that card (default 1.0, as glm53)
+ *   COLI_VK_DEV3=<idx>|auto    which Vulkan physical device hosts the tier's
+ *                              mandatory device (default auto), as V1
+ *   COLI_VK_DEV2=<idx>|auto    ADD a second expert-only device (unset = off,
+ *                              V1's single-device behaviour); same convention
+ *                              as glm53's COLI_VK_DEV2
+ *   COLI_VK_EXPERTS3=<n>       cap dev3's resident expert count (0/unset =
+ *                              budget only), as V1
+ *   COLI_VK_EXPERTS2=<n>       cap dev2's resident expert count, same
+ *                              convention as glm53's COLI_VK_EXPERTS2
+ *   COLI_VK_TIER_RESERVE_GB=<g> VRAM to leave free on each tier device
+ *                              (default 1.0, as glm53's G6 rule)
  *   COLI_VK_SHADERS=<dir|.spv> where qmatmul.spv and friends live
  *   HEAT_FILE=<path>           routing-heat table, read for fill order and rewritten at exit
  *   QT_NO_WARMSTART=1          (read by qwen36.c) skip the fill; the tier then holds nothing
@@ -50,67 +91,94 @@
 #include "backend_vulkan.h"
 #include "tier.h"
 
+#define QT_VK_MAX_DEV 2   /* dev2 + dev3; see the file header for why not more */
+
 typedef struct {
     ColiVkTensor *tg, *tu, *td;
     uint32_t heat;
     uint8_t resident, planned;
+    uint8_t dev;                    /* index into G.phys[], valid once planned/resident */
 } QSlot;
 
 static struct {
     int on;
     int nl, ne, D, Ih, topk;
-    int egs;                       /* expert group size (64 on the gs64 container) */
+    int egs;                       /* expert group size (64 on the gs64 container, 0 = per-row) */
+    int wfmt;                      /* 4 = packed int4 (gs64), 1 = int8 per-row */
     size_t sc_gu, sc_d;            /* scale counts per matrix */
     size_t exp_bytes;              /* payload bytes one expert occupies in VRAM */
-    size_t budget, used;           /* byte budget for the planner */
-    int cap_count;                 /* COLI_VK_EXPERTS3, 0 = no count cap */
+    int ndev;                      /* 1 or 2 active devices */
+    int phys[QT_VK_MAX_DEV];       /* physical suffix, 2 or 3, in activation order */
+    size_t budget[QT_VK_MAX_DEV], used[QT_VK_MAX_DEV];
+    size_t dev_planned[QT_VK_MAX_DEV];
+    int cap_count[QT_VK_MAX_DEV];  /* COLI_VK_EXPERTS2/3, 0 = no count cap on that device */
+    int budget_stop[QT_VK_MAX_DEV];
+    uint64_t uploads[QT_VK_MAX_DEV], upload_fail[QT_VK_MAX_DEV];
+    uint64_t hits[QT_VK_MAX_DEV];
     double reserve_gb;
     QSlot *slot;                   /* [nl*ne] */
     int *fill_order; int fill_cur;
     uint32_t *heat0;
-    pthread_mutex_t up_mx;         /* serialises coli_vk_tensor_ensure3 */
-    /* issue state of the single decode thread */
-    int is_cnt, is_k[32];
-    float *is_x, *is_y;            /* 32*D each */
-    uint64_t hits, miss, uploads, upload_fail;
-    int budget_stop;               /* the live VRAM read stopped the fill */
+    pthread_mutex_t up_mx;         /* serialises coli_vk_tensor_ensure2/3, both devices */
+    /* issue state of the single decode thread, per device */
+    int is_cnt[QT_VK_MAX_DEV], is_k[QT_VK_MAX_DEV][32];
+    float *is_x, *is_y;            /* [ndev][32][D] each */
+    uint64_t miss;
 } G;
 
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
+static int home(int eid){ return eid % G.ndev; }
+
+/* ---- two-way dispatch: Vulkan's per-device API is three fixed function
+ * names, not one function taking a device index (see backend_vulkan.h). The
+ * CUDA tier's home()+per-device arrays generalise to any device count for
+ * free because coli_cuda_* already takes a device argument; here the same
+ * generalisation needs this small table instead. Two cases, not eight --
+ * dev0 is not offered a slot (file header) -- so a switch is clearer than a
+ * function-pointer table for two entries. */
+static const char *vk_tag(int phys){ return phys == 2 ? "dev2" : "dev3"; }
+static int vk_mem_budget(int phys, double *u, double *b){
+    return phys == 2 ? coli_vk_mem_budget2(u,b) : coli_vk_mem_budget3(u,b);
+}
+static int vk_tensor_ensure(int phys, ColiVkTensor **t, const void *w, const float *sc,
+                            int fmt, int I, int O, int grp){
+    return phys == 2 ? coli_vk_tensor_ensure2(t,w,sc,fmt,I,O,grp)
+                     : coli_vk_tensor_ensure3(t,w,sc,fmt,I,O,grp);
+}
+static int vk_group_issue(int phys, ColiVkTensor *const *g, ColiVkTensor *const *u,
+                          ColiVkTensor *const *d, const int *rows, int n, const float *x){
+    return phys == 2 ? coli_vk_expert_group_issue2(g,u,d,rows,n,x)
+                     : coli_vk_expert_group_issue3(g,u,d,rows,n,x);
+}
+static int vk_group_take(int phys, float *y){
+    return phys == 2 ? coli_vk_expert_group_take2(y) : coli_vk_expert_group_take3(y);
+}
 
 /* Staging: qwen36 keeps its packed int4 experts as TWO'S-COMPLEMENT nibbles
  * (qwen36.c's unpack_int4_to_int8 sign-extends: `(int8_t)(byte<<4)>>4`, and
- * c/tools/convert_qwen36.py packs them that way). Both GPU backends take
- * OFFSET-BINARY nibbles at their upload API:
- *
- *   CUDA  coli_cuda_tensor_upload(fmt=2|4) runs offset_to_signed_s4 -- an
- *         XOR 0x88 kernel -- over the bytes right after the H2D copy
- *         (backend_cuda.cu:1428), and weight_at() then sign-extends.
- *   VULKAN upload_tensor copies the nibbles verbatim (backend_vulkan.c:912)
- *         and every shader decodes them with i4(w,l) = (nibble & 0xf) - 8
- *         (qmatmul.comp:47, qmatmul_tile.comp:48, qmatmul_gate_up.comp:33,
- *         qmatmul_gate_up_tile.comp:27) -- i.e. offset binary, which is what
- *         that file's own header comment calls "int4 (nibble-8)". glm53 hands
- *         its q4 straight to coli_vk_tensor_ensure because ITS container is
- *         already offset binary (quant.h decodes `(b&0xF)-8`).
- *
- * So the XOR 0x88 the CUDA tier does here is NOT a CUDA-specific step and must
- * NOT be dropped for Vulkan. tools/hot-expert/V1-STEP0-2026-09-16.md sections
- * (c), (d) and (e) say the opposite; that reading took the shader's `- 8` for a
- * two's-complement decode and looked only at backend_cuda.cu's weight_at(),
- * not at the XOR its upload path performs on the device. Dropping the XOR
- * would offset every expert weight by 8 quanta and is exactly the class of bug
- * V1-STEP0 section (f) warned would "pass a coarse runs-and-looks-plausible
- * check and fail teacher_forcing". tests/test_qwen36_vk_nibble.c proves the
- * round trip over all 256 byte values. */
+ * c/tools/convert_qwen36.py packs them that way). The Vulkan upload API takes
+ * OFFSET-BINARY nibbles (qmatmul.comp:47 and friends decode
+ * i4(w,l) = (nibble & 0xf) - 8), so int4 experts get the XOR 0x88 conversion
+ * here, exactly as V1 had it (see the file header and
+ * tests/test_qwen36_vk_nibble.c). Row-wise int8 (wfmt==1) is already the
+ * upload's byte layout -- a straight copy, no XOR, because XORing whole
+ * int8 bytes the way the int4 nibble trick does would be corruption, not a
+ * convention change (the CUDA tier's own stage() draws the same line between
+ * its wfmt==1 and int4 branches, qwen36_tier.c). */
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
                   const float *gs, const float *us, const float *ds){
-    size_t mb = (size_t)G.D*G.Ih/2;
-    const uint64_t X = 0x8888888888888888ull;
-    const uint64_t *sg=(const uint64_t*)g4, *su=(const uint64_t*)u4, *sd=(const uint64_t*)d4;
-    uint64_t *w0=(uint64_t*)dw, *w1=(uint64_t*)(dw+mb), *w2=(uint64_t*)(dw+2*mb);
-    for(size_t i=0;i<mb/8;i++){ w0[i]=sg[i]^X; w1[i]=su[i]^X; w2[i]=sd[i]^X; }
+    size_t mb = (G.wfmt == 4) ? (size_t)G.D*G.Ih/2 : (size_t)G.D*G.Ih;
+    if(G.wfmt == 1){
+        memcpy(dw,       g4, mb);
+        memcpy(dw+mb,    u4, mb);
+        memcpy(dw+2*mb,  d4, mb);
+    } else {
+        const uint64_t X = 0x8888888888888888ull;
+        const uint64_t *sg=(const uint64_t*)g4, *su=(const uint64_t*)u4, *sd=(const uint64_t*)d4;
+        uint64_t *w0=(uint64_t*)dw, *w1=(uint64_t*)(dw+mb), *w2=(uint64_t*)(dw+2*mb);
+        for(size_t i=0;i<mb/8;i++){ w0[i]=sg[i]^X; w1[i]=su[i]^X; w2[i]=sd[i]^X; }
+    }
     memcpy(dsc,             gs, G.sc_gu*sizeof(float));
     memcpy(dsc+G.sc_gu,     us, G.sc_gu*sizeof(float));
     memcpy(dsc+2*G.sc_gu,   ds, G.sc_d *sizeof(float));
@@ -118,9 +186,10 @@ static void stage(uint8_t *dw, float *dsc,
 
 /* ---- the parts of the qt_* contract V1 does not implement ----------------
  * The trunk placement (R4: lm_head and the DeltaNet projections on their own
- * device) is a second, independent mechanism in qwen36_tier.c. V1's scope is
- * the EXPERT tier; these stubs keep every one of qwen36.c's call sites valid
- * and keep the trunk on the CPU, which is where it is on this binary today. */
+ * device) is a second, independent mechanism in qwen36_tier.c. V1's and F3
+ * step 1's scope is the EXPERT tier; these stubs keep every one of
+ * qwen36.c's call sites valid and keep the trunk on the CPU, which is where
+ * it is on this binary today. */
 int  qt_place_of(const char *component, int layer){ (void)component; (void)layer; return QT_PLACE_CPU; }
 void qt_trunk_offer(const char *component, int layer, size_t bytes){ (void)component; (void)layer; (void)bytes; }
 int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){ (void)q;(void)sc;(void)I;(void)O; return 0; }
@@ -129,7 +198,7 @@ int  qt_dnproj_init(int layer, const int8_t *q, const float *sc, int I, int O, i
     (void)layer;(void)q;(void)sc;(void)I;(void)O;(void)device; return 0; }
 int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
     (void)layer;(void)y;(void)x;(void)I;(void)O; return 0; }
-/* fp8 streaming is Qwen3.8's mode; this engine's experts are int4 and resident. */
+/* fp8 streaming is Qwen3.8's mode; this engine's experts are int4/int8 and resident. */
 int  qt_init_fp8(int nl,int ne,int D,int Ih,int cap,int topk,const float *lut){
     (void)nl;(void)ne;(void)D;(void)Ih;(void)cap;(void)topk;(void)lut; return 0; }
 
@@ -143,19 +212,27 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         return 0;
     }
     if(topk > 32){ fprintf(stderr,"[qtier-vk] topk>32 unsupported\n"); return 0; }
-    if(!expert_is_int4 || expert_gs <= 0){
-        /* Vulkan fmt=1 (int8, per-row scales) exists, but V1 is specified and
-         * measured on the int4-gs64 container and nothing else has been proved
-         * here; refusing loudly beats a silent second numeric path. */
-        fprintf(stderr,"[qtier-vk] container is %s -> tier disabled (V1 serves packed "
-                       "int4 with group scales, fmt=4)\n",
-                expert_is_int4 ? "int4 with per-row scales" : "int8");
-        return 0;
-    }
-    if((expert_gs & 7) || expert_gs < 8){
-        fprintf(stderr,"[qtier-vk] expert_gs=%d is not a multiple of 8; the fmt=4 "
-                       "shader path requires word-aligned groups -> tier disabled\n", expert_gs);
-        return 0;
+    int wfmt;
+    if(expert_is_int4){
+        if(expert_gs <= 0){
+            fprintf(stderr,"[qtier-vk] int4 container without group scales (expert_gs<=0) "
+                           "-> tier disabled\n");
+            return 0;
+        }
+        if((expert_gs & 7) || expert_gs < 8){
+            fprintf(stderr,"[qtier-vk] expert_gs=%d is not a multiple of 8; the fmt=4 "
+                           "shader path requires word-aligned groups -> tier disabled\n", expert_gs);
+            return 0;
+        }
+        wfmt = 4;
+    } else {
+        if(expert_gs > 0){
+            fprintf(stderr,"[qtier-vk] int8 experts with grouped scales (gs=%d) cannot be "
+                           "expressed on the GPU (fmt=1 is per-row only) -> tier disabled\n",
+                    expert_gs);
+            return 0;
+        }
+        wfmt = 1;
     }
     if(D > 6144){
         fprintf(stderr,"[qtier-vk] hidden=%d exceeds the gate_up shader's xsh[6144] "
@@ -163,7 +240,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         return 0;
     }
     memset(&G,0,sizeof G);
-    G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk; G.egs=expert_gs;
+    G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk; G.egs=expert_gs; G.wfmt=wfmt;
 
     char spv[1024];
     const char *given = getenv("COLI_VK_SHADERS");
@@ -173,43 +250,61 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier-vk] coli_vk_init(%s) failed -> CPU path\n", spv);
         return 0;
     }
-    /* The tier device. coli_vk_init_dev3 needs device 0 up first (it shares the
-     * instance), which is what the call above did; device 0 holds nothing of
-     * ours. Default auto = the best real GPU that is not device 0; this rig
-     * passes COLI_VK_DEV3=2 to name PCI 0000:86:00.0 explicitly. */
-    const char *dv = getenv("COLI_VK_DEV3");
-    int didx = (!dv || !*dv || !strcmp(dv,"auto")) ? -1 : atoi(dv);
-    if(!coli_vk_init_dev3(spv, didx) || !coli_vk_dev3_available()){
+
+    /* dev2 is OPTIONAL and ADDITIVE (only tried when COLI_VK_DEV2 is set);
+     * dev3 stays MANDATORY, exactly as V1. This ordering is what keeps "only
+     * COLI_VK_DEV3 set" the unchanged default: G.ndev==1, home(eid)==0 for
+     * every expert, one budget line, one device in every loop below. */
+    G.ndev = 0;
+    const char *d2 = getenv("COLI_VK_DEV2");
+    if(d2 && *d2){
+        int didx2 = !strcmp(d2,"auto") ? -1 : atoi(d2);
+        if(coli_vk_init_dev2(spv, didx2) && coli_vk_dev2_available()){
+            G.phys[G.ndev++] = 2;
+        } else {
+            fprintf(stderr,"[qtier-vk] dev2 (COLI_VK_DEV2=%s) not available -- continuing "
+                           "without it\n", d2);
+        }
+    }
+    const char *d3 = getenv("COLI_VK_DEV3");
+    int didx3 = (!d3 || !*d3 || !strcmp(d3,"auto")) ? -1 : atoi(d3);
+    if(!coli_vk_init_dev3(spv, didx3) || !coli_vk_dev3_available()){
         fprintf(stderr,"[qtier-vk] dev3 (COLI_VK_DEV3=%s) not available -> CPU path\n",
-                dv && *dv ? dv : "auto");
+                d3 && *d3 ? d3 : "auto");
         return 0;
     }
+    G.phys[G.ndev++] = 3;
 
-    G.sc_gu = (size_t)Ih * (size_t)((D  + expert_gs - 1)/expert_gs);
-    G.sc_d  = (size_t)D  * (size_t)((Ih + expert_gs - 1)/expert_gs);
-    /* Charged by PAYLOAD, not by an allocator-granularity curve. The CUDA tier
-     * carries dev_alloc_footprint because cudaMalloc rounds to 2 MiB above
-     * 1 MiB; RADV's rounding under this backend's suballocating arena is
-     * unmeasured, so rather than port a curve that may not transfer, the
-     * planner charges bytes and the LIVE budget read below (G6's rule, every
-     * 8 uploads) is the authority that stops the fill. qt_stats() prints both
-     * the planned and the driver-reported figure so the gap is visible. */
-    G.exp_bytes = 3*((size_t)D*Ih/2) + (2*G.sc_gu + G.sc_d)*sizeof(float);
+    G.sc_gu = G.egs ? (size_t)Ih * (size_t)((D  + G.egs - 1)/G.egs) : (size_t)Ih;
+    G.sc_d  = G.egs ? (size_t)D  * (size_t)((Ih + G.egs - 1)/G.egs) : (size_t)D;
+    /* Charged by PAYLOAD, not by an allocator-granularity curve -- see V1's
+     * measurement (record V1: predicted 18.12 GB, driver reported 18.26,
+     * 0.8% gap, RADV's suballocating arena does not need CUDA's curve). Bytes
+     * per expert follow wfmt: int8 (wfmt=1) is one byte/element, int4
+     * (wfmt=4) is packed two nibbles/byte. */
+    size_t mat_bytes = (G.wfmt == 4) ? (size_t)D*Ih/2 : (size_t)D*Ih;
+    G.exp_bytes = 3*mat_bytes + (2*G.sc_gu + G.sc_d)*sizeof(float);
 
     G.reserve_gb = 1.0;
     { const char *r=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r){ double v=atof(r); if(v>=0.0) G.reserve_gb=v; } }
-    { const char *c3=getenv("COLI_VK_EXPERTS3"); G.cap_count = c3 ? atoi(c3) : 0; }
 
-    double used_gb=0, budget_gb=0;
-    if(coli_vk_mem_budget3(&used_gb,&budget_gb) && budget_gb > G.reserve_gb)
-        G.budget = (size_t)((budget_gb - used_gb - G.reserve_gb) * 1e9);
-    else
-        G.budget = 0;
-    fprintf(stderr,"[qtier-vk] dev3: %.1f of %.1f GB used, reserve %.1f -> budget %.2f GB "
-                   "(~%zu experts at %.2f MB each)\n",
-            used_gb, budget_gb, G.reserve_gb, G.budget/1e9,
-            G.exp_bytes ? G.budget/G.exp_bytes : 0, G.exp_bytes/1048576.0);
+    for(int i=0;i<G.ndev;i++){
+        const char *envname = G.phys[i]==2 ? "COLI_VK_EXPERTS2" : "COLI_VK_EXPERTS3";
+        const char *c = getenv(envname);
+        G.cap_count[i] = c ? atoi(c) : 0;
+
+        double used_gb=0, budget_gb=0;
+        int have = vk_mem_budget(G.phys[i], &used_gb, &budget_gb);
+        if(have && budget_gb > G.reserve_gb)
+            G.budget[i] = (size_t)((budget_gb - used_gb - G.reserve_gb) * 1e9);
+        else
+            G.budget[i] = 0;
+        fprintf(stderr,"[qtier-vk] %s: %.1f of %.1f GB used, reserve %.1f -> budget %.2f GB "
+                       "(~%zu experts at %.2f MB each)\n",
+                vk_tag(G.phys[i]), used_gb, budget_gb, G.reserve_gb, G.budget[i]/1e9,
+                G.exp_bytes ? G.budget[i]/G.exp_bytes : 0, G.exp_bytes/1048576.0);
+    }
 
     G.slot = calloc((size_t)nl*ne, sizeof(QSlot));
     if(!G.slot) return 0;
@@ -232,13 +327,20 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier-vk] HEAT_FILE unset -- filling in natural order\n");
     }
 
-    G.is_x = malloc((size_t)32*D*sizeof(float));
-    G.is_y = malloc((size_t)32*D*sizeof(float));
+    G.is_x = malloc((size_t)G.ndev*32*D*sizeof(float));
+    G.is_y = malloc((size_t)G.ndev*32*D*sizeof(float));
     if(!G.is_x || !G.is_y){ free(G.is_x); free(G.is_y); free(G.slot); G.slot=NULL; return 0; }
     pthread_mutex_init(&G.up_mx,NULL);
     G.on = 1;
-    fprintf(stderr,"[qtier-vk] Vulkan VRAM expert tier active on dev3: fmt=4 gs=%d, "
-                   "%d x %d experts, %.2f MB/expert\n", G.egs, nl, ne, G.exp_bytes/1048576.0);
+    { char devlist[32]; devlist[0]=0;
+      for(int i=0;i<G.ndev;i++){
+          char tmp[16]; snprintf(tmp,sizeof tmp,"%s%s", i?"+":"", vk_tag(G.phys[i]));
+          strncat(devlist,tmp,sizeof(devlist)-strlen(devlist)-1);
+      }
+      fprintf(stderr,"[qtier-vk] Vulkan VRAM expert tier active on %s: fmt=%d gs=%d, "
+                     "%d x %d experts, %.2f MB/expert\n",
+              devlist, G.wfmt, G.egs, nl, ne, G.exp_bytes/1048576.0);
+    }
     return 1;
 }
 
@@ -282,6 +384,15 @@ static int cmp_heat_desc(const void *a,const void *b){
     return ia<ib ? -1 : ia>ib ? 1 : 0;
 }
 
+/* Is device index di full, either on its live budget or its count cap
+ * (COLI_VK_EXPERTS2/3)? Shared by the fill loop and its "give up entirely"
+ * check below. */
+static int dev_full(int di){
+    if(G.used[di] + G.exp_bytes > G.budget[di]) return 1;
+    if(G.cap_count[di] > 0 && G.dev_planned[di] >= (size_t)G.cap_count[di]) return 1;
+    return 0;
+}
+
 int qt_plan_fill(int *layers,int *eids,int max){
     if(!G.on) return 0;
     size_t n=(size_t)G.nl*G.ne;
@@ -294,20 +405,40 @@ int qt_plan_fill(int *layers,int *eids,int max){
         G.fill_cur=0;
     }
     while((size_t)G.fill_cur<n && cnt<max){
-        if(G.used + G.exp_bytes > G.budget) break;
-        if(G.cap_count > 0 && cnt >= G.cap_count) break;
-        int gi=G.fill_order[G.fill_cur++];
+        int gi=G.fill_order[G.fill_cur];
         int l=gi/G.ne, e=gi%G.ne;
+        int di=home(e);
         QSlot *s=qs(l,e);
-        if(s->resident||s->planned) continue;
-        G.used += G.exp_bytes;
-        s->planned=1;
+        if(s->resident||s->planned){ G.fill_cur++; continue; }
+        if(dev_full(di)){
+            /* This device is done; another might not be -- keep scanning the
+             * fill order (an eid homed elsewhere may still fit) instead of
+             * stopping the whole plan, which single-device V1 could do
+             * because there was nowhere else for an expert to go. Only stop
+             * once EVERY device is full. */
+            int all_full=1;
+            for(int d=0; d<G.ndev; d++) if(!dev_full(d)){ all_full=0; break; }
+            if(all_full) break;
+            G.fill_cur++;
+            continue;
+        }
+        G.fill_cur++;
+        G.used[di] += G.exp_bytes;
+        G.dev_planned[di]++;
+        s->planned=1; s->dev=(uint8_t)di;
         layers[cnt]=l; eids[cnt]=e; cnt++;
     }
-    if(max > 1)
-        fprintf(stderr,"[qtier-vk] planned %d experts (%.2f GB of a %.2f GB budget%s)\n",
-                cnt, G.used/1e9, G.budget/1e9,
-                G.cap_count>0 ? ", count-capped by COLI_VK_EXPERTS3" : "");
+    if(max > 1){
+        size_t tot_used=0, tot_budget=0;
+        for(int d=0; d<G.ndev; d++){ tot_used+=G.used[d]; tot_budget+=G.budget[d]; }
+        fprintf(stderr,"[qtier-vk] planned %d experts (%.2f GB of a %.2f GB budget total across "
+                       "%d device%s)\n",
+                cnt, tot_used/1e9, tot_budget/1e9, G.ndev, G.ndev>1?"s":"");
+        for(int d=0; d<G.ndev; d++)
+            fprintf(stderr,"[qtier-vk] %s: planned %zu experts, %.2f of %.2f GB%s\n",
+                    vk_tag(G.phys[d]), G.dev_planned[d], G.used[d]/1e9, G.budget[d]/1e9,
+                    G.cap_count[d]>0 ? " (count-capped)" : "");
+    }
     return cnt;
 }
 
@@ -319,62 +450,69 @@ int qt_fill_next(int *layer,int *eid){
 }
 
 /* Stage + upload one planned expert. Called from qwen36.c's parallel warmstart
- * loop: the container read and int4 unpack run on many threads, the upload
- * itself is serialised because backend_vulkan's suballocating arena is not
- * re-entrant. Which experts are resident does not depend on the thread order
- * -- qt_plan_fill decided that, deterministically, before any thread ran. */
+ * loop: the container read and int4/int8 unpack run on many threads, the
+ * upload itself is serialised (one mutex across BOTH devices, exactly as V1's
+ * single mutex serialised the one device it had) because backend_vulkan's
+ * suballocating arena is not re-entrant per device and glm53's own multi-
+ * device preload (vk_preload_tier, c/glm53.c) never uploads to two devices
+ * concurrently either -- device-level overlap in this codebase is a
+ * decode-time (issue/take) property, not a preload one. Which device an
+ * expert lands on does not depend on thread order -- qt_plan_fill decided
+ * that, deterministically, before any thread ran. */
 void qt_note_planned(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
     if(!G.on || layer<0 || eid<0 || layer>=G.nl || eid>=G.ne) return;
     QSlot *s=qs(layer,eid);
     if(!s->planned) return;
+    int di = s->dev;
     if(!g4 || !u4 || !d4 || !gs || !us || !ds){
         /* Nothing to upload: hand the reservation back, exactly as the CUDA
          * tier does, or the bytes stay out of the budget for the whole run
          * (#1331's shape). */
         pthread_mutex_lock(&G.up_mx);
-        if(s->planned){ if(G.used>=G.exp_bytes) G.used-=G.exp_bytes; s->planned=0; }
+        if(s->planned){ if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes; s->planned=0; }
         pthread_mutex_unlock(&G.up_mx);
         return;
     }
-    size_t mb=(size_t)G.D*G.Ih/2;
+    size_t mb=(G.wfmt==4) ? (size_t)G.D*G.Ih/2 : (size_t)G.D*G.Ih;
     uint8_t *w=malloc(3*mb);
     float *sc=malloc((2*G.sc_gu+G.sc_d)*sizeof(float));
     if(!w||!sc){ free(w); free(sc); return; }
     stage(w,sc,g4,u4,d4,gs,us,ds);
 
     pthread_mutex_lock(&G.up_mx);
-    if(G.budget_stop){ pthread_mutex_unlock(&G.up_mx); free(w); free(sc); return; }
+    if(G.budget_stop[di]){ pthread_mutex_unlock(&G.up_mx); free(w); free(sc); return; }
     /* G6's rule, ported: stop on the LIVE VRAM budget as well as on the
-     * planned byte count. These are device-local allocations that can spill to
-     * host RAM over ReBAR rather than fail, so without this a mis-estimated
-     * exp_bytes would quietly move the page cache out of RAM instead of
-     * stopping -- which is the 91 GB bug G6 fixed for glm53. */
-    if((G.uploads & 7) == 0){
+     * planned byte count, per device. These are device-local allocations
+     * that can spill to host RAM over ReBAR rather than fail, so without
+     * this a mis-estimated exp_bytes would quietly move the page cache out
+     * of RAM instead of stopping -- which is the 91 GB bug G6 fixed for
+     * glm53. */
+    if((G.uploads[di] & 7) == 0){
         double u=0,b=0;
-        if(coli_vk_mem_budget3(&u,&b) && (b-u) < G.reserve_gb){
-            fprintf(stderr,"[qtier-vk] preload dev3: stopping on VRAM budget "
+        if(vk_mem_budget(G.phys[di],&u,&b) && (b-u) < G.reserve_gb){
+            fprintf(stderr,"[qtier-vk] preload %s: stopping on VRAM budget "
                            "(%.1f of %.1f GB used, %.1f reserve) after %llu experts\n",
-                    u,b,G.reserve_gb,(unsigned long long)G.uploads);
-            G.budget_stop=1;
+                    vk_tag(G.phys[di]),u,b,G.reserve_gb,(unsigned long long)G.uploads[di]);
+            G.budget_stop[di]=1;
             pthread_mutex_unlock(&G.up_mx); free(w); free(sc); return;
         }
     }
     ColiVkTensor *tg=NULL,*tu=NULL,*td=NULL;
-    int ok = coli_vk_tensor_ensure3(&tg, w,        sc,             4, G.D,  G.Ih, G.egs)
-          && coli_vk_tensor_ensure3(&tu, w+mb,     sc+G.sc_gu,     4, G.D,  G.Ih, G.egs)
-          && coli_vk_tensor_ensure3(&td, w+2*mb,   sc+2*G.sc_gu,   4, G.Ih, G.D,  G.egs);
-    if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; }
+    int ok = vk_tensor_ensure(G.phys[di], &tg, w,        sc,             G.wfmt, G.D,  G.Ih, G.egs)
+          && vk_tensor_ensure(G.phys[di], &tu, w+mb,     sc+G.sc_gu,     G.wfmt, G.D,  G.Ih, G.egs)
+          && vk_tensor_ensure(G.phys[di], &td, w+2*mb,   sc+2*G.sc_gu,   G.wfmt, G.Ih, G.D,  G.egs);
+    if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads[di]++; }
     else {
         if(tg) coli_vk_tensor_free(tg);
         if(tu) coli_vk_tensor_free(tu);
         if(td) coli_vk_tensor_free(td);
-        if(!G.upload_fail)
-            fprintf(stderr,"[qtier-vk] upload refused at expert %d/%d -- the rest stay on the CPU\n",
-                    layer, eid);
-        G.upload_fail++;
-        G.budget_stop=1;                     /* the card is full: stop trying */
+        if(!G.upload_fail[di])
+            fprintf(stderr,"[qtier-vk] upload refused at expert %d/%d on %s -- the rest stay "
+                           "on the CPU\n", layer, eid, vk_tag(G.phys[di]));
+        G.upload_fail[di]++;
+        G.budget_stop[di]=1;                     /* this card is full: stop trying */
     }
     s->planned=0;
     pthread_mutex_unlock(&G.up_mx);
@@ -383,75 +521,110 @@ void qt_note_planned(int layer,int eid,
 
 void qt_fill_wait(void){ /* uploads are synchronous: nothing in flight */ }
 
+/* Launch the GPU groups for the resident subset of K, on EVERY involved
+ * device before any of them is taken (glm53, c/glm53.c: "issue every
+ * device's chunk first, join afterward" -- so the (at most two) devices run
+ * concurrently with each other instead of one after the other; qwen36_tier.c
+ * ports the same shape for CUDA). A layer's up-to-32 chosen experts sort
+ * into at most G.ndev buckets by home(eid); this issues one group call per
+ * non-empty bucket. */
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     if(!G.on || K>32 || K<1) return 0;
-    ColiVkTensor *tg[32],*tu[32],*td[32];
+    ColiVkTensor *tg[QT_VK_MAX_DEV][32], *tu[QT_VK_MAX_DEV][32], *td[QT_VK_MAX_DEV][32];
     static int rows[32];
     if(!rows[0]) for(int i=0;i<32;i++) rows[i]=1;
     uint32_t mask=0;
-    G.is_cnt=0;
+    for(int d=0; d<G.ndev; d++) G.is_cnt[d]=0;
     for(int k=0;k<K;k++){
         int e=eids[k];
         if(e<0||e>=G.ne){ G.miss++; continue; }
         QSlot *s=qs(layer,e);
         if(!s->resident){ G.miss++; continue; }
-        int c=G.is_cnt;
-        tg[c]=s->tg; tu[c]=s->tu; td[c]=s->td;
-        G.is_k[c]=k; G.is_cnt=c+1;
-        mask |= 1u<<k; G.hits++;
+        int d=s->dev;
+        int c=G.is_cnt[d];
+        tg[d][c]=s->tg; tu[d][c]=s->tu; td[d][c]=s->td;
+        G.is_k[d][c]=k; G.is_cnt[d]=c+1;
+        mask |= 1u<<k; G.hits[d]++;
     }
-    if(!G.is_cnt) return 0;
-    for(int j=0;j<G.is_cnt;j++)
-        memcpy(G.is_x + (size_t)j*G.D, x, (size_t)G.D*sizeof(float));
-    if(!coli_vk_expert_group_issue3(tg,tu,td,rows,G.is_cnt,G.is_x)){
-        /* hand these k back to the CPU for this token */
-        G.hits -= (uint64_t)G.is_cnt; G.miss += (uint64_t)G.is_cnt;
-        G.is_cnt=0;
-        return 0;
+    if(!mask) return 0;
+    for(int d=0; d<G.ndev; d++){
+        int c=G.is_cnt[d];
+        if(!c) continue;
+        float *xr = G.is_x + (size_t)d*32*G.D;
+        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
+        if(!vk_group_issue(G.phys[d], tg[d], tu[d], td[d], rows, c, xr)){
+            /* hand these k back to the CPU for this token */
+            for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[d][j]);
+            G.hits[d] -= (uint64_t)c; G.miss += (uint64_t)c;
+            G.is_cnt[d]=0;
+        }
     }
     return mask;
 }
 
 void qt_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
-    if(!G.on || !mask || !G.is_cnt) return;
-    int c=G.is_cnt; G.is_cnt=0;
-    if(!coli_vk_expert_group_take3(G.is_y)){
-        /* qt_issue already told the engine these k were handled, so the caller
-         * did NOT compute them on the CPU: their contribution is now missing
-         * from this token. Say so once and loudly rather than returning a
-         * quietly wrong hidden state -- the fence only fails when the device
-         * is lost, and a silent drop would survive every text oracle that
-         * happens to sample the same argmax. */
-        static int said=0;
-        if(!said){ said=1;
-            fprintf(stderr,"[qtier-vk] expert-group take FAILED -- %d expert(s) dropped from "
-                           "this token; output from here on is NOT trustworthy\n", c); }
-        G.hits -= (uint64_t)c; G.miss += (uint64_t)c;
-        return;
-    }
-    for(int j=0;j<c;j++){
-        float w=val[G.is_k[j]];
-        const float *row=G.is_y + (size_t)j*G.D;
-        for(int d=0;d<G.D;d++) out[d]+=w*row[d];
+    if(!G.on || !mask) return;
+    for(int d=0; d<G.ndev; d++){
+        int c=G.is_cnt[d];
+        if(!c) continue;
+        float *yb = G.is_y + (size_t)d*32*G.D;
+        if(!vk_group_take(G.phys[d], yb)){
+            /* qt_issue already told the engine these k were handled, so the
+             * caller did NOT compute them on the CPU: their contribution is
+             * now missing from this token. Say so once and loudly rather
+             * than returning a quietly wrong hidden state -- the fence only
+             * fails when the device is lost, and a silent drop would
+             * survive every text oracle that happens to sample the same
+             * argmax. */
+            static int said=0;
+            if(!said){ said=1;
+                fprintf(stderr,"[qtier-vk] expert-group take FAILED on %s -- %d expert(s) "
+                               "dropped from this token; output from here on is NOT "
+                               "trustworthy\n", vk_tag(G.phys[d]), c); }
+            G.hits[d] -= (uint64_t)c; G.miss += (uint64_t)c;
+            G.is_cnt[d]=0;
+            continue;
+        }
+        for(int j=0;j<c;j++){
+            float w=val[G.is_k[d][j]];
+            const float *row=yb + (size_t)j*G.D;
+            for(int dd=0; dd<G.D; dd++) out[dd]+=w*row[dd];
+        }
+        G.is_cnt[d]=0;
     }
 }
 
 void qt_stats(void){
     if(!G.on) return;
-    size_t res=0;
-    for(size_t i=0;i<(size_t)G.nl*G.ne;i++) res += G.slot[i].resident;
-    double u=0,b=0; int have=coli_vk_mem_budget3(&u,&b);
-    double tot=(double)(G.hits+G.miss);
+    size_t res_dev[QT_VK_MAX_DEV] = {0};
+    size_t total_res=0;
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
+        if(!G.slot[i].resident) continue;
+        total_res++;
+        res_dev[G.slot[i].dev]++;
+    }
+    uint64_t tot_uploads=0, tot_fail=0, tot_hits=0; int any_stop=0;
+    for(int d=0; d<G.ndev; d++){
+        double u=0,b=0; int have=vk_mem_budget(G.phys[d],&u,&b);
+        fprintf(stderr,"[qtier-vk] %s: resident %zu | uploads %llu | refused %llu | "
+                       "budget-stop %d\n",
+                vk_tag(G.phys[d]), res_dev[d], (unsigned long long)G.uploads[d],
+                (unsigned long long)G.upload_fail[d], G.budget_stop[d]);
+        fprintf(stderr,"[qtier-vk] %s planned %.2f GB, driver reports %.2f of %.2f GB used%s\n",
+                vk_tag(G.phys[d]), G.used[d]/1e9, u, b,
+                have ? "" : " (VK_EXT_memory_budget absent: figures unavailable)");
+        tot_uploads += G.uploads[d]; tot_fail += G.upload_fail[d]; tot_hits += G.hits[d];
+        any_stop |= G.budget_stop[d];
+    }
     fprintf(stderr,"[qtier-vk] resident %zu/%d experts | uploads %llu | refused %llu | "
                    "budget-stop %d\n",
-            res, G.nl*G.ne, (unsigned long long)G.uploads,
-            (unsigned long long)G.upload_fail, G.budget_stop);
-    fprintf(stderr,"[qtier-vk] dev3 planned %.2f GB, driver reports %.2f of %.2f GB used%s\n",
-            G.used/1e9, u, b, have ? "" : " (VK_EXT_memory_budget absent: figures unavailable)");
+            total_res, G.nl*G.ne, (unsigned long long)tot_uploads,
+            (unsigned long long)tot_fail, any_stop);
+    double tot=(double)(tot_hits+G.miss);
     fprintf(stderr,"[qtier-vk] VRAM hit rate: %.1f %% (hits %llu, CPU misses %llu)\n",
-            tot>0 ? 100.0*(double)G.hits/tot : 0.0,
-            (unsigned long long)G.hits, (unsigned long long)G.miss);
+            tot>0 ? 100.0*(double)tot_hits/tot : 0.0,
+            (unsigned long long)tot_hits, (unsigned long long)G.miss);
 }
 
 void qt_shutdown(void){

@@ -308,6 +308,16 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - `qwen38` (CPU) and `qwen38-vk` (VK=1 target, `Q38_VULKAN=1` plus
   `COLI_VK_DEV2=auto COLI_VK_DEV3=auto`) — `c/qwen38.c`, `c/qwen38_core.h`.
 - `glm53` (`COLI_VULKAN=1`, three devices) — `c/glm53.c`, `c/sparse_index.h`.
+- `qwen36` (CPU) and `qwen36-vk` (`make -C c qwen36-vk VK=1`, `Q36_VULKAN=1`)
+  — `c/qwen36.c`, `c/qwen36_tier_vk.c`: Qwen3.6-35B-A3B, the Franken plan's F3
+  model. **Use the row-wise int8 container `~/models/qwen36_i8_row` with
+  `COLI_VK_DEV2=auto COLI_VK_DEV3=auto`** (all 10 240 experts resident,
+  16.17 GB on each of dev2/dev3; int4-gs64 costs mean KL 0.0316 / top-1
+  92.96 % against it and is no faster, record §F3-STEP0/§F3-STEP1). With
+  only `COLI_VK_DEV3` set and `~/models/qwen36_i4_gs64` it is V1,
+  bit-identical. The trunk runs on the CPU (71 % of a 47 ms token), dev0 is
+  idle; no slots, no prefix checkpoints, `[timers]` prints in CLI mode only.
+  Gate binaries: `~/bench/qwen36-vk.v1`, `qwen36-vk.f3s1` = `1e0a0ad`.
 - Shared: `c/quant.h` (CPU kernels; `matmul_fp8` is Qwen-only in practice),
   `c/backend_vulkan.c`, `c/shaders/*.comp`. A shared-file change must
   rebuild and re-measure both engines.

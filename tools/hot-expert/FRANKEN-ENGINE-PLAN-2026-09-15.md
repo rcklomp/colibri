@@ -14,6 +14,32 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 26 (2026-09-20 09:15 CEST, 07:15 UTC) -- F8 step 0 ANSWERED (Sonnet,
+> record §F8-STEP0).** Three arbitration rounds on the same CPU
+> microbenchmark, no engine change, no gateway downtime. Round 1's near-
+> linear 1->8 thread scaling looked bandwidth-bound; round 2 tested and
+> REFUTED the alternative "FMA-latency-chain" hypothesis directly (§G14's
+> own `coli_i4_row_f4`, 4 independent accumulators, is statistically flat
+> against the fork/join fix in the engine's own multi-row-per-thread
+> structure, and an 8-accumulator extension is measurably worse); round 3
+> found the real mechanism -- with gs=64 every group pays a 64-deep SCALAR
+> reduction chain (`hsum256` + `fmaf` into the row total) across a 4096-wide
+> row, on top of the vector work. A group-vector combine that stays in
+> vector form until one `hsum` at the row's end (`coli_i4_row_gv`, same
+> bit-trick decode as `f4`, reassociation-only, rel_l2 ~3.3e-07, the same
+> order as `f4`'s own ~1e-7) plus fusing the window's three thread-team
+> spawns into one (bit-identical) together project **~30% off the 73 ms
+> CPU-expert decode bucket, ~21.6 ms/token, upper bound** (§G14's own
+> isolated-to-in-engine attenuation, 1.26-1.65x -> 1.095x, means the
+> delivered number will be smaller; not yet measured in the engine). F5's
+> precondition ("a materially cheaper CPU miss") is PROJECTED but not
+> DELIVERED, so **F5 stays deferred** until the change lands and is measured
+> in situ. **Order now: wire `coli_i4_row_gv` + the fork/join fusion into
+> `ffn_moe_run_deferred_cpu` behind `GLM53_I4_FAST`, gate it like F7
+> (`teacher_forcing`+KL, A,B,B,A ladder, a jitter arm) -> re-open F5 if the
+> in-engine number holds up; F9 (indexer on the GPU) in parallel, Opus for
+> the shader; F3 when a model is named.**
+>
 > **Rev 25 (2026-09-20 08:00 CEST, 06:00 UTC) -- the profile after F7, F5
 > deferred, F8 started, F9 opened.** No rig time: the ladder's own B arm
 > (`f709200252_B1`, `[OPTIME req=6 ctx=18439]`, 482.8 s of layer time) is the

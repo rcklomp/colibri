@@ -80,6 +80,19 @@
  *   COLI_VK_SHADERS=<dir|.spv> where qmatmul.spv and friends live
  *   HEAT_FILE=<path>           routing-heat table, read for fill order and rewritten at exit
  *   QT_NO_WARMSTART=1          (read by qwen36.c) skip the fill; the tier then holds nothing
+ *   Q36_VK_TRUNK=1             F3 step 2a: also place lm_head and every DeltaNet
+ *                              layer's fused qkv++z input projection on dev0 (the
+ *                              device coli_vk_init(spv) above already brought up;
+ *                              idle otherwise -- experts live on dev2/dev3 only).
+ *                              Off by default: qt_place_of, qt_lmhead_init/matmul
+ *                              and qt_dnproj_init/matmul then behave exactly as
+ *                              before this knob existed (trunk stays on the
+ *                              CPU). Row-wise int8 (fmt=1),
+ *                              same q/sc bytes qwen36.c dense-i8 quantization
+ *                              (qdw_register) already produces for the CPU path --
+ *                              a REASSOCIATION of the same products, not a
+ *                              different computation (see qwen36_tier.c own
+ *                              R4 comment, this is a port of that mechanism).
  */
 #ifdef Q36_VK_TIER
 
@@ -184,20 +197,81 @@ static void stage(uint8_t *dw, float *dsc,
     memcpy(dsc+2*G.sc_gu,   ds, G.sc_d *sizeof(float));
 }
 
-/* ---- the parts of the qt_* contract V1 does not implement ----------------
- * The trunk placement (R4: lm_head and the DeltaNet projections on their own
- * device) is a second, independent mechanism in qwen36_tier.c. V1's and F3
- * step 1's scope is the EXPERT tier; these stubs keep every one of
- * qwen36.c's call sites valid and keep the trunk on the CPU, which is where
- * it is on this binary today. */
-int  qt_place_of(const char *component, int layer){ (void)component; (void)layer; return QT_PLACE_CPU; }
+/* ---- R4 trunk placement over dev0 (F3 step 2a) ---------------------------
+ * A PORT of qwen36_tier.c's own qt_lmhead_init/matmul and qt_dnproj_init/
+ * matmul onto this backend's dev0 entry points (coli_vk_matmul,
+ * coli_vk_tensor_ensure -- the unsuffixed, single-device API glm53 already
+ * drives its own dense matrices and its lm_head through, `mv()` in
+ * c/glm53.c). dev0 is not part of the expert pool (dev2/dev3 only, file
+ * header); its Vulkan context is already live by the time these run --
+ * brought up by qt_init's own coli_vk_init(spv) call above, not a second
+ * device bring-up. Off by default (Q36_VK_TRUNK unset): qt_place_of returns
+ * QT_PLACE_CPU exactly as before this knob existed and the two _init
+ * functions are no-ops, so qwen36.c's unconditional call sites leave the
+ * trunk on the CPU, unchanged.
+ *
+ * Numerics: this REORDERS the same row-wise int8 dot products qwen36.c's
+ * dense-i8 quantization already produces for the CPU path (qdw_register:
+ * per-row scale, y[o] = acc*sc[o], the exact semantics fmt=1 applies) --
+ * AVX2-lane summation on the CPU vs. the GPU's subgroup reduction, not a
+ * different quantization or a different weight. Ships behind the knob per
+ * CLAUDE.md's rule for any change that reorders a float sum. */
+/* Read fresh every call, not cached: it is only consulted at load time
+ * (qt_place_of, once per dnproj layer; the two _init entry points, once
+ * each), never in the per-token matmul path, so there is no per-token cost
+ * to weigh against a cache -- and a test process that runs qt_init more than
+ * once with a different Q36_VK_TRUNK (this file's own fake-backend test)
+ * gets the value it just set, not a first-call snapshot. */
+static int qt_vk_trunk_on(void){
+    const char *e = getenv("Q36_VK_TRUNK");
+    return (e && atoi(e)) ? 1 : 0;
+}
+static struct { ColiVkTensor *t; int on; } G_lmh;
+static struct { ColiVkTensor *t; int on; } *G_dnp;   /* [G.nl], calloc'd in qt_init */
+
+int  qt_place_of(const char *component, int layer){
+    (void)layer;
+    if (!qt_vk_trunk_on() || !G.on) return QT_PLACE_CPU;
+    if (!strcmp(component, "lmhead") || !strcmp(component, "dnproj")) return 0; /* dev0 */
+    return QT_PLACE_CPU;
+}
 void qt_trunk_offer(const char *component, int layer, size_t bytes){ (void)component; (void)layer; (void)bytes; }
-int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){ (void)q;(void)sc;(void)I;(void)O; return 0; }
-int  qt_lmhead_matmul(float *y, const float *x, int I, int O){ (void)y;(void)x;(void)I;(void)O; return 0; }
+
+int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
+    if (!qt_vk_trunk_on() || !G.on || !q || !sc) return 0;
+    if (!coli_vk_tensor_ensure(&G_lmh.t, q, sc, 1, I, O, 0)) {
+        fprintf(stderr, "[trunk-vk] lm_head upload to dev0 failed -> stays on CPU\n");
+        return 0;
+    }
+    G_lmh.on = 1;
+    fprintf(stderr, "[trunk-vk] lm_head [%d x %d] int8 resident on dev0 (%.2f GB)\n",
+            O, I, (double)O * I / 1073741824.0);
+    return 1;
+}
+int  qt_lmhead_matmul(float *y, const float *x, int I, int O){
+    if (!G_lmh.on) return 0;
+    if (coli_vk_matmul(&G_lmh.t, y, x, NULL, NULL, 1, 1, I, O, 0)) return 1;
+    fprintf(stderr, "[trunk-vk] lm_head GPU matmul failed; falling back to CPU from here on\n");
+    G_lmh.on = 0;
+    return 0;
+}
 int  qt_dnproj_init(int layer, const int8_t *q, const float *sc, int I, int O, int device){
-    (void)layer;(void)q;(void)sc;(void)I;(void)O;(void)device; return 0; }
+    (void)device;   /* one target (dev0); the CUDA tier's ordinal has nothing to select here */
+    if (!qt_vk_trunk_on() || !G.on || !G_dnp || layer < 0 || layer >= G.nl || !q || !sc) return 0;
+    if (!coli_vk_tensor_ensure(&G_dnp[layer].t, q, sc, 1, I, O, 0)) {
+        fprintf(stderr, "[trunk-vk] dnproj layer %d upload to dev0 failed -> stays on CPU\n", layer);
+        return 0;
+    }
+    G_dnp[layer].on = 1;
+    return 1;
+}
 int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
-    (void)layer;(void)y;(void)x;(void)I;(void)O; return 0; }
+    if (!G_dnp || layer < 0 || layer >= G.nl || !G_dnp[layer].on) return 0;
+    if (coli_vk_matmul(&G_dnp[layer].t, y, x, NULL, NULL, 1, 1, I, O, 0)) return 1;
+    fprintf(stderr, "[trunk-vk] dnproj layer %d GPU matmul failed; CPU from here on\n", layer);
+    G_dnp[layer].on = 0;
+    return 0;
+}
 /* fp8 streaming is Qwen3.8's mode; this engine's experts are int4/int8 and resident. */
 int  qt_init_fp8(int nl,int ne,int D,int Ih,int cap,int topk,const float *lut){
     (void)nl;(void)ne;(void)D;(void)Ih;(void)cap;(void)topk;(void)lut; return 0; }
@@ -241,6 +315,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     }
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk; G.egs=expert_gs; G.wfmt=wfmt;
+    /* G_lmh/G_dnp are file-scope, not part of G -- qt_init can in principle run
+     * more than once in a test process, so reset them here too. */
+    G_lmh.t = NULL; G_lmh.on = 0;
+    free(G_dnp); G_dnp = NULL;
 
     char spv[1024];
     const char *given = getenv("COLI_VK_SHADERS");
@@ -308,6 +386,8 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
 
     G.slot = calloc((size_t)nl*ne, sizeof(QSlot));
     if(!G.slot) return 0;
+    G_dnp = calloc((size_t)nl, sizeof *G_dnp);   /* trunk dnproj slots, one per model layer */
+    if(!G_dnp){ free(G.slot); G.slot=NULL; return 0; }
     const char *hf = getenv("HEAT_FILE");
     if(hf){
         FILE *f=fopen(hf,"rb");

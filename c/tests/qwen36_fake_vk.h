@@ -16,7 +16,15 @@
  *                         which suffix issued (2 or 3), the row count and the
  *                         input pointer; its return value is what issue
  *                         returns. NULL (the default) reproduces the old
- *                         always-0 stub. */
+ *                         always-0 stub.
+ *   fake_vk_matmul_ok0  - F3 step 2a (trunk placement): coli_vk_tensor_ensure /
+ *                         coli_vk_matmul WITHOUT a device suffix are dev0's own
+ *                         API (backend_vulkan.h), used by qt_lmhead_init/matmul
+ *                         and qt_dnproj_init/matmul when Q36_VK_TRUNK=1.
+ *                         Recorded the same way as
+ *                         dev2/dev3's uploads (fake_vk_uploads0 etc); set to 0
+ *                         to make coli_vk_matmul fail so a test can check the
+ *                         GPU-failure fallback path. */
 #ifndef QWEN36_FAKE_VK_H
 #define QWEN36_FAKE_VK_H
 
@@ -114,5 +122,42 @@ int coli_vk_expert_group3(ColiVkTensor *const *g, ColiVkTensor *const *u, ColiVk
 void coli_vk_tensor_free(ColiVkTensor *t) { free(t); }
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? (size_t)t->I * t->O : 0; }
 int coli_vk_tensor_dev(const ColiVkTensor *t) { return t ? t->dev : -1; }
+
+/* dev0 (unsuffixed): the trunk-placement API (F3 step 2a). Recorded the same
+ * way as dev2/dev3's coli_vk_tensor_ensure2/3 above; coli_vk_matmul does no
+ * real arithmetic (none of these tests check computed numerics -- that is
+ * the KL chain's job, on real hardware) but mirrors upload_tensor's own
+ * early-return shape check in backend_vulkan.c so a second call with
+ * weights=NULL (the cached-tensor path qt_lmhead_matmul/qt_dnproj_matmul
+ * use) behaves like the real backend instead of crashing on a NULL deref. */
+static int fake_vk_uploads0;
+static int fake_vk_last_fmt0 = -1;
+static size_t fake_vk_last_bytes0;
+static unsigned char fake_vk_captured0[4096];
+static size_t fake_vk_captured0_len;
+static int fake_vk_matmul_calls0;
+static int fake_vk_matmul_ok0 = 1;
+static int fake_vk_last_S0, fake_vk_last_I0, fake_vk_last_O0;
+
+int coli_vk_tensor_ensure(ColiVkTensor **t, const void *w, const float *sc, int fmt, int I, int O, int gs) {
+    (void)sc;
+    return upload_common(t, w, fmt, I, O, gs, 0, &fake_vk_uploads0, &fake_vk_last_fmt0,
+                         &fake_vk_last_bytes0, fake_vk_captured0, &fake_vk_captured0_len);
+}
+int coli_vk_matmul(ColiVkTensor **t, float *y, const float *x,
+                   const void *w, const float *sc, int fmt, int S, int I, int O, int gs) {
+    (void)x;
+    if (*t) {
+        ColiVkTensor *e = *t;
+        if (e->fmt != fmt || e->I != I || e->O != O) return 0;
+    } else if (!coli_vk_tensor_ensure(t, w, sc, fmt, I, O, gs)) {
+        return 0;
+    }
+    fake_vk_matmul_calls0++;
+    fake_vk_last_S0 = S; fake_vk_last_I0 = I; fake_vk_last_O0 = O;
+    if (!fake_vk_matmul_ok0) return 0;
+    if (y) for (int i = 0; i < S * O; i++) y[i] = 0.0f;
+    return 1;
+}
 
 #endif /* QWEN36_FAKE_VK_H */

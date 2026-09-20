@@ -57,6 +57,14 @@ static inline int coli_sparse_index_scalar_on(void) {
     return cached;
 }
 
+/* AVX2/FMA availability, checked BEFORE coli_sparse_index_lanes_on below so
+ * its default can depend on it (P5.1's own COLI_MLA_HEADVEC gate, glm53.c,
+ * is the same shape: no AVX2/FMA, no default-on). */
+#if defined(__AVX2__) && defined(__FMA__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define COLI_INDEX_HEADVEC 1
+#endif
+
 /* F9a: head-lane SIMD for the score pass's per-pool dot, ported from P5.1's
  * MLA attention core (glm53.c's glm_transpose/glm_lane_dots). The per-pool,
  * per-head dot `for d: dot += query[h][d] * pv[d]` below is exactly the
@@ -94,17 +102,20 @@ static inline int coli_sparse_index_scalar_on(void) {
  * A clang build of this same source was found, while writing this item, to
  * contract the reference's OWN scalar dot into vfmadd in cases GCC does not
  * (e.g. a short head count's remainder), which would silently break the
- * match -- so on anything other than real GCC the default is off, same as
- * P5.1's own COLI_MLA_HEADVEC gate defaults off without AVX2/FMA. The env
- * var still forces it on any compiler for whoever explicitly wants that
- * (their choice to make, not this default's). GLM53_INDEX_SCALAR=1 (the
- * original single-threaded O(wanted*pools) scan, F6a) never reaches this
- * code at all, so it implies lanes off regardless. */
+ * match -- so the default requires both real GCC AND AVX2/FMA
+ * (COLI_INDEX_HEADVEC, defined just above), same as P5.1's own
+ * COLI_MLA_HEADVEC gate defaults off without AVX2/FMA (and the scalar tail
+ * this loop falls back to without AVX2 has the identical GCC-only FMA
+ * concern -- see COLI_IDX_MULADD_SCALAR below). The env var still forces it
+ * on for whoever explicitly wants that on another compiler or ISA (their
+ * choice to make, not this default's). GLM53_INDEX_SCALAR=1 (the original
+ * single-threaded O(wanted*pools) scan, F6a) never reaches this code at
+ * all, so it implies lanes off regardless. */
 static int g_coli_index_lanes_cached = -1;
 static inline int coli_sparse_index_lanes_on(void) {
     if (g_coli_index_lanes_cached < 0) {
         const char *e = getenv("GLM53_INDEX_LANES");
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(COLI_INDEX_HEADVEC) && defined(__GNUC__) && !defined(__clang__)
         g_coli_index_lanes_cached = e ? atoi(e) : 1;
 #else
         g_coli_index_lanes_cached = e ? atoi(e) : 0;
@@ -137,12 +148,27 @@ static inline int coli_sparse_index_lanes_usable(int dim) {
     return coli_sparse_index_lanes_on() && dim % 4 == 0;
 }
 
-#if defined(__AVX2__) && defined(__FMA__) && (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#define COLI_INDEX_HEADVEC 1
+#ifdef COLI_INDEX_HEADVEC
 #define COLI_IDX_MULADD(acc, x, y) do { __m256 m_ = _mm256_mul_ps((x), (y)); \
                                         __asm__("" : "+x"(m_)); \
                                         (acc) = _mm256_add_ps((acc), m_); } while (0)
+#endif
+
+/* Scalar version of the same empty-asm trick, for the head-count tail
+ * below. `#pragma STDC FP_CONTRACT OFF` was tried first and does nothing on
+ * GCC -- GCC has never implemented it and says so (`warning: ignoring
+ * '#pragma STDC FP_CONTRACT'`), and its actual default for plain C is
+ * contraction ON: a standalone TU with exactly this tail's shape (checked
+ * on the rig, gcc -O3 -march=native -fopenmp) compiles `dot += a[d]*b[d]`
+ * into `vfmadd231ss`. The empty-asm barrier on the scalar product, same
+ * idea as COLI_IDX_MULADD, reliably blocks it there (0 vfmadd in that same
+ * probe once applied) and needs only SSE, so it holds without AVX2 too. */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#define COLI_IDX_MULADD_SCALAR(acc, x, y) do { float m_ = (x) * (y); \
+                                               __asm__("" : "+x"(m_)); \
+                                               (acc) = (acc) + m_; } while (0)
+#else
+#define COLI_IDX_MULADD_SCALAR(acc, x, y) do { (acc) = (acc) + (x) * (y); } while (0)
 #endif
 
 /* a[N][K] -> aT[K][N], 8x8 blocked -- verbatim shape of glm53.c's
@@ -226,19 +252,16 @@ static inline void coli_index_lane_dots(float *dst, const float *aT, const float
         _mm256_storeu_ps(dst + h, a0);
     }
 #endif
-    /* Portable tail for a head count not a multiple of 8 (and the whole
-     * dot, on a build without AVX2/FMA): plain per-d multiply-then-add, in
-     * the SAME order the reference computes. `#pragma STDC FP_CONTRACT OFF`
-     * -- unlike the empty-asm trick above, needed only where the compiler
-     * fuses a same-width intrinsic mul+add it issued itself -- reliably
-     * blocks contraction for a plain scalar reduction like this one on both
-     * GCC and Clang; verified against a mismatch this exact loop produced
-     * without it (F9a record). */
+    /* Portable tail for a head count not a multiple of 8 (and the whole dot,
+     * on a build without AVX2/FMA): plain per-d multiply-then-add, in the
+     * SAME order the reference computes, FMA contraction blocked by
+     * COLI_IDX_MULADD_SCALAR (see its own comment -- the pragma this used to
+     * say does the same thing does nothing at all on GCC). */
     {
-#pragma STDC FP_CONTRACT OFF
         for (; h < H; h++) {
             float dot = 0.0f;
-            for (int d = 0; d < L; d++) dot += qT[(size_t)d * H + h] * c_j[d];
+            for (int d = 0; d < L; d++)
+                COLI_IDX_MULADD_SCALAR(dot, qT[(size_t)d * H + h], c_j[d]);
             dst[h] = dot;
         }
     }

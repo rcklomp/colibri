@@ -26,7 +26,11 @@ since 2026-09-16 (items F0–F10), and until 2026-09-20 this list did not
 name it at all.** Read its highest `Rev N` for what is open, its §8.3 table
    for the state of every item, and `tools/hot-expert/HANDOFF-2026-09-20.md`
    for how the track got where it is: what was refuted, why each decision was
-   taken, the working method, what waits on the owner. The two roadmaps below
+   taken, the working method, what waits on the owner. **For the whole project
+   in one file -- history of all three tracks, every bug and what found it,
+   what is left and whose decision it is -- read
+   `tools/hot-expert/PROJECT-HANDOFF-2026-09-20.md` (written 2026-09-20 evening,
+   after F3 steps 0-2a).** The two roadmaps below
    are both finished; they are history and rules, not a to-do list.
 0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` — the prefill /
    interactive-use track, opened 2026-09-06 when Open WebUI exposed that

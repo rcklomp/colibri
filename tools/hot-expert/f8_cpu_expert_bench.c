@@ -279,6 +279,67 @@ static inline float coli_i4_row_f8(const uint8_t *w, const float *scl,
     return a;
 }
 
+/* coli_i4_row_gv ("group-vector"): F8 arbitration round 3. f4/f8 broke the
+ * within-group FMA chain but bought ~0 in the engine's own multi-row-per-
+ * thread structure (measured: f4 1-team ~= baseline 1-team; f8 1-team
+ * SLOWER). Remaining suspect: with gs=64 every group still pays
+ * `hsum256(acc)` (a 256->32 bit reduction) followed by a SCALAR
+ * `fmaf(hsum,sc,a)` that chains across all 64 groups of a 4096-wide row --
+ * a 64-deep scalar dependency chain on top of the vector work. This kernel
+ * is f4's own bit-trick decode and 4-accumulator group body, UNCHANGED,
+ * with only the end-of-group combine rewritten: the group's scaled partial
+ * stays a VECTOR (`fmadd(group_sum, scale_broadcast, tot_k)`), folded into
+ * one of two alternating running vector totals (tot0 for even groups, tot1
+ * for odd) so consecutive groups do not serialise on each other either --
+ * ONE hsum at the very end of the row, not one per group. Bench-local, not
+ * a shipped kernel; scalar tail copied from f4 for shapes not a multiple of
+ * 16, folded into a plain scalar running total added in at the end. */
+static inline float coli_i4_row_gv(const uint8_t *w, const float *scl,
+                                   const float *xs, int I, int gs) {
+    const int ng = (I + gs - 1) / gs;
+    float a_tail = 0;
+#ifdef __AVX2__
+    __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
+    const __m128i m4 = _mm_set1_epi8(0x0F); const __m256i b8 = _mm256_set1_epi32(8);
+#endif
+    for (int g = 0; g < ng; g++) {
+        int base = g * gs, glen = gs; if (base + glen > I) glen = I - base;
+        float sc = scl[g];
+        int i = base;
+#ifdef __AVX2__
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        for (; i + 32 <= base + glen; i += 32) {
+            __m128i by = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
+            __m128i lo = _mm_and_si128(by, m4), hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+            __m128i n0 = _mm_unpacklo_epi8(lo, hi), n1 = _mm_unpackhi_epi8(lo, hi);
+            __m256 w0 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(n0), b8));
+            __m256 w1 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(n0, 8)), b8));
+            __m256 w2 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(n1), b8));
+            __m256 w3 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(n1, 8)), b8));
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i),      w0, a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 8),  w1, a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 16), w2, a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i + 24), w3, a3);
+        }
+        __m256 gsum = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        __m256 scv = _mm256_set1_ps(sc);
+        if ((g & 1) == 0) tot0 = _mm256_fmadd_ps(gsum, scv, tot0);
+        else              tot1 = _mm256_fmadd_ps(gsum, scv, tot1);
+#endif
+        for (; i < base + glen; i += 2) {
+            if (i + 1 < base + glen) { uint8_t byte = w[i >> 1];
+                a_tail += (xs[i] * (float)((int)(byte & 0xF) - 8) + xs[i + 1] * (float)((int)(byte >> 4) - 8)) * sc; }
+            else { uint8_t byte = w[i >> 1]; a_tail += xs[i] * (float)((int)(byte & 0xF) - 8) * sc; }
+        }
+    }
+#ifdef __AVX2__
+    return hsum256(_mm256_add_ps(tot0, tot1)) + a_tail;
+#else
+    return a_tail;
+#endif
+}
+
 typedef float (*RowFn)(const uint8_t *, const float *, const float *, int, int);
 
 /* Generic single-expert path, same 3-stage/1-team structure as mlp3_like,
@@ -717,25 +778,41 @@ int main(int argc, char **argv) {
         int a, b, c; pick3(pool_n, &a, &b, &c);
         Expert e3[3] = {pool[a], pool[b], pool[c]};
         float sg1[INTER], su1[INTER];
-        float out_base[HIDDEN], out_f4[HIDDEN], out_f8[HIDDEN];
+        float out_base[HIDDEN], out_f4[HIDDEN], out_f8[HIDDEN], out_gv[HIDDEN];
         mlp3_kern(out_base, x, &e3[0], sg1, su1, coli_i4_row);
         mlp3_kern(out_f4, x, &e3[0], sg1, su1, coli_i4_row_f4);
         mlp3_kern(out_f8, x, &e3[0], sg1, su1, coli_i4_row_f8);
-        double maxrel_f4 = 0, maxrel_f8 = 0;
+        mlp3_kern(out_gv, x, &e3[0], sg1, su1, coli_i4_row_gv);
+        /* relative L2 of the WHOLE expert output vs baseline, not a per-
+         * element max-relative-diff -- the latter blows up on near-zero
+         * output elements (an artefact of the metric, not the kernel: a
+         * full 3-stage MLP with a nonlinearity amplifies a tiny per-row
+         * reassociation difference unevenly across output dims). Max abs
+         * kept alongside for scale. */
+        double sq_base = 0, sq_d4 = 0, sq_d8 = 0, sq_dgv = 0;
+        double maxabs_f4 = 0, maxabs_f8 = 0, maxabs_gv = 0;
         for (int i = 0; i < HIDDEN; i++) {
-            double denom = fabs((double)out_base[i]) > 1e-12 ? fabs((double)out_base[i]) : 1e-12;
-            double r4 = fabs((double)out_f4[i] - (double)out_base[i]) / denom;
-            double r8 = fabs((double)out_f8[i] - (double)out_base[i]) / denom;
-            if (r4 > maxrel_f4) maxrel_f4 = r4;
-            if (r8 > maxrel_f8) maxrel_f8 = r8;
+            double bv = out_base[i];
+            double d4 = (double)out_f4[i] - bv, d8 = (double)out_f8[i] - bv, dgv = (double)out_gv[i] - bv;
+            sq_base += bv * bv; sq_d4 += d4 * d4; sq_d8 += d8 * d8; sq_dgv += dgv * dgv;
+            if (fabs(d4) > maxabs_f4) maxabs_f4 = fabs(d4);
+            if (fabs(d8) > maxabs_f8) maxabs_f8 = fabs(d8);
+            if (fabs(dgv) > maxabs_gv) maxabs_gv = fabs(dgv);
         }
-        printf("INFO reassociation check (one expert, one row kernel each): coli_i4_row_f4 max_rel_diff=%.3e, coli_i4_row_f8 max_rel_diff=%.3e (both expect ~1e-7, G14's own figure for f4)\n",
-               maxrel_f4, maxrel_f8);
+        double l2base = sqrt(sq_base);
+        double rel_l2_f4 = l2base > 0 ? sqrt(sq_d4) / l2base : sqrt(sq_d4);
+        double rel_l2_f8 = l2base > 0 ? sqrt(sq_d8) / l2base : sqrt(sq_d8);
+        double rel_l2_gv = l2base > 0 ? sqrt(sq_dgv) / l2base : sqrt(sq_dgv);
+        printf("INFO reassociation check (one expert, full 3-stage output vs coli_i4_row baseline): "
+               "f4 rel_l2=%.3e max_abs=%.3e | f8 rel_l2=%.3e max_abs=%.3e | gv rel_l2=%.3e max_abs=%.3e\n",
+               rel_l2_f4, maxabs_f4, rel_l2_f8, maxabs_f8, rel_l2_gv, maxabs_gv);
 
         double *ms_f4 = malloc(sizeof(double) * n_windows);
         double *ms_f4_fused = malloc(sizeof(double) * n_windows);
         double *ms_f8 = malloc(sizeof(double) * n_windows);
         double *ms_f8_fused = malloc(sizeof(double) * n_windows);
+        double *ms_gv = malloc(sizeof(double) * n_windows);
+        double *ms_gv_fused = malloc(sizeof(double) * n_windows);
         float out[HIDDEN], sg[INTER], su[INTER];
         for (int w = 0; w < n_windows; w++) {
             int p, q, r; pick3(pool_n, &p, &q, &r);
@@ -768,13 +845,30 @@ int main(int argc, char **argv) {
             mlp3_window_fused_kern(outF, x, ew, sgF, suF, coli_i4_row_f8);
             ms_f8_fused[w] = now_ms() - t0;
         }
+        for (int w = 0; w < n_windows; w++) {
+            int p, q, r; pick3(pool_n, &p, &q, &r);
+            double t0 = now_ms();
+            mlp3_kern(out, x, &pool[p], sg, su, coli_i4_row_gv);
+            mlp3_kern(out, x, &pool[q], sg, su, coli_i4_row_gv);
+            mlp3_kern(out, x, &pool[r], sg, su, coli_i4_row_gv);
+            ms_gv[w] = now_ms() - t0;
+        }
+        for (int w = 0; w < n_windows; w++) {
+            int p, q, r; pick3(pool_n, &p, &q, &r);
+            Expert ew[3] = {pool[p], pool[q], pool[r]};
+            double t0 = now_ms();
+            mlp3_window_fused_kern(outF, x, ew, sgF, suF, coli_i4_row_gv);
+            ms_gv_fused[w] = now_ms() - t0;
+        }
         double gmacs_win = window_gmacs();
         double gbytes_win = (double)ebytes * 3.0 / 1e9;
         report("f4_3_teams_per_window", ms_f4, n_windows, gmacs_win, gbytes_win);
         report("f4_1_team_per_window", ms_f4_fused, n_windows, gmacs_win, gbytes_win);
         report("f8_3_teams_per_window", ms_f8, n_windows, gmacs_win, gbytes_win);
         report("f8_1_team_per_window", ms_f8_fused, n_windows, gmacs_win, gbytes_win);
-        free(ms_f4); free(ms_f4_fused); free(ms_f8); free(ms_f8_fused);
+        report("gv_3_teams_per_window", ms_gv, n_windows, gmacs_win, gbytes_win);
+        report("gv_1_team_per_window", ms_gv_fused, n_windows, gmacs_win, gbytes_win);
+        free(ms_f4); free(ms_f4_fused); free(ms_f8); free(ms_f8_fused); free(ms_gv); free(ms_gv_fused);
     }
 
     /* ================= item 5: expert-parallel, disjoint groups ========= */

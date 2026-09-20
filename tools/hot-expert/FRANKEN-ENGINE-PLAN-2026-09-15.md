@@ -714,7 +714,7 @@
 > degenerate, own shaders → coherent. `start_glm53.sh` and every gate use a
 > binary's own shaders; nothing served or measured was affected. Standing rule
 > from it: gitignored build artefacts survive `git checkout` — a chain that
-> builds another commit must do so in its own clone (as `p13_chain.sh` does),
+> builds another commit must do so in its own tree -- a `git worktree`, removed when the item lands, NOT a clone (corrected 2026-09-20: this line said "clone", agents took it literally and left 37 of them on the rig; `p13_chain.sh` happens to use one),
 > and `COLI_VK_SHADERS` always names the shaders built with the binary. The
 > record's §X2 G12 row is therefore an artefact, not a G12 finding.
 

@@ -76,6 +76,16 @@ static struct {
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
+    /* F7: batched DSA attention core for PREFILL (four pipelines on ONE 8-binding
+     * layout: lat, slot, q, sc, pool, ctx, W, Wscale). Absent shaders -> every
+     * handle stays VK_NULL_HANDLE and coli_vk_mla_attn returns 0, which is the
+     * caller's CPU fallback. Nothing here is on the decode path. */
+    VkShaderModule sh_m7s, sh_m7sm, sh_m7p, sh_m7v;
+    VkDescriptorSetLayout dsl_m7; VkPipelineLayout plyt_m7;
+    VkPipeline pipe_m7s, pipe_m7sm, pipe_m7p, pipe_m7v;
+    VkDescriptorPool dpool_m7; VkDescriptorSet dset_m7;
+    Scratch m7_lat, m7_slot, m7_q, m7_sc, m7_pool, m7_ctx;
+    double m7_copy_ms, m7_gpu_ms; long m7_calls, m7_submits;
     VkCommandPool cpool;
     VkCommandBuffer cmd;
     VkFence fence;
@@ -160,6 +170,8 @@ struct PCKD { int heads, k_dim; float gate_lb; };      /* kda_decay */
 struct PCKN { int heads, v_dim; float eps; };          /* kda_headnorm */
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
+/* F7: one push-constant block shared by the four mla_attn_*.comp passes. */
+struct PCMla { int fmt, S, H, L, V, W, seen, rowWords, gs, soff, usedOff; float scale; };
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -824,6 +836,29 @@ int coli_vk_init(const char *spv_path) {
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
 
+    /* F7: the four prefill DSA-attention passes, all on ONE 8-binding layout.
+     * Optional in the same way the absorb core is: any missing .spv leaves the
+     * whole group off and coli_vk_mla_attn returns 0 for ever after. */
+    {
+        char s_p[512], m_p[512], p_p[512], v_p[512];
+        derive_dir_file(spv_path, "mla_attn_score.spv",   s_p, sizeof(s_p));
+        derive_dir_file(spv_path, "mla_attn_softmax.spv", m_p, sizeof(m_p));
+        derive_dir_file(spv_path, "mla_attn_pool.spv",    p_p, sizeof(p_p));
+        derive_dir_file(spv_path, "mla_attn_vproj.spv",   v_p, sizeof(v_p));
+        G.sh_m7s  = load_spv(G.dev, s_p);
+        G.sh_m7sm = load_spv(G.dev, m_p);
+        G.sh_m7p  = load_spv(G.dev, p_p);
+        G.sh_m7v  = load_spv(G.dev, v_p);
+        if (G.sh_m7s && G.sh_m7sm && G.sh_m7p && G.sh_m7v) {
+            if (!build_pipeline(G.dev, 8, sizeof(struct PCMla), G.sh_m7s, &G.dsl_m7,
+                                &G.plyt_m7, &G.pipe_m7s, &G.dpool_m7, &G.dset_m7))
+                return 0;
+            G.pipe_m7sm = build_pipeline_on(G.dev, G.sh_m7sm, G.plyt_m7);
+            G.pipe_m7p  = build_pipeline_on(G.dev, G.sh_m7p,  G.plyt_m7);
+            G.pipe_m7v  = build_pipeline_on(G.dev, G.sh_m7v,  G.plyt_m7);
+        }
+    }
+
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
     VKCHECK(vkCreateCommandPool(G.dev, &cpci, NULL, &G.cpool), "cmdPool");
@@ -841,8 +876,9 @@ int coli_vk_init(const char *spv_path) {
     snprintf(G.spv, sizeof(G.spv), "%s", spv_path);
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
-            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "");
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s%s\n", p.deviceName, G.qfam, G.memtype,
+            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
+            G.pipe_m7v ? ", batched MLA prefill attention" : "");
     return 1;
 }
 
@@ -2583,6 +2619,129 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(ctx, G.y.ptr, cb);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
+    return 1;
+}
+
+/* ---- F7: the batched DSA attention core for PREFILL ---------------------------
+ * tools/hot-expert/F7-MLA-ATTN-GPU-DESIGN-2026-09-19.md.
+ *
+ * One call does a whole chunk of S rows of ONE layer:
+ *   sc[s][h][u]   = scale * sum_d lat[slot[s][u]][d] * absorbed[s][h][d]
+ *   sc[s][h][.]   = softmax over u < used[s]
+ *   pool[s][h][d] = sum_u sc[s][h][u] * lat[slot[s][u]][d]
+ *   ctx[s][h][v]  = sum_d dequant(kvb_v[h*V+v][d]) * pool[s][h][d]
+ * and hands ctx back on the host, where the caller does the o-projection with
+ * the existing resident-matmul path.
+ *
+ * WHERE THE LATENTS LIVE, and why it is not the decode path's device KV mirror.
+ * coli_vk_kv_ensure keeps a PERSISTENT per-layer copy; for 11 DSA layers that is
+ * 0.41 GB at 18k and 1.47 GB at the engine's 65 536-position cap, per sequence,
+ * and there are four KV slots. dev0 has ~1.4 GB free while serving. So this path
+ * copies the prefix into ONE shared scratch per call instead: 134 MB at the cap,
+ * nothing per layer and nothing per slot, and no invalidation to get wrong when a
+ * checkpoint is restored or a prefill is cancelled. The copy is priced in the
+ * design note and is reported through coli_vk_mla_attn_prof.
+ *
+ * Rows are sub-batched (`sb`) only to bound the score scratch, which is
+ * sb*H*width floats -- 67 MB at sb = 128, 268 MB at a full 512-row chunk.
+ *
+ * Returns 0 -> the caller keeps its CPU path for this call. */
+int coli_vk_mla_attn_ready(void) { return G.ready && G.pipe_m7s && G.pipe_m7sm && G.pipe_m7p && G.pipe_m7v; }
+
+void coli_vk_mla_attn_prof(double *copy_ms, double *gpu_ms, long *calls, long *submits) {
+    if (copy_ms) *copy_ms = G.m7_copy_ms;
+    if (gpu_ms)  *gpu_ms  = G.m7_gpu_ms;
+    if (calls)   *calls   = G.m7_calls;
+    if (submits) *submits = G.m7_submits;
+}
+
+int coli_vk_mla_attn(ColiVkTensor **vp, const void *vw, const float *vsc, int vfmt, int vgs,
+                     float *ctx_out, const float *absorbed, const float *latent,
+                     const int *slots, const int *used,
+                     int S, int H, int L, int V, int width, int seen, int sb, float scale) {
+    if (!coli_vk_mla_attn_ready()) return 0;
+    if (S < 1 || H != 64 || L < 64 || L > 512 || (L & 63) || V < 1 || width < 1 || seen < 1) return 0;
+    if (sb < 1 || sb > S) sb = S;
+    if (!upload_tensor(vp, vw, vsc, vfmt, L, H * V, vgs)) return 0;
+    ColiVkTensor *vt = *vp;
+
+    const size_t lat_b  = (size_t)seen * L * 4;
+    const size_t slot_b = ((size_t)S * width + (size_t)S) * 4;
+    const size_t q_b    = (size_t)sb * H * L * 4;
+    const size_t sc_b   = (size_t)sb * H * width * 4;
+    const size_t pool_b = (size_t)sb * H * L * 4;
+    const size_t ctx_b  = (size_t)sb * H * V * 4;
+    if (!scratch_reserve(&G.m7_lat,  lat_b)  || !scratch_reserve(&G.m7_slot, slot_b) ||
+        !scratch_reserve(&G.m7_q,    q_b)    || !scratch_reserve(&G.m7_sc,   sc_b)   ||
+        !scratch_reserve(&G.m7_pool, pool_b) ||
+        !scratch_reserve_mt(&G.m7_ctx, ctx_b, G.memtype_cached))
+        return 0;
+
+    double t0 = vk_now();
+    memcpy(G.m7_lat.ptr, latent, lat_b);
+    memcpy(G.m7_slot.ptr, slots, (size_t)S * width * 4);
+    memcpy((int *)G.m7_slot.ptr + (size_t)S * width, used, (size_t)S * 4);
+    G.m7_copy_ms += vk_now() - t0;
+
+    VkDescriptorBufferInfo bi[8] = {
+        {.buffer = G.m7_lat.buf,  .range = VK_WHOLE_SIZE}, {.buffer = G.m7_slot.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.m7_q.buf,    .range = VK_WHOLE_SIZE}, {.buffer = G.m7_sc.buf,   .range = VK_WHOLE_SIZE},
+        {.buffer = G.m7_pool.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.m7_ctx.buf,  .range = VK_WHOLE_SIZE},
+        {.buffer = vt->wbuf,      .range = VK_WHOLE_SIZE}, {.buffer = vt->sbuf,      .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wd[8];
+    for (int i = 0; i < 8; i++) wd[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_m7,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 8, wd, 0, NULL);
+
+    const VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+
+    for (int off = 0; off < S; off += sb) {
+        const int rows = (S - off < sb) ? (S - off) : sb;
+        t0 = vk_now();
+        memcpy(G.m7_q.ptr, absorbed + (size_t)off * H * L, (size_t)rows * H * L * 4);
+        G.m7_copy_ms += vk_now() - t0;
+
+        struct PCMla pc = {vfmt, rows, H, L, V, width, seen, vt->rowWords, vt->gs,
+                           off, S * width, scale};
+        VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_m7, 0, 1, &G.dset_m7, 0, NULL);
+        vkCmdPushConstants(G.cmd, G.plyt_m7, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_m7s);
+        vkCmdDispatch(G.cmd, (uint32_t)((width + 63) / 64), (uint32_t)rows, 1);
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_m7sm);
+        vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)rows, 1);
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_m7p);
+        vkCmdDispatch(G.cmd, (uint32_t)(L / 64), (uint32_t)rows, 1);
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_m7v);
+        vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)rows, 1);
+        VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                           .pCommandBuffers = &G.cmd};
+        VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+        t0 = vk_now();
+        VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+        if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+        G.m7_gpu_ms += vk_now() - t0;
+        G.m7_submits++;
+
+        t0 = vk_now();
+        memcpy(ctx_out + (size_t)off * H * V, G.m7_ctx.ptr, (size_t)rows * H * V * 4);
+        G.m7_copy_ms += vk_now() - t0;
+    }
+    G.m7_calls++;
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
     return 1;
 }

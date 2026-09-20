@@ -1,0 +1,101 @@
+#version 450
+// F7: GLM-5.3 DSA attention core, pass 1 of 4 -- the SCORE pass, batched over a
+// chunk's rows (tools/hot-expert/F7-MLA-ATTN-GPU-DESIGN-2026-09-19.md).
+//
+//   sc[s][h][u] = scale * sum_d lat[slot[soff+s][u]][d] * q[s][h][d]
+//
+// for u < used[soff+s]. This is glm53.c's glm_lane_dots with the slots as the M
+// axis of a tiled GEMM instead of an OpenMP axis. One workgroup per (row s, tile
+// of 64 slots); 256 threads hold a 64(u) x 64(h) output tile as 4x4 registers
+// each; the K axis (latent dim L) walks in steps of 32 through two 32x64 LDS
+// tiles.
+//
+// Selection is per row, so the M axis is a GATHER (slot[]) -- that is the one
+// thing that stops the whole chunk being a single GEMM.
+//
+// All four F7 shaders share ONE 8-binding descriptor layout and ONE push-constant
+// block; each uses a subset. Unused bindings are still bound by the host.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer LATB { float lat[]; };   // [seen][L]
+layout(std430, binding = 1) readonly  buffer SLOTB{ int   slt[]; };   // [Srow][W] then [Srow] used
+layout(std430, binding = 2) readonly  buffer QB   { float q[]; };     // [S][H][L] absorbed
+layout(std430, binding = 3)           buffer SCB  { float sc[]; };    // [S][H][W]
+layout(std430, binding = 4)           buffer POOLB{ float pool[]; };  // [S][H][L]
+layout(std430, binding = 5) writeonly buffer CTXB { float ctx[]; };   // [S][H][V]
+layout(std430, binding = 6) readonly  buffer WB   { uint  w[]; };     // kvb_v quant
+layout(std430, binding = 7) readonly  buffer WSCB { float wsc[]; };   // kvb_v scales
+
+layout(push_constant) uniform P {
+    int fmt;        // kvb_v format (1=int8, 2=int4 flat, 4=int4 grouped)
+    int S;          // rows in THIS sub-batch
+    int H, L, V, W; // heads, kv_lora, v_head, width (max selected slots per row)
+    int seen;       // rows of lat[]
+    int rowWords;   // uint32 words per kvb_v row
+    int gs;         // kvb_v group size (fmt 4)
+    int soff;       // this sub-batch's first row in slt[]
+    int usedOff;    // element offset of the used[] counts inside slt[]
+    float scale;    // 1/sqrt(qk_nope)
+} p;
+
+shared float latT[32 * 64];   // [d][u]
+shared float qT[32 * 64];     // [d][h]
+
+void main() {
+    int s  = int(gl_WorkGroupID.y);
+    int u0 = int(gl_WorkGroupID.x) * 64;
+    int tid = int(gl_LocalInvocationID.x);
+    int used = slt[p.usedOff + p.soff + s];
+    if (u0 >= used) return;
+
+    int tx = tid & 15;            // 4 slots:  u0 + tx*4 + i
+    int ty = tid >> 4;            // 4 heads:  ty*4 + j
+    int ub = tx * 4, hb = ty * 4;
+    int slotRow = (p.soff + s) * p.W;
+
+    float acc[4][4];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) acc[i][j] = 0.0;
+
+    for (int d0 = 0; d0 < p.L; d0 += 32) {
+        // latT[d][u] = lat[slot[u0+u]][d0+d]; 32 consecutive d per thread run
+        for (int e = tid; e < 32 * 64; e += 256) {
+            int u = e >> 5, d = e & 31;
+            int ua = u0 + u;
+            float v = 0.0;
+            if (ua < used) {
+                int sl = slt[slotRow + ua];
+                if (sl >= 0 && sl < p.seen) v = lat[sl * p.L + d0 + d];
+            }
+            latT[d * 64 + u] = v;
+        }
+        // qT[d][h] = q[s][h][d0+d]
+        for (int e = tid; e < 32 * 64; e += 256) {
+            int h = e >> 5, d = e & 31;
+            qT[d * 64 + h] = q[(s * p.H + h) * p.L + d0 + d];
+        }
+        barrier();
+        for (int d = 0; d < 32; d++) {
+            float lv0 = latT[d * 64 + ub],     lv1 = latT[d * 64 + ub + 1];
+            float lv2 = latT[d * 64 + ub + 2], lv3 = latT[d * 64 + ub + 3];
+            float qv0 = qT[d * 64 + hb],       qv1 = qT[d * 64 + hb + 1];
+            float qv2 = qT[d * 64 + hb + 2],   qv3 = qT[d * 64 + hb + 3];
+            acc[0][0] = fma(lv0, qv0, acc[0][0]); acc[0][1] = fma(lv0, qv1, acc[0][1]);
+            acc[0][2] = fma(lv0, qv2, acc[0][2]); acc[0][3] = fma(lv0, qv3, acc[0][3]);
+            acc[1][0] = fma(lv1, qv0, acc[1][0]); acc[1][1] = fma(lv1, qv1, acc[1][1]);
+            acc[1][2] = fma(lv1, qv2, acc[1][2]); acc[1][3] = fma(lv1, qv3, acc[1][3]);
+            acc[2][0] = fma(lv2, qv0, acc[2][0]); acc[2][1] = fma(lv2, qv1, acc[2][1]);
+            acc[2][2] = fma(lv2, qv2, acc[2][2]); acc[2][3] = fma(lv2, qv3, acc[2][3]);
+            acc[3][0] = fma(lv3, qv0, acc[3][0]); acc[3][1] = fma(lv3, qv1, acc[3][1]);
+            acc[3][2] = fma(lv3, qv2, acc[3][2]); acc[3][3] = fma(lv3, qv3, acc[3][3]);
+        }
+        barrier();
+    }
+    for (int j = 0; j < 4; j++) {
+        int h = hb + j;
+        int base = (s * p.H + h) * p.W;
+        for (int i = 0; i < 4; i++) {
+            int ua = u0 + ub + i;
+            if (ua < used) sc[base + ua] = acc[i][j] * p.scale;
+        }
+    }
+}

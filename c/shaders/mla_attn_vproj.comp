@@ -1,0 +1,73 @@
+#version 450
+// F7 pass 4 of 4: the value rows.
+//
+//   ctx[s][h][v] = sum_d dequant(kvb_v[h*V + v][d]) * pool[s][h][d]
+//
+// glm53.c's `mv_rows(context + h*V, &l->kvb_v, pooled + h*L, h*V, V)`, batched:
+// one workgroup per (row s, head h), one thread per output v, the head's pooled
+// latent staged in LDS. Doing it here rather than on the host is what keeps the
+// 33.5 MB/layer-chunk `pooled` readback off the bus -- ctx is a quarter of it.
+//
+// Dequant layouts are the ones attention_absorb.comp already uses:
+//   fmt 1 int8, one f32 scale per row; fmt 2 int4 nibble-8, one f32 per row;
+//   fmt 4 int4 nibble-8 with one f32 per (row, gs-group)  <- the served model.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer LATB { float lat[]; };
+layout(std430, binding = 1) readonly  buffer SLOTB{ int   slt[]; };
+layout(std430, binding = 2) readonly  buffer QB   { float q[]; };
+layout(std430, binding = 3)           buffer SCB  { float sc[]; };
+layout(std430, binding = 4)           buffer POOLB{ float pool[]; };
+layout(std430, binding = 5) writeonly buffer CTXB { float ctx[]; };
+layout(std430, binding = 6) readonly  buffer WB   { uint  w[]; };
+layout(std430, binding = 7) readonly  buffer WSCB { float wsc[]; };
+
+layout(push_constant) uniform P {
+    int fmt; int S; int H, L, V, W; int seen; int rowWords; int gs; int soff; int usedOff;
+    float scale;
+} p;
+
+shared float pl[512];
+
+float i8(uint x, int l) { int b = int((x >> (uint(l) * 8u)) & 0xffu); if (b >= 128) b -= 256; return float(b); }
+float i4(uint x, int l) { return float(int((x >> (uint(l) * 4u)) & 0xfu) - 8); }
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int s = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int pbase = (s * p.H + h) * p.L;
+    for (int d = tid; d < p.L; d += 256) pl[d] = pool[pbase + d];
+    barrier();
+
+    int ng = (p.gs > 0) ? (p.L + p.gs - 1) / p.gs : 1;
+    for (int v = tid; v < p.V; v += 256) {
+        int row = h * p.V + v;
+        uint rb = uint(row) * uint(p.rowWords);
+        float acc = 0.0;
+        if (p.fmt == 1) {
+            int words = (p.L + 3) / 4;
+            for (int wi = 0; wi < words; wi++) {
+                uint pk = w[rb + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.L) acc = fma(pl[i], i8(pk, k), acc); }
+            }
+            acc *= wsc[row];
+        } else if (p.fmt == 4) {
+            int words = (p.L + 7) / 8;
+            for (int wi = 0; wi < words; wi++) {
+                uint pk = w[rb + uint(wi)]; int i0 = wi * 8;
+                float a = 0.0;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.L) a = fma(pl[i], i4(pk, k), a); }
+                acc = fma(a, wsc[uint(row) * uint(ng) + uint(i0 / p.gs)], acc);
+            }
+        } else {
+            int words = (p.L + 7) / 8;
+            for (int wi = 0; wi < words; wi++) {
+                uint pk = w[rb + uint(wi)]; int i0 = wi * 8;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.L) acc = fma(pl[i], i4(pk, k), acc); }
+            }
+            acc *= wsc[row];
+        }
+        ctx[(s * p.H + h) * p.V + v] = acc;
+    }
+}

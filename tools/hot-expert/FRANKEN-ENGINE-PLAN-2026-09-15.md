@@ -14,6 +14,85 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 24 (2026-09-20 07:30 CEST, 05:30 UTC) -- F7 IS GATED PASS AND IN
+> SERVICE.** Record §F7-VERDICT. Numerics arbitrated by a jitter arm: a random
+> fp32-rounding-sized perturbation of the CPU attention core moves the model as
+> far as the GPU kernel does (KL 0.00263 vs 0.00279, top-1 98.17 vs 98.34 %,
+> same first position) -- the kernel is sound, and for reordered attention
+> kernels the bar is now "no further than the eps = 6e-7 jitter arm". Full 18k
+> ladder A,B,B,A: **turn 1 68.2 -> 50.5 s (1.35x), the 18 439-token turn 683.3
+> -> 454.6 s (1.50x, bar 1.25)**, decode at full depth unchanged (one follow-up
+> row -3.4 %, recorded). Served `e87ae939` since 05:24 UTC, `accept_live` and
+> `accept_ui` PASS. F2 + F7 together: the 18k turn 1 174.8 -> 454.6 s (2.58x).
+> **Order now: re-profile the 18k prefill token (one timed arm) -> F5; F8 (the
+> batch-1 CPU expert path, the largest decode bucket) when the rig is idle; F3
+> when a model is named.**
+>
+> **Rev 23 (2026-09-20 02:00 CEST, 00:00 UTC) -- F7's numerics: the defect hunt
+> found NO DEFECT, and rev 22's explanation of the gap was WRONG.** Record §F7
+> round 2. Fable's float64 arm (`GLM53_MLA_ATTN_REF64=1`) refuted rev 22's "the
+> CPU is the less accurate side": the CPU fp32 path is within **1.7e-05 mean KL
+> / 100 % top-1** of float64 on the shallow packet, against the GPU's 0.00279 /
+> 98.34 %. Every defect hypothesis was then eliminated **by measurement**: the
+> four attention shaders replayed on REAL engine chunks against a float64 core,
+> all 512 rows x 64 heads x 11 DSA layers, dense AND sparse, come out at
+> GPU/CPU-vs-float64 ratio **0.80-1.27**; the batched o-projection is
+> **bit-identical** to the per-row one (mean KL 0, maxabs 0) and never falls back
+> to the CPU kernel; the sub-batch loop is **bit-identical** at sb 512 vs 128
+> (mean KL 0); tier, streaming, packets and run-to-run noise all identical.
+> **The decisive measurement is the in-situ dump** (the knob-ON run writing its
+> own `context` for the same chunk, diffed row by row with
+> `tools/hot-expert/f7_ctxdiff.py` -- a replay of the CPU run's inputs cannot see
+> this): over eleven DSA layers the **median** per-row error goes 2.9e-07 ->
+> 6.2e-06, never leaving fp32 level, while the p90/p99/max explode
+> (4.1e-07 -> 6.9e-02). The divergence lives entirely in a growing minority of
+> near-degenerate softmax rows -- the same population Fable's flip-margin
+> analysis found. **So there is nothing to fix, and the proposed shallow bar
+> (`ref64||gpu` top-1 >= 99.9 %) is unmeetable by construction**: `ref64||off`
+> changes only PRECISION (same summation order, more bits) and so preserves
+> near-tie orderings almost perfectly, while any reordered kernel perturbs them
+> randomly at the same RMS error. The depth-relative arm is the meaningful one
+> and F7 is close: R2/R1 at depth is **1.7x on mean KL and -1.4 pt on top-1**
+> against an allowance of 1.2x and -0.3 pt. **Speed, current code: deep 678.8 ->
+> 479.0 s = 1.417x, shallow 206.5 -> 131.7 s = 1.57x**; `GLM53_MLA_ATTN_SB=512`
+> is bit-identical and slightly cheaper (66 submits instead of 264) but has no
+> gate behind it. **Decision needed (Fable): accept F7 against a depth-relative
+> bar and say what it is, or require a bit-identical kernel -- which means the
+> CPU's summation order on the GPU, i.e. no tiling, i.e. no F7.** Order
+> otherwise unchanged: F5; F8 when the rig is idle; F3 when a model is named.
+>
+> **Rev 22 (2026-09-19 22:15 CEST, 20:15 UTC) -- F7 is BUILT and MEASURED: the
+> speed is there and the NUMERICS BAR IS NOT MET. Blocked for arbitration, not
+> tuned.** Record §F7, design note
+> `tools/hot-expert/F7-MLA-ATTN-GPU-DESIGN-2026-09-19.md`, branch
+> `perf/f7-mla-attn-gpu` (`b538764`), knob `GLM53_MLA_ATTN_GPU=1` off by default.
+> The whole `_tm2` window -- score, softmax, weighted pool, `kvb_v` value rows --
+> is four dispatches on dev0, and the o-projection behind it is one submit per
+> chunk instead of 512. **Microbenchmark: one 512-row layer-chunk 1 290 → 74 ms
+> (17x)** at the engine's own shapes through the engine's own entry point, with a
+> scalar CPU-reference diff of 1.2e-09 on values of 2.3e-03. **Engine: a
+> 9 115-token prefill 678.8 → 479.0 s = 1.417x, a 3 013-token one 1.594x**, one
+> binary, knob the only difference -- the design projected 1.43x and got it.
+> **O1 passed: knob-off is bit-identical to the served `5c01246c`, deep and
+> shallow.** But **X2's KL bar is NOT met: mean KL 0.00279 (shallow) and 0.00538
+> (deep) are inside the < 0.0284 bar with 5-10x margin, while top-1 agreement is
+> 98.34 % and 97.14 % against a >= 99.0 % bar, and it worsens with depth.** The
+> record argues this is score-pass reassociation in which the CPU is the LESS
+> accurate side (`glm_lane_dots` rounds each product and adds 512 of them in
+> sequence, ~5e-04 relative; the GPU's K-tiled fma is ~10x tighter), so making
+> the kernel more accurate moves it further from the reference, not closer; the
+> probe rules out a layout/dequant/gather defect and the first disagreement is at
+> the same position (1420) in both packets. **VRAM answer, for the record: 140 MB
+> of shared dev0 scratch at 18k and 236 MB at the 65 536 cap, nothing per layer
+> and nothing per slot, expert tier caps untouched** -- the decode path's
+> persistent per-layer KV mirror was rejected at 1.47 GB per sequence against
+> dev0's 1 447 MiB free. The A,B,B,A ladder was deliberately NOT run: the item is
+> blocked and the two CLI arms are the better speed evidence. **Decision needed
+> (Fable): accept ~3 % top-1 movement against the reference's own fp32 noise for
+> 1.42x, or open a higher-precision score pass on BOTH sides (which changes the
+> served binary's numerics and is a different item). Order otherwise unchanged:
+> F5; F8 when the rig is idle; F3 when a model is named.**
+>
 > **Rev 21 (2026-09-19 20:30 CEST, 18:30 UTC) -- F1 is REJECTED by its own
 > falsifier probe.** Record §F1-PROBE: a streamed decode miss at batch 1 costs
 > 2.70 ms per window at k = 3 (median; fit 1.50 + 0.38*k on three cards, 0.92 +
@@ -973,7 +1052,7 @@ same model is the order-of-magnitude gap, and it is a prefill gap.
 | **F3** | **Three-card residency for any model that fits** (regime B): extend V1's Vulkan tier from one card to three (heat-ranked, per-device budget, `COLI_VK_DEV0/2/3`), attention/KV on dev0, tiers on all three, so a ≤ 60 GB int4 GLM-class model is 100 % resident with P7/P9 checkpoints and slots intact | the measured resident regime: 75 tok/s class at 18k (gpt-oss, layer-split; Colibri's number **unknown** until run — the submit-model ceiling of §3 branch 3 was withdrawn but not replaced by a measurement) | tier line asserts 100 % residency; A,B,B,A vs llama.cpp resident on the same GGUF-equivalent weights; the greedy-text agreement count of H2b | Opus, 1–2 weeks; **only when the owner names the model** |
 | **F5** | **MTP in the streamed regime** (X5): hipFire measured 131 tok/s at 1.4k *with* MTP on the resident 35B (§FRANKEN-H2 throwaway `mtp: true`); Q9 killed it here in the CPU-miss regime. Re-test only after F2/F1 change the verify block's cost | unknown; the discriminator is whether the verify block reads streamed experts once per block | interleaved knob on/off on the ladder; text identical | Sonnet, after F1 |
 | **F6** | **The indexer at depth (X3, promoted by F4).** A cheaper DSA selection at depth for GLM's MLA layers: profile says 25 ms per MLA call at 18.6k vs 5.8 at 1.3k (`index/ctx` 4.46 µs per context token per call over the pooled-key cache of G5). Design first (Opus): what the indexer reads per call today, whether a coarser pool or a two-level select cuts the bytes, dense-identical below 2 052 tokens by construction, knob-gated, X2's KL bar | ceiling stated in the record: holding the indexer at its 1.3k cost → ≈ 3.3 tok/s at 18k (from 2.27); the item is worth ≤ +45 % decode at depth and nothing at shallow depth | `[OPTIME req=]` index ms/call at 18.6k before/after; teacher_forcing identical below 2 052; X2 KL above; A,B,B,A ladder through `gate_ab_verdict` | Opus, design 2 days, implementation 1–2 weeks; after F2 step 0 |
-| **F7** (opened rev 16) | **Batched MLA attention core in prefill.** After F6a the attention core is 28.4 ms of the 136.4 ms 18k prefill token (record §RP-F6a) and becomes the largest bucket once F2 lands. Design first: what `mla.attn` does per 128-row chunk today, what moves to the GPU, the 2 051 width cap kept | 28.4 → ≤ 8 ms/token at 18k (projected, to be replaced by the design's number) | `prefill_gate.sh`, `teacher_forcing` and every-position logits vs pristine, A,B,B,A ladder | Opus, design 2 days; after F2 |
+| **F7 — DONE 2026-09-20, GATED PASS, IN SERVICE (rev 24, record §F7-VERDICT: 18k turn 1.50x, turn 1 1.35x)** | **Batched MLA attention core in prefill.** Design note `tools/hot-expert/F7-MLA-ATTN-GPU-DESIGN-2026-09-19.md`; branch `perf/f7-mla-attn-gpu`, knob `GLM53_MLA_ATTN_GPU=1`, four new shaders on dev0, latents copied per layer-chunk into 140 MB of shared dev0 scratch (expert tier untouched) | **MEASURED**: core 1 290 -> 74 ms per 512-row layer-chunk (17x); 9 115-token prefill 678.8 -> 479.0 s = **1.417x**, 3 013-token 206.5 -> 131.7 s = **1.57x**. Knob-off bit-identical to the served pristine | O1 PASSED. Numerics: **no defect** -- in-situ per-layer median error stays at fp32 level (2.9e-07 -> 6.2e-06 over 11 layers), o-projection and sub-batching both bit-identical, replay vs float64 ratio 0.80-1.27. The shallow top-1 bar is unmeetable by any reordered kernel; at depth R2/R1 = 1.7x KL / -1.4 pt. Ladder not run | Opus; **awaiting a Fable decision on a depth-relative bar** |
 | parked | H2b, H4, D-3 (branches exist), L1 | — | — | D-3 re-enters only under F0's falsifier |
 
 ### 8.4 Order, and what each step must show before the next

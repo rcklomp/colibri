@@ -171,6 +171,22 @@ void coli_vk_kv_reset(void);
 int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt, int grp,
                               float *ctx, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale);
+
+/* F7: the batched DSA (sparse-selection) attention core for PREFILL -- score,
+ * softmax, weighted pool and the kvb_v value rows for a whole chunk of S rows of
+ * ONE layer, in sub-batches of `sb` rows. Unlike the decode absorb core above
+ * there is NO persistent device KV mirror: `latent` [seen][L] is copied into a
+ * shared scratch on every call, which is what keeps the VRAM bill off the expert
+ * tier (see the F7 design note). `slots`/`used` are the per-row selected
+ * positions, already compacted by the caller; ctx_out is [S][H*V] on the host and
+ * the caller still does the o-projection. Requires H == 64 and L a multiple of 64
+ * (<= 512). Returns 0 -> caller falls back to CPU for this call. */
+int  coli_vk_mla_attn_ready(void);
+int  coli_vk_mla_attn(ColiVkTensor **vp, const void *vw, const float *vsc, int vfmt, int vgs,
+                      float *ctx_out, const float *absorbed, const float *latent,
+                      const int *slots, const int *used,
+                      int S, int H, int L, int V, int width, int seen, int sb, float scale);
+void coli_vk_mla_attn_prof(double *copy_ms, double *gpu_ms, long *calls, long *submits);
 /* Two resident matmuls sharing one input x in ONE submit (q_a + kv_a prologue pair).
  * Returns 0 -> caller falls back to single-matmul calls. */
 /* q-prep chain: [q_a+kv_a pair] -> rmsnorm(q latent) -> q_b in ONE submit (needs

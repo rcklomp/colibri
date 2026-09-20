@@ -1795,6 +1795,267 @@ static int index_cache_on(void) {
     return g_index_cache;
 }
 
+/* F7 (tools/hot-expert/F7-MLA-ATTN-GPU-DESIGN-2026-09-19.md): the whole DSA
+ * attention core -- score, softmax, weighted pool, kvb_v value rows -- for a
+ * PREFILL chunk's rows at once on dev0, with the o-projection batched behind it.
+ *
+ * OFF by default. The CPU path below is unchanged and is the fallback on any
+ * Vulkan failure, on decode (tokens == 1), and on any shape the shaders do not
+ * cover. Knob-on changes the summation order of the score and pool passes and
+ * uses RADV's exp() and a float tree total instead of glibc's expf() and a
+ * sequential double -- so it is judged by the KL bar, not by bit-identity.
+ *
+ * GLM53_MLA_ATTN_SB is the sub-batch of rows per submit; it only bounds the
+ * score scratch (sb*H*width floats, 67 MB at 128) and does not change results. */
+static int g_mla_attn_gpu = -1;
+static int mla_attn_gpu_on(void) {
+    if (g_mla_attn_gpu < 0) {
+        const char *e = getenv("GLM53_MLA_ATTN_GPU");
+        g_mla_attn_gpu = (e && atoi(e)) ? 1 : 0;
+    }
+    return g_mla_attn_gpu;
+}
+static int mla_attn_gpu_sb(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GLM53_MLA_ATTN_SB");
+        v = e ? atoi(e) : 128;
+        if (v < 1) v = 128;
+    }
+    return v;
+}
+
+/* F7 numerics arbitration: neither the CPU fp32 path (glm_lane_dots / the
+ * scalar dot below round each product to float and add up to `width` of
+ * them in sequence) nor the GPU's 32-wide K-tiled fma is the exact
+ * arithmetic -- this is. GLM53_MLA_ATTN_REF64=1 recomputes the score/softmax/
+ * pool core of mla_layer in double, for the SAME selected slots in the SAME
+ * order as every other path (chosen[i], skipping at < 0 || at >= seen), and
+ * casts the pooled result down to float only at the very end, right before
+ * the EXISTING mv_rows(...)/mv(...) projections -- those, and everything
+ * upstream of the core (the absorb pass, the indexer), are untouched.
+ * Oracle only: no attempt is made to make this fast, only correct. It takes
+ * precedence over headvec/blocked pooling and over GLM53_MLA_ATTN_GPU (if
+ * both are set, REF64 wins) and, for simplicity, applies to every call of
+ * the core, prefill and decode alike -- unlike the GPU knob, it is not
+ * gated on tokens > 1. Unset (the default), the branch below is not
+ * entered and behaviour is unchanged. */
+static int g_mla_attn_ref64 = -1;
+static int mla_attn_ref64_on(void) {
+    if (g_mla_attn_ref64 < 0) {
+        const char *e = getenv("GLM53_MLA_ATTN_REF64");
+        g_mla_attn_ref64 = (e && atoi(e)) ? 1 : 0;
+        if (g_mla_attn_ref64)
+            fprintf(stderr, "[MLA] attention core: float64 reference (oracle only)\n");
+    }
+    return g_mla_attn_ref64;
+}
+
+/* Per-thread double scratch, nthreads x L (pooled) and nthreads x width
+ * (score) -- the same per-thread-pool shape as pooled_pool/score_pool
+ * below, and for the same reason (P5b.1/G4): a shared slice would corrupt
+ * every head's softmax while still emitting a plausible token. */
+static void mla_attn_ref64_core(const Cfg *c, const GLayer *l, int tokens, int seen, int width,
+                                const int *selected, const float *absorbed, const float *latent,
+                                float *out) {
+    const int H = c->n_heads, QK = c->qk_nope, V = c->v_head, L = c->kv_lora;
+    const double scale = 1.0 / sqrt((double)QK);
+    const int nthreads_mla = coli_kda_threads();
+    float *context = malloc((size_t)H * V * sizeof(float));
+    double *pooled_pool = malloc((size_t)nthreads_mla * L * sizeof(double));
+    double *score_pool = malloc((size_t)nthreads_mla * width * sizeof(double));
+    float *pooledf_pool = malloc((size_t)nthreads_mla * L * sizeof(float));
+    if (!context || !pooled_pool || !score_pool || !pooledf_pool) {
+        fprintf(stderr, "OOM nell'attenzione MLA (ref64)\n"); exit(1);
+    }
+    for (int t = 0; t < tokens; t++) {
+        const int *chosen = selected + (size_t)t * width;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int h = 0; h < H; h++) {
+#ifdef _OPENMP
+            double *pooled = pooled_pool + (size_t)omp_get_thread_num() * L;
+            double *score = score_pool + (size_t)omp_get_thread_num() * width;
+            float *pooledf = pooledf_pool + (size_t)omp_get_thread_num() * L;
+#else
+            double *pooled = pooled_pool;
+            double *score = score_pool;
+            float *pooledf = pooledf_pool;
+#endif
+            const float *q = absorbed + ((size_t)t * H + h) * L;
+            double top = -HUGE_VAL;
+            int used = 0;
+            for (int i = 0; i < width; i++) {
+                const int at = chosen[i];
+                if (at < 0 || at >= seen) continue;
+                const float *c_j = latent + (size_t)at * L;
+                double dot = 0.0;
+                for (int d = 0; d < L; d++) dot += (double)q[d] * (double)c_j[d];
+                score[used] = dot * scale;
+                if (score[used] > top) top = score[used];
+                used++;
+            }
+            float *result = context + (size_t)h * V;
+            memset(result, 0, (size_t)V * sizeof(float));
+            if (!used) continue;
+            double total = 0.0;
+            for (int i = 0; i < used; i++) { score[i] = exp(score[i] - top); total += score[i]; }
+            for (int d = 0; d < L; d++) pooled[d] = 0.0;
+            int seen_slot = 0;
+            for (int i = 0; i < width; i++) {
+                const int at = chosen[i];
+                if (at < 0 || at >= seen) continue;
+                const double weight = score[seen_slot++] / total;
+                const float *c_j = latent + (size_t)at * L;
+                for (int d = 0; d < L; d++) pooled[d] += weight * (double)c_j[d];
+            }
+            for (int d = 0; d < L; d++) pooledf[d] = (float)pooled[d];
+            mv_rows(result, &l->kvb_v, pooledf, h * V, V);
+        }
+        mv(out + (size_t)t * c->hidden, &l->o, context);
+    }
+    free(pooledf_pool); free(score_pool); free(pooled_pool); free(context);
+}
+
+/* F7 defect hunt (2026-09-19, after Fable's float64 arbitration): dump ONE real
+ * layer-chunk's inputs and the CPU fp32 `context` it produced, so the GPU core
+ * can be replayed against a float64 reference OUTSIDE the engine.
+ *
+ * GLM53_MLA_ATTN_DUMP=<path> with the GPU knob OFF writes the first call whose
+ * row window contains GLM53_MLA_ATTN_DUMP_ROW (default 1420, the first position
+ * at which the GPU and CPU logits disagree on both oracle packets) and then
+ * never writes again. Diagnostic only: nothing reads this in a served or gated
+ * run, and the pointer is NULL unless the env is set. */
+static float *g_mla_dumpctx = NULL;
+
+/* Writes the armed chunk: shapes, the real absorbed queries, the real latent
+ * prefix, the real per-row `selected`, the `context` the path under test
+ * produced, and kvb_v. Called from BOTH paths -- the CPU nest fills
+ * g_mla_dumpctx per row, the GPU path copies its ctx_all in one go -- so the
+ * two files can be diffed row by row for the same chunk. */
+static void mla_dump_write(const char *path, const GLayer *l, int tokens, int H, int L,
+                           int V, int QK, int width, int seen, int base,
+                           const float *absorbed, const float *latent, const int *selected) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    const Mat *vm = &l->kvb_v;
+    const int vpacked = (vm->columns + 1) / 2;
+    const int vng = vm->gs ? vm->columns / vm->gs : 1;
+    const int hdr[13] = { 0x50443746 /* "F7DP" */, 1, tokens, H, L, V, width, seen, base,
+                          vm->fmt, vm->gs, vm->rows, vpacked };
+    const float sc_f = 1.0f / sqrtf((float)QK);
+    fwrite(hdr, sizeof hdr, 1, f);
+    fwrite(&vng, sizeof vng, 1, f);
+    fwrite(&sc_f, sizeof sc_f, 1, f);
+    fwrite(absorbed, sizeof(float), (size_t)tokens * H * L, f);
+    fwrite(latent,   sizeof(float), (size_t)seen * L, f);
+    fwrite(selected, sizeof(int),   (size_t)tokens * width, f);
+    fwrite(g_mla_dumpctx, sizeof(float), (size_t)tokens * H * V, f);
+    fwrite(vm->q4, 1, (size_t)vm->rows * vpacked, f);
+    fwrite(vm->s, sizeof(float), (size_t)vm->rows * vng, f);
+    fclose(f);
+    fprintf(stderr, "[MLA] F7 chunk dump -> %s (tokens=%d base=%d seen=%d width=%d)\n",
+            path, tokens, base, seen, width);
+}
+
+#ifdef COLI_VULKAN
+static int mla_attn_gpu_try(const Cfg *c, const GLayer *l, int tokens, int seen, int width,
+                            const int *selected, const float *absorbed, const float *latent,
+                            float *out) {
+    const int H = c->n_heads, L = c->kv_lora, V = c->v_head;
+    if (!g_vk_ready || !coli_vk_mla_attn_ready()) return 0;
+    if (l->kvb_v.fmt != 1 && l->kvb_v.fmt != 4) return 0;
+    int *slot = malloc((size_t)tokens * width * sizeof(int));
+    int *used = malloc((size_t)tokens * sizeof(int));
+    float *ctx_all = malloc((size_t)tokens * H * V * sizeof(float));
+    if (!slot || !used || !ctx_all) { free(slot); free(used); free(ctx_all); return 0; }
+    /* Same compaction, in the same order, as the CPU path's slot_at[]. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < tokens; t++) {
+        const int *chosen = selected + (size_t)t * width;
+        int *dst = slot + (size_t)t * width;
+        int n = 0;
+        for (int i = 0; i < width; i++) {
+            const int at = chosen[i];
+            if (at < 0 || at >= seen) continue;
+            dst[n++] = at;
+        }
+        used[t] = n;
+    }
+    Mat *mw = (Mat *)&l->kvb_v;      /* ->vk is a cache inside a read-only Mat, as in mv() */
+    const int ok = coli_vk_mla_attn((ColiVkTensor **)&mw->vk,
+                                    mw->fmt == 4 ? (const void *)mw->q4 : (const void *)mw->q8,
+                                    mw->s, mw->fmt, mw->gs,
+                                    ctx_all, absorbed, latent, slot, used,
+                                    tokens, H, L, V, width, seen, mla_attn_gpu_sb(),
+                                    1.0f / sqrtf((float)c->qk_nope));
+    /* The o-projection. The CPU path does `tokens` separate mv() calls; batching
+     * them is only legitimate if the batched call lands on the SAME kernel.
+     * mv_rows_s hides two ways it might not: P4's tiled pipeline is chosen for
+     * S > 1 (measured bit-identical here, record §F7), and coli_vk_matmul
+     * SILENTLY returns 0 -- falling back to the CPU int4 kernel, which is a
+     * different kernel entirely -- if its 33.5 MB S-row scratch cannot be
+     * reserved. That second one is invisible and is why this call is explicit
+     * and reports. GLM53_MLA_ATTN_O_PERROW=1 is the A/B: `tokens` separate
+     * mv() calls, i.e. literally what the CPU path does. */
+    if (ok && g_mla_dumpctx)
+        memcpy(g_mla_dumpctx, ctx_all, (size_t)tokens * H * V * sizeof(float));
+    if (ok) {
+        static int o_perrow = -1, warned = 0;
+        if (o_perrow < 0) {
+            const char *e = getenv("GLM53_MLA_ATTN_O_PERROW");
+            o_perrow = (e && atoi(e)) ? 1 : 0;
+        }
+        if (o_perrow) {
+            for (int t = 0; t < tokens; t++)
+                mv(out + (size_t)t * c->hidden, &l->o, ctx_all + (size_t)t * H * V);
+        } else {
+            Mat *om = (Mat *)&l->o;
+            int gok = 0;
+            if (g_vk_ready && (om->fmt == 1 || om->fmt == 4))
+                gok = coli_vk_matmul((ColiVkTensor **)&om->vk, out, ctx_all,
+                                     om->fmt == 4 ? (const void *)om->q4 : (const void *)om->q8,
+                                     om->s, om->fmt, tokens, om->columns, om->rows, om->gs);
+            if (!gok) {
+                if (!warned) {
+                    fprintf(stderr, "[MLA] F7: the batched o-projection fell back to the CPU "
+                                    "kernel (S=%d) -- that is a DIFFERENT kernel from the "
+                                    "per-row GPU one the CPU path uses\n", tokens);
+                    warned = 1;
+                }
+                mv_rows_s(out, &l->o, ctx_all, tokens);
+            }
+        }
+    }
+    free(ctx_all); free(used); free(slot);
+    return ok;
+}
+#endif
+
+
+/* F7 arbitration (oracle only): GLM53_MLA_ATTN_JITTER=<eps> multiplies every
+ * value of the CPU attention core's context by (1 + eps*r), r a deterministic
+ * hash in [-1,1] of (row position, index). It answers one question: how far
+ * does the model's output move when the attention core is perturbed at fp32
+ * rounding level (eps ~ 3e-7) and nothing else changes? Unset: not entered. */
+static double g_mla_jitter = -1.0;
+static double mla_jitter_eps(void) {
+    if (g_mla_jitter < 0.0) { const char *v = getenv("GLM53_MLA_ATTN_JITTER"); g_mla_jitter = v ? atof(v) : 0.0; if (g_mla_jitter < 0.0) g_mla_jitter = 0.0;
+        if (g_mla_jitter > 0.0) fprintf(stderr, "[MLA] attention core: jitter eps=%g (oracle only)\n", g_mla_jitter); }
+    return g_mla_jitter;
+}
+static void mla_jitter_apply(float *context, int n, int at) {
+    const double eps = mla_jitter_eps();
+    if (eps <= 0.0) return;
+    for (int i = 0; i < n; i++) {
+        uint32_t h = (uint32_t)at * 2654435761u ^ (uint32_t)i * 40503u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+        const double r = (double)(h & 0xFFFFFF) / 8388607.5 - 1.0;
+        context[i] = (float)((double)context[i] * (1.0 + eps * r));
+    }
+}
 static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
@@ -1932,6 +2193,53 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
     if (optime_on()) { g_mt_index += optime_now() - _tm1; }
     const double _tm2 = optime_on() ? optime_now() : 0.0;
+    /* F7 numerics arbitration: REF64 wins over everything else below,
+     * including the GPU knob -- see mla_attn_ref64_on()'s comment. */
+    if (mla_attn_ref64_on()) {
+        mla_attn_ref64_core(c, l, tokens, seen, width, selected, absorbed, latent, out);
+        if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+        free(selected); free(valid); free(head_w);
+        free(iq); free(absorbed); free(queries); free(qa);
+        return;
+    }
+    static int dump_n = 0;
+    const char *dump_env = getenv("GLM53_MLA_ATTN_DUMP");
+    const char *dump_nmax_s = getenv("GLM53_MLA_ATTN_DUMP_N");
+    const int dump_nmax = dump_nmax_s ? atoi(dump_nmax_s) : 1;
+    char dump_buf[512];
+    const char *dump_path = (dump_env && dump_n < dump_nmax) ? dump_env : NULL;
+    if (dump_path) {
+        const char *rs = getenv("GLM53_MLA_ATTN_DUMP_ROW");
+        const int want = rs ? atoi(rs) : 1420;
+        if (!(tokens > 1 && base <= want && want < base + tokens)) dump_path = NULL;
+    }
+    if (dump_path) {
+        /* one file per matching CALL, so N = 11 captures every DSA layer of the
+         * same chunk and a defect that lives in one layer cannot hide */
+        snprintf(dump_buf, sizeof dump_buf, "%s.%d", dump_env, dump_n);
+        dump_path = dump_buf;
+        g_mla_dumpctx = malloc((size_t)tokens * H * V * sizeof(float));
+        if (!g_mla_dumpctx) dump_path = NULL;
+    }
+#ifdef COLI_VULKAN
+    /* F7: the whole chunk's core on the GPU. Prefill only; anything at all that
+     * does not work falls through to the CPU nest below. The dump is armed
+     * ABOVE this, so the knob-on run writes its own context for the same chunk
+     * and the two files can be diffed row by row. */
+    if (mla_attn_gpu_on() && tokens > 1 &&
+        mla_attn_gpu_try(c, l, tokens, seen, width, selected, absorbed, latent, out)) {
+        if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+        if (dump_path && g_mla_dumpctx) {
+            mla_dump_write(dump_path, l, tokens, H, L, V, QK, width, seen, base,
+                           absorbed, latent, selected);
+            dump_n++;
+        }
+        free(g_mla_dumpctx); g_mla_dumpctx = NULL;
+        free(selected); free(valid); free(head_w);
+        free(iq); free(absorbed); free(queries); free(qa);
+        return;
+    }
+#endif
     float *context = malloc((size_t)H * V * sizeof(float));
     /* score/pooled are the one thing 64 independent heads would share if run
      * concurrently -- each gets its own slice of a pool sized per thread,
@@ -2037,7 +2345,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                         mv_rows(context + (size_t)h * V, &l->kvb_v,
                                 pooled_all + (size_t)h * L, h * V, V);
                 }
-                mv(out + (size_t)t * c->hidden, &l->o, context);
+                mla_jitter_apply(context, H * V, base + t); mv(out + (size_t)t * c->hidden, &l->o, context);
                 continue;
             }
 #ifdef _OPENMP
@@ -2069,7 +2377,9 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 }
                 mv_rows(result, &l->kvb_v, pooled, h * V, V);
             }
-            mv(out + (size_t)t * c->hidden, &l->o, context);
+            mla_jitter_apply(context, H * V, base + t); mv(out + (size_t)t * c->hidden, &l->o, context);
+            if (g_mla_dumpctx)
+                memcpy(g_mla_dumpctx + (size_t)t * H * V, context, (size_t)H * V * sizeof(float));
             continue;
         }
         /* Heads are independent: each reads its own absorbed[] query and
@@ -2120,9 +2430,15 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             }
             mv_rows(result, &l->kvb_v, pooled, h * V, V);
         }
-        mv(out + (size_t)t * c->hidden, &l->o, context);
+        mla_jitter_apply(context, H * V, base + t); mv(out + (size_t)t * c->hidden, &l->o, context);
     }
     if (optime_on()) { g_mt_attn += optime_now() - _tm2; g_mn_calls++; g_mn_seen += seen; }
+    if (dump_path && g_mla_dumpctx) {
+        mla_dump_write(dump_path, l, tokens, H, L, V, QK, width, seen, base,
+                       absorbed, latent, selected);
+        free(g_mla_dumpctx); g_mla_dumpctx = NULL;
+        dump_n++;
+    }
     free(slot_at); free(sc); free(qT);
     free(pool_all_raw); free(acc_raw);
     free(score_raw); free(pooled_raw);
@@ -4466,6 +4782,18 @@ static void optime_report(const char *tag) {
                 g_mt_index, 1e3 * g_mt_index / g_mn_calls,
                 g_mt_attn,  1e3 * g_mt_attn  / g_mn_calls,
                 1e6 * g_mt_index / g_mn_seen);
+#ifdef COLI_VULKAN
+    /* F7: where the GPU attention core's time went. Zero when the knob is off. */
+    if (mla_attn_gpu_on()) {
+        double f7_copy = 0, f7_gpu = 0; long f7_calls = 0, f7_sub = 0;
+        coli_vk_mla_attn_prof(&f7_copy, &f7_gpu, &f7_calls, &f7_sub);
+        if (f7_calls)
+            fprintf(stderr, "%s mla attn gpu (F7): calls=%ld submits=%ld copy=%.3fs gpu=%.3fs "
+                            "(%.3f + %.3f ms/call)\n",
+                    tag, f7_calls, f7_sub, f7_copy / 1e3, f7_gpu / 1e3,
+                    f7_copy / f7_calls, f7_gpu / f7_calls);
+    }
+#endif
     fprintf(stderr, "%s moe split: router=%.3fs shared=%.3fs (n=%ld, %.3f + %.3f ms/call); "
                     "eg and cpu experts are the [PROF] line; the rest of ffn_moe is bind+dispatch+accumulate\n",
             tag, g_ot_router, g_ot_shared, g_on_router,

@@ -1,0 +1,56 @@
+#version 450
+// F7 pass 2 of 4: the per-(row, head) softmax, in place over sc[s][h][0..used).
+//
+// Matches glm53.c's CPU softmax in structure: the SAME max over the SAME set
+// (max is exact and order-independent, so this part is bit-identical), exp of
+// (score - max), a total, then score/total.
+//
+// Two deliberate differences from the CPU, both priced in the F7 design note:
+//   * the total is a float workgroup TREE reduction, not the CPU's sequential
+//     `double total`. shaderFloat64 is not enabled on this device (the engine
+//     passes no pEnabledFeatures), so fp64 is not available here. A tree over
+//     <= 2051 non-negative terms has a relative error bound of about
+//     log2(2051)*eps = 6.6e-7 -- orders of magnitude under the score pass's own
+//     reordering error, which is what the KL bar is actually measuring.
+//   * exp() is RADV's, not glibc's expf().
+// Both are why the whole path ships behind GLM53_MLA_ATTN_GPU=1.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer LATB { float lat[]; };
+layout(std430, binding = 1) readonly  buffer SLOTB{ int   slt[]; };
+layout(std430, binding = 2) readonly  buffer QB   { float q[]; };
+layout(std430, binding = 3)           buffer SCB  { float sc[]; };
+layout(std430, binding = 4)           buffer POOLB{ float pool[]; };
+layout(std430, binding = 5) writeonly buffer CTXB { float ctx[]; };
+layout(std430, binding = 6) readonly  buffer WB   { uint  w[]; };
+layout(std430, binding = 7) readonly  buffer WSCB { float wsc[]; };
+
+layout(push_constant) uniform P {
+    int fmt; int S; int H, L, V, W; int seen; int rowWords; int gs; int soff; int usedOff;
+    float scale;
+} p;
+
+shared float red[256];
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int s = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int used = slt[p.usedOff + p.soff + s];
+    if (used <= 0) return;
+    int base = (s * p.H + h) * p.W;
+
+    float m = -3.0e38;
+    for (int u = tid; u < used; u += 256) m = max(m, sc[base + u]);
+    red[tid] = m; barrier();
+    for (int o = 128; o > 0; o >>= 1) { if (tid < o) red[tid] = max(red[tid], red[tid + o]); barrier(); }
+    float top = red[0]; barrier();
+
+    float acc = 0.0;
+    for (int u = tid; u < used; u += 256) { float e = exp(sc[base + u] - top); sc[base + u] = e; acc += e; }
+    red[tid] = acc; barrier();
+    for (int o = 128; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; barrier(); }
+    float total = red[0]; barrier();
+
+    for (int u = tid; u < used; u += 256) sc[base + u] = sc[base + u] / total;
+}

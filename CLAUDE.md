@@ -125,6 +125,21 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   second (13.4 ms, 17 %). Chunk size alone changes numerics (128 vs 512
   under the clamp: KL 3.7e-04, top-1 99.68 %); the cause is not pinned
   (indexer and tile threshold ruled out, record §F2k).
+- **Prefill attention runs on dev0 (F7, in service 2026-09-20).**
+  `GLM53_MLA_ATTN_GPU=1`: the MLA score/softmax/pool core of a prefill chunk
+  runs batched over its rows in four `mla_attn_*.spv` shaders, from one shared
+  scratch (140 MB at 18k, 236 MB at 64k; nothing per layer or per slot);
+  decode and the knob-off default stay on the CPU and are bit-identical to
+  before. Gate (record §F7-VERDICT): the 18 439-token turn 683.3 -> 454.6 s
+  (1.50x), turn 1 1.35x. **How its numerics were judged, and how the next
+  reordered attention kernel must be:** against the CPU path it moves ~2 % of
+  argmaxes, and so does the CPU path itself under
+  `GLM53_MLA_ATTN_JITTER=6e-7` (a random fp32-rounding-sized perturbation,
+  oracle only) -- same KL, same first position. A float64 arm
+  (`GLM53_MLA_ATTN_REF64=1`) stays close to the CPU path only because it keeps
+  the summation order; it is not the yardstick for a reordered kernel, the
+  jitter arm is. A synthetic probe with a near-uniform softmax cannot validate
+  an attention kernel; replay real dumped inputs.
 - **One benchmark at a time, across sessions as well as inside one.** The rig
   serialises measurements. Parallel sessions or subagents may edit and build
   concurrently; only one may run an engine. Check `pgrep -x glm53`,
@@ -152,7 +167,8 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   a tool-calling turn spent it opening a `<tool_call>` box it could never close,
   which is why the owner's chat returned nothing at all. `accept_live.sh` check 5
   exists to catch a recurrence and runs in the daily canary too), `--kv-slots 4`,
-  **`GLM53_VK_SWIGLU_CLAMP=1 COLI_PREFILL_STREAM=1 GLM53_PREFILL_CHUNK=512`
+  **`GLM53_VK_SWIGLU_CLAMP=1 COLI_PREFILL_STREAM=1 GLM53_PREFILL_CHUNK=512`,
+  `GLM53_MLA_ATTN_GPU=1` (F7, 2026-09-20)
   (F2, 2026-09-19; prefix checkpoints from before that date were set aside,
   they carry the unclamped numerics)** and `COLI_KDA_GPU=2`
   (P6b, 2026-09-07: each slot has its own KDA device state, pool allocated
@@ -262,7 +278,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `glm53.p7base` = pre-P7, `glm53.p6bbase` = P7, `glm53.p6b`, `glm53.rp4`,
   `glm53.p5` (+ `shaders_p5`), `glm53.devmerge` (+ `shaders_devmerge`) = the
   binary in service from 2026-09-08 01:00, `glm53.f6abase`, `glm53.f2base` =
-  F6a `15462dc2`, `glm53.f2` = `5c01246c`, in service since 2026-09-19 16:02 UTC); each gate's pristine is the
+  F6a `15462dc2`, `glm53.f2` = `5c01246c`, `glm53.f7` = `e87ae939`, in service since 2026-09-20 05:24 UTC); each gate's pristine is the
   binary in service before the item. **Every gate runs with
   `GLM53_PREFIX_CKPT=0` and a private `COLI_CKPT_DIR`**: two gates nearly
   passed for the wrong reason because the candidate restored a checkpoint

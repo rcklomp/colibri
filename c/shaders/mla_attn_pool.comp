@@ -1,0 +1,85 @@
+#version 450
+// F7 pass 3 of 4: the weighted pool.
+//
+//   pool[s][h][d] = sum_u sc[s][h][u] * lat[slot[soff+s][u]][d]
+//
+// glm53.c's glm_pool_blocked, as a tiled GEMM per row: one workgroup per
+// (row s, tile of 64 latent dims), 256 threads holding a 64(h) x 64(d) output
+// tile as 4x4 registers, K walking the selected slots 32 at a time. The latent
+// is read once per (row, d-tile) rather than once per head -- the shape
+// COLI_MLA_POOL=2 has on the CPU, which is the one that wins when the latent
+// stops fitting in cache.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer LATB { float lat[]; };
+layout(std430, binding = 1) readonly  buffer SLOTB{ int   slt[]; };
+layout(std430, binding = 2) readonly  buffer QB   { float q[]; };
+layout(std430, binding = 3)           buffer SCB  { float sc[]; };
+layout(std430, binding = 4)           buffer POOLB{ float pool[]; };
+layout(std430, binding = 5) writeonly buffer CTXB { float ctx[]; };
+layout(std430, binding = 6) readonly  buffer WB   { uint  w[]; };
+layout(std430, binding = 7) readonly  buffer WSCB { float wsc[]; };
+
+layout(push_constant) uniform P {
+    int fmt; int S; int H, L, V, W; int seen; int rowWords; int gs; int soff; int usedOff;
+    float scale;
+} p;
+
+shared float wT[32 * 64];     // [u][h]
+shared float latT[32 * 64];   // [u][d]
+
+void main() {
+    int s  = int(gl_WorkGroupID.y);
+    int d0 = int(gl_WorkGroupID.x) * 64;
+    int tid = int(gl_LocalInvocationID.x);
+    int used = slt[p.usedOff + p.soff + s];
+    int slotRow = (p.soff + s) * p.W;
+
+    int tx = tid & 15;            // 4 latent dims: d0 + tx*4 + i
+    int ty = tid >> 4;            // 4 heads:       ty*4 + j
+    int db = tx * 4, hb = ty * 4;
+
+    float acc[4][4];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) acc[i][j] = 0.0;
+
+    for (int u0 = 0; u0 < used; u0 += 32) {
+        // wT[u][h] = sc[s][h][u0+u]; 32 consecutive u per thread run
+        for (int e = tid; e < 32 * 64; e += 256) {
+            int h = e >> 5, u = e & 31;
+            int ua = u0 + u;
+            wT[u * 64 + h] = (ua < used) ? sc[(s * p.H + h) * p.W + ua] : 0.0;
+        }
+        // latT[u][d] = lat[slot[u0+u]][d0+d]; 64 consecutive d per thread run
+        for (int e = tid; e < 32 * 64; e += 256) {
+            int u = e >> 6, d = e & 63;
+            int ua = u0 + u;
+            float v = 0.0;
+            if (ua < used) {
+                int sl = slt[slotRow + ua];
+                if (sl >= 0 && sl < p.seen) v = lat[sl * p.L + d0 + d];
+            }
+            latT[u * 64 + d] = v;
+        }
+        barrier();
+        for (int u = 0; u < 32; u++) {
+            float wv0 = wT[u * 64 + hb],     wv1 = wT[u * 64 + hb + 1];
+            float wv2 = wT[u * 64 + hb + 2], wv3 = wT[u * 64 + hb + 3];
+            float lv0 = latT[u * 64 + db],     lv1 = latT[u * 64 + db + 1];
+            float lv2 = latT[u * 64 + db + 2], lv3 = latT[u * 64 + db + 3];
+            acc[0][0] = fma(wv0, lv0, acc[0][0]); acc[0][1] = fma(wv1, lv0, acc[0][1]);
+            acc[0][2] = fma(wv2, lv0, acc[0][2]); acc[0][3] = fma(wv3, lv0, acc[0][3]);
+            acc[1][0] = fma(wv0, lv1, acc[1][0]); acc[1][1] = fma(wv1, lv1, acc[1][1]);
+            acc[1][2] = fma(wv2, lv1, acc[1][2]); acc[1][3] = fma(wv3, lv1, acc[1][3]);
+            acc[2][0] = fma(wv0, lv2, acc[2][0]); acc[2][1] = fma(wv1, lv2, acc[2][1]);
+            acc[2][2] = fma(wv2, lv2, acc[2][2]); acc[2][3] = fma(wv3, lv2, acc[2][3]);
+            acc[3][0] = fma(wv0, lv3, acc[3][0]); acc[3][1] = fma(wv1, lv3, acc[3][1]);
+            acc[3][2] = fma(wv2, lv3, acc[3][2]); acc[3][3] = fma(wv3, lv3, acc[3][3]);
+        }
+        barrier();
+    }
+    for (int j = 0; j < 4; j++) {
+        int h = hb + j;
+        int base = (s * p.H + h) * p.L + d0 + db;
+        for (int i = 0; i < 4; i++) pool[base + i] = acc[i][j];
+    }
+}

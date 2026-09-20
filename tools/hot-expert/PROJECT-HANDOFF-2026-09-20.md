@@ -15,8 +15,11 @@ commit body. Anything that is arithmetic and not a measurement says so.
 
 ## 0. Read this first: what the last session got wrong, and what it cost the owner
 
-The owner's verdict on the session that wrote this file (Fable, 2026-09-20
-afternoon): too expensive for what it delivered. He hit his plan's usage limit
+The owner's verdict on the session that wrote this file (Fable 5.1, the most
+expensive tier, 2026-09-20 afternoon): too expensive for what it delivered.
+Every mistake below was made or left unchecked by the orchestrator -- the model
+that wrote the plans, the briefs and this file -- not by the cheaper agents it
+directed. They did what they were told. He hit his plan's usage limit
 during it. The facts behind that, so the next agent does not repeat them:
 
 | mistake | what it cost | what to do instead |
@@ -26,7 +29,7 @@ during it. The facts behind that, so the next agent does not repeat them:
 | **Commissioned F3 step 2a on a projection instead of a measurement.** Plan rev 36 said "~27 tok/s by arithmetic"; the arithmetic assumed a GPU call gets cheaper when the work is smaller. It measured 22.4 tok/s, +2.0 % against a +20 % gate. The number that refutes the projection (0.25 ms per GPU round trip) was already in the session's own step-1 profile | 224k Sonnet tokens, two gateway stops (~20 min), for a negative result | **Step 0 is a measurement, never arithmetic.** A ten-minute microbenchmark of one `coli_vk_matmul` call at the two real shapes would have killed the item for free. `CLAUDE.md` and the older handoff both said this; it was skipped |
 | Ran two `accept_ui.sh` checks on top of each other (launched the second while the first hung on the dead engine) | both results void, ten more minutes | one acceptance run at a time, and look at why the first one hangs before starting another |
 | Plan revs 33 and 34 (previous session, same day) asserted two things nobody had checked: that 8-bit needed "a new int8 tier kernel" (the shaders already had it) and that "the per-op submit model" was what separated Colibri from hipFire (V1's own record said tier submits were 2 % of the token) | would have sent F3 to Opus for a kernel that existed | grep the code and the record before writing a claim into a plan |
-| Left build trees behind on the rig. Every session since 09-09 made a `~/src/colibri-<item>` clone or worktree per item and none removed them: 37 in `~/src` (3 GB) and three in `~`, three of them from that afternoon | the owner found his `~/src` buried in them | a worktree, not a clone; remove it and its sync branch when the item lands (`CLAUDE.md`). All 40 were merged work and were removed 2026-09-20 evening; the one uncommitted diff was saved to `~/bench/colibri-g5.uncommitted.diff` |
+| Left build trees behind on the rig. **This is the orchestrator's failure, not the subagents':** every Fable session since 09-09 wrote briefs that said "work in a rig checkout" without saying how or when to remove it, Fable's own Franken plan told agents to use "its own clone", and no Fable session ever looked at what its agents left on the owner's machine. Every item made a `~/src/colibri-<item>` clone or worktree per item and none removed them: 37 in `~/src` (3 GB) and three in `~`, three of them from that afternoon | the owner found his `~/src` buried in them | a worktree, not a clone; remove it and its sync branch when the item lands (`CLAUDE.md`). All 40 were merged work and were removed 2026-09-20 evening; the one uncommitted diff was saved to `~/bench/colibri-g5.uncommitted.diff` |
 | Long status messages and option lists when the owner had asked for one decision and the work | his time, and his patience | decide, do, report the number |
 
 **Spend that afternoon:** three Sonnet subagents, 777k tokens (step 0 208k,

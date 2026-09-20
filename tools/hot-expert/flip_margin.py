@@ -16,6 +16,9 @@ for p in range(n):
         pa = probs_top(a, [ia, ib]); pb = probs_top(b, [ia, ib])
         flips.append((p, pa[0], pa[1], pb[0], pb[1]))
 print(f"positions={n} flips={len(flips)} ({100*len(flips)/n:.2f}%)")
+if not flips:
+    print("  no flips: every argmax agrees, nothing to measure")
+    sys.exit(0)
 gaps = sorted(f[1] - f[2] for f in flips)
 for thr in (0.01, 0.02, 0.05, 0.10, 0.20):
     print(f"  ref P(top1)-P(cand's top1) < {thr:.2f}: {sum(g < thr for g in gaps)} of {len(flips)}")

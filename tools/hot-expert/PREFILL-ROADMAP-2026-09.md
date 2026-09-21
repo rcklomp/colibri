@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 41, 2026-09-21)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 42, 2026-09-21)
+
+**Rev 42 (2026-09-21): the 256k rung, record §F11-DEPTH; nothing served changed.** Qwen3.8-Flash-Next UD-IQ4_XS under llama.cpp with a 262144 window: cold prefill 19k 30-33 s, 84k 184-191 s, 168k 509-526 s, 257k 1 005-1 039 s (1.0-2.0 ms per new token, rising with depth); follow-up turn at 257k 1.5 s; decode 15 -> 6.1-6.5 tok/s from 39k to 257k. Next: the owner's quality swap (Franken plan rev 41).
 
 **Rev 41 (2026-09-21): F11 step 0 measured, record §F11-STEP0; nothing served changed.** Under llama.cpp (HIP) with its own fit and a 256k window: Qwen3.8-Flash-Next UD-IQ4_XS cold 19 415-token prompt 34-36 s (GLM-5.3 served: 356 s at 18 439), decode 14.4-15.2 tok/s; DeepSeek-V4-Flash UD-IQ2_M 97 s, 8.0 tok/s. Next: a one-command model swap for the owner's quality judgement, then rungs at 64k/128k/256k (Franken plan rev 40).
 

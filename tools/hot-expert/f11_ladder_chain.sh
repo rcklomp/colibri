@@ -223,7 +223,8 @@ RESERVE_PER_CARD_GIB=3
 # fine steps (1 GiB/card, up to MAX_TRIES); an overshoot would measure a
 # needlessly CPU-heavy placement. The ladder itself still stops at ~18k.
 F11_CTX=262144
-MAX_TRIES=10
+MAX_TRIES=1          # placement is llama.cpp's fit (see start_f11): one load, no N search
+FIT_MARGIN_MIB=1024  # llama.cpp's default free margin per card
 VRAM_TOTAL_BYTES=$(( VRAM_PER_CARD_GIB * CARDS * GIB ))
 RESERVE_BYTES=$(( RESERVE_PER_CARD_GIB * CARDS * GIB ))
 VRAM_USABLE_BYTES=$(( VRAM_TOTAL_BYTES - RESERVE_BYTES ))
@@ -403,6 +404,21 @@ F11_CONTAINER_NAME=""
 
 start_f11() {   # start_f11 <model> <ncmoe> <name> <alias>
   local model=$1 ncmoe=$2 name=$3 alias=$4
+  # PLACEMENT (2026-09-21, first run f1109210905): "-ngl 999 --n-cpu-moe 21
+  # --tensor-split 1,1,1" loaded Q with 20.0 / 5.8 / 24.5 GB on the three cards:
+  # an even LAYER split puts the N expert-less layers on one card and leaves it
+  # empty while another is full. llama.cpp's own fit (common/fit.cpp, on by
+  # default) sizes KV + compute at the requested ctx from measured free memory,
+  # keeps every dense tensor on the cards, fills each card with experts and
+  # writes an uneven tensor split -- but it ABORTS as soon as the user has set
+  # n_gpu_layers, tensor_split or a tensor override, which is what the line
+  # above did. "fit" therefore passes none of them.
+  local -a place
+  if [ "$ncmoe" = fit ]; then
+    place=(--fit on --fit-target "$FIT_MARGIN_MIB" --fit-ctx "$F11_CTX")
+  else
+    place=(-ngl 999 --n-cpu-moe "$ncmoe" --tensor-split 1,1,1)
+  fi
   docker run --rm --name "$name" \
     -p "127.0.0.1:${F11_PORT}:${F11_PORT}" \
     --device /dev/kfd --device /dev/dri --group-add video \
@@ -411,8 +427,8 @@ start_f11() {   # start_f11 <model> <ncmoe> <name> <alias>
     -v /home/ronald:/home/ronald \
     "$F11_IMAGE" \
     "${F11_BIN_DIR}/llama-server" \
-    -m "$model" -ngl 999 --n-cpu-moe "$ncmoe" \
-    --tensor-split 1,1,1 --split-mode layer --device ROCm0,ROCm1,ROCm2 \
+    -m "$model" "${place[@]}" \
+    --split-mode layer --device ROCm0,ROCm1,ROCm2 \
     -fa on -ctk q8_0 -ctv q8_0 -t 16 -tb 8 \
     --reasoning-effort low \
     --host 0.0.0.0 --port "$F11_PORT" \
@@ -446,8 +462,10 @@ find_n_cpu_moe() {
   echo "=== $label: --n-cpu-moe search, n0=$n0 step=$step total_layers=$total (max $MAX_TRIES tries) $(date -Is)"
   warm_and_verify "$snap" "$label-presearch"
   for try in $(seq 1 "$MAX_TRIES"); do
-    n=$(( n0 + (try - 1) * step ))
-    [ "$n" -gt "$total" ] && n=$total
+    if [ "$n0" = fit ]; then n=fit; else
+      n=$(( n0 + (try - 1) * step ))
+      [ "$n" -gt "$total" ] && n=$total
+    fi
     name="f11_search_${label}_try${try}"
     echo "--- $label search try $try/$MAX_TRIES: n-cpu-moe=$n $(date -Is)"
     precheck "${name}-pre"
@@ -459,11 +477,11 @@ find_n_cpu_moe() {
       FOUND_VRAM0=$(VRAM 0); FOUND_VRAM1=$(VRAM 1); FOUND_VRAM2=$(VRAM 2)
       echo "$label search try $try: n-cpu-moe=$n LOADED. VRAM card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2"
       echo "--- $label: llama.cpp's own buffer sizes at ctx=$F11_CTX, n-cpu-moe=$n (what the 256k window costs in VRAM)"
-      grep -iE "KV buffer|KV self size|compute buffer|model buffer|RS buffer|n_ctx " "$GOUT/${TAG}_${name}.log" | tail -40 || true
+      grep -iE "fit|KV buffer|compute buffer|model buffer|RS buffer|n_ctx|offload|tensor.split|MiB" "$GOUT/${TAG}_${name}.log" | cut -c1-240 | tail -60 || true
       stop_f11
       assert_vram_free "${name}-post" || { echo "FATAL: $label search VRAM stuck after stop -- aborting chain (box-safety)"; exit 1; }
       FOUND_N=$n; FOUND_TRIES=$try
-      summary="{\"tag\":\"$TAG\",\"model\":\"$label\",\"n0\":$n0,\"step\":$step,\"total_layers\":$total,\"chosen_n\":$n,\"tries\":$try,\"vram_used_bytes\":[$FOUND_VRAM0,$FOUND_VRAM1,$FOUND_VRAM2]}"
+      summary="{\"tag\":\"$TAG\",\"model\":\"$label\",\"n0\":$n0,\"step\":$step,\"total_layers\":$total,\"chosen_n\":\"$n\",\"tries\":$try,\"vram_used_bytes\":[$FOUND_VRAM0,$FOUND_VRAM1,$FOUND_VRAM2]}"
       echo "$summary" > "$OUT/${TAG}_${label}_search.json"
       echo "$label search summary: $summary"
       return 0
@@ -475,7 +493,7 @@ find_n_cpu_moe() {
       echo "$label search try $try: n-cpu-moe=$n TIMED OUT after ${SEARCH_TIMEOUT}s with the server still alive -- NOT raising N; $label's arms are SKIPPED (read $GOUT/${TAG}_${name}.log)"
       stop_f11
       assert_vram_free "${name}-post-timeout" || { echo "FATAL: $label search VRAM stuck after a timed-out try -- aborting chain (box-safety)"; exit 1; }
-      echo "{\"tag\":\"$TAG\",\"model\":\"$label\",\"chosen_n\":null,\"tries\":$try,\"timed_out_at_n\":$n}" > "$OUT/${TAG}_${label}_search.json"
+      echo "{\"tag\":\"$TAG\",\"model\":\"$label\",\"chosen_n\":null,\"tries\":$try,\"timed_out_at_n\":\"$n\"}" > "$OUT/${TAG}_${label}_search.json"
       return 1
     fi
     echo "$label search try $try: n-cpu-moe=$n FAILED (server exited before /health=200 -- load failure)"
@@ -642,11 +660,11 @@ assert_vram_free "post-stop-gateway" || exit 1
 # --------------------------------------------------------- n-cpu-moe search --
 Q_N=""; D_N=""
 Q_VRAM_NOTE=""; D_VRAM_NOTE=""
-if find_n_cpu_moe "$Q_MODEL" "$Q_SNAP_DIR" "$Q_N0" "$Q_STEP" "$Q_LAYERS" "q"; then
+if find_n_cpu_moe "$Q_MODEL" "$Q_SNAP_DIR" fit "$Q_STEP" "$Q_LAYERS" "q"; then
   Q_N=$FOUND_N
   Q_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/$MAX_TRIES)"
 fi
-if find_n_cpu_moe "$D_MODEL" "$D_SNAP_DIR" "$D_N0" "$D_STEP" "$D_LAYERS" "d"; then
+if find_n_cpu_moe "$D_MODEL" "$D_SNAP_DIR" fit "$D_STEP" "$D_LAYERS" "d"; then
   D_N=$FOUND_N
   D_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/$MAX_TRIES)"
 fi

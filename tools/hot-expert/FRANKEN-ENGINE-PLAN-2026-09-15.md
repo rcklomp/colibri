@@ -38,8 +38,12 @@
 > `~/models/Qwen3.8-Flash-Next/UD-IQ4_XS` (93.7 GB, arch `qwen4exp`, 48
 > blocks, 512 experts top-10) and
 > `~/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M` (90.9 GB, arch
-> `deepseek4`). The rig's llama.cpp (`15586e2`, 2026-08-06) knows both
-> architectures (checked in `src/llama-arch.cpp`, no GPU touched).
+> `deepseek4`). **Corrected the same day:** the source of `~/src/llama.cpp`
+> (`15586e2`) names both architectures, but its Vulkan BUILD (2026-08-07) is
+> older than `qwen4exp` and its `libllama.so` does not contain the string;
+> the HIP build `~/src/llama-glm53/build-hip` (the one the 09-16 GF arms ran,
+> in docker) has both (`strings libllama.so.0.3.0`, no GPU touched). F11's
+> chain, `f11_ladder_chain.sh`, therefore runs both models on HIP.
 > **New item F11, step 0 = a MEASUREMENT, no projection is offered:** both
 > files under llama.cpp on the 09-16 context ladder (turns 1-7, to 18k), as
 > many layers' experts on the three cards as load, the rest `--n-cpu-moe`;

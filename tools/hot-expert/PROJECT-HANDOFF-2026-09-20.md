@@ -269,6 +269,12 @@ formula subtracting true GB from GiB.
 ## 6. What still needs to be done
 
 ### 6.1 The one open decision — the owner's
+**DECIDED 2026-09-21 (Franken plan rev 38): the owner closed F3. Qwen3.6 is
+too far behind; only the recent Chinese models (Qwen3.8, DeepSeek V4.x,
+GLM-5.3) are acceptable, on whatever engine fits the rig, smart quantizations
+included. Step 2b is not started. The open item is F11 (rev 38). What follows
+in this section is history.**
+
 **F3 step 2b: the GPU-resident decode token for Qwen3.6-35B-A3B.** The whole
 token recorded once on the GPU — DeltaNet conv + gated delta recurrence,
 attention with KV on dev0, router + top-k, expert dispatch to dev2/dev3,

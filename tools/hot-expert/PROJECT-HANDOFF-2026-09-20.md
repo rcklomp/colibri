@@ -290,11 +290,21 @@ cards. A cheap way to learn whether the model is worth any of it: put the int8
 the owner compare answers with GLM-5.3. That is a Sonnet afternoon and no
 kernel work. **Recommended next action if the owner wants to continue F3.**
 
+**Correction, 2026-09-21 (checked, not built): "on a second port" is not
+possible and "an afternoon" is understated.** GLM-5.3 in service holds
+22.3–23.1 of 24 GiB on all three cards; the int8 `qwen36-vk` needs 16.17 GB on
+each of two. The comparison is a SWAP: GLM out of service while Qwen answers.
+And `openai_server.py` refuses any request carrying `tools` for `qwen36`
+("Tool use is not wired up"), which is every Open WebUI request under the
+current preset; with no prefix checkpoints each new chat would also pay a full
+prefill. So the trial needs a tools-off preset and an evening the owner
+agrees to be without GLM -- his call, with those costs stated.
+
 ### 6.2 Candidates on GLM-5.3, none opened (evidence in `HANDOFF-2026-09-20.md` §4)
 | candidate | evidence | size |
 |---|---|---|
-| KDA `proj` in decode: 19 % of the decode token at 18k, eight batch-1 GPU matmuls per layer at ~0.4 ms each | served profile, req 7 | Sonnet: count submits per layer, then fuse (G13's pattern) |
-| `hc+norm` in prefill: 13 % of the 18k turn, CPU, never examined | same profile | Sonnet step 0 |
+| ~~KDA `proj` in decode: 19 % of the decode token at 18k, eight batch-1 GPU matmuls per layer at ~0.4 ms each~~ **CLOSED by reading the code, 2026-09-21, nothing built:** under the served `COLI_KDA_GPU=2` `kda_layer` already runs the whole layer (eight projections, decay, recurrence, head norm, `ko`) in ONE submit, `coli_vk_kda_layer` (G12), and books all of it under `proj`. 0.911 ms is one round trip plus the layer's GPU work; there is nothing left to fuse | `c/glm53.c` `kda_layer`, the `gpu == 2` branch | none |
+| `hc+norm` in prefill: 13 % of the 18k turn. **Read 2026-09-21:** not unexamined -- `run_layers` already runs `coli_hc_pre`+`rms` and `coli_hc_post` row-parallel over the chunk (P2.3) on G10's kernels; what is left is two passes over `n*H*D` floats per site. Fusing a site's post with the next site's pre saves one pass at best, a few % of the long turn | `c/glm53.c` `run_layers` | not worth an item |
 | F10's shader: token loop inside `kda_step`, ≤ 8 % of the 18k turn | §F10-STEP0 | Opus, 200–300k tokens, parked |
 | CPU expert kernel redesign (several rows per nibble decode) | §F8-STEP0 | Opus, not opened |
 | F5 (MTP) re-pricing with F8's cheaper miss | arithmetic, no rig | free |

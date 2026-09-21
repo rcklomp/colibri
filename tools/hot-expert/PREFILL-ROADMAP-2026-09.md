@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 42, 2026-09-21)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 43, 2026-09-21)
+
+**Rev 43 (2026-09-21): WHAT IS SERVED CHANGED, by the owner's direction and reversibly.** Since 12:08 UTC port 8081 is llama-server with Qwen3.8-Flash-Next UD-IQ4_XS (`serve_alt.sh`, record §F11-SERVE), labelled `glm-5.3-flash` in Open WebUI; `serve_alt.sh glm` restores the GLM gateway and runs `accept_live`. In the browser: new chat first token 9.6 s cold, 0.8 s warm. No Colibri checkpoints, ledger or canary apply while it serves.
 
 **Rev 42 (2026-09-21): the 256k rung, record §F11-DEPTH; nothing served changed.** Qwen3.8-Flash-Next UD-IQ4_XS under llama.cpp with a 262144 window: cold prefill 19k 30-33 s, 84k 184-191 s, 168k 509-526 s, 257k 1 005-1 039 s (1.0-2.0 ms per new token, rising with depth); follow-up turn at 257k 1.5 s; decode 15 -> 6.1-6.5 tok/s from 39k to 257k. Next: the owner's quality swap (Franken plan rev 41).
 

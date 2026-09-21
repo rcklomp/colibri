@@ -212,6 +212,17 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `datapoint.py` run with a second `glm53` starting underneath it).
   `tools/rome_bench.sh` now takes the lock and handles the stop/restart
   itself; if you ever stop the gateway some other way, take the lock first.
+- **Port 8081 may not be GLM (since 2026-09-21).** `tools/hot-expert/serve_alt.sh
+  qwen38|deepseek|glm|status` swaps the model behind Open WebUI: llama-server
+  (HIP build `~/src/llama-glm53/build-hip`, docker, `--fit on`, 262144 window)
+  on the gateway's port, key and model id, so Open WebUI LABELS it
+  `glm-5.3-flash` whatever answers. Run `serve_alt.sh status` before assuming
+  anything about what serves; while an alternative serves the rig lock is held
+  by `serve_alt-<model>`, `accept_live.sh` REFUSES, and no engine benchmark can
+  run until `serve_alt.sh glm` has passed. Never give llama-server `-ngl`,
+  `--tensor-split` or `--n-cpu-moe` here: its fit aborts and one card stays
+  nearly empty (record §F11-STEP0). The owner does not need the rig by day:
+  run measurements at once.
 - **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
   `openai_server.py` on 8081 with **`--max-tokens 4096`** (2026-09-14: it was
   `256` from the first day of Open WebUI service, and `openai_server.py` clamps

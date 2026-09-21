@@ -14,6 +14,16 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 42 (2026-09-21 14:15 CEST, 12:15 UTC) -- THE SWAP EXISTS AND
+> QWEN3.8-FLASH-NEXT IS IN SERVICE FOR THE OWNER'S JUDGEMENT (record
+> §F11-SERVE).** `tools/hot-expert/serve_alt.sh qwen38|deepseek|glm|status`.
+> Both directions ran: in the browser a new chat's first token 9.6 s cold and
+> 0.8 s warm on Qwen3.8; back to GLM with `accept_live` PASS. **Open WebUI
+> still shows the model as `glm-5.3-flash` while Qwen answers.** To go back:
+> `ssh rome '~/src/colibri/tools/hot-expert/serve_alt.sh glm'`. **F11 now
+> waits on the owner's verdict on the answers.** Untested: a tool-calling turn
+> through Open WebUI on Qwen3.8; DeepSeek through the swap; two chats at once.
+>
 > **Rev 41 (2026-09-21 13:50 CEST, 11:50 UTC) -- THE 256k RUNG IS MEASURED
 > (record §F11-DEPTH): Qwen3.8-Flash-Next UD-IQ4_XS, llama.cpp HIP, fit, one
 > slot, reached 257 018 tokens in both arms.** Decode 14.6-15.3 tok/s to 39k,

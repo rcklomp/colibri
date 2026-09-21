@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 43, 2026-09-21)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 44, 2026-09-21)
+
+**Rev 44 (2026-09-21): quality is being measured, not asked for (Franken plan rev 43); tool calling on Qwen3.8 verified through Open WebUI (record §F11-TOOLS).** `f11_quality_chain.sh` runs Qwen3.8 -> DeepSeek -> GLM and ends with the GLM gateway in service.
 
 **Rev 43 (2026-09-21): WHAT IS SERVED CHANGED, by the owner's direction and reversibly.** Since 12:08 UTC port 8081 is llama-server with Qwen3.8-Flash-Next UD-IQ4_XS (`serve_alt.sh`, record §F11-SERVE), labelled `glm-5.3-flash` in Open WebUI; `serve_alt.sh glm` restores the GLM gateway and runs `accept_live`. In the browser: new chat first token 9.6 s cold, 0.8 s warm. No Colibri checkpoints, ledger or canary apply while it serves.
 

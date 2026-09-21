@@ -14,6 +14,26 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 43 (2026-09-21 16:10 CEST, 14:10 UTC) -- THE OWNER WILL NOT JUDGE
+> QUALITY BY HAND AND SHOULD NOT HAVE BEEN ASKED TO: IT IS MEASURED.** He is
+> at work; "F11 waits on the owner's verdict" (rev 42) handed him the job.
+> Replaced by `quality_eval.py` + `f11_quality_chain.sh`: the same frozen 70
+> MMLU-Pro questions (5 per category, sha256 `0e697795...`, zero-shot CoT,
+> temperature 0, 3 500-token budget) and an 8-needle retrieval test at
+> 30k/60k (all) and 120k/200k (the two llama-server models) on Qwen3.8
+> IQ4_XS, DeepSeek-V4-Flash IQ2_M and the served GLM-5.3 int4; paired McNemar,
+> Wilson intervals, and an explicit NOT DISTINGUISHABLE verdict -- 70 items
+> cannot resolve less than ~10 points, so the run can show a quantization is
+> BROKEN or clearly worse, not rank near-equals. Pilot on Qwen3.8: first 6
+> items correct, 185-508 tokens, no truncation. Running since 14:0x UTC,
+> estimate ~6 h; the chain ends with GLM serving and `accept_live` passed.
+> Tool calling on Qwen3.8 is verified at the API and through Open WebUI
+> (record §F11-TOOLS). **The decision rule, fixed before the numbers are in:**
+> a model whose MMLU-Pro score is not distinguishably below GLM-5.3's and
+> whose needles are >= 7/8 at every depth it supports replaces GLM as the
+> served default, fastest first; otherwise GLM stays and the finding is
+> recorded.
+>
 > **Rev 42 (2026-09-21 14:15 CEST, 12:15 UTC) -- THE SWAP EXISTS AND
 > QWEN3.8-FLASH-NEXT IS IN SERVICE FOR THE OWNER'S JUDGEMENT (record
 > §F11-SERVE).** `tools/hot-expert/serve_alt.sh qwen38|deepseek|glm|status`.

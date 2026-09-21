@@ -198,7 +198,20 @@ F11_BIN_DIR=/home/ronald/src/llama-glm53/build-hip/bin
 F11_IMAGE=rocm/dev-ubuntu-24.04:7.14.0-full
 F11_PORT=8093
 
-LADDER_TIMEOUT=2700   # 45 min -- see the header note (no prior measurement)
+LADDER_TIMEOUT=${F11_LADDER_TIMEOUT:-2700}   # 45 min -- see the header note (no prior measurement)
+# Depth mode (2026-09-21, the owner's 256k target). Environment, all optional:
+#   F11_ONLY=Q|D        run that model only (two arms, Q1 Q2 / D1 D2)
+#   F11_STEPS=a,b,...   ladder increments in the tool's nominal tokens
+#                       (3.6 chars each; Q's tokenizer counts ~5 % more, so a
+#                       nominal total of 229376 lands near 242k real tokens,
+#                       inside the 262144 window with room for the reply)
+#   F11_SKIP_SWEEP=1    no cold sweep (the ladder's summed step prefills ARE
+#                       the cold time at depth; a second cold 240k prompt per
+#                       arm would double the run for no new number)
+#   F11_LADDER_TIMEOUT  seconds
+F11_ONLY=${F11_ONLY:-}
+F11_STEPS=${F11_STEPS:-1024,1024,2048,4096,8192}
+F11_SKIP_SWEEP=${F11_SKIP_SWEEP:-0}
 SWEEP_TIMEOUT=2700    # 45 min
 SEARCH_TIMEOUT=1200   # 20 min per --n-cpu-moe try, = READY_TIMEOUT: a timeout skips the model, it never raises N
 READY_TIMEOUT=1200    # 20 min -- matches GF's own bound (149 GB cold read)
@@ -537,7 +550,7 @@ run_f11_arm() {
   echo "--- $tagarm ladder+followups (timeout ${LADDER_TIMEOUT}s)"
   timeout "$LADDER_TIMEOUT" python3 "$HERE/context_ladder.py" \
       --url "http://127.0.0.1:$F11_PORT" --model-id "$model_id" \
-      --steps 1024,1024,2048,4096,8192 --gen 128 --followups 2 \
+      --steps "$F11_STEPS" --gen 128 --followups 2 \
       --snap "$snap" --min-resident 90 --warm \
       --arm "$key" --tag "$TAG" --json "$json" \
       --server-log "$elog" 2>&1 | tee -a "$console"
@@ -549,6 +562,10 @@ run_f11_arm() {
   fi
 
   # 2/2: cold-sweep-only, second invocation, same json/tag/arm.
+  if [ "$F11_SKIP_SWEEP" = 1 ]; then
+    echo "--- $tagarm cold sweep SKIPPED (F11_SKIP_SWEEP=1)"
+    rc_sweep=0
+  else
   echo "--- $tagarm cold-sweep-only, second invocation, same json (timeout ${SWEEP_TIMEOUT}s)"
   timeout "$SWEEP_TIMEOUT" python3 "$HERE/context_ladder.py" \
       --url "http://127.0.0.1:$F11_PORT" --model-id "$model_id" \
@@ -558,6 +575,7 @@ run_f11_arm() {
       --arm "$key" --tag "$TAG" --json "$json" \
       --server-log "$elog" 2>&1 | tee -a "$console"
   rc_sweep=${PIPESTATUS[0]}
+  fi
   if [ "$rc_sweep" = 124 ]; then
     echo "=== $tagarm cold-sweep TIMEOUT (${SWEEP_TIMEOUT}s cap) -- continuing chain"
   else
@@ -660,11 +678,11 @@ assert_vram_free "post-stop-gateway" || exit 1
 # --------------------------------------------------------- n-cpu-moe search --
 Q_N=""; D_N=""
 Q_VRAM_NOTE=""; D_VRAM_NOTE=""
-if find_n_cpu_moe "$Q_MODEL" "$Q_SNAP_DIR" fit "$Q_STEP" "$Q_LAYERS" "q"; then
+if [ "$F11_ONLY" != D ] && find_n_cpu_moe "$Q_MODEL" "$Q_SNAP_DIR" fit "$Q_STEP" "$Q_LAYERS" "q"; then
   Q_N=$FOUND_N
   Q_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/$MAX_TRIES)"
 fi
-if find_n_cpu_moe "$D_MODEL" "$D_SNAP_DIR" fit "$D_STEP" "$D_LAYERS" "d"; then
+if [ "$F11_ONLY" != Q ] && find_n_cpu_moe "$D_MODEL" "$D_SNAP_DIR" fit "$D_STEP" "$D_LAYERS" "d"; then
   D_N=$FOUND_N
   D_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/$MAX_TRIES)"
 fi

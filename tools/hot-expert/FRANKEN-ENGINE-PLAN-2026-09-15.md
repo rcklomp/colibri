@@ -14,6 +14,24 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 39 (2026-09-21 12:00 CEST, 10:00 UTC) -- THE OWNER'S CONTEXT TARGET:
+> AT LEAST 256k TOKENS, "the size where models become usable for real work".
+> Nothing run.** This is a requirement on every candidate from here on, and it
+> is far from what is served: `~/start_glm53.sh` sets `GLM53_MAXT=65536` per
+> slot (4 slots), and no ladder on this box has gone past 18.4k. What it
+> changes now: **F11 step 0 searches and measures its expert placement with a
+> 262144-token KV cache allocated** (`f11_ladder_chain.sh`, `F11_CTX`), not
+> 32768 -- the VRAM a 256k window takes comes out of the experts that can be
+> resident, so a 32k placement would have measured a configuration the owner
+> will not use. The chain prints llama.cpp's KV/compute buffer sizes at load;
+> the only figure in hand is an upper bound that prices every layer as dense
+> attention (~13 GB for Qwen3.8-Flash-Next, ~11.5 GB for DeepSeek-V4-Flash at
+> q8_0), and both models are sparse/compressed-attention, so the real number
+> is unknown until tonight. **What step 0 does NOT answer:** speed AT depth.
+> The ladder stops at ~18k; prefill time and decode tok/s at 64k/128k/256k
+> are a second measurement (hours per rung at GLM-5.3's current prefill
+> rate), to be specified from tonight's rates, not projected from them.
+>
 > **Rev 38 (2026-09-21 10:30 CEST, 08:30 UTC) -- THE OWNER CLOSED F3 AND SET
 > THE TRACK'S TERMS. Nothing built, no engine run.** His words, condensed:
 > (1) **Qwen3.6 is too far behind; step 2b is not started and F3 is CLOSED.**

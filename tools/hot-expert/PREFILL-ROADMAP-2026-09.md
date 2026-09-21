@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 39, 2026-09-21)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 40, 2026-09-21)
+
+**Rev 40 (2026-09-21): the owner's context target is at least 256k tokens.** Franken plan rev 39. Served today: `GLM53_MAXT=65536` per slot; deepest ladder rung ever measured: 18.4k. F11 step 0 now places experts beside a 262144-token KV cache. Speed at 64k-256k is unmeasured for every model on this box and is a separate measurement after step 0.
 
 **Rev 39 (2026-09-21): nothing served changed; the owner closed F3, and two of this track's listed candidates were closed by reading the code.** Franken plan rev 38. (1) The owner: Qwen3.6 is not an acceptable model, F3 step 2b is not started; acceptable are Qwen3.8, DeepSeek V4.x, GLM-5.3, on whatever engine fits the rig, smart quantizations included. (2) KDA `proj` in decode is not "eight batch-1 matmuls": under the served `COLI_KDA_GPU=2` the whole KDA layer is one submit (`coli_vk_kda_layer`) booked under `proj`; nothing to fuse. `hc+norm` (13 % of the 18k turn) is already row-parallel on G10's kernels; a few % at most. (3) **What is next: F11 step 0**, a measurement -- `f11_ladder_chain.sh` runs `Qwen3.8-Flash-Next` UD-IQ4_XS and `DeepSeek-V4-Flash-0731` UD-IQ2_M under llama.cpp (HIP) on the 09-16 context ladder, next to the served GLM-5.3 numbers (18k turn 356 s, 5.04 tok/s). The chain is merged and has NOT been run.
 

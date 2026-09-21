@@ -467,7 +467,7 @@ cmd_alt() {
   # A keeper tied 1:1 to the container's own lifetime (see the header's lock design): this
   # blocks until the container exits, then exits itself, so the lock's liveness IS the
   # server's liveness.
-  docker wait "$ALT_NAME" > /dev/null 2>&1 &
+  nohup docker wait "$ALT_NAME" > /dev/null 2>&1 < /dev/null &   # must survive this script and its ssh session
   SERVE_ALT_KEEPER_PID=$!
   disown "$SERVE_ALT_KEEPER_PID" 2>/dev/null || true
   rig_lock_rebind_pid "serve_alt-$logname" "$SERVE_ALT_KEEPER_PID"

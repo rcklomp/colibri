@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 40, 2026-09-21)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 41, 2026-09-21)
+
+**Rev 41 (2026-09-21): F11 step 0 measured, record §F11-STEP0; nothing served changed.** Under llama.cpp (HIP) with its own fit and a 256k window: Qwen3.8-Flash-Next UD-IQ4_XS cold 19 415-token prompt 34-36 s (GLM-5.3 served: 356 s at 18 439), decode 14.4-15.2 tok/s; DeepSeek-V4-Flash UD-IQ2_M 97 s, 8.0 tok/s. Next: a one-command model swap for the owner's quality judgement, then rungs at 64k/128k/256k (Franken plan rev 40).
 
 **Rev 40 (2026-09-21): the owner's context target is at least 256k tokens.** Franken plan rev 39. Served today: `GLM53_MAXT=65536` per slot; deepest ladder rung ever measured: 18.4k. F11 step 0 now places experts beside a 262144-token KV cache. Speed at 64k-256k is unmeasured for every model on this box and is a separate measurement after step 0.
 

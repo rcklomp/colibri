@@ -14,6 +14,27 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 40 (2026-09-21 12:15 CEST, 10:15 UTC) -- F11 STEP 0 MEASURED (record
+> §F11-STEP0): with a 256k window allocated and the cards filled by
+> llama.cpp's own fit, Qwen3.8-Flash-Next UD-IQ4_XS decodes 14.4-15.2 tok/s at
+> 19k and answers a cold 19k prompt in 35 s; DeepSeek-V4-Flash UD-IQ2_M 8.0
+> tok/s and 97 s. Neither slows between 1k and 19k.** Served GLM-5.3: 5.04
+> tok/s and 356 s at 18k, 65k window. Colibri's own `qwen38-vk` on the FP8
+> Qwen3.8-Flash-Next: 4.04-4.09 tok/s. Gateway restored, `accept_live` PASS
+> twice, the second after the chain had fully exited. **What it took:** the
+> owner said the rig is a development machine by day, so it ran at once; a
+> first run was stopped after one load because `--n-cpu-moe` with an even
+> layer split left a card at 5.8 GB of 24 -- the engine's own fit fills all
+> three and is what F11 uses from here. **What this does NOT say:** whether
+> either quantization answers well enough (the owner's judgement), and speed
+> past 21k (nothing on this box has been measured there). **Next, in this
+> order:** (1) a swap script, not written yet: one command that swaps the gateway's model for
+> Q or D under llama-server on the port Open WebUI already uses, and back, so
+> the owner can judge answers -- Sonnet; (2) the depth ladder to 64k / 128k /
+> 256k on Q first: at the measured ~0.9 ms per prefill token a cold 256k
+> prompt is minutes, not hours, IF the rate holds, which is exactly what the
+> rung measures. Nothing is built in Colibri before both are in.
+>
 > **Rev 39 (2026-09-21 12:00 CEST, 10:00 UTC) -- THE OWNER'S CONTEXT TARGET:
 > AT LEAST 256k TOKENS, "the size where models become usable for real work".
 > Nothing run.** This is a requirement on every candidate from here on, and it
@@ -73,7 +94,7 @@
 > model next to GLM-5.3's served numbers (5.04 tok/s and 356 s at 18k). Quality
 > is NOT measured by it: whether IQ2_M DeepSeek or IQ4_XS Qwen3.8 answers well
 > enough is the owner's judgement in Open WebUI, and the chain's second
-> deliverable is a one-command swap (`serve_alt.sh <model>` / back) so he can
+> deliverable is a one-command swap (a script not written yet) so he can
 > make it. Only after both: decide what, if anything, is built (hot-expert
 > placement from Colibri's histogram into llama.cpp's tensor override is the
 > obvious Franken candidate; it is a hypothesis until step 0 says residency is
@@ -1390,7 +1411,7 @@ same model is the order-of-magnitude gap, and it is a prefill gap.
 | **F8 — DONE 2026-09-20, GATED PASS, IN SERVICE (rev 26–28, record §F8-STEP0, §F8; `93f0f681`)** | **The batch-1 CPU expert path in decode.** `GLM53_MOE_ONE_TEAM=1` (one OpenMP team per MoE layer, bit-identical) + `GLM53_I4_FAST=2` (`coli_i4_row_gv`: the int4 row kernel keeps its group sums in vector form, one `hsum` per row; reassociation only, relL2 ~3e-7). Step 0 refuted two cheaper hypotheses first (bandwidth-bound; FMA latency chain, worth 10 %) | projected ≤ 30 % off the 73 ms CPU-expert bucket; delivered `cpu_in` 1.868 → 1.489 ms per window | **decode +6.4 to +9.6 %, SEPARATED at all seven turns to 19.3k (4.270 → 4.585 tok/s at the deepest)**, TTFT unchanged, greedy text identical. Known gap: the chain's KL report is vacuous for a decode-only change (streamed prefill runs no CPU expert) | Sonnet throughout (~3 rounds) |
 | **F9a — DONE 2026-09-20, GATED PASS, IN SERVICE (rev 29, record §F9a, §F9a-VERDICT; `189fd945`). F9 (the GPU indexer) CLOSED WITHOUT BEING BUILT** | **The DSA indexer's score pass with the heads in the SIMD lanes** (P5.1's pattern in `c/sparse_index.h`; each dot keeps its summation order, so bit-identical; on by default, `GLM53_INDEX_LANES=0` restores the scalar dot) | the indexer was 25 % of the 18k turn after F7 | **18 439-token turn 455.0 → 357.7 s (1.27×, bar 1.10), decode at 18k +8.3 %, follow-up TTFT −20 %**; `teacher_forcing`, text, the full logit dump and 33 495 index rows identical to the served binary | Sonnet; Fable read the loop first, which is what saved the Opus shader |
 | **F10 — STEP 0 DONE 2026-09-20, THE FIX IS PARKED FOR THE OWNER (rev 30/31, record §F10-STEP0)** | **KDA in prefill.** In service the projections and the recurrence both run on the GPU; `coli_vk_kda_step_rows` records S sequential 64-workgroup dispatches per layer-chunk, each behind a memory barrier: 0.111 ms per row-layer, 33.9 s of the 357 s turn, latency-bound. Candidate fix: the token loop inside the shader (one dispatch per layer-chunk; per-head order unchanged, so a bit-identical oracle applies). `proj` (40.8 s) not examined | ≤ ~30 s of 357 s (8 %) on long prompts, nothing for decode | not built; would gate like F9a (bit-identical dump + A,B,B,A ladder, bar 1.05×) | Opus, ~200–300k tokens by F7's bill; **the owner says "do F10" or it stays parked** |
-| **F11 — OPENED 2026-09-21 (rev 38), step 0 not yet run** | **The acceptable models at a smart quantization, mostly VRAM-resident, on whatever engine runs them.** Step 0: `Qwen3.8-Flash-Next` UD-IQ4_XS (93.7 GB) and `DeepSeek-V4-Flash-0731` UD-IQ2_M (90.9 GB) under the rig's llama.cpp on the 09-16 context ladder, experts on the cards as far as they load, arms Q,D,D,Q | Sonnet writes the chain; the orchestrator launches and polls | a measurement, no gate: decode tok/s and TTFT per depth next to GLM-5.3's served 5.04 tok/s / 356 s at 18k; then the owner judges answer quality through a one-command swap | nothing is built before both are in |
+| **F11 — STEP 0 DONE 2026-09-21 (rev 40, record §F11-STEP0): Qwen3.8-Flash-Next UD-IQ4_XS 14.4-15.2 tok/s at 19k, cold 19k prompt 35 s; DeepSeek-V4-Flash UD-IQ2_M 8.0 tok/s, 97 s; both with a 256k window, cards filled by llama.cpp's fit. Next: the owner's quality swap, then the 64k-256k rungs** | **The acceptable models at a smart quantization, mostly VRAM-resident, on whatever engine runs them.** Step 0: `Qwen3.8-Flash-Next` UD-IQ4_XS (93.7 GB) and `DeepSeek-V4-Flash-0731` UD-IQ2_M (90.9 GB) under the rig's llama.cpp on the 09-16 context ladder, experts on the cards as far as they load, arms Q,D,D,Q | Sonnet writes the chain; the orchestrator launches and polls | a measurement, no gate: decode tok/s and TTFT per depth next to GLM-5.3's served 5.04 tok/s / 356 s at 18k; then the owner judges answer quality through a one-command swap | nothing is built before both are in |
 | parked | H2b, H4, D-3 (branches exist), L1 | — | — | D-3 re-enters only under F0's falsifier |
 
 ### 8.4 Order, and what each step must show before the next

@@ -200,7 +200,7 @@ F11_PORT=8093
 
 LADDER_TIMEOUT=2700   # 45 min -- see the header note (no prior measurement)
 SWEEP_TIMEOUT=2700    # 45 min
-SEARCH_TIMEOUT=480    # 8 min per --n-cpu-moe try (warm cache; see header)
+SEARCH_TIMEOUT=1200   # 20 min per --n-cpu-moe try, = READY_TIMEOUT: a timeout skips the model, it never raises N
 READY_TIMEOUT=1200    # 20 min -- matches GF's own bound (149 GB cold read)
 
 OUT=~/bench/ctx_ladder_out; mkdir -p "$OUT"
@@ -361,7 +361,11 @@ start_gateway() {
 
 stop_gateway() {
   pkill -f "openai_[s]erver.py" 2>/dev/null || true
-  sleep 3
+  # The server must be GONE before the engine is killed: a server that
+  # survives its SIGTERM with a dead engine answers /v1/models 200 and every
+  # chat 500, and on_exit would see "gateway up" and leave it that way.
+  for _ in $(seq 1 10); do pgrep -f "openai_[s]erver.py" >/dev/null || break; sleep 1; done
+  pkill -9 -f "openai_[s]erver.py" 2>/dev/null || true
   pkill -9 -x glm53 2>/dev/null || true
   wait_no_glm53
 }
@@ -375,7 +379,7 @@ wait_ready_f11() {   # wait_ready_f11 <port> <label> <timeout_s>
     sleep 5
   done
   echo "$label: FATAL -- /health never returned 200 after ${cap}s"
-  return 1
+  return 2   # still loading, NOT a load failure: the search must not read it as "N too small"
 }
 
 # --------------------------------------------------------------- F11 arm --
@@ -451,7 +455,17 @@ find_n_cpu_moe() {
       echo "$label search summary: $summary"
       return 0
     fi
-    echo "$label search try $try: n-cpu-moe=$n FAILED (no /health=200 within ${SEARCH_TIMEOUT}s)"
+    if [ "$rc" = 2 ]; then
+      # A server that is alive but not ready is a slow load, not an OOM. Raising
+      # N on it would measure a needlessly CPU-heavy placement and call it the
+      # model's speed. Stop here and say so.
+      echo "$label search try $try: n-cpu-moe=$n TIMED OUT after ${SEARCH_TIMEOUT}s with the server still alive -- NOT raising N; $label's arms are SKIPPED (read $GOUT/${TAG}_${name}.log)"
+      stop_f11
+      assert_vram_free "${name}-post-timeout" || { echo "FATAL: $label search VRAM stuck after a timed-out try -- aborting chain (box-safety)"; exit 1; }
+      echo "{\"tag\":\"$TAG\",\"model\":\"$label\",\"chosen_n\":null,\"tries\":$try,\"timed_out_at_n\":$n}" > "$OUT/${TAG}_${label}_search.json"
+      return 1
+    fi
+    echo "$label search try $try: n-cpu-moe=$n FAILED (server exited before /health=200 -- load failure)"
     stop_f11
     assert_vram_free "${name}-post-fail" || { echo "FATAL: $label search VRAM stuck after a failed try -- aborting chain (box-safety)"; exit 1; }
   done
@@ -566,7 +580,15 @@ on_exit() {
   echo "--- final re-warm of GLM before restart"
   warm_glm
   assert_glm_resident "final" || echo "WARNING: GLM not >=90% resident at restart time"
-  pgrep -f "openai_[s]erver.py" >/dev/null || start_gateway
+  # In service = server up AND a live (non-zombie) engine. Anything else --
+  # neither, or a server over a dead engine -- is cleared and restarted;
+  # glm53 is killed here only on the way to that restart.
+  if pgrep -f "openai_[s]erver.py" >/dev/null && engine_alive; then
+    echo "gateway already in service -- left alone"
+  else
+    stop_gateway
+    start_gateway
+  fi
   echo "=== f11_ladder_chain exit rc=$rc tag=$TAG $(date -Is)"
   echo "=== results: $OUT (jsonl/search-json), $GOUT (server logs/consoles)"
   echo "--- accept_live.sh (the request AFTER the chain is part of the measurement)"

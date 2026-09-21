@@ -213,10 +213,21 @@ GIB=1073741824
 VRAM_PER_CARD_GIB=24
 CARDS=3
 RESERVE_PER_CARD_GIB=3
+# 2026-09-21, the owner's target: a 256k window is the size at which a model is
+# usable for real work. The placement is therefore searched and measured with
+# the KV cache of 262144 tokens allocated, not 32768: the header's naive KV
+# bound scales x8 (to ~13 GB for Q, ~11.5 GB for D) and how much of that these
+# sparse-attention models really allocate is unknown until llama.cpp prints
+# its KV buffer sizes -- which is one of the things this run is for. The
+# search only goes UP, so it starts from the LOW reserve above and climbs in
+# fine steps (1 GiB/card, up to MAX_TRIES); an overshoot would measure a
+# needlessly CPU-heavy placement. The ladder itself still stops at ~18k.
+F11_CTX=262144
+MAX_TRIES=10
 VRAM_TOTAL_BYTES=$(( VRAM_PER_CARD_GIB * CARDS * GIB ))
 RESERVE_BYTES=$(( RESERVE_PER_CARD_GIB * CARDS * GIB ))
 VRAM_USABLE_BYTES=$(( VRAM_TOTAL_BYTES - RESERVE_BYTES ))
-STEP_HEADROOM_BYTES=$(( 2 * CARDS * GIB ))   # ~2 GiB/card freed per retry
+STEP_HEADROOM_BYTES=$(( 1 * CARDS * GIB ))   # ~1 GiB/card freed per retry
 
 ceil_div() { # ceil_div <num> <den> -- integer ceiling division, num/den >= 0
   local num=$1 den=$2
@@ -405,7 +416,7 @@ start_f11() {   # start_f11 <model> <ncmoe> <name> <alias>
     -fa on -ctk q8_0 -ctv q8_0 -t 16 -tb 8 \
     --reasoning-effort low \
     --host 0.0.0.0 --port "$F11_PORT" \
-    --parallel 1 --ctx-size 32768 --alias "$alias" \
+    --parallel 1 --ctx-size "$F11_CTX" --alias "$alias" \
     >> "$GOUT/${TAG}_${name}.log" 2>&1 < /dev/null &
   F11_PID=$!
   F11_CONTAINER_UP=1
@@ -432,13 +443,13 @@ find_n_cpu_moe() {
   local model=$1 snap=$2 n0=$3 step=$4 total=$5 label=$6
   local try n name rc summary
   FOUND_N=""; FOUND_VRAM0=""; FOUND_VRAM1=""; FOUND_VRAM2=""; FOUND_TRIES=""
-  echo "=== $label: --n-cpu-moe search, n0=$n0 step=$step total_layers=$total (max 6 tries) $(date -Is)"
+  echo "=== $label: --n-cpu-moe search, n0=$n0 step=$step total_layers=$total (max $MAX_TRIES tries) $(date -Is)"
   warm_and_verify "$snap" "$label-presearch"
-  for try in $(seq 1 6); do
+  for try in $(seq 1 "$MAX_TRIES"); do
     n=$(( n0 + (try - 1) * step ))
     [ "$n" -gt "$total" ] && n=$total
     name="f11_search_${label}_try${try}"
-    echo "--- $label search try $try/6: n-cpu-moe=$n $(date -Is)"
+    echo "--- $label search try $try/$MAX_TRIES: n-cpu-moe=$n $(date -Is)"
     precheck "${name}-pre"
     assert_vram_free "${name}-pre" || { echo "FATAL: $label search VRAM not free before try $try -- aborting chain (box-safety)"; exit 1; }
     start_f11 "$model" "$n" "$name" "$name"
@@ -447,6 +458,8 @@ find_n_cpu_moe() {
     if [ "$rc" = 0 ]; then
       FOUND_VRAM0=$(VRAM 0); FOUND_VRAM1=$(VRAM 1); FOUND_VRAM2=$(VRAM 2)
       echo "$label search try $try: n-cpu-moe=$n LOADED. VRAM card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2"
+      echo "--- $label: llama.cpp's own buffer sizes at ctx=$F11_CTX, n-cpu-moe=$n (what the 256k window costs in VRAM)"
+      grep -iE "KV buffer|KV self size|compute buffer|model buffer|RS buffer|n_ctx " "$GOUT/${TAG}_${name}.log" | tail -40 || true
       stop_f11
       assert_vram_free "${name}-post" || { echo "FATAL: $label search VRAM stuck after stop -- aborting chain (box-safety)"; exit 1; }
       FOUND_N=$n; FOUND_TRIES=$try
@@ -469,8 +482,8 @@ find_n_cpu_moe() {
     stop_f11
     assert_vram_free "${name}-post-fail" || { echo "FATAL: $label search VRAM stuck after a failed try -- aborting chain (box-safety)"; exit 1; }
   done
-  echo "$label: no working --n-cpu-moe found in 6 tries (up to N=$n of $total) -- $label's arms are SKIPPED, chain continues"
-  summary="{\"tag\":\"$TAG\",\"model\":\"$label\",\"n0\":$n0,\"step\":$step,\"total_layers\":$total,\"chosen_n\":null,\"tries\":6}"
+  echo "$label: no working --n-cpu-moe found in $MAX_TRIES tries (up to N=$n of $total) -- $label's arms are SKIPPED, chain continues"
+  summary="{\"tag\":\"$TAG\",\"model\":\"$label\",\"n0\":$n0,\"step\":$step,\"total_layers\":$total,\"chosen_n\":null,\"tries\":$MAX_TRIES}"
   echo "$summary" > "$OUT/${TAG}_${label}_search.json"
   return 1
 }
@@ -631,11 +644,11 @@ Q_N=""; D_N=""
 Q_VRAM_NOTE=""; D_VRAM_NOTE=""
 if find_n_cpu_moe "$Q_MODEL" "$Q_SNAP_DIR" "$Q_N0" "$Q_STEP" "$Q_LAYERS" "q"; then
   Q_N=$FOUND_N
-  Q_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/6)"
+  Q_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/$MAX_TRIES)"
 fi
 if find_n_cpu_moe "$D_MODEL" "$D_SNAP_DIR" "$D_N0" "$D_STEP" "$D_LAYERS" "d"; then
   D_N=$FOUND_N
-  D_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/6)"
+  D_VRAM_NOTE="card0=$FOUND_VRAM0 card1=$FOUND_VRAM1 card2=$FOUND_VRAM2 (try $FOUND_TRIES/$MAX_TRIES)"
 fi
 echo "=== search done: Q_N=${Q_N:-SKIPPED} ($Q_VRAM_NOTE)  D_N=${D_N:-SKIPPED} ($D_VRAM_NOTE)"
 

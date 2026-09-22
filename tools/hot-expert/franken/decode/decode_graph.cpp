@@ -816,6 +816,85 @@ void DecodeRunner::report_cache_bytes(FILE * out) const {
     }
 }
 
+// ------------------------------------------- serving: state save/restore --
+//
+// The pieces, in the one order every one of the three functions below walks.
+// Only what a chunk boundary CARRIES is here: the conv windows' chunk slots
+// are written before they are read inside a chunk (conv_slide has already
+// moved the tail into the history slots by the time step() returns), and the
+// per-token scratch is dead between chunks by construction.
+void DecodeRunner::state_pieces(std::vector<StatePiece> & out) {
+    out.clear();
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        LayerState & st = lstate_[il - model_.il0()];
+        Backend * be = &model_.dev_for(il);
+        if (is_recurrent_layer(il)) {
+            out.push_back({ be, st.conv_win,
+                            (size_t) GDN_CONV_HIST * GDN_CONV_DIM * sizeof(float) });
+            out.push_back({ be, st.gdn_state,
+                            (size_t) GDN_V_HEADS * GDN_STATE * GDN_STATE * sizeof(float) });
+        } else {
+            out.push_back({ be, st.idx_sum,  (size_t) IDX_DIM * sizeof(float) });
+            out.push_back({ be, st.idx_raw0, (size_t) IDX_DIM * sizeof(float) });
+        }
+    }
+    if (need_ple_) {
+        const int pd = model_.dev_of(PLE_LAYER);
+        out.push_back({ &model_.dev(pd), pool_[pd].ple_win,
+                        (size_t) PLE_CONV_HIST * HC_DIM * sizeof(float) });
+    }
+}
+
+size_t DecodeRunner::state_bytes() const {
+    // const, so it counts rather than walks -- same order, same arithmetic.
+    size_t n = 0;
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        if (is_recurrent_layer(il))
+            n += (size_t) GDN_CONV_HIST * GDN_CONV_DIM * sizeof(float)
+               + (size_t) GDN_V_HEADS * GDN_STATE * GDN_STATE * sizeof(float);
+        else
+            n += 2 * (size_t) IDX_DIM * sizeof(float);
+    }
+    if (need_ple_) n += (size_t) PLE_CONV_HIST * HC_DIM * sizeof(float);
+    return n;
+}
+
+void DecodeRunner::save_state(void * dst) {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    // Every device first: a download that races the chunk still in flight
+    // would copy a half-written state, and the chunk before a snapshot is
+    // exactly the one the pipeline was allowed not to wait for.
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    char * p = (char *) dst;
+    for (const auto & s : pieces) { s.be->download(p, s.ptr, s.bytes); p += s.bytes; }
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+}
+
+void DecodeRunner::load_state(const void * src, int pos) {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    const char * p = (const char *) src;
+    for (const auto & s : pieces) { s.be->upload(s.ptr, p, s.bytes); p += s.bytes; }
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    pos_ = pos;
+    xn_ready_ = false;
+}
+
+void DecodeRunner::reset_state() {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    size_t big = 0;
+    for (const auto & s : pieces) big = std::max(big, s.bytes);
+    std::vector<char> zero(big, 0);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    for (const auto & s : pieces) s.be->upload(s.ptr, zero.data(), s.bytes);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    pos_ = 0;
+    xn_ready_ = false;
+}
+
 std::vector<float> DecodeRunner::logits_host() {
     std::vector<float> v;
     if (!model_.have_head()) return v;

@@ -583,3 +583,113 @@ reads 0 and is the check that it stays that way.
 
 The CPU graph is still bit-identical (538 of 538 taps `cos=1.000000`), and the
 routing capture through the router kernel reproduces the same overlap.
+
+## Step 4 (2026-09-22): the engine behind the gateway
+
+`franken_decode --serve` (or `SERVE=1`, which is what `c/openai_server.py`
+sets) is the same binary speaking the gateway's line protocol on stdin/stdout
+instead of running a CLI turn. The protocol is specified, with a `file:line`
+for every claim, in `GATEWAY-PROTOCOL.md`; the implementation is
+`franken_serve.cpp`, and §7 of that document is the map from one to the other.
+
+```
+franken_decode --serve          # every setting comes from the environment
+franken_decode_cpu --serve-test # the same loop, CPU backend, short span
+```
+
+Six decisions in it that are not obvious:
+
+- **stdout is the wire, so fd 1 is pointed at stderr.** `wire_open()` dups the
+  real stdout to a private unbuffered `FILE *` and then `dup2(2, 1)`. Every
+  `printf` already in this directory — the runner's progress lines, the VRAM
+  report, libllama's loader chatter — lands in the log, and no future one can
+  corrupt a frame.
+- **The tokenizer is `dlopen`ed, not linked.** `ldd libggml.so.0` lists
+  `libggml-hip.so.0`, so `-lllama` would put a HIP runtime in
+  `franken_decode_cpu`'s dependency list and break `make ldd-check`. It is
+  also loaded **after** the weights are placed: the conformance log shows
+  `ggml_cuda_init` running during a *vocab-only* load, so on a box with cards
+  visible ggml does enumerate them, and doing it after this engine's own
+  `hipSetDevice` means it finds contexts rather than creating them.
+  (`libhipblas.so.3`/`librocblas.so.5` are not on this host's path — /opt/rocm
+  here is 6.2 and the build is 7.14 — so the two are preloaded by absolute
+  path from the rocm SDK wheels. `LD_LIBRARY_PATH` is deliberately *not* used:
+  that directory also holds a different `libamdhip64`.)
+- **Prefix reuse is a rollback, not a checkpoint cache.** The K/V cells and the
+  pooled indexer keys are positional and stay valid up to any earlier
+  position; what is *not* is the recurrent state (GDN state + conv windows,
+  the indexer's running block sum, the PLE conv window). `DecodeRunner::
+  save_state/load_state/reset_state` move exactly that set — 118 MB a snapshot
+  at 48 layers, host side, one download a card — taken at every prefill chunk
+  boundary and once at the end of every turn, eight kept per slot with
+  decimation on eviction (the useful snapshot is the one just below the shared
+  prefix's end, and that end is anywhere).
+- **`reused` is the position rolled back to**, i.e. the exact number of tokens
+  the turn did not run through the model. The end-of-turn snapshot is what
+  makes a continuation report *exactly* `prompt + completion (- 1 if the turn
+  hit its budget)`, which is the gateway's own independent prediction —
+  `accept_live.sh` check 2b fails the gate on any disagreement.
+- **Feed, then sample.** An emitted token is fed back before the next one is
+  sampled, which is what makes the two cases above land on the ledger's
+  arithmetic instead of one token away from it.
+- **The PLE gather is windowed.** The hash reads a token and its two
+  predecessors and nothing else, so a chunk gathers over
+  `[start-2, start+T)` rather than the whole prefix — the CLI's per-token
+  whole-prefix gather is O(pos) a token and unusable at 256k.
+  `FRANKEN_PLE_SELFCHECK=1` checks the window against the full gather
+  (`--serve-test` has it on: every row `IDENTICAL`).
+
+### The CPU conformance run (2026-09-22)
+
+`serve_conformance.py` plays the gateway's half by hand — the exact SUBMIT
+bytes `Engine.generate` writes, the exact parse `Engine._dispatch_stdout`
+does — against `franken_decode_cpu --serve-test` with `--layers 0-3`,
+`--chunk 8`, `--ctx 512` and `HIP_VISIBLE_DEVICES=` (the second guard; the
+first is the binary). 14 checks, 0 failures: boot handshake, CONTEXT_EXCEEDED,
+EMPTY_PROMPT, a stray CANCEL answered NOT_FOUND, a full round trip
+(ACCEPT/DATA×n/DONE with all seven STAT fields), a continuation reusing
+`prompt + completion - limited` exactly, a **rollback** to the snapshot below
+the LCP (24 of 26 tokens at chunk 8), a CANCEL in flight ending `DONE` then
+`ERROR CANCELLED`, and a normal request served after it. The output is
+garbage text, as it must be with 4 of 48 layers — this run tests the
+protocol, not the model.
+
+### What the GPU run needs (nothing here claims a GPU measurement)
+
+```
+tools/hot-expert/serve_alt.sh franken     # stops GLM, takes the rig lock,
+                                          # warms the GGUF, starts the gateway
+                                          # with franken_decode behind it,
+                                          # sends one real chat, then runs
+                                          # accept_live.sh
+tools/hot-expert/serve_alt.sh glm         # the way back (accept_live must PASS)
+```
+
+`start_franken.sh` is what it launches: `openai_server.py --arch qwen38`
+(Qwen3.8's own chat template — the model's) `--model-id glm-5.3-flash` (the
+name Open WebUI already has), `--max-tokens 4096`, `--kv-slots 1`, with
+`FRANKEN_CTX=262144 FRANKEN_CHUNK=256 FRANKEN_GEMM_LDS=0 FRANKEN_DEVICES=3`.
+From the Mac, `tools/hot-expert/accept_ui.sh` is the browser-side check the
+owner is owed before anyone says serving works.
+
+Known gaps, all of them unmeasured rather than unknown:
+
+1. **One slot at 262144 cells**, because that is what the cards have room for
+   (1.21 GB a card a slot). Slots are allocated lazily and a slot that does not
+   fit answers `ERROR <id> SLOT_UNAVAILABLE` rather than killing the engine.
+   The qwen38 family caps `--kv-slots` at 1 anyway.
+2. **No prefix checkpoints.** `accept_live.sh` check 3 (the API two-turn with
+   memory) is the checkpoint path on GLM; here it has to pass on plain slot
+   reuse or not at all. `GATEWAY-PROTOCOL.md` §5 argues it should; nothing has
+   run it.
+3. **Sampling drops the tail below rank `FRANKEN_TOPK_CAND` (4096)** before
+   applying top_p. Greedy (`temperature 0`) uses the device argmax and
+   downloads no logits at all; every other temperature costs one ~1 MB logit
+   download a token.
+4. **The snapshot cost at 256k is not measured**: 118 MB a chunk boundary is
+   ~2.6 % of a 256-token chunk's compute at the recorded 1.63 ms/token, on
+   paper. `FRANKEN_SNAP_EVERY` (tokens) is the knob; raising it trades reuse
+   granularity for prefill speed, and taking a snapshot forces the chunk to be
+   awaited, so it also costs the pipeline.
+5. **Tool calling** is parsed gateway-side out of the DATA text for this family
+   as for every other; nothing about it has been exercised here.

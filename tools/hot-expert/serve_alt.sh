@@ -9,6 +9,11 @@
 #
 #   serve_alt.sh qwen38    -> GLM gateway out, llama-server + Qwen3.8-Flash-Next UD-IQ4_XS in
 #   serve_alt.sh deepseek  -> GLM gateway out, llama-server + DeepSeek-V4-Flash-0731 UD-IQ2_M in
+#   serve_alt.sh franken   -> GLM gateway out, Colibri's OWN gateway with the FRANKEN ENGINE in,
+#                             on the same Qwen3.8 GGUF the `qwen38` arm serves (L0 step 4,
+#                             2026-09-22). This one is not a container: it is openai_server.py
+#                             with franken_decode as its child, so it is the arm that measures
+#                             the new engine on the owner's own path.
 #   serve_alt.sh glm       -> alt server out, GLM gateway back, accept_live.sh must PASS
 #   serve_alt.sh status    -> what is serving, since when, VRAM per card, lock holder
 #
@@ -132,6 +137,19 @@ G_MODEL=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-0000
 G_SNAP_DIR=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS
 G_LABEL="GLM-5.3-Flash UD-IQ4_XS (llama.cpp)"
 
+# --- the Franken engine (L0 step 4, 2026-09-22) ------------------------------------------------
+# The one arm here that is NOT llama-server in a container: Colibri's own gateway
+# (openai_server.py) with tools/hot-expert/franken/decode/franken_decode behind it, speaking the
+# line protocol GATEWAY-PROTOCOL.md specs. Same port, same key, same model id as every other arm,
+# so Open WebUI is unchanged; the chat template is Qwen3.8's, because the model is Qwen3.8's
+# (start_franken.sh's header says why --arch qwen38 and --model-id glm-5.3-flash are not in
+# conflict). It runs the SAME GGUF as the qwen38 arm, which is what makes the two comparable:
+# one command apart, the only difference is which engine is behind the port.
+F_START=$HOME/src/colibri/tools/hot-expert/franken/start_franken.sh
+F_SNAP_DIR=$Q_SNAP_DIR
+F_LABEL="Qwen3.8-Flash-Next UD-IQ4_XS (Franken engine)"
+F_LOG=$HOME/bench/serve_alt_franken.log
+
 # --- backend: HIP docker, same bin dir/image the F11 chain used --------------------------------
 ALT_BIN_DIR=/home/ronald/src/llama-glm53/build-hip/bin
 ALT_IMAGE=rocm/dev-ubuntu-24.04:7.14.0-full
@@ -150,6 +168,17 @@ ALT_READY_TIMEOUT=1200        # 20 min -- matches f11_ladder_chain.sh's READY_TI
 VRAM() { cat "/sys/class/drm/card$1/device/mem_info_vram_used" 2>/dev/null || echo -1; }
 
 engine_alive() { ps -C glm53 -o stat= 2>/dev/null | grep -qv '^Z'; }
+
+# The same zombie-safe test for the Franken engine. `pgrep -x` would answer YES for a process
+# that has been killed and not yet reaped, which is the bug that left five chains believing an
+# engine was alive on 2026-09-20 (CLAUDE.md); `ps -C <name> -o stat=` plus the ^Z filter is the
+# fix that went into run_chain.sh and gateway_watchdog.sh, reused verbatim.
+franken_alive() { ps -C franken_decode -o stat= 2>/dev/null | grep -qv '^Z'; }
+
+wait_no_franken() {   # bounded 240 s, 2 s steps
+  for _ in $(seq 1 120); do franken_alive || return 0; sleep 2; done
+  echo "FATAL: franken_decode still alive (non-zombie) after 240 s"; return 1
+}
 
 wait_no_glm53() {   # bounded 240 s, 2 s steps; zombie-safe (a killed engine child is a ZOMBIE
                      # and still matches `pgrep -x glm53` -- CLAUDE.md, 2026-09-20)
@@ -223,7 +252,11 @@ stop_gateway() {
   for _ in $(seq 1 10); do pgrep -f "openai_[s]erver.py" >/dev/null || break; sleep 1; done
   pkill -9 -f "openai_[s]erver.py" 2>/dev/null || true
   pkill -9 -x glm53 2>/dev/null || true
-  wait_no_glm53
+  # The gateway may have had the FRANKEN engine behind it rather than glm53. Killing only glm53
+  # would leave franken_decode holding ~22 GB on each card, and the very next step
+  # (assert_vram_free) would then refuse to start anything at all -- with nothing saying why.
+  pkill -9 -x franken_decode 2>/dev/null || true
+  wait_no_glm53 && wait_no_franken
 }
 
 start_gateway() {   # requirement 6: exactly how every chain restarts the gateway
@@ -484,6 +517,71 @@ cmd_alt() {
   echo "=== to go back: $HERE/serve_alt.sh glm"
 }
 
+# start_franken -- the gateway with the Franken engine behind it, waiting the way start_gateway
+# waits for GLM's (server answering /v1/models 200 AND a live engine process, never one of the
+# two: a server that outlives its engine answers 200 on /v1/models and 500 on every chat, which
+# is exactly the failure five F3 chains produced on 2026-09-20).
+start_franken() {
+  [ -x "$F_START" ] || { echo "FATAL: $F_START is not executable"; return 1; }
+  SKIP_WARM=1 setsid nohup "$F_START" > "$F_LOG" 2>&1 < /dev/null &
+  local i
+  for i in $(seq 1 240); do
+    if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $(cat "$KEY_FILE")" \
+         -w '%{http_code}' "http://127.0.0.1:${ALT_PORT}/v1/models" 2>/dev/null)" = 200 ] \
+       && franken_alive; then
+      return 0
+    fi
+    # A boot that has already failed should not cost 20 minutes of polling.
+    if ! pgrep -f "openai_[s]erver.py" >/dev/null && [ "$i" -gt 6 ]; then
+      echo "FATAL: the gateway process is gone; last lines of $F_LOG:"; tail -20 "$F_LOG"; return 1
+    fi
+    sleep 5
+  done
+  echo "FATAL: the Franken gateway did not come up within 1200 s; last lines of $F_LOG:"
+  tail -20 "$F_LOG"
+  return 1
+}
+
+# cmd_franken -- same safety order as cmd_alt (requirement 5), with the container steps replaced
+# by the gateway ones. The weights are the qwen38 arm's own GGUF, so the warm step is identical.
+cmd_franken() {
+  echo "=== serve_alt: switching to $F_LABEL $(date -Is)"
+  refuse_if_busy franken || exit 1
+  serve_alt_lock_take "$$" "serve_alt-setup-franken" || exit 3
+  ensure_alt_stopped
+  echo "[1/7] stopping whatever the gateway is serving now"
+  if ! stop_gateway; then restore_glm "stop_gateway failed"; exit 1; fi
+  echo "[2/7] confirming VRAM is free on all three cards"
+  if ! assert_vram_free "pre-franken"; then restore_glm "VRAM not free before the Franken engine"; exit 1; fi
+  echo "[3/7] warming the GGUF in page cache (two passes, target >=90% resident)"
+  warm_and_verify "$F_SNAP_DIR" franken || true
+  echo "[4/7] starting the gateway with the Franken engine ($F_LOG)"
+  if ! start_franken; then restore_glm "the Franken gateway did not come up"; exit 1; fi
+  for c in 0 1 2; do echo "  card$c VRAM used: $(VRAM "$c") bytes"; done
+  echo "[5/7] sending one real chat completion to verify"
+  if ! send_test_chat "$F_LABEL"; then restore_glm "the Franken test chat failed"; exit 1; fi
+  echo "[6/7] accept_live.sh -- the owner's own path, including the request AFTER the one it tests"
+  # Not fatal, and that is deliberate: this engine implements plain per-slot reuse and no prefix
+  # CHECKPOINTS, so check 3 (the API two-turn with memory, which is the checkpoint path on GLM)
+  # may not behave identically. A FAIL here is a result to read, not a reason to throw the box
+  # back to GLM automatically -- the owner asked to judge this engine's answers.
+  "$HERE/accept_live.sh" || echo "NOTE: accept_live.sh did not pass -- see its output above; the engine is still serving"
+  echo "[7/7] handing the rig lock to the running engine (safe to exit this script now)"
+  # The keeper's liveness IS the engine's liveness: tail --pid exits when that pid does, so a
+  # crashed engine leaves a stale lock that rig_lock_holder's existing kill -0 rule clears.
+  local epid keeper
+  epid=$(pgrep -x franken_decode | head -1)
+  nohup tail --pid="$epid" -f /dev/null > /dev/null 2>&1 < /dev/null &
+  keeper=$!
+  disown "$keeper" 2>/dev/null || true
+  SERVE_ALT_KEEPER_PID=$keeper
+  rig_lock_rebind_pid "serve_alt-franken" "$keeper"
+  write_state F "$F_LABEL"
+  echo "=== now serving: $F_LABEL on port $ALT_PORT (Open WebUI still shows it as 'glm-5.3-flash')"
+  echo "=== engine pid $epid, gateway log $F_LOG"
+  echo "=== to go back: $HERE/serve_alt.sh glm"
+}
+
 cmd_glm() {
   echo "=== serve_alt: switching back to GLM-5.3 $(date -Is)"
   refuse_if_busy glm || exit 1
@@ -510,6 +608,9 @@ cmd_status() {
     echo "container '$ALT_NAME' started: $started"
   elif pgrep -f "openai_[s]erver.py" >/dev/null && engine_alive; then
     echo "serving: GLM-5.3 (model id 'glm-5.3-flash') via the Colibri gateway on port $ALT_PORT"
+  elif pgrep -f "openai_[s]erver.py" >/dev/null && franken_alive; then
+    echo "serving: $F_LABEL via the Colibri gateway on port $ALT_PORT (Open WebUI shows it as 'glm-5.3-flash')"
+    echo "engine pid: $(pgrep -x franken_decode | head -1), gateway log $F_LOG"
   else
     echo "serving: NOTHING recognizable on port $ALT_PORT -- run '$HERE/serve_alt.sh glm' to restore GLM"
   fi
@@ -528,10 +629,11 @@ case "${1:-}" in
   qwen38)   cmd_alt Q ;;
   deepseek) cmd_alt D ;;
   glm-llama) cmd_alt G ;;
+  franken)  cmd_franken ;;
   glm)      cmd_glm ;;
   status)   cmd_status ;;
   *)
-    echo "usage: $0 {qwen38|deepseek|glm|status}"
+    echo "usage: $0 {qwen38|deepseek|glm-llama|franken|glm|status}"
     exit 2
     ;;
 esac

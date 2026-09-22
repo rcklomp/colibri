@@ -32,6 +32,7 @@
 #include "decode_graph.h"
 #include "decode_model.h"
 #include "decode_oracle.h"
+#include "franken_serve.h"
 
 using namespace fk;
 
@@ -95,7 +96,15 @@ void usage(const char * p) {
         "                           so one run can be the oracle of another\n"
         "          [--jitter X]     perturb every block input by +-X (oracle only):\n"
         "                           how far apart two equally correct summation\n"
-        "                           orders of this architecture land\n", p);
+        "                           orders of this architecture land\n"
+        "          [--serve]        speak c/openai_server.py's line protocol on\n"
+        "                           stdin/stdout instead of running a CLI turn\n"
+        "                           (GATEWAY-PROTOCOL.md; SERVE=1 does the same).\n"
+        "                           Everything it takes comes from the environment:\n"
+        "                           SNAP/FRANKEN_GGUF, KV_SLOTS, FRANKEN_CTX,\n"
+        "                           FRANKEN_CHUNK, FRANKEN_GEMM_LDS, FRANKEN_DEVICES.\n"
+        "          [--serve-test]   --serve on the CPU backend with a short layer\n"
+        "                           span and a small context, for serve_conformance.py\n", p);
 }
 
 bool parse_range(const std::string & s, int & a, int & b) {
@@ -115,6 +124,22 @@ double median(std::vector<double> v) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    // SERVE MODE FIRST, before anything reads argv or writes a byte: under the
+    // gateway this process is launched as `[binary, <cap>]` with SERVE=1 in the
+    // environment (GATEWAY-PROTOCOL.md section 1), which the CLI parser below
+    // would reject as an unrecognised argument -- and stdout is the wire, so
+    // nothing may print on it. franken_serve.cpp owns the process from here.
+    {
+        bool serve = false, serve_test = false;
+        for (int i = 1; i < argc; ++i) {
+            if      (!std::strcmp(argv[i], "--serve"))      serve = true;
+            else if (!std::strcmp(argv[i], "--serve-test")) serve = serve_test = true;
+        }
+        const char * s = std::getenv("SERVE");
+        if (s && !std::strcmp(s, "1")) serve = true;
+        if (serve) return fk::serve_main(argc, argv, serve_test);
+    }
+
     // Line-buffered, so the progress lines survive an abort: a GPU memory
     // fault kills the process and a full stdout buffer goes with it, which
     // is how the first three-card run produced no output at all.

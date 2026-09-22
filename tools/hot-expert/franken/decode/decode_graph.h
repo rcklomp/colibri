@@ -154,6 +154,43 @@ public:
     // the engine rather than the instrumentation.
     void set_capture(bool on) { capture_ = on; }
 
+    // ---- serving: the state a prefix-reuse rollback has to move (L0 step 4) --
+    //
+    // What a slot holds after `pos` tokens splits in two:
+    //
+    //   POSITIONAL, and therefore still valid after a rollback to any p <= pos:
+    //     the q8_0 K/V cache (cell j IS position j) and the pooled indexer keys
+    //     of the blocks that are already closed. Nothing below touches them.
+    //
+    //   RECURRENT, and therefore only valid AT pos: the GDN state of every
+    //     recurrent layer, the GDN conv window's GDN_CONV_HIST history slots,
+    //     the PLE conv window's PLE_CONV_HIST history slots, and the indexer's
+    //     running block sum (idx_sum) with its fill value (idx_raw0) on every
+    //     QSA layer. That is what these three move.
+    //
+    // So: save_state() at a chunk boundary, load_state(blob, p) to roll back to
+    // it, and re-feed the tokens from p on. The re-fed chunk rewrites the K/V
+    // cells and the pooled keys of every block it joins, exactly as the first
+    // run did -- idx_sum is part of the blob, so a block that straddles p is
+    // re-pooled from the same partial sum and lands on the same bits.
+    //
+    // Sizes at the served geometry (48 layers, 36 of them recurrent): 3.1 MB of
+    // GDN state a layer dominates, 118 MB a snapshot in total. This is a HOST
+    // copy: it costs one download a device per snapshot and nothing in VRAM.
+    size_t state_bytes() const;
+    void   save_state(void * dst);
+    void   load_state(const void * src, int pos);
+    // A fresh sequence: every recurrent buffer zeroed and pos back to 0, which
+    // is the state the constructor left (alloc_f32 zeroes). The positional
+    // caches are deliberately NOT cleared -- every cell they hold is about to
+    // be overwritten before it can be read, since a read is bounded by pos.
+    void   reset_state();
+
+    int    ctx()       const { return cfg_.ctx; }
+    int    max_chunk() const { return max_T_; }
+    // stdout is the wire in SERVE mode: nothing may print there but a frame.
+    void   set_progress(bool on) { cfg_.progress = on; }
+
     // Bytes of QSA cache this device holds, and the per-token rate, so the
     // sizing is a printed number rather than a belief (`kv_bytes_dev<i>=`).
     void report_cache_bytes(FILE * out) const;
@@ -178,6 +215,12 @@ private:
         float *    idx_raw0   = nullptr;  // [IDX_DIM] cell 0's key, the fill value
         uint16_t * idx_pooled = nullptr;  // [ctx/ratio][IDX_DIM] bf16 pooled keys
     };
+
+    // One contiguous run of recurrent state on one device. The list is built
+    // in a fixed order (layers in index order, then the PLE window), so a blob
+    // written by save_state() is read back by load_state() piece for piece.
+    struct StatePiece { Backend * be; void * ptr; size_t bytes; };
+    void state_pieces(std::vector<StatePiece> & out);
 
     void hc_mix(const LayerWeights & L, const float * w_norm, const Mat & down,
                 const Mat & up, const Mat & inj, const float * x,

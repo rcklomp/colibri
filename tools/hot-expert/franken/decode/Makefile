@@ -46,20 +46,27 @@ GGML_LIB_DIR := $(LLAMA_DIR)/build-hip/bin
 # of DecodeModel::place_mat -> Backend::place.
 COMMON_SRC := ../gguf_model.cpp ../ple.cpp \
               decode_model.cpp decode_graph.cpp decode_oracle.cpp \
-              decode_cpu.cpp franken_decode.cpp
+              decode_cpu.cpp franken_serve.cpp franken_decode.cpp
 HDRS := decode_shapes.h decode_quant.h decode_backend.h decode_model.h \
-        decode_graph.h decode_oracle.h ../gguf_model.h ../ple.h \
+        decode_graph.h decode_oracle.h franken_serve.h ../gguf_model.h ../ple.h \
         ../../m1/m1_native_decode.h
 
 CPU_BIN := franken_decode_cpu
 GPU_BIN := franken_decode
 GPU_SRC := decode_gpu.hip
 
-INCS     := -I$(GGML_INC) -I$(GGML_SRC_INC) -I..
+# llama.h is included for its TYPES only: franken_serve.cpp dlopens libllama at
+# run time rather than linking it, because `ldd libggml.so.0` lists
+# libggml-hip.so.0 and linking -lllama would put a HIP runtime in
+# franken_decode_cpu's dependency list -- exactly what `make ldd-check` exists
+# to forbid. -DFRANKEN_LLAMA_SO_DEFAULT is where the dlopen looks by default.
+LLAMA_INC := $(LLAMA_DIR)/include
+INCS     := -I$(GGML_INC) -I$(GGML_SRC_INC) -I$(LLAMA_INC) -I.. \
+            -DFRANKEN_LLAMA_SO_DEFAULT='"$(GGML_LIB_DIR)/libllama.so"'
 # No -lggml-hip on either binary: no ggml backend is initialised in this
 # directory, the kernels are ours, and the CPU binary must not gain a HIP
 # dependency through the back door.
-LDLIBS   := -L$(GGML_LIB_DIR) -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(GGML_LIB_DIR)
+LDLIBS   := -L$(GGML_LIB_DIR) -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(GGML_LIB_DIR) -ldl
 
 .PHONY: all clean resources cpu gpu ldd-check moe-gather-test
 all: $(CPU_BIN) $(GPU_BIN)

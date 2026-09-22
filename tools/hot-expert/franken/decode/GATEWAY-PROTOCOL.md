@@ -15,13 +15,16 @@ service and the one `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md`
 targets replacing. Where qwen38/qwen36 differ in a way a new engine should
 prefer, it is called out as "the newer dialect".
 
-`tools/hot-expert/franken/decode/franken_decode.cpp` is, as of this writing,
-a `--tokens <id> [<id> ...]` CLI oracle/measurement harness (M0-M5 of the
-Franken design) with **no tokenizer, no chat template, no SERVE loop, no
-SUBMIT/CANCEL/STOP handling at all** (`franken_decode.cpp:6,42,117,151-184`
-— the whole arg parser). None of what follows exists in it yet; this
-document is the target it would have to grow into to sit behind
-`openai_server.py` in `glm53`'s place.
+`tools/hot-expert/franken/decode/franken_decode.cpp` was, when this document
+was written (L0 step 4, first half of 2026-09-22), a `--tokens <id> [<id> ...]`
+CLI oracle/measurement harness with **no tokenizer, no chat template, no SERVE
+loop, no SUBMIT/CANCEL/STOP handling at all**. **That changed the same day:
+`franken_decode --serve` implements what follows, in
+`tools/hot-expert/franken/decode/franken_serve.cpp`, and §7 at the end of this
+document maps every requirement here onto the code that answers it plus the
+CPU conformance run that exercised it.** The body below is unchanged: it
+describes what `openai_server.py` and `glm53.c` do, which is the same
+whoever is behind the pipe.
 
 ## 1. Process contract
 
@@ -482,8 +485,8 @@ its terminal `DONE`/`ERROR`.
   `<SNAP>/tokenizer.json` at boot (`c/glm53.c:6919-6921`). **A new engine
   must own its own tokenizer and its own token-id-to-UTF-8 decode** (for
   `DATA` frame text) — nothing upstream of the SUBMIT frame does this for
-  it. This is the single biggest gap for `franken_decode`, which today
-  takes token ids directly on argv and has no tokenizer linked in at all.
+  it. This was the single biggest gap for `franken_decode`; it is closed by
+  the GGUF's own tokenizer through libllama with `vocab_only=true` (§7).
 - **Stop sequences / EOS**: two layers. The gateway maintains its own
   client-facing `stop_filter` over the decoded text stream (matching
   user-supplied `stop` strings and the family's default role markers,
@@ -620,8 +623,7 @@ as it does true per-slot KV reuse.
    ignore) an optional 7th (`xlen`) and 8th (`prefix_bytes`) field, and an
    `IMAGE` frame preceding it (reject IMAGE cleanly if unsupported) (§2).
 3. **Own tokenizer**: encode the payload text to token ids and decode
-   generated ids back to UTF-8 text (§4) — this is new work for
-   `franken_decode`, which currently only accepts pre-tokenized ids.
+   generated ids back to UTF-8 text (§4).
 4. **Per-slot KV state**: `KV_SLOTS` independent, persistent contexts;
    given a new prompt's token sequence, compute the longest exact prefix
    match against the slot's last remembered sequence, reuse that much KV
@@ -684,9 +686,8 @@ exact bytes it should produce and replaying them:
 ## Top 5 things a new engine most easily gets wrong
 
 1. **Assuming the SUBMIT payload is already tokenized.** It is UTF-8 prompt
-   text. `franken_decode` today only accepts `--tokens <id>...` on argv and
-   has no tokenizer at all — this is the largest actual gap, not a subtlety
-   (§4).
+   text, already chat-templated by the gateway — the largest actual gap for a
+   harness that took `--tokens <id>...` on argv, not a subtlety (§4).
 2. **Treating `reused` as advisory or skippable.** It is a specific,
    checked number the gateway's ledger cross-validates against its own
    independent prediction every single continuation turn
@@ -720,3 +721,33 @@ exact bytes it should produce and replaying them:
 overflows context. Free to copy `glm53`'s other gaps for parity, but not
 this one, since `_engine_error` (`c/openai_server.py:79-106`) already knows
 how to produce the better message if the engine gives it the chance.)
+
+## 7. What answers each of these, in `franken_serve.cpp` (L0 step 4, 2026-09-22)
+
+The checklist of §6 against the code, so the two can be diffed rather than
+believed. Everything below was exercised by `serve_conformance.py` on the CPU
+binary (14 checks, 0 failures, `--layers 0-3`); **no GPU run has happened.**
+
+| §6 item | where | conformance check |
+|---|---|---|
+| 1 boot: READY then `STAT 0 0.00 0.0 <rss>` | `Server::run()` | "boot: READY + STAT with >= 5 fields" |
+| 2 SUBMIT parse, 6/7/8 fields, counted-byte body | `FrameIO::read_body` | every turn |
+| 3 own tokenizer | `Vocab`, libllama `vocab_only=true`, `dlopen`ed | every turn (the prompt is text) |
+| 4 per-slot KV + honest `reused` | `Slot`, `plan_reuse`, `DecodeRunner::save_state/load_state` | "turn B: reused == ledger_expect_reuse", "turn C: rollback to the snapshot below the LCP" |
+| 5 DATA per token, flushed, stop token never sent | `wire_data`, the decode loop's `is_eog` break | "one DATA per emitted token" |
+| 6 DONE with all seven STAT fields | end of `serve_one` | every turn |
+| 7 CANCEL: drain, queue SUBMITs, DONE **then** ERROR CANCELLED | `FrameIO::drain`, `serve_one` | "turn D", "turn E" |
+| 8 BAD_FRAME / EMPTY_PROMPT / CONTEXT_EXCEEDED | `serve_one`, `read_body` | "context overflow", "empty prompt" |
+| 9 STOP is a no-op | `FrameIO::drain` ignores it | — |
+| 10 ACCEPT sent (optional but recommended); TOOL/ECHO/HWINFO/EMAP/HITS/PROF absent | `serve_one` | "turn A: ACCEPT carries prompt_tokens" |
+
+Two things this engine does that `glm53` does not, both called for above:
+it sends `ACCEPT <id> <prompt_tokens>` before prefilling, and it spells a
+context overflow `CONTEXT_EXCEEDED prompt_tokens=N requested=M capacity=C`
+(the qwen38 form `_engine_error` understands) instead of `BAD_REQUEST`, so the
+client gets a 400 that says what to do.
+
+One thing it does not do: prefix **checkpoints**. Per §5 that is allowed —
+plain per-slot reuse is what `accept_live.sh` checks 2/2b/3 need — but it is
+also the one place where a real serving run could still differ from `glm53`'s
+behaviour, and no serving run has been made.

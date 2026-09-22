@@ -244,3 +244,97 @@ gate) are the next candidates and are the same pattern.
 against its own pre-change dump: 538 of 538 points `cos=1.000000`, STEP2
 PASS — so the GPU-side rework cannot have moved the math, and
 `--dump`/`--oracle` will say whether it moved the kernels.
+
+## Step 2b (2026-09-22): the launch count, and per-projection bandwidth
+
+The profiled run (`be26445`, box idle) gave `layers0_15_ms_median=11.7251`,
+`prof_host_syncs_per_token=0` — the sync work of the first cut was right —
+and `prof_launches_per_token=931`, i.e. **58 launches a layer**, with
+`trunk_gemv 5890 µs` and `elem_hc 2004 µs` of an 11.7 ms token.
+
+### Why ≤ 15 launches a layer is not reachable, and what is
+
+Seventeen of those 58 were projections, one kernel each however small:
+`hc_down`×2, `hc_inject`×2, `hc_up`×2, `ssm_qkv`, `ssm_gate`, `ssm_beta`,
+`ssm_alpha`, `ssm_out`, `ffn_gate_inp`, `sh_up`, `sh_gate`, `sh_down`,
+`sh_gate_inp`, expert gate_up, expert down. That is already above 15 before a
+single elementwise op. The only thing that collapses them is that most
+**share an activation vector**, so they can share a kernel:
+
+| batch | matrices | rows | launches |
+|---|---|---:|---:|
+| `xn` → hc | `hc_down` + `hc_inject` | 324 | 2 → 1 (+1 reduce) |
+| `mixed` → GDN | `ssm_qkv` + `ssm_gate` + `ssm_beta` + `ssm_alpha` | 16480 | 4 → 1 |
+| `mixed` → QSA | `wq` + `wk` + `wv` + `idx_q` + `idx_k` | 13952 | 5 → 1 |
+| `mixed` → FFN | `ffn_gate_inp` + `sh_up` + `sh_gate` + `sh_gate_inp` | 1793 | 4 → 1 |
+| `ple_emb` → PLE | `ple_key` + `ple_value` | 12800 | 2 → 1 |
+
+`k_gemv_batch` runs one kernel over the concatenated row space, with a
+per-matrix format (the QSA batch mixes Q8_0 and BF16), output pointer and
+epilogue. **Predicted** (not measured — `prof_launches_per_token` is the
+measurement): **23 a GDN layer, 26 a QSA layer, ~389 a token**, against 931.
+
+The rest of the reduction is fusions that all keep every oracle tap:
+
+- the scale+silu and the sigmoid became GEMV **epilogues** (`GE_SCALE_SILU`,
+  `GE_SIGMOID`), riding on the split reduce a 320-row matrix needs anyway;
+- `ssm_qkv` writes **straight into the conv ring slot** and the PLE norm into
+  its own ring slot, so neither conv needs a copy in front of it;
+- the GDN conv and the whole gate chain are one launch (`k_gdn_conv_gate`),
+  the gate's 48 elements riding on threads past the channel count;
+- `q_conv` and `k_conv` are adjacent, so one `l2_norm` of 32 groups does both;
+- `hc_combine` also produces the **next** hc_mix's norm (`k_hc_combine_norm`)
+  — both reduce over the same 2 560 elements — including across the layer
+  boundary, except before the PLE layer, which rewrites the residual;
+- the shared expert's down-projection forms its own `silu(gate)*up`
+  activation inside the GEMV (`GX_SILU_MUL`);
+- `k_moe_finish` does the weighted expert sum, the shared-expert gate and the
+  add in one launch, writing `ffn_moe_out` and `ffn_shexp_gated`; the sigmoid
+  lives here rather than in the GEMV epilogue so `shared_expert_gate` stays a
+  tap too;
+- `k_qsa_qk_post` does the `[q|gate]` split, the three QK-norms, the three
+  IMRoPEs and the output gate's sigmoid — nine launches with grids as small as
+  four workgroups of one wave — in one kernel of 30 workgroups;
+- the attention combine applies the gate and writes both `kqv_out` and
+  `attn_gated`;
+- **the top-k is not launched at all** when the budget covers the cache. At
+  ctx 512 against a 2 051-cell budget the reference's own `ggml_top_k` is the
+  identity, so `k_qsa_expand` writes the selection. That was a 1 024-thread
+  workgroup doing four passes of LDS histograms and scans over ~70 scores,
+  every QSA layer, and it is the largest single piece of the 292 µs a QSA
+  layer cost.
+
+### Per-projection bandwidth, and two knobs instead of two guesses
+
+`--profile` now reports, per batch group,
+`prof_gemv_<group>_us`, `_mb` and `_gbs` — the weight bytes those launches
+actually read over their device time — for `hc_down_inject`, `hc_up`,
+`gdn_qkv_gate_beta_alpha`, `ssm_out`, `ffn_router_shexp`, `shexp_down`,
+`qsa_q_k_v_indexer`, `attn_output` and `ple`. That is the number to hold
+against §M5's 800 GB/s, not the lumped 5 890 µs.
+
+Two things the brief asked about cannot be settled without running, so both
+are **runtime knobs** rather than assumptions:
+
+- `--gemv-lds 0|1` stages the activation slice in LDS instead of reading it
+  from L1. The kernel is weight-bandwidth-bound and x is small enough to sit
+  in L1, so this may well be neutral; sweep it.
+- `--gemv-min-rows N` (default 1024) is the row count below which K is split.
+  **Total waves == total rows**, so wider workgroups never add parallelism —
+  only splitting K does, at the price of a reduce launch. Sweep it against
+  `prof_gemv_*_gbs`.
+
+On 16-byte loads: two consecutive Q8_0 blocks are 68 bytes and `qs` sits at
+offset 34b+2, so a block's payload is 4-byte aligned only for even b and
+**never** 16-byte aligned. A `dwordx4` from such an address is not something
+this file will do on the strength of a guess. The widest safe request stays
+the 32 contiguous bytes a wave pulls per block; what is tunable is how many
+are in flight, so the unroll depth is the compile-time `GEMV_UNROLL`
+(default 4).
+
+**Correctness:** the CPU graph after this rewrite is **bit-identical** to
+before it — 538 of 538 taps `cos=1.000000` against the pre-rewrite dump,
+`missing=0` — and the llama.cpp comparison is unchanged (`l_last-0`
+0.999993, `l_last-3` 0.999407 under `--quant-act`). 35 kernels, still zero
+scratch and zero spills, occupancy 16 except `attn_flash_split` at 15;
+`k_gemv_batch` is 46 VGPR. Not run: no GPU was touched.

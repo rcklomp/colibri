@@ -50,6 +50,10 @@ void usage(const char * p) {
         "                           (device-side; read back AFTER the body)\n"
         "          [--profile]      per-kernel-class device time for one token, plus\n"
         "                           prof_host_syncs_per_token and prof_launches_per_token\n"
+        "          [--gemv-lds 0|1] stage the GEMV activation in LDS (default 1);\n"
+        "                           both arms exist so the profile can decide\n"
+        "          [--gemv-min-rows N] split K below this many output rows (default\n"
+        "                           1024); sweep it against prof_gemv_*_gbs\n"
         "          [--dump DIR]     write this run's taps in the oracle's own format,\n"
         "                           so one run can be the oracle of another\n"
         "          [--jitter X]     perturb every block input by +-X (oracle only):\n"
@@ -90,6 +94,8 @@ int main(int argc, char ** argv) {
     bool quant_act = false;
     bool verbose = false;
     bool profile = false;
+    int  gemv_lds = 1;
+    int  gemv_min_rows = 1024;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -99,6 +105,8 @@ int main(int argc, char ** argv) {
         else if (a == "--quant-act")              quant_act = true;
         else if (a == "--verbose")                verbose = true;
         else if (a == "--profile")                profile = true;
+        else if (a == "--gemv-lds" && i + 1 < argc) gemv_lds = std::atoi(argv[++i]);
+        else if (a == "--gemv-min-rows" && i + 1 < argc) gemv_min_rows = std::atoi(argv[++i]);
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--jitter" && i + 1 < argc) jitter = (float) std::atof(argv[++i]);
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
@@ -121,6 +129,8 @@ int main(int argc, char ** argv) {
         std::unique_ptr<Backend> be(use_cpu ? make_cpu_backend(threads) : make_gpu_backend(0));
         if (quant_act) be->set_quant_act(true);
         if (profile)   be->set_profile(true);
+        be->set_gemv_lds(gemv_lds);
+        be->set_gemv_min_rows(gemv_min_rows);
         std::printf("backend=%s layers=%d-%d ctx=%d tokens=%zu quant_act=%d\n",
                     be->name(), il0, il1, ctx, tokens.size(), (int) quant_act);
 

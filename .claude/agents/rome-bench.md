@@ -73,7 +73,7 @@ branch or commit `eabeb9a`.
 
 ## Franken track addendum (2026-09-20)
 
-F items are not measured with `rome_bench.sh`. Their gate is a chain
+F items (all closed) and the design's M items (2026-09-22) are not measured with `rome_bench.sh`. Their gate is a chain
 (`tools/hot-expert/f*_gate_chain.sh` through `run_chain.sh`) that the
 orchestrating session launches and polls; see `tools/hot-expert/MEASURING.md`.
 Your part on that track is filling the record from a finished chain's logs in

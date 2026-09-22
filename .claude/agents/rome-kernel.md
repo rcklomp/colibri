@@ -43,7 +43,7 @@ recorded.
 
 ## Franken track addendum (2026-09-20) — read before any F item
 
-The active track is `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md`
+The active track since 2026-09-22 is `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md` (measurement program M0-M5, build ladder L0-L5; every item is a component measurement on gfx1100, never "serve engine X for model Y"). Its decision log is `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md`
 (F items), with `tools/hot-expert/HANDOFF-2026-09-20.md` as its narrative and
 `tools/hot-expert/MEASURING.md` for its gate. Where this addendum and the
 procedure above disagree, the addendum wins for F items.

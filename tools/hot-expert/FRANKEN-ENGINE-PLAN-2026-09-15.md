@@ -291,7 +291,7 @@
 > and a 70 GB BF16 download, so it is built only if step 0's KL of int4
 > against int8 on the CPU engine shows int4 costs quality. The dense
 > Qwen3.8-27B stays what it is today, a llama.cpp model, not a Colibri item.
-> Do not re-open this choice with the owner; he asked for it to be made.
+> Do not re-open this choice with the owner; he asked for it to be made. [2026-09-22: the owner re-opened and closed it himself, rev 38.]
 >
 > **Rev 33 (2026-09-20 16:15 CEST, 14:15 UTC) -- THE OWNER NAMED F3's MODEL:
 > the sparse 35B at 8-bit. F3 is unblocked; nothing built yet.** Checked the
@@ -1055,6 +1055,8 @@
 
 ## 0. Decision in one paragraph
 
+**[2026-09-22: superseded.** The Franken-engine is a NEW engine assembled from the best-measuring parts of Colibri, llama.cpp, hipFire and hipEngine for this rig (plan rev 45); the design and the live program (M0-M5, L0-L5) are `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md`. F3/Qwen3.6 is closed (rev 38). What follows is kept as history.**] The plan body below (sections 0-8) is the analysis of 2026-09-15 and frames the question as "Colibri vs hipFire, which engine serves which model"; that framing is withdrawn.
+
 The first head-to-head (§2, H2) cannot separate "HIP beats Vulkan" from "a
 3B-active model in 960 GB/s VRAM beats a 180 GB model whose misses come from
 host DRAM", because **today** no engine here runs the same model in the same
@@ -1189,7 +1191,7 @@ to `--sizes 512,2048`, one repeat, 30 min wall, run last.
 |---|---|---|---|---|---|---|
 | **H0** | **hipFire on this box at all.** Under the rig lock with the gateway stopped (a chain, not by hand — the watchdog): check `/dev/kfd` access for the user (`id -nG` includes `render`/`video`; if not, that is an owner action, `usermod`, and the item stops there and says so); `ROCM_PATH=/opt/rocm-6.2.0 rocminfo` lists three gfx1100; build hipFire (Rust toolchain user-local via rustup; `hipcc` from `/opt/rocm-6.2.0/bin`) — **read its README for its minimum ROCm first; if it needs > 6.2, stop and report: installing a second ROCm is a system change the owner decides, not this item**; download the Qwen3.6-35B-A3B MQ4R; serve it on dev3's HIP index on a side port; one request through its HTTP API. Record: the API shape (OpenAI-compatible `/v1/chat/completions` with SSE, or Ollama-style `/api/chat` NDJSON — the driver needs to know), whether the response carries `usage.prompt_tokens` / prompt-eval timings, whether it exposes **any prefix/KV cache across requests** and **any speculative/MTP knob** (both decide items below), its CPU thread setting, and the PCI-BDF → HIP-index map | ROCm 6.2 unused so far; RADV has been the only path | runs, or fails on a named cause | ½ day + a short lock window | Sonnet (+ owner if a group membership is missing) | a coherent 64-token greedy reply on the ladder's question, `usage` or an equivalent token count reported, VRAM released after exit (sysfs `mem_info_vram_used` back under 1 GB on that card) — **or a named blocker** |
 | **H1** | **Extend `context_ladder.py` with `--url`** (reuse `ttft_serve.HttpDriver`, add its `--api-key`, `--model-id`, `--server-log`, `--tools` arguments), plus: residency over the files under `--snap` whatever their extension; the P8 reply pin only in engine mode (an unknown message field may be rejected by another server); in HTTP mode the REUSE-based abort is replaced by a loud `REUSE UNVERIFIED (http)` note and `reused=None` in the row — **the cold sweep decides reuse, not a guess**; `--cold-sweep 2048,4096,8192,16384 --sweep-offset-chars 300000` (fresh single-message prompts of those sizes from a disjoint corpus region, each its own conversation, HTTP mode only; **refused in engine mode with the arithmetic** — 2k+4k+8k+16k on GLM is 260+572+1355+3555 s = 96 min per pass); `side`/`arm` fields in every JSON row; decode from `usage.completion_tokens` when the stream reports it, else delta count, and the row says which. If H0 found an Ollama-style API, a second small driver class with the same `run()` contract. **Plus `context_compare`** (new, Python, under `tools/hot-expert/`): reads the jsonl of the four arms, pairs rows by turn index, prints per depth D_A×2, D_B×2, TTFT_inc×2 each, applies `gate_ab_verdict`'s rule (overlap → NO VERDICT; conservative worst-against-best when separated; refuse < 2 samples per arm) by sourcing `gate_lib.sh`, and prints the reuse ratio r (§2.4) per sweep depth | `HttpDriver` already reads SSE, `usage`, and the gateway log; the ladder hardcodes `EngineDriver` | a driver that is symmetric across arms | 1 day | Sonnet | (i) engine mode reproduces tonight's ladder turn 1–2 within the box's spread (374 tokens 45.4 s / 121.5 ms/token; turn 2 REUSE 381/731 at 110.8 ms/token — `eb4dd5b`), (ii) `--url http://127.0.0.1:8081 --steps 256,256 --gen 16` against the **live** gateway (read-only, no stop, prefill-snapshot style) shows the REUSE lines from `~/glm53_server.log` covering the previous prompt on turn 2 — the HTTP driver is proven on the engine whose reuse signal exists before it meets one whose does not |
-| **H2** | **The chain, `franken_chain.sh`**, launched only through `run_chain.sh` (lock; refused while the current benchmark holds it): stop gateway → `wait_no_engine` → warm GLM shards, assert ≥ 90 % → **A1** ladder `--steps 1024,1024,2048,4096,8192 --gen 128 --followups 2` (cumulative user text 1/2/4/8/16 Ki; the engine's own count lands near tonight's 18 055 point) → stop engine, assert VRAM free → **B1** start hipFire, throwaway request, ladder with the same steps **plus** `--steps …,8192,8192,8192,8192,8192,8192` to 64Ki (cheap for it; the 64Ki rows are B-only and labelled so; Colibri's 64Ki is the 9.6 h projection, not run), then the cold sweep → stop hipFire, assert VRAM free → **B2** identical, fresh process → assert VRAM free, re-warm GLM, assert ≥ 90 % → **A2** identical to A1 → **C** (`coli serve` on `qwen36`, `--sizes 512,2048`, 30 min cap) → re-warm GLM → restart gateway on every exit path → `accept_live.sh` (the request *after* the measurement is part of the measurement) | every rule in CLAUDE.md "How a change is measured"; MEASURING.md's factor-of-two on cache state | rig ≈ 70 min (A1) + ~20 (B1) + ~20 (B2) + 70 (A2) + ≤ 30 (C) + ~20 warm/restart ≈ **4 h**; schedule at night, tell the owner the gateway is down for it | Sonnet writes, Haiku runs | the chain exits 0 with four jsonl files whose A rows all carry `majflt=0`, every arm's pre-checks logged (DPM level, VRAM free, residency), `accept_live.sh` PASS at the end; **any A row with majflt > 0 or residency < 90 % invalidates that arm and the chain says so instead of averaging it** |
+| **H2** | **The chain, `franken_chain.sh`**, launched only through `run_chain.sh` (lock; refused while the current benchmark holds it): stop gateway → `wait_no_engine` → warm GLM shards, assert ≥ 90 % → **A1** ladder `--steps 1024,1024,2048,4096,8192 --gen 128 --followups 2` (cumulative user text 1/2/4/8/16 Ki; the engine's own count lands near tonight's 18 055 point) → stop engine, assert VRAM free → **B1** start hipFire, throwaway request, ladder with the same steps **plus** `--steps …,8192,8192,8192,8192,8192,8192` to 64Ki (cheap for it; the 64Ki rows are B-only and labelled so; Colibri's 64Ki is the 9.6 h projection, not run), then the cold sweep → stop hipFire, assert VRAM free → **B2** identical, fresh process → assert VRAM free, re-warm GLM, assert ≥ 90 % → **A2** identical to A1 → **C** (`coli serve` on `qwen36`, `--sizes 512,2048`, 30 min cap) → re-warm GLM → restart gateway on every exit path → `accept_live.sh` (the request *after* the measurement is part of the measurement) | every rule in CLAUDE.md "How a change is measured"; MEASURING.md's factor-of-two on cache state | rig ≈ 70 min (A1) + ~20 (B1) + ~20 (B2) + 70 (A2) + ≤ 30 (C) + ~20 warm/restart ≈ **4 h**; ~~schedule at night, tell the owner the gateway is down for it~~ [2026-09-22: run at once] | Sonnet writes, Haiku runs | the chain exits 0 with four jsonl files whose A rows all carry `majflt=0`, every arm's pre-checks logged (DPM level, VRAM free, residency), `accept_live.sh` PASS at the end; **any A row with majflt > 0 or residency < 90 % invalidates that arm and the chain says so instead of averaging it** |
 | **H3** | **The table.** `context_compare` output, plus D_B at empty context from the throwaway (the transfer check, §2.4 Q1), plus arm C's rows, plus the reuse ratio, into the record as §FRANKEN-H2 with the raw jsonl paths | — | one table | ½ day | Haiku | every cell either a measured number with its two samples or `NO VERDICT` / `REFUSED` from `gate_lib.sh`; no cell computed by hand |
 | **H4** | **The owner's read (§2.5)**, not a gate: the same 12 prompts through both lanes, tabulated side by side, `finish_reason` and tool-call outcome per row | ninfer's 225-response audit is the pattern: throughput is not usable output | a page the owner reads | ½ day | Haiku | all 12 rows present for both lanes with `finish_reason=stop` counts; no scoring |
 
@@ -1401,7 +1403,7 @@ Risks, each with the check that catches it:
 - **Streaming granularity.** A server that batches deltas would misreport
   TTFT and decode; `usage.completion_tokens` is preferred and the row says
   which source it used. If neither exists the cell is REFUSED, not estimated.
-- **The daily driver is down for ~4 h.** Once, at night, announced. The chain
+- ~~The daily driver is down for ~4 h. Once, at night, announced.~~ [2026-09-22: the rig is a development machine; measurements run at once, nothing is scheduled for the night or announced to the owner.]
   restarts it on every exit path and `accept_live.sh` proves it.
 - **The current benchmark.** Nothing here runs until it releases the lock;
   `run_chain.sh` refuses otherwise.
@@ -1429,7 +1431,7 @@ This plan will **not**:
 | H1 | ladder `--url`, cold sweep, `context_compare`; gate against tonight's ladder and the live gateway | Sonnet | 0 (live gateway, read-only) | 1 day |
 | H0 | hipFire on the box; API/prefix-cache/MTP facts; device map | Sonnet (+ owner) | one short lock window | ½ day |
 | M0 | rccl-tests, `-g 3` and `-g 2` | Sonnet | 15 min under lock | ½ day |
-| H2 | the chain, A B B A + C, at night | Haiku runs | ~4 h | — |
+| H2 | the chain, A B B A + C, at once (2026-09-22: never at night) | Haiku runs | ~4 h | — |
 | H3 | the table into the record | Haiku | 0 | ½ day |
 | H4 / X4 | the audit page, both lanes | Haiku | ~1 h under lock (the B lane) | ½ day |
 | D-3 | same-op microbench | Opus | 30 min under lock | 1 day |
@@ -1523,13 +1525,15 @@ F0 → F4 → F6 design → F6a → re-profile → F2 (gate re-based to 1.6×/2.
 
 F0 (1 day) → F2 (the prefill item; the owner's long-document wait) in
 parallel with F4 (2 h of rig, the decode question) → the decode item F4
-names → F1 → F5. F3 runs whenever the owner names a ≤ 60 GB model; it is
+names → F1 → F5. ~~F3 runs whenever the owner names a ≤ 60 GB model~~ (closed 2026-09-21); it was
 the shortest path to the 75 tok/s regime and does not wait for anything
 above. Every item ships behind a knob, off by default, with its oracle and
 its A,B,B,A row in the commit body; every projection above is a thing to be
 beaten or refuted by that row.
 
 ### 8.5 The one decision that is the owner's
+
+**[2026-09-22: this section is superseded. The owner decided: the engine is built, not chosen (rev 45); the models are Qwen3.8, DeepSeek V4.x, GLM-5.3 (rev 38); the target is 256k (rev 39). The A-or-B regime choice and "F3 the moment a model is named" no longer exist. See `FRANKEN-ENGINE-DESIGN-2026-09-22.md` §7.]**
 
 Regime A keeps GLM-5.3-Flash: prefill falls by an order of magnitude (F2),
 decode at depth is whatever F4 finds, and stays under ~3 tok/s until then.

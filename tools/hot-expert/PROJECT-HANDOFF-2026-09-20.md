@@ -74,7 +74,7 @@ cherry-pick, ours go out as PRs through `upstream_lint.sh` (#1521, #1524 sent).
 | Gateway env (`~/start_glm53.sh`) | `GLM53_VK_SWIGLU_CLAMP=1 COLI_PREFILL_STREAM=1 GLM53_PREFILL_CHUNK=512 GLM53_MLA_ATTN_GPU=1 GLM53_MOE_ONE_TEAM=1 GLM53_I4_FAST=2 COLI_KDA_GPU=2`, prefix checkpoints + pin, `--max-tokens 4096 --kv-slots 4`, tier caps 1695/1695 |
 | Acceptance | `accept_ui.sh` PASS 18:10 CEST (first token in the browser 2.07 s), `accept_live.sh` PASS 16:10 UTC, engine alive, rig lock free |
 | Branch | `hot-expert-tier`; Mac = Gitea (`origin`) = rig; `doc_currency.sh` PASS |
-| Plan revs | Franken plan rev 37, prefill roadmap rev 38, decode roadmap closed |
+| Plan revs | Franken plan rev 37, prefill roadmap rev 38, decode roadmap closed (as of 09-20; on 2026-09-22: plan rev 46, prefill roadmap rev 45, design rev 2) |
 | Rollback | `serve_candidate.sh` with `glm53.f8` / `.f7` / `.f2` / `.f2base` and the matching `~/bench/start_glm53.sh.pre-*` |
 
 What the owner gets from GLM-5.3 today, against where each track started:
@@ -275,36 +275,7 @@ GLM-5.3) are acceptable, on whatever engine fits the rig, smart quantizations
 included. Step 2b is not started. The open item is F11 (rev 38). What follows
 in this section is history.**
 
-**F3 step 2b: the GPU-resident decode token for Qwen3.6-35B-A3B.** The whole
-token recorded once on the GPU — DeltaNet conv + gated delta recurrence,
-attention with KV on dev0, router + top-k, expert dispatch to dev2/dev3,
-lm_head — with the hidden state never returning to the host between layers.
-That is how hipFire reaches 88–124 tok/s on one of these cards with these
-weights; Colibri's per-op design gives 22. It is a new decode path, not a
-port: an Opus design note first (which shaders exist — `rmsnorm`, `qmatmul*`,
-`kda_*`, `mla_attn_*` — and what DeltaNet, the conv ring and top-k need), then
-weeks of kernel work. Before it could replace GLM as the daily model `qwen36`
-also needs KV slots, prefix checkpoints and the ledger (it has none), which is
-Sonnet-sized porting from `glm53`. **Not started. Nothing of F3 proceeds
-without the owner's go.**
-
-Honest framing for that decision: hipFire already serves this model on this
-box at 4–5× what step 2b could plausibly reach first time. What Colibri adds
-is one gateway, the checkpoint/ledger machinery Open WebUI needs, and three
-cards. A cheap way to learn whether the model is worth any of it: put the int8
-`qwen36-vk` (22 tok/s) behind `coli`'s model switch on a second port and let
-the owner compare answers with GLM-5.3. That is a Sonnet afternoon and no
-kernel work. **Recommended next action if the owner wants to continue F3.**
-
-**Correction, 2026-09-21 (checked, not built): "on a second port" is not
-possible and "an afternoon" is understated.** GLM-5.3 in service holds
-22.3–23.1 of 24 GiB on all three cards; the int8 `qwen36-vk` needs 16.17 GB on
-each of two. The comparison is a SWAP: GLM out of service while Qwen answers.
-And `openai_server.py` refuses any request carrying `tools` for `qwen36`
-("Tool use is not wired up"), which is every Open WebUI request under the
-current preset; with no prefix checkpoints each new chat would also pay a full
-prefill. So the trial needs a tools-off preset and an evening the owner
-agrees to be without GLM -- his call, with those costs stated.
+[2026-09-22: the F3 step-2b text and the Qwen3.6 trial recommendation that stood here were deleted; both are dead with F3 (rev 38). The live program is `FRANKEN-ENGINE-DESIGN-2026-09-22.md`.]
 
 ### 6.2 Candidates on GLM-5.3, none opened (evidence in `HANDOFF-2026-09-20.md` §4)
 | candidate | evidence | size |
@@ -356,7 +327,8 @@ No single prefill bucket exceeds 36 %, so no single item is worth more than
 |---|---|
 | Rules and traps | `CLAUDE.md` |
 | Every measured number | `tools/hot-expert/ROME-3x7900XTX-2026-09-04.md` (15k lines; grep `^## §`) |
-| Active plan | `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` (top rev, §8.3 table) |
+| **The design (current truth, 2026-09-22)** | `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md` (M0-M5, L0-L5) |
+| Decision log | `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` (top rev; its F items are all closed) |
 | Closed plans | `ROADMAP-2026-09.md` (decode G/Q), `PREFILL-ROADMAP-2026-09.md` |
 | Which tool measures what | `tools/hot-expert/MEASURING.md` |
 | Upstream policy | `tools/hot-expert/UPSTREAM-POLICY-2026-09-15.md` |

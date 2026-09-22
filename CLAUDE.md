@@ -21,7 +21,8 @@ that is a claim to verify, not to assume.**
 
 
 **Then, ahead of the numbered list:
-`tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` is the ACTIVE track
+THE CURRENT TRUTH SINCE 2026-09-22 IS `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md` (rev 2): the Franken-engine is a NEW engine assembled from the best-measuring parts of Colibri, llama.cpp, hipFire and hipEngine for this rig, with a measurement program M0-M5 and a build ladder L0-L5; acceptable models are Qwen3.8, DeepSeek V4.x, GLM-5.3 and successors at a 256k window; the rig is a development machine (measure at once, never schedule for the night, never hand a decision back); quality is measured, never asked of the owner. `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` carries the decision log (read its highest `Rev N`; 46 on 2026-09-22) -- its items F0-F10 are all closed, F3/Qwen3.6 by the owner, and its 09-15 body is history.** Before that:
+`tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` was the ACTIVE track
 since 2026-09-16 (items F0–F10), and until 2026-09-20 this list did not
 name it at all.** Read its highest `Rev N` for what is open, its §8.3 table
    for the state of every item, and `tools/hot-expert/HANDOFF-2026-09-20.md`
@@ -30,7 +31,7 @@ name it at all.** Read its highest `Rev N` for what is open, its §8.3 table
    in one file -- history of all three tracks, every bug and what found it,
    what is left and whose decision it is -- read
    `tools/hot-expert/PROJECT-HANDOFF-2026-09-20.md` (written 2026-09-20 evening,
-   after F3 steps 0-2a).** The two roadmaps below
+   after F3 steps 0-2a; it predates the design and still treats F3 as continuable -- it is not).** The two roadmaps below
    are both finished; they are history and rules, not a to-do list.
 0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` — the prefill /
    interactive-use track, opened 2026-09-06 when Open WebUI exposed that
@@ -346,7 +347,8 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - `glm53` (`COLI_VULKAN=1`, three devices) — `c/glm53.c`, `c/sparse_index.h`.
 - `qwen36` (CPU) and `qwen36-vk` (`make -C c qwen36-vk VK=1`, `Q36_VULKAN=1`)
   — `c/qwen36.c`, `c/qwen36_tier_vk.c`: Qwen3.6-35B-A3B, the Franken plan's F3
-  model. **Use the row-wise int8 container `~/models/qwen36_i8_row` with
+  model (F3 CLOSED 2026-09-21: Qwen3.6 is not an acceptable model; the engine and
+  its containers are kept only as measured history). **Use the row-wise int8 container `~/models/qwen36_i8_row` with
   `COLI_VK_DEV2=auto COLI_VK_DEV3=auto`** (all 10 240 experts resident,
   16.17 GB on each of dev2/dev3; int4-gs64 costs mean KL 0.0316 / top-1
   92.96 % against it and is no faster, record §F3-STEP0/§F3-STEP1). With

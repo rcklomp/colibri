@@ -6,6 +6,7 @@ forming any plan, read, in this order:
 1. `CLAUDE.md` — the rules and traps of this machine. They apply to every
    agent, not only Claude. Its "Read first" section lists the rest.
 2. `tools/hot-expert/PROJECT-HANDOFF-2026-09-20.md` — the whole project in one
+   (as of 2026-09-20; the current truth is `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md`, read it first)
    file. **Its section 0 lists what the previous session got wrong and what it
    cost the owner (an hour of his daily service down, a wasted item, his plan's
    usage limit). Do not repeat those mistakes.**

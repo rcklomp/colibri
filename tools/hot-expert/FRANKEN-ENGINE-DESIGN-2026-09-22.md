@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 2)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 3)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -20,6 +20,7 @@ open, the measurement that closes it is named.
 | resident MoE on three cards, llama.cpp | 75 tok/s at 18k (gpt-oss-120b); 17.6 with all experts in RAM | §GPTOSS-3CARD |
 | one card, resident 35B, hipFire kernels | 131 → 79 tok/s down the ladder, 164 short | plan §1 |
 | llama.cpp HIP, Qwen3.8-Flash-Next IQ4_XS, ~¼ of experts in RAM, 256k window | 15 tok/s to 39k, 6.1–6.5 at 257k; cold 257k prompt 17 min; 1.0–2.0 ms per prefill token | §F11-STEP0, §F11-DEPTH |
+| the same, same placement (30 % of the file on the host), 32k window | 25–29 tok/s at 1.5–10k, 24 at 19.5k; 0.34–0.47 ms per prefill token. **The 256k reservation alone costs llama.cpp 1.6–1.9× decode and 2.1–2.4× prefill at every depth** — a property of the reference engine the new engine must not inherit | §F11-M0 (M0, 2026-09-22) |
 | Colibri, GLM-5.3 int4 with 60–70 % of the model in RAM | 5.04 tok/s at 18k; 18k prompt 356 s | served, §F9a |
 | the models | none fits 72 GiB at an acceptable quant: GLM 149–184 GB, Qwen3.8 94 GB (IQ4) / 173 (FP8), DeepSeek 91 GB (IQ2) | disk |
 
@@ -113,14 +114,15 @@ exists) as a workload parameter, not skipped.
 
 | id | question | how | closes |
 |---|---|---|---|
-| M0 (running) | cost of RAM-resident experts under llama.cpp's HIP MoE path: 32k vs 256k window on Qwen3.8 | `f11_ladder_chain.sh` with `F11_CTX`, `--fit-print` | the miss-cost term in §1(a) on real kernels |
+| M0 (**done 2026-09-22, §F11-M0**) | cost of RAM-resident experts under llama.cpp's HIP MoE path: 32k vs 256k window on Qwen3.8 | `f11_ladder_chain.sh` with `F11_CTX`, `llama-fit-params` | fit places the same tensors at both windows, so M0 measured the window reservation instead: 1.6× decode / 2.3× prefill at every depth. Miss-cost term calibrated at 30 % host residency: ~24 of 34–40 ms a token (arithmetic in §F11-M0). |
+| M0b (in flight) | is that reservation cost a slope in the window or a step near the full card: 64k and 128k windows, same ladder | `~/bench/f11_fit3.sh` | whether attention/KV layout (§2 row 2, §3.4) or VRAM headroom (§3.3 budget) is the lesson |
 | M1 | expert kernel + format head to head on gfx1100: hipFire mq4r vs llama.cpp IQ4_XS/Q4_K vs Colibri int4-g64, same expert shapes (Qwen3.8: 512×48, hidden 2560), batch 1 and batch 32 rows | one microbenchmark binary per candidate, weights in VRAM, 1 000 iterations, median; no engine, no gateway stop | §2 row 3 |
 | M2 | expert usage histograms and per-layer miss bytes for Qwen3.8 and DeepSeek at 256k-scale prompts; hit rate of router lookahead | Colibri's histogram tooling ported to read llama.cpp's router output (a debug hook, CPU) | §3.1, §3.2, §3.3 |
 | M3 | KV bytes per token per model at 256k; attention time per layer at 32k/128k/256k, candidate kernels | from llama.cpp's own graph on one card, timers | §2 row 2, §3.4 |
 | M4 | streaming prefill on three cards: Colibri's F2 ring driven from three queues at once, AND the shared-link pair contending deliberately | `vk_stream_probe`-style, real expert sizes | the ≤ 1 ms/token projection; the pair's real joint bandwidth (§3.3) |
 | M5 | pipeline boundary cost: P2P copy of one hidden vector card→card, and one layer-range's whole-token command stream on hipFire's kernels | microbenchmark | §1(b), §1(c) |
 
-Order: M0 (in flight), M1 and M3 in parallel (no gateway stop for either),
+Order: M0 done, M0b in flight, M1 and M3 in parallel (no gateway stop for either),
 M2, then M5, then M4. Tier: M1/M5 are kernel work (Opus writes the
 benchmarks from the two codebases; the orchestrator reads the hot loops
 first); M2/M3/M4 are Sonnet ports of existing tooling.

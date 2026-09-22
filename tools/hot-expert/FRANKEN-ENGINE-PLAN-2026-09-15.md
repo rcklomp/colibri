@@ -14,6 +14,24 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 47 (2026-09-22 09:30 CEST, 07:30 UTC) -- M0 MEASURED (record §F11-M0,
+> design rev 3).** Qwen3.8-Flash-Next UD-IQ4_XS under llama.cpp fit, a 32k
+> against a 256k window: `llama-fit-params` places the SAME tensors at both
+> (61.2 GiB on the cards, 27.5 GiB = 30 % on the host), so the arms differ
+> only in the reservation. Decode 24-29 tok/s at 1.5-19.5k with the 32k
+> window against 14-17 with the 256k one -- **the 256k reservation alone costs
+> llama.cpp 1.6-1.9x decode and 2.1-2.4x prefill at every depth**, before the
+> separate depth slope of §F11-DEPTH (15 -> 6 tok/s). The design's reference
+> is therefore ~25 tok/s at 32k / 15 at 256k on this engine, and the new
+> engine's attention must cost only the used cells (design §2 row 2, §3.4).
+> Miss-cost term calibrated: at 30 % host residency ~24 of 34-40 ms a token
+> is the host-read (arithmetic, labelled). M0b in flight (64k and 128k
+> windows, `~/bench/f11_fit3.sh`): slope in the window or a step near the
+> full card. GLM back in service, `accept_live` PASS 01:27 UTC after the
+> chain exited. Quality run 2 (`f11_quality2_chain.sh`) is not resumed; its
+> partial results stay under `~/bench/f11_quality/`. Next: M1 and M3 (read
+> the hot loops first), per design §4.
+>
 > **Rev 46 (2026-09-22 02:40 CEST, 00:40 UTC) -- THE DESIGN EXISTS:
 > `FRANKEN-ENGINE-DESIGN-2026-09-22.md` rev 1.** The owner's addendum: this
 > is an architect's analysis and design, and inventing what the other

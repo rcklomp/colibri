@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 8)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 9)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -223,10 +223,12 @@ tensors read wholesale per token.**
 streams, `hc_count` × 2 560) to card 1 → layers 16–31 → card 2 → layers
 32–47 → lm_head → logits to host → sample. Every layer: hc mix, norm,
 attention (GDN or QSA), hc mix, norm, shared expert + router + 10 routed
-experts, residual. Launch count per layer ≈ 12–18 plain kernels; §M5 says
-240 launches a token cost nothing observable when queued asynchronously, so
-no fusion is required for L0 beyond what the source kernels already do
-(hipFire's gate+up in one launch; M3's three attention kernels).
+experts, residual. Launch count per layer ≈ 12–18 plain kernels. **Rev 9 correction:** §M5's
+"240 launches a token are free" holds only for kernels with enough work
+behind them; the first decode loop's 58 launches a layer of tiny norm /
+gate / mix kernels cost ~4 ms of the 11.7 (§L0-STEP2). Fusion IS required:
+norm + hyper-connection mix in one kernel, GEMV epilogues carrying their
+gates, the GDN gate chain as one launch, ≤ 15 launches a layer.
 
 **9.3 Kernels and formats (the parts, by source).**
 - Trunk GEMVs (Q8_0 weights, f32 activations): hipFire's Q8-class GEMV or
@@ -272,6 +274,12 @@ llama.cpp is not the reference to beat, the 5-minute target of §6 is.
    against llama.cpp's dumped activations — the first item of step 2.
 2. One card, layers 0–15, decode loop with GDN + QSA + MoE; oracle per
    layer against the dumps; timing per layer (§M5's harness pattern).
+   **Done functionally 2026-09-22 (§L0-STEP2): GPU = CPU graph, llama.cpp
+   matched to the floor through layer 6, routing divergence beyond is the
+   reference's rounding. First timing 11.7 ms / 16 layers, launch-bound
+   (58 launches a layer) and a trunk GEMV 2.7× off. Step 2b: fusion to
+   ≤ 15 launches a layer and the trunk GEMV at the bytes; gate = routing
+   set match per layer + greedy text on real prompts, not cos at layer 15.**
 3. Three cards, the two boundaries, lm_head; oracle: greedy text identical
    on the F11 prompts, last-token logits cosine/argmax.
 4. Gateway protocol, `serve_alt.sh franken`, `accept_live`, the depth

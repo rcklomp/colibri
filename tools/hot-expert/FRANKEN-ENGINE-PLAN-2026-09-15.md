@@ -14,6 +14,21 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 52 (2026-09-22 17:50 CEST, 15:50 UTC) -- L0 STEP 2 RUNS (record
+> §L0-STEP2, design rev 9).** The one-card decode loop over layers 0-15
+> exists (`tools/hot-expert/franken/decode/`, 35 kernels, one graph with a
+> CPU and a GPU backend); the GPU equals the CPU graph (534/534 taps cos
+> 1.0); against llama.cpp's 1 256-tap CPU dump it matches to the floor
+> through layer 6 and diverges beyond by router near-ties that llama.cpp's
+> own activation quantisation flips (measured with a --quant-act arm and a
+> jitter arm). The oracle bar for L0 is therefore the design's: routing set
+> per layer + greedy text on real prompts. Timing: 11.7 ms for 16 layers,
+> 0 host syncs, 931 launches -- launch-bound small kernels (~4 ms) and a
+> trunk GEMV at 2.7x its bytes; experts at §M1's number. Two harness facts
+> corrected by the port: the indexer has ONE key head (M3's depth term was
+> 4x too high) and M3's GDN step was not the model's op. Step 2b
+> commissioned: fusion to <= 15 launches a layer, trunk GEMV at the bytes.**
+>
 > **Rev 51 (2026-09-22 14:45 CEST, 12:45 UTC) -- L0 STEP 1 (record §L0-STEP1,
 > §M1 candidate 3; design rev 8).** The loader exists
 > (`tools/hot-expert/franken/`): 64.9 GB of Qwen3.8 on three cards by layer

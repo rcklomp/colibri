@@ -160,24 +160,45 @@ default is 0.** Bit 0 is gate/up and bit 1 is down, so one run each says which
 stage is at fault; they write different tensors and the first differing tap
 distinguishes them.
 
-**The cause is not yet identified, and that is stated rather than guessed at.**
-What has been checked and is NOT the cause: each gather kernel reproduces its
-per-assignment kernel's accumulation block for block and accumulator for
-accumulator (four for IQ3_S closing on `(a0+a1)+(a2+a3)`, two for IQ4_XS, the
-`lo`/`hi` pair for IQ4_NL, the hoisted `(d*q)*h` for Q8_0); the counting
-sort's invariants hold on inspection (buckets are contiguous and disjoint,
-`tile_exp` is the bucket's expert, the tile-grid bound
-`min(n,512) + ceil(n/8)` dominates `sum ceil(c_e/8)`); every assignment writes
-its own output column so the scatter order inside a bucket cannot matter; and
-`moe_finish` still sums a token's ten contributions in rank order because the
-column index is `t*K_TOP + k` either way. No spills and no scratch in any of
-the four kernels.
+A second pass with the mask per stage narrowed it further:
 
-**What it costs to have it off:** the chunk reads a chosen expert's row once
+| arm | result |
+|---|---|
+| `--expert-gather 1` (gate/up only) | **bit-identical** — so gate/up is exact and is ON by default |
+| `--expert-gather 2` (down only) | diverges from layer 1 on, `Kcur-11` 1.7e-6 … `Kcur-27` 1.0e-3 |
+
+So **the default mask is 1**: the gate/up gather is measured exact and runs,
+the down gather is measured wrong and does not. That is most of the
+amortisation — gate and up are two `K = 2 560` tensors an assignment against
+down's one `K = 640`, about 60 % of the expert bytes.
+
+**Why the down gather is wrong is still not known, and what that now rules
+out is the interesting part.** `moe_gather_test.cpp` transcribes both down
+paths on the host — emulating a 32-lane wave, over the SAME shared primitives
+from `decode_quant.h` / `m1_native_decode.h` that the kernels call, so the
+decode is not re-derived and a disagreement could only be the loop, the
+indexing, the accumulators or the reduction. They agree **bit for bit**, as
+do the counting sort's invariants (every column covered exactly once, by a
+tile whose `tile_exp` is its expert). The sort is independently proved on the
+device by the mask-1 arm, which shares it. And `moe_finish` sums a token's ten
+contributions in rank order either way, because the column index is
+`t*K_TOP + k` in both paths.
+
+So the fault is not the algorithm, not the indexing, not the accumulator
+structure and not the reduction: it is something the device's code generation
+does to one of these two kernels and not to its per-assignment twin. The
+Q8_0 gather's one textual difference — a hoisted `d * qs[tid]`, algebraically
+identical and bit-identical on the host — has been removed, so its inner
+statement is now literally the per-assignment kernel's. That leaves IQ4_NL's
+array-of-accumulators against the per-assignment kernel's two scalars as the
+last textual difference standing, and the next device run is the one that
+says whether removing the hoist was enough.
+
+**What the down stage being off costs:** it reads a chosen expert's row once
 per assignment rather than once per group — at `T = 256`, 2 560 reads a layer
-instead of ~512. The 7.48 ms/token first prefill number was measured with the
-gather ON, so it needs re-taking, and `prof_expert_gate_up_us` /
-`prof_expert_down_us` will now carry the unamortised cost.
+instead of ~512, for ~40 % of the expert bytes. The 7.48 ms/token first
+prefill number was measured with the whole gather ON, so it needs re-taking
+either way.
 
 **Not measured here:** anything on a GPU by the agent that wrote this.
 

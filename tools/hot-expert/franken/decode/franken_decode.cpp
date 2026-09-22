@@ -71,9 +71,9 @@ void usage(const char * p) {
         "          [--gemv-min-rows N] split K below this many output rows (default\n"
         "                           1024); sweep it against prof_gemv_*_gbs\n"
         "          [--expert-gather M] design 9.4 item 5's device-side sort + row-gather\n"
-        "                           per stage: bit 0 gate/up, bit 1 down. DEFAULT 0 --\n"
-        "                           it is NOT bit-identical to the per-assignment path\n"
-        "                           and the cause is not yet found (decode_backend.h).\n"
+        "                           per stage: bit 0 gate/up, bit 1 down. DEFAULT 1 --\n"
+        "                           gate/up is MEASURED bit-exact, down is measured NOT\n"
+        "                           to be and is off until it is (decode_backend.h).\n"
         "                           --no-expert-gather is the same as --expert-gather 0\n"
         "          [--sync-debug]   drain and check after every launch and copy;\n"
         "                           names the failing op, its class, layer and device\n"
@@ -129,7 +129,7 @@ int main(int argc, char ** argv) {
     int  gemv_lds = 1;
     int  gemv_min_rows = 1024;
     bool sync_debug = false;
-    int expert_gather = 0;
+    int expert_gather = 1;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

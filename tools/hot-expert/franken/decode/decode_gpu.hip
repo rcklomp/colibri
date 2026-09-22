@@ -829,15 +829,18 @@ void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expe
 #pragma unroll
     for (int m = 0; m < MOE_TILE_E; ++m) acc[m] = 0.0f;
 
+    // The inner statement is TEXTUALLY the per-assignment kernel's, down to
+    // the primitive call. It used to hoist `d * qs[tid]` out of the column
+    // loop -- algebraically the same thing, and the host test agrees to the
+    // bit -- but the device did not, so the hoist is gone: when two paths
+    // must produce the same bits, the cheapest guarantee is that they are
+    // the same source. The decode is then recomputed per column, which for
+    // Q8_0 is one f16 widen and one multiply off L1.
     for (int b = 0; b < nblk; ++b) {
-        const unsigned char * bp = A + (size_t) b * FK_Q8_0_BLOCK_BYTES;
-        // the one format whose lane value IS a single weight, so the decode
-        // really is hoisted here rather than served from L1
-        const float w = fk_q8_0_block_d(bp) *
-                        (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[tid];
 #pragma unroll
         for (int m = 0; m < MOE_TILE_E; ++m)
-            if (m < cnt) acc[m] += w * h[xb[m] + b * FK_Q8_0_BLOCK_WEIGHTS + tid];
+            if (m < cnt) acc[m] += fk_q8_0_lane_dot(A + (size_t) b * FK_Q8_0_BLOCK_BYTES,
+                                                    h + xb[m] + b * FK_Q8_0_BLOCK_WEIGHTS, tid);
     }
 
 #pragma unroll
@@ -2751,9 +2754,9 @@ private:
     int        cand_cap_ = 0;
     int        gemv_lds_ = 1;
     int        gemv_min_rows_ = 1024;
-    // 0 = every assignment on its own, as a decode token does. See
-    // decode_backend.h for why that is the default.
-    int        expert_gather_ = 0;
+    // Bit 0 (gate/up) is MEASURED bit-exact on three cards; bit 1 (down) is
+    // measured NOT to be and is off until it is. See decode_backend.h.
+    int        expert_gather_ = 1;
     int        dev_ = 0;
     char       name_[24] = {0};
     hipStream_t stream_{};

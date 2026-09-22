@@ -101,3 +101,45 @@ QSA per-query buffers do not grow with T at all, because that stage loops.
   first, so the oracle gate is met on a smaller change, then the sort lands on
   a proven base
 - prefix checkpoints, and any reuse of a cache across requests
+
+## 7. What landed, and what it measured (2026-09-22)
+
+All of the above is implemented, in three commits, and **the row-gather is no
+longer pending**: section 6's first bullet is history.
+
+| commit | what |
+|---|---|
+| `5baa3f3` | items 1-3: token-major T-wide scratch and graph, one GEMM path (`k_gemv_batch` deleted), the GDN conv window + `conv_slide` + the in-order recurrence, QSA after the chunk's cache writes |
+| `94d9522` | item 4: `--chunk C` (default 256, cap 512), `--time-prefill N`, the oracle |
+| `53c1644` | item 5: `k_moe_sort` + the `_gather` expert kernels, on the `T > 1` path only |
+
+**The oracle, run on the CPU arm** (`franken_decode_cpu`, no GPU touched),
+6 tokens, layers 0-47, ctx 512, against a `--chunk 1 --dump` of the same
+binary:
+
+```
+compared=1604  missing=0  incomparable=60  refused=0   STEP2 PASS
+1 592 float taps  cos=1.000000  maxabs=0     <- bit-for-bit, not a tolerance
+12 indexer_top_k  contained=1.000000
+```
+
+with the same verdict at `--chunk 2`, `4` (= 4+2) and `5` (= 5+1), which is
+where the cross-chunk carries are exercised rather than the single-chunk
+case, and `--chunk 6 --greedy 16` giving the same 16 ids and the same
+`residual l1=4136.68` as `--chunk 1`. The 60 incomparable are
+`indexer_k` / `indexer_k_pooled`, which the comparator refuses at any cache
+depth by design.
+
+**Two things that keep it bit-for-bit, and that a later change must not
+undo.** The split-K count of a GEMM is chosen from the MATRIX alone and never
+from T -- it sets the summation order, so a chunk whose split differed from a
+decode token's would not be comparable to it. And there is only ONE
+GEMV/GEMM kernel: `k_gemm_batch` runs the decode token as a chunk of one,
+carrying the old one-column kernel's accumulator structure, because two
+kernels would mean the decode path and the prefill path could disagree in
+the last bit and this gate would be comparing two different things.
+
+**Not measured here:** anything on a GPU. The device arm of the oracle, the
+`--time-prefill` numbers and whether the IQ3_S gather's occupancy 7 (213
+VGPR, against 94 and occupancy 16 for the kernel it replaces on the `T > 1`
+path) is a win are all for the session that holds the rig lock.

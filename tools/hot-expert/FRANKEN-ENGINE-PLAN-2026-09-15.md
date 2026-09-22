@@ -14,6 +14,16 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 56 (2026-09-22 21:00 CEST, 19:00 UTC) -- PREFILL BISECTED AND PROFILED
+> (record §L0-PREFILL).** The chunked run's divergence is entirely the
+> expert row-gather's summation order (with it off: bit-identical on the
+> GPU); decode restored to 23.3 ms with a TILE=1 GEMM specialisation. Prefill
+> 7.6 ms/token = three cards in sequence (2.5 ms each) + a first-cut GEMM
+> 6x off its bytes + batched experts far off theirs. Next, in order:
+> pipeline chunks across the cards (~3x, legitimate for prefill), an
+> LDS-tiled int8 GEMM (dot4 if the toolchain exposes it on gfx1100), the
+> gather's order and efficiency. Then the depth ladder and step 4.**
+>
 > **Rev 55 (2026-09-22 20:30 CEST, 18:30 UTC) -- BATCHED PREFILL EXISTS (record
 > §L0-PREFILL).** T-wide graph, GDN over T, causal QSA over T (proof in
 > decode/PREFILL.md), expert row-gather batching. CPU arm: chunked ==

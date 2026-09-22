@@ -183,7 +183,10 @@ __device__ __forceinline__ void split_range(int n_units, int nsplit, int split,
 // the 32 contiguous bytes one wave already pulls per block. What IS tunable
 // is how many of those are in flight, so the unroll depth is a compile-time
 // knob (GEMV_UNROLL, default 4) that the profile can move.
-#define GEMV_BATCH_MAX     8
+// The largest batch is the QSA projection's five (wq, wk, wv, indexer q/k).
+// The descriptor travels as a BY-VALUE kernel argument, so its size is host
+// work on every GEMV launch: eight slots cost ~404 bytes a launch, five ~260.
+#define GEMV_BATCH_MAX     5
 #define GEMV_LDS_MAX_FLOATS 4096
 #ifndef GEMV_UNROLL
 #define GEMV_UNROLL 4
@@ -451,7 +454,8 @@ __global__ void k_silu_mul(const float * __restrict__ g, const float * __restric
 // gives the CPU path), then the clamped normalisation.
 __global__ __launch_bounds__(N_EXPERT)
 void k_router(const float * __restrict__ logits, int * __restrict__ ids,
-              float * __restrict__ w) {
+              float * __restrict__ w, int * __restrict__ ids_log,
+              float * __restrict__ w_log) {
     __shared__ float sv[N_EXPERT];
     __shared__ int   si[N_EXPERT];
     __shared__ float sp[N_EXPERT];
@@ -497,13 +501,18 @@ void k_router(const float * __restrict__ logits, int * __restrict__ ids,
 
     if (t < N_EXPERT_USED) {
         ids[t] = taken[t];
-    }
-    __syncthreads();
+        if (ids_log) ids_log[t] = taken[t];      // the routing oracle's copy,
+    }                                            // written here so capture
+    __syncthreads();                             // costs no extra launch
     if (t == 0) {
         float s = 0.0f;
         for (int k = 0; k < N_EXPERT_USED; ++k) s += sp[taken[k]];
         s = fmaxf(s, 6.103515625e-5f);           // build_moe_ffn's f16 clamp
-        for (int k = 0; k < N_EXPERT_USED; ++k) w[k] = sp[taken[k]] / s;
+        for (int k = 0; k < N_EXPERT_USED; ++k) {
+            const float v = sp[taken[k]] / s;
+            w[k] = v;
+            if (w_log) w_log[k] = v;
+        }
     }
 }
 
@@ -1453,8 +1462,6 @@ class GpuBackend : public Backend {
 public:
     explicit GpuBackend(int dev) : dev_(dev) {
         HIP_CHECK(hipSetDevice(dev));
-        cur_device_slot() = dev;   // keep dev_ensure's tracker true: a raw hipSetDevice left it stale,
-                                   // so dev_ensure(0) did nothing and set_profile made device-0 events on device 2
         HIP_CHECK(hipStreamCreate(&stream_));
         std::snprintf(name_, sizeof(name_), "gpu(device %d)", dev_);
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_iq3s_grid),  iq3s_grid,      sizeof(uint32_t) * 512));
@@ -1799,10 +1806,11 @@ public:
         const int t = red_threads(ne0);
         k_gated_rms_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, z, y, ne0, eps);
     }
-    void router(const float * logits, int * ids, float * w) override {
+    void router(const float * logits, int * ids, float * w,
+                int * ids_log, float * w_log) override {
         mark(PC_ROUTER);
         last_op_ = "router";
-        k_router<<<1, N_EXPERT, 0, stream_>>>(logits, ids, w);
+        k_router<<<1, N_EXPERT, 0, stream_>>>(logits, ids, w, ids_log, w_log);
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu) override {
@@ -1921,7 +1929,6 @@ public:
 
     void set_profile(bool on) override {
         prof_ = on;
-        dev_ensure(dev_);   // the events must be created on THIS backend's device (lost once in a rebase; invalid resource handle at mark())
         if (on && ev_.empty()) {
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);
@@ -1940,7 +1947,8 @@ public:
         dev_ensure(dev_);
         debug_check("end of token");
         blocking_in_body_ += blocking_ - blocking_at_token_start_;
-        launches_in_body_ += launches_ - launches_at_token_start_;
+        launches_last_ = launches_ - launches_at_token_start_;
+        launches_in_body_ += launches_last_;
         ++tokens_profiled_;
         if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
         // one closing event, then ONE synchronisation for the whole token
@@ -1974,9 +1982,13 @@ public:
         }
         std::fprintf(out, "prof_host_syncs_per_token=%.2f\n", (double) blocking_in_body_ / n);
         std::fprintf(out, "prof_launches_per_token=%.2f\n", (double) launches_in_body_ / n);
+        std::fprintf(out, "prof_events_merged_per_token=%.2f  (class runs sharing one event)\n",
+                     (double) ev_merged_ / n);
         if (n_ev_ >= PROF_MAX_EVENTS)
             std::fprintf(out, "prof_WARNING=event pool exhausted, times are a lower bound\n");
     }
+
+    long long launches_last_token() const override { return launches_last_; }
 
     void   timer_start() override {
         dev_ensure(dev_);
@@ -2024,6 +2036,17 @@ private:
         ++launches_;                       // one op == one launch, except where noted
         if (gemv_group >= 0 && gemv_group < GG_N) gemv_bytes_[gemv_group] += (double) bytes;
         if (!prof_ || n_ev_ >= PROF_MAX_EVENTS) return;
+        // Record only when the CLASS CHANGES. The interval from event i to
+        // event i+1 is charged to ev_cls_[i], so a run of ops in one class
+        // needs one event, not one each -- and hipEventRecord is host work in
+        // the issue path, which is exactly what --profile was perturbing. A
+        // GEMV always takes its own event, because the per-projection
+        // bandwidths are per launch group.
+        if (n_ev_ > 0 && cls == ev_cls_[n_ev_ - 1] && gemv_group < 0 &&
+            ev_grp_[n_ev_ - 1] < 0) {
+            ++ev_merged_;
+            return;
+        }
         HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         ev_cls_[n_ev_] = cls;
         ev_grp_[n_ev_] = gemv_group;
@@ -2037,6 +2060,7 @@ private:
     int        last_cls_ = 0;
     int        dbg_layer_ = -1;
     int        n_ev_ = 0;
+    long long  ev_merged_ = 0;
     long long  launches_ = 0;
     long long  blocking_ = 0;              // host-blocking calls, counted always
     long long  blocking_at_token_start_ = 0;
@@ -2044,6 +2068,7 @@ private:
     int        tokens_profiled_ = 0;
     long long  blocking_in_body_ = 0;
     long long  launches_in_body_ = 0;
+    long long  launches_last_ = 0;
     double     prof_us_[PC_N] = {0};
     double     gemv_us_[GG_N]  = {0};
     double     gemv_bytes_[GG_N] = {0};

@@ -6,6 +6,7 @@
 #include "decode_graph.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <random>
 #include <cstdio>
@@ -488,7 +489,15 @@ void DecodeRunner::layer_ffn(const LayerWeights & L, int il, Recorder & rec) {
     // softmax over all 512, top-10 of the same probabilities, then normalise
     // the ten (clamped at 6.103515625e-5). expert_weights_scale is absent
     // from this GGUF, so build_moe_ffn's scale step does not run.
-    bep_->router(logits_, ids_, wts_);
+    // The router writes the per-layer log itself, so capturing the routed
+    // experts costs NO extra op. It used to be two device-to-device copies a
+    // layer -- 32 a token, and they stalled the queue badly enough to make a
+    // --routing run 1.8x slower on every card.
+    const int slot = il - model_.il0();
+    const bool cap = capture_ && (cfg_.verbose || cfg_.log_routing);
+    bep_->router(logits_, ids_, wts_,
+                 cap ? ids_log_ + (size_t) slot * N_EXPERT_USED : nullptr,
+                 cap ? wts_log_ + (size_t) slot * N_EXPERT_USED : nullptr);
     rec.tap(*bep_, "ffn_moe_weights_norm", il, wts_, N_EXPERT_USED);
 
     // The top-10-of-512 selection is DISCONTINUOUS in its input: a change of
@@ -496,14 +505,7 @@ void DecodeRunner::layer_ffn(const LayerWeights & L, int il, Recorder & rec) {
     // ffn_moe_out by percent, which is why a plain cosine bar on ffn_moe_out
     // tests the routing, not the arithmetic. Printing the chosen ids makes
     // that visible instead of leaving it as an unexplained divergence.
-    if (cfg_.verbose || cfg_.log_routing) {
-        // device->device only: reading these back here would put a sync per
-        // layer inside the body, which is exactly what --profile must be able
-        // to report as zero. step() reads them AFTER the body.
-        const int slot = il - model_.il0();
-        bep_->copy((float *) (ids_log_ + (size_t) slot * N_EXPERT_USED), (const float *) ids_, N_EXPERT_USED);
-        bep_->copy(wts_log_ + (size_t) slot * N_EXPERT_USED, wts_, N_EXPERT_USED);
-    }
+
 
     bep_->moe_gate_up(L.exp_gate, L.exp_up, ids_, mixed_, ygate_, yup_);
     bep_->silu_mul(ygate_, yup_, hmoe_, (size_t) N_EXPERT_USED * N_FF_EXP);
@@ -538,9 +540,9 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
 
     bind(model_.dev_of(model_.il0()));
 
-    std::vector<float> emb(N_EMBD);
-    model_.embed_row(token, emb.data());
-    bep_->upload(x_, emb.data(), N_EMBD * sizeof(float));
+    if (emb_.size() != (size_t) N_EMBD) emb_.resize(N_EMBD);
+    model_.embed_row(token, emb_.data());
+    bep_->upload(x_, emb_.data(), N_EMBD * sizeof(float));
     if (ple_emb) {
         // the PLE layer may not be on device 0; the gather goes to its card
         const int pd = (PLE_LAYER >= model_.il0() && PLE_LAYER <= model_.il1())
@@ -557,6 +559,7 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
     xn_ready_ = false;
 
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).timer_start();
+    const auto t_issue0 = std::chrono::steady_clock::now();
 
     for (int il = model_.il0(); il <= model_.il1(); ++il) {
         const LayerWeights & L = model_.layer(il);
@@ -637,6 +640,11 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
         bep_->argmax(logits_all_, (int) model_.lm_head().rows, greedy_id_);
     }
 
+    // Everything above only ENQUEUED work; the first thing that waits is
+    // below. This is the host cost of a token.
+    last_issue_ms_ = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t_issue0).count();
+
     if (cfg_.progress && pos_ == 0) { std::printf("  head done on dev%d\n", cur_dev_); std::fflush(stdout); }
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).prof_end_token();
     last_body_ms_ = bep_->timer_stop_ms();
@@ -647,7 +655,7 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
 
     // The routed ids are logged device-to-device inside the body and read
     // back HERE, after it, so no layer pays a sync for them.
-    if (cfg_.verbose || cfg_.log_routing) {
+    if (capture_ && (cfg_.verbose || cfg_.log_routing)) {
         const int nl = model_.il1() - model_.il0() + 1;
         std::vector<float> w((size_t) nl * N_EXPERT_USED);
         for (int d = 0; d < model_.n_devices(); ++d) {

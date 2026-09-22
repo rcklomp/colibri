@@ -477,7 +477,8 @@ public:
     }
 
     // -- MoE ------------------------------------------------------------------
-    void router(const float * logits, int * ids, float * weights) override {
+    void router(const float * logits, int * ids, float * weights,
+                int * ids_log, float * w_log) override {
         // ggml_soft_max over all N_EXPERT, then ggml_top_k on the same probs
         float mx = logits[0];
         for (int i = 1; i < N_EXPERT; ++i) mx = std::max(mx, logits[i]);
@@ -495,6 +496,8 @@ public:
         // build_moe_ffn: clamp to the smallest f16 before the divide
         const float den = std::max((float) wsum, 6.103515625e-5f);
         for (int k = 0; k < N_EXPERT_USED; ++k) weights[k] /= den;
+        if (ids_log) for (int k = 0; k < N_EXPERT_USED; ++k) ids_log[k] = ids[k];
+        if (w_log)   for (int k = 0; k < N_EXPERT_USED; ++k) w_log[k]   = weights[k];
         // expert_weights_scale is 0 for this file, so no scale step (see decode_shapes.h)
     }
 

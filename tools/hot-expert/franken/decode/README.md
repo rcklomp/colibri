@@ -543,3 +543,43 @@ backend; the argmax scratch, logits and head scratch are the last device's;
 the `__constant__` decode tables are filled per device in each constructor
 after its `hipSetDevice`; and every `Mat` and `LayerState` buffer is placed
 through `dev_for(il)`.
+
+### Step 3b (2026-09-22): the host issue rate
+
+The three-card run gave `layers0_47_ms_median=28.38` with dev0 at 12.04 ms for
+389 launches and dev1 at 7.6 ms of compute for the same layer shapes. dev1 and
+dev2 have their whole token pre-queued while they wait on a boundary; **dev0
+does not**, so dev0's device-timeline intervals are the host's issue period —
+~31 µs an op against §M5's 3 µs launch floor.
+
+`issue_ms` measures it directly: the host wall time to **enqueue** one token's
+whole body and head, with nothing waited on. `prof_cpu_per_launch_us` is that
+over the launches all devices made. Printed by `--time`. Run it with and
+without `--profile` and the difference is what the instrumentation costs.
+
+Per-launch host work removed:
+
+- **The routed-expert log was two device-to-device copies a layer** — 32 a
+  token — and they stalled the queue badly enough to make a `--routing` run
+  1.8× slower on *every* card. `k_router` now writes the log itself, so
+  capture costs **no extra op at all**.
+- **`--profile` recorded an event per op.** It now records only on a **class
+  change**: the interval from event i to event i+1 is charged to `ev_cls_[i]`,
+  so a run of ops in one class needs one event. A GEMV always takes its own,
+  because the per-projection bandwidths are per launch group.
+  `prof_events_merged_per_token` says how many were saved.
+- **The batch descriptor is a by-value kernel argument**, so its size is host
+  work on every GEMV launch. `GEMV_BATCH_MAX` is 5 — the largest batch is the
+  QSA projection's five — not 8: ~260 bytes a launch instead of ~404.
+- **A `std::vector<float>` was allocated per token** for the embedding row.
+  Hoisted to a member.
+- `--time` turns the `--verbose`/`--routing` capture off, so a timing loop
+  measures the engine and not the instrumentation; `--dump` already recorded
+  only the last prompt token.
+
+`debug_check` is a single `if (!sync_debug_) return;`, and nothing else in the
+issue path calls a blocking HIP entry point — `prof_host_syncs_per_token`
+reads 0 and is the check that it stays that way.
+
+The CPU graph is still bit-identical (538 of 538 taps `cos=1.000000`), and the
+routing capture through the router kernel reproduces the same overlap.

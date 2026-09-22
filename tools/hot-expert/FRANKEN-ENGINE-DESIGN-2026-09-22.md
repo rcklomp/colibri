@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 1)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 2)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -53,15 +53,20 @@ the loop between layers.
 
 ## 3. What has to be invented
 
-3.1 **Router lookahead prefetch.** A miss costs one expert's bytes over PCIe
-(~2.5 MB at int4 for Qwen3.8: 16 MB × 48 layers ÷ 512... measured per model in
-M1) plus latency; at 61 GB/s a 20 MB miss wave is ~0.3 ms, the same as a sync
-call. Hiding it needs the NEXT layer's expert ids before the next layer runs.
-Candidate: run layer l+1's router on layer l's output before layer l's expert
-sum is complete (the router input is the post-attention normed state, which
-exists before the MoE sum) — exact for the layer's own attention, approximate
-across the residual; measure the hit rate of the prediction (M2). Fallback
-candidate: MTP draft (F5) as a two-token lookahead.
+3.1 **Router lookahead prefetch -- corrected in rev 2.** Rev 1 claimed layer
+l+1's router input "exists before layer l's MoE sum"; it does not: it is the
+normed residual AFTER layer l's expert sum. So any lookahead is a PREDICTION
+of layer l+1's expert ids from layer l's pre-MoE state, and its hit rate is
+an empirical number (M2), expected to be imperfect on hybrid GDN/sparse-attention
+models. Degradation ladder, each measured: (a) prefetch the top-2k of the
+CURRENT router's distribution beyond the top-k actually used (cheap, exact
+for this layer's tail, useful only for prefill/multi-slot); (b) predicted
+next-layer ids, prefetch on prediction, pay the miss on a wrong guess; (c)
+an MTP draft as a two-token window (F5's economics: it lost before on a
+bandwidth-starved path and must be re-priced on the resident trunk). A miss
+wave at 61 GB/s aggregate is ~0.3 ms per 20 MB; the design tolerates an
+imperfect lookahead if the resident work is ~10 ms -- which is why the
+number that matters first is M1/M5, not the hit rate.
 
 3.2 **Hottest experts replicated on every card.** In a layer-range pipeline
 each expert lives on one card; the histogram's top few hundred experts per
@@ -70,15 +75,38 @@ prefill chunk then has them local. Measured need: the histogram's
 concentration (`~/.glm53_explain.bin` exists for GLM; build the same for the
 other two in M2).
 
-3.3 **Layer-range assignment that respects the shared PCIe link.** The two
-cards on one upstream link must not both stream misses at full rate: assign
-them the layer ranges with the lowest miss rate (from the histogram), the
-lone card the highest. Measured input: per-layer miss bytes from M2.
+3.3 **PCIe bandwidth as a scheduled resource (rev 2).** The 61 GB/s aggregate
+(§PCIE-STREAM) was measured with each card streaming its own block; two cards
+on one upstream link contending for misses at once is NOT that measurement.
+M4 measures it. The engine gives the shared-link pair one joint byte budget
+per token and a time-sliced streaming queue; layer-range assignment puts the
+lowest-miss ranges (M2) on the pair and the highest on the lone card. Until
+M4 exists the pair's budget is assumed to be ONE card's 28 GB/s, not two.
 
 3.4 **256k prefix checkpoints.** At 256k a conversation's KV is hundreds of
 MB to a few GB (M3 measures it per model); disk write at NVMe rate (723 MB/s
 measured, memory `decode-slowdown`) is seconds — acceptable once per
 conversation; the ledger logic is unchanged.
+
+3.5 **Pipeline bubbles (rev 2).** A layer-range pipeline is sequential per
+token; decode for ONE conversation has exactly one token in flight, so
+micro-batching across stages cannot hide a stalled stage (it helps only with
+concurrent slots, which this owner rarely has). The bubble is therefore the
+slowest stage's miss cost, and the only levers are placement (fewer misses on
+any one stage), lookahead (§3.1) and the miss wave's own latency. M5 measures
+the boundary cost; the MVP ladder (§7) measures the bubble before anything
+is built to hide it.
+
+3.6 **One weight format, one KV layout, one command-stream abstraction
+(rev 2).** Stitching hipFire kernels (own quant layouts, retained graphs),
+llama.cpp graphs and Colibri's ring without these three decided first
+reproduces the per-op round trips the design exists to remove. Decided by
+measurement BEFORE any port: the expert/trunk format by M1 (converted
+OFFLINE, no runtime conversion; Colibri's streaming path carries the same
+format for cold experts), the KV layout by M3, the command-stream model by
+M5. Quality of the chosen format per model is measured with the existing
+harness (`quality_eval.py`, KL against the FP8/BF16 reference where one
+exists) as a workload parameter, not skipped.
 
 ## 4. The measurement program (each closes a design choice; none is a gate on a build)
 
@@ -88,13 +116,17 @@ conversation; the ledger logic is unchanged.
 | M1 | expert kernel + format head to head on gfx1100: hipFire mq4r vs llama.cpp IQ4_XS/Q4_K vs Colibri int4-g64, same expert shapes (Qwen3.8: 512×48, hidden 2560), batch 1 and batch 32 rows | one microbenchmark binary per candidate, weights in VRAM, 1 000 iterations, median; no engine, no gateway stop | §2 row 3 |
 | M2 | expert usage histograms and per-layer miss bytes for Qwen3.8 and DeepSeek at 256k-scale prompts; hit rate of router lookahead | Colibri's histogram tooling ported to read llama.cpp's router output (a debug hook, CPU) | §3.1, §3.2, §3.3 |
 | M3 | KV bytes per token per model at 256k; attention time per layer at 32k/128k/256k, candidate kernels | from llama.cpp's own graph on one card, timers | §2 row 2, §3.4 |
-| M4 | streaming prefill on three cards: Colibri's F2 ring driven from three queues at once | `vk_stream_probe`-style, real expert sizes | the ≤ 1 ms/token projection |
+| M4 | streaming prefill on three cards: Colibri's F2 ring driven from three queues at once, AND the shared-link pair contending deliberately | `vk_stream_probe`-style, real expert sizes | the ≤ 1 ms/token projection; the pair's real joint bandwidth (§3.3) |
 | M5 | pipeline boundary cost: P2P copy of one hidden vector card→card, and one layer-range's whole-token command stream on hipFire's kernels | microbenchmark | §1(b), §1(c) |
 
 Order: M0 (in flight), M1 and M3 in parallel (no gateway stop for either),
 M2, then M5, then M4. Tier: M1/M5 are kernel work (Opus writes the
 benchmarks from the two codebases; the orchestrator reads the hot loops
 first); M2/M3/M4 are Sonnet ports of existing tooling.
+
+**Go/no-go (rev 2):** M3 > 10-12 ms per token at 256k, or M1 showing no
+kernel within 2x of bandwidth-bound on gfx1100, and the 40 tok/s projection
+in §6 is withdrawn before anything is built on it.
 
 ## 5. What this design refuses
 
@@ -114,3 +146,34 @@ attention at 256k unknown (M3). If M3 is ≤ 10 ms, the target is **≥ 40 tok/s
 at 256k** against llama.cpp's 6 today. Prefill ≤ 1 ms/token → **a cold 256k
 prompt in ~5 min** against 17. Both are arithmetic until M1/M3/M4 say
 otherwise, and the plan's own rule applies: step 0 is a measurement.
+
+## 7. The build ladder (rev 2): smallest working pipeline first
+
+No target in §6 is a requirement. The first thing built is the smallest
+pipeline that produces a measured tok/s and prefill rate, then each design
+element is added one at a time against that number:
+
+| rung | what | adds |
+|---|---|---|
+| L0 | ONE model (Qwen3.8-Flash-Next: lightest active set, fastest today), TWO cards (the pair that does NOT share a link + one), layer-range pipeline, hipFire-class trunk kernels in one command stream per card, Colibri's ring for non-resident experts, no replication, no lookahead, Colibri's gateway in front | the first real number for §1(a)-(c) |
+| L1 | third card | the shared-link contention, measured |
+| L2 | histogram placement with the PCIe budget (§3.3) | fewer misses per stage |
+| L3 | replication of the hottest experts (§3.2) | only if M2 says the histogram is concentrated |
+| L4 | lookahead ladder (§3.1 a/b/c) | only if the bubble is the limiter after L2 |
+| L5 | DeepSeek-V4-Flash, GLM-5.3-Flash on the same pipeline | per-architecture graphs from llama.cpp's reference |
+
+Each rung is one gated item with the plan's rules (oracle, A,B,B,A, record
+row). L0 is not started until M1, M3 and M5 have reported.
+
+## 8. Audit, 2026-09-22 (an external review, relayed by the owner)
+
+Accepted and folded in above: pipeline bubbles under partial residency
+(§3.5), PCIe contention as a scheduled resource (§3.3, M4), the lookahead
+correction and degradation ladder (§3.1), the unquantified replication
+trade-off (§3.2 already required M2; L3 now waits on it), the integration
+surface (§3.6), M3 as go/no-go, quality per format (§3.6), the MVP ladder
+(§7), the gateway staying Colibri's (§2, unchanged). Rejected: in-flight
+micro-batches to hide bubbles (single-stream decode has one token in flight,
+§3.5). Not adopted: the review's model parameter counts and its community
+prefill figures -- nothing on this rig verifies them, and the design uses
+only numbers measured here.

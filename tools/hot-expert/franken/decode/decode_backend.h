@@ -55,6 +55,56 @@ struct Mat {
     bool ok() const { return base != nullptr; }
 };
 
+// ----------------------------------------------------- batched GEMV ------
+//
+// Step 2b. 931 launches a token (58 a layer) at a device floor of a few us
+// each was ~4 ms of an 11.7 ms token, and 17 of those 58 were projections --
+// one kernel each, however small. Most of them SHARE an activation vector,
+// which is the only thing that lets them share a kernel:
+//
+//   xn (attn/ffn)  -> hc_down + hc_inject            2 -> 1, twice a layer
+//   mixed (attn)   -> ssm_qkv, gate, beta, alpha     4 -> 1  (GDN layer)
+//   mixed (attn)   -> wq, wk, wv, idx_q, idx_k       5 -> 1  (QSA layer)
+//   mixed (ffn)    -> ffn_gate_inp, sh_up, sh_gate, sh_gate_inp  4 -> 1
+//
+// A batch is one kernel over the CONCATENATED row space of up to
+// GEMV_BATCH_MAX matrices, which may differ in format (the QSA batch mixes
+// Q8_0 and BF16) and each of which gets its own output pointer and epilogue.
+// Batching also raises the row count, which IS the wave count -- grouping
+// rows into wider workgroups never does, because total waves == total rows.
+enum GemvEpi {
+    GE_NONE = 0,
+    GE_SIGMOID,     // build_moe_ffn's shared-expert gate, build_hc_mix's gate
+    GE_SCALE_SILU,  // build_hc_mix's silu(scale(lo, 1/hc))
+};
+
+// How the activation is formed. GX_SILU_MUL lets the shared expert's
+// down-projection consume silu(gate)*up without a kernel of its own.
+enum GemvX { GX_PLAIN = 0, GX_SILU_MUL };
+
+struct GemvJob {
+    const Mat * W    = nullptr;
+    float *     out  = nullptr;
+    int         epi  = GE_NONE;
+    float       arg  = 0.0f;
+};
+
+// Profiling groups, so --profile can report achieved GB/s per projection
+// class rather than one lumped trunk number.
+enum GemvGroup {
+    GG_HC_DOWN_INJECT = 0,
+    GG_HC_UP,
+    GG_GDN_PROJ,        // ssm_qkv + gate + beta + alpha
+    GG_SSM_OUT,
+    GG_FFN_PROJ,        // ffn_gate_inp + shexp up/gate/gate_inp
+    GG_SH_DOWN,
+    GG_QSA_PROJ,        // wq + wk + wv + indexer q/k
+    GG_ATTN_OUT,
+    GG_PLE,
+    GG_N
+};
+const char * gemv_group_name(int g);
+
 // ------------------------------------------------------------- unary ops --
 enum FkUnary  { FK_SILU = 0, FK_SIGMOID, FK_SOFTPLUS, FK_EXP, FK_NEG_NOP };
 enum FkBinary { FK_ADD = 0, FK_MUL, FK_SUB };
@@ -86,6 +136,10 @@ public:
 
     // -- generic vector ops -------------------------------------------------
     virtual void gemv(const Mat & W, const float * x, float * y) = 0;
+    // One kernel for `n` matrices sharing `x`. `x2` is used only by
+    // GX_SILU_MUL, where the activation is silu(x[i])*x2[i].
+    virtual void gemv_batch(const GemvJob * jobs, int n, const float * x,
+                            int group, int x_mode = GX_PLAIN, const float * x2 = nullptr) = 0;
     // W with expert_stride != 0, one expert chosen by `expert`.
     virtual void gemv_expert(const Mat & W, int expert, const float * x, float * y) = 0;
 
@@ -93,10 +147,12 @@ public:
     virtual void unary(int op, const float * x, float * y, size_t n) = 0;
     virtual void binary(int op, const float * a, const float * b, float * y, size_t n) = 0;
     virtual void scale(const float * x, float s, float * y, size_t n) = 0;
+    // y = a + b + c, build_ple's closing `hidden + gated + conv_out`
+    virtual void binary3_add(const float * a, const float * b, const float * c,
+                             float * y, size_t n) = 0;
     // build_hc_mix's silu(scale(lo, 1/hc)) as one op. Every elementwise op
     // costs a dependent kernel latency whatever its size, and the hc modules
     // run 32 times a token.
-    virtual void scale_silu(const float * x, float s, float * y, size_t n) = 0;
     // y[i] = x[i] * w[i % ne0_w]; ne0_w == n means a plain elementwise mul.
     virtual void mul_tiled(const float * x, const float * w, float * y, size_t n, size_t ne0_w) = 0;
     // dst[r*row_len + i] = src[r*src_stride + src_off + i] -- the strided view
@@ -117,6 +173,12 @@ public:
     virtual void hc_broadcast(const float * x, float * res_hc) = 0;              // [2560] -> [4][2560]
     virtual void hc_collapse(const float * xn, const float * gate, float * out) = 0;
     virtual void hc_combine(float * res_hc, const float * blk, const float * inject) = 0;
+    // hc_combine followed by the grouped RMSNorm the next hc_mix would have
+    // launched on its own; `w_norm == nullptr` does the combine alone. Both
+    // reduce over the same 2 560 elements of one hc stream, so they fuse for
+    // free.
+    virtual void hc_combine_norm(float * res_hc, const float * blk, const float * inject,
+                                 const float * w_norm, float * xn, float eps) = 0;
 
     // -- PLE (qwen4exp.cpp:1137-1227) ---------------------------------------
     // s[c] = sum_i key[c][i]*query[c][i] / sqrt(n_embd);
@@ -129,15 +191,16 @@ public:
     virtual void ple_conv_silu(const float * ring, int head, const float * w, float * out) = 0;
 
     // -- Gated DeltaNet (qwen4exp.cpp:793-918 + the fused op's formula) -----
-    // ggml_ssm_conv over GDN_CONV_K taps of the ring, then silu.
-    virtual void gdn_conv_silu(const float * ring, int head, const float * w, float * out) = 0;
+    // ggml_ssm_conv over GDN_CONV_K taps of the ring, then silu -- together
+    // with the gate chain, whose 48 elements ride along for free.
+    virtual void gdn_conv_gate(const float * ring, int head, const float * w,
+                               const float * beta_raw, const float * alpha_raw,
+                               const float * dt, const float * ssm_a,
+                               float * conv_out, float * beta_sig,
+                               float * a_softplus, float * gate, float * g_exp) = 0;
     // qwen4exp.cpp:816-834's gate chain -- sigmoid(beta), softplus(alpha+dt),
     // *ssm_a, exp -- as ONE op over 48 elements instead of five. It still
     // writes a_softplus and gate, so the oracle taps are unchanged.
-    virtual void gdn_gate(const float * beta_raw, const float * alpha_raw,
-                          const float * dt, const float * ssm_a,
-                          float * beta_sig, float * a_softplus,
-                          float * gate, float * g_exp, int n) = 0;
     // One delta-rule step. `g_exp` is already exp(g) per v-head.
     virtual void gdn_step(float * state, const float * q, const float * k, const float * v,
                           const float * g_exp, const float * beta, float * out) = 0;
@@ -152,7 +215,16 @@ public:
                              const float * x, float * y_gate, float * y_up) = 0;
     virtual void silu_mul(const float * gate, const float * up, float * h, size_t n) = 0;
     virtual void moe_down(const Mat & down, const int * ids, const float * h, float * expert_out) = 0;
-    virtual void moe_combine(const float * expert_out, const float * weights, float * out) = 0;
+    // build_moe_ffn's tail in one op: the weighted expert sum, the shared
+    // expert's gate and the add. Writes ffn_moe_out and ffn_shexp_gated
+    // because both are oracle taps.
+    // `sh_gate` is the RAW shared-expert logit; the sigmoid is applied here,
+    // so build_moe_ffn's shared_expert_gate and shared_expert_gate_sigmoid
+    // are both taps and neither costs a launch.
+    virtual void moe_finish(const float * expert_out, const float * weights,
+                            const float * sh_raw, const float * sh_gate,
+                            float * sh_gate_sig, float * moe_out,
+                            float * sh_gated, float * out) = 0;
 
     // -- IMRoPE (ggml_rope_multi, mode GGML_ROPE_TYPE_IMROPE) ---------------
     virtual void rope_imrope(float * x, int n_heads, int head_dim, int n_rot, int pos) = 0;
@@ -186,13 +258,28 @@ public:
     // could not be pooled, 0 otherwise (llama-memory-hybrid-idx.cpp:438-447).
     // It used to be a host-side array uploaded per QSA layer, which put a
     // BLOCKING hipMemcpy inside the 16-layer body -- see decode_graph.cpp.
-    virtual void qsa_expand(const float * blk_scores, float * cell_scores,
-                            int n_kv, int q_pos, int ratio, int tail_start) = 0;
+    // Also writes the identity selection when the budget covers the whole
+    // cache, which is when the reference's top-k is the identity too -- then
+    // topk_select is not called at all.
+    virtual void qsa_expand(const float * blk_scores, float * cell_scores, int * sel,
+                            int n_kv, int q_pos, int ratio, int tail_start,
+                            int sel_identity) = 0;
     // Returns how many were selected (min(width, visible)); fills `out`.
     virtual int  topk_select(const float * scores, int n, int width, int * out) = 0;
+    // build_layer_attn's per-head post-processing in one op: the [q|gate]
+    // split of attn_q's interleaved rows, the QK-norms, IMRoPE on q, k and
+    // the indexer query, and the output gate's sigmoid.
+    virtual void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
+                             const float * q_norm, const float * k_norm, const float * iq_norm,
+                             float * qcur, float * gate, float * gsig,
+                             float * kcur, float * idxq, int pos, float eps) = 0;
+    // `out` is the reference's kqv_out / attn_pregate, `out_gated` is
+    // attn_gated: the sigmoid gate is applied in the combine, so neither tap
+    // costs a launch of its own.
     virtual void attn_qsa(const int8_t * kqs, const uint16_t * ksc,
                           const int8_t * vqs, const uint16_t * vsc,
-                          const float * q, const int * sel, int n_sel, float * out) = 0;
+                          const float * q, const int * sel, int n_sel,
+                          const float * gsig, float * out, float * out_gated) = 0;
 
     // -- timing (GPU only; the CPU backend returns 0) -----------------------
     // Diagnostic arm, CPU backend only (--quant-act). llama.cpp's CPU
@@ -219,6 +306,16 @@ public:
     // it -- which is the number that distinguishes "this kernel is slow" from
     // "the GPU was idle waiting for the host".
     virtual void set_profile(bool) {}
+    // --gemv-lds 0|1: stage the activation slice in LDS or read it from L1.
+    // A runtime switch so both arms are measurable with one binary -- which
+    // of them wins on a weight-bandwidth-bound kernel is a question for the
+    // profile, not an assumption.
+    virtual void set_gemv_lds(int) {}
+    // Below this many output ROWS a GEMV splits K to raise the wave count
+    // (total waves == total rows, so wider workgroups never help). The
+    // threshold trades a reduce launch against occupancy, and the profile's
+    // per-group GB/s is what should set it, so it is a runtime knob.
+    virtual void set_gemv_min_rows(int) {}
     virtual void prof_reset() {}
     virtual void prof_end_token() {}
     virtual void prof_report(FILE * out, int n_tokens) { (void) out; (void) n_tokens; }

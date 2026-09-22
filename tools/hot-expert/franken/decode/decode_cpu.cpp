@@ -63,6 +63,21 @@ static_assert(offsetof(block_iq4_xs, scales_l) == FK_IQ4XS_OFF_SCALES_L, "iq4_xs
 static_assert(offsetof(block_iq4_xs, qs)       == FK_IQ4XS_OFF_QS,       "iq4_xs qs moved");
 
 namespace fk {
+
+const char * gemv_group_name(int g) {
+    switch (g) {
+        case GG_HC_DOWN_INJECT: return "hc_down_inject";
+        case GG_HC_UP:          return "hc_up";
+        case GG_GDN_PROJ:       return "gdn_qkv_gate_beta_alpha";
+        case GG_SSM_OUT:        return "ssm_out";
+        case GG_FFN_PROJ:       return "ffn_router_shexp";
+        case GG_SH_DOWN:        return "shexp_down";
+        case GG_QSA_PROJ:       return "qsa_q_k_v_indexer";
+        case GG_ATTN_OUT:       return "attn_output";
+        default:                return "ple";
+    }
+}
+
 namespace {
 
 // ------------------------------------------------------------- threading --
@@ -231,6 +246,35 @@ public:
     // -- GEMV ---------------------------------------------------------------
     void gemv(const Mat & W, const float * x, float * y) override { gemv_at(W, (const unsigned char *) W.base, x, y); }
 
+    // The host reference simply runs the jobs in turn: batching exists to cut
+    // GPU launches, and reproducing it here would only make this path slower
+    // and less obviously correct. The epilogues and the GX_SILU_MUL
+    // activation ARE reproduced, because those change the arithmetic.
+    void gemv_batch(const GemvJob * jobs, int n, const float * x, int group,
+                    int x_mode, const float * x2) override {
+        (void) group;
+        std::vector<float> xbuf;
+        const float * xin = x;
+        if (x_mode == GX_SILU_MUL) {
+            xbuf.resize((size_t) jobs[0].W->K);
+            for (size_t i = 0; i < xbuf.size(); ++i) xbuf[i] = siluf(x[i]) * x2[i];
+            xin = xbuf.data();
+        }
+        for (int i = 0; i < n; ++i) {
+            const Mat & W = *jobs[i].W;
+            gemv(W, xin, jobs[i].out);
+            switch (jobs[i].epi) {
+                case GE_SIGMOID:
+                    for (int64_t r = 0; r < W.rows; ++r) jobs[i].out[r] = sigmoidf(jobs[i].out[r]);
+                    break;
+                case GE_SCALE_SILU:
+                    for (int64_t r = 0; r < W.rows; ++r) jobs[i].out[r] = siluf(jobs[i].out[r] * jobs[i].arg);
+                    break;
+                default: break;
+            }
+        }
+    }
+
     void gemv_expert(const Mat & W, int e, const float * x, float * y) override {
         gemv_at(W, (const unsigned char *) W.base + (size_t) e * W.expert_stride, x, y);
     }
@@ -260,20 +304,9 @@ public:
     void scale(const float * x, float s, float * y, size_t n) override {
         for (size_t i = 0; i < n; ++i) y[i] = x[i] * s;
     }
-    void scale_silu(const float * x, float s, float * y, size_t n) override {
-        for (size_t i = 0; i < n; ++i) y[i] = siluf(x[i] * s);
-    }
-    void gdn_gate(const float * beta_raw, const float * alpha_raw, const float * dt,
-                  const float * ssm_a, float * beta_sig, float * a_softplus,
-                  float * gate, float * g_exp, int n) override {
-        for (int i = 0; i < n; ++i) {
-            beta_sig[i]   = sigmoidf(beta_raw[i]);
-            const float sp = softplusf(alpha_raw[i] + dt[i]);
-            a_softplus[i] = sp;
-            const float g = sp * ssm_a[i];      // ssm_a already holds -exp(A_log)
-            gate[i]       = g;
-            g_exp[i]      = std::exp(g);
-        }
+    void binary3_add(const float * a, const float * b, const float * c,
+                     float * y, size_t n) override {
+        for (size_t i = 0; i < n; ++i) y[i] = a[i] + b[i] + c[i];
     }
     void mul_tiled(const float * x, const float * w, float * y, size_t n, size_t ne0_w) override {
         for (size_t i = 0; i < n; ++i) y[i] = x[i] * w[i % ne0_w];
@@ -323,10 +356,19 @@ public:
         }
     }
     void hc_combine(float * res, const float * blk, const float * inject) override {
+        hc_combine_norm(res, blk, inject, nullptr, nullptr, 0.0f);
+    }
+    void hc_combine_norm(float * res, const float * blk, const float * inject,
+                         const float * w_norm, float * xn, float eps) override {
         for (int c = 0; c < HC; ++c) {
             const float w = 2.0f * sigmoidf(inject[c] * (1.0f / (float) HC));
             float * rc = res + (size_t) c * N_EMBD;
-            for (int i = 0; i < N_EMBD; ++i) rc[i] += blk[i] * w;
+            double ss = 0.0;
+            for (int i = 0; i < N_EMBD; ++i) { rc[i] += blk[i] * w; ss += (double) rc[i] * rc[i]; }
+            if (!w_norm) continue;
+            const float sc = 1.0f / std::sqrt((float)(ss / N_EMBD) + eps);
+            const float * wg = w_norm + (size_t) c * N_EMBD;
+            for (int i = 0; i < N_EMBD; ++i) xn[(size_t) c * N_EMBD + i] = rc[i] * sc * wg[i];
         }
     }
 
@@ -349,8 +391,20 @@ public:
     }
 
     // -- Gated DeltaNet ------------------------------------------------------
-    void gdn_conv_silu(const float * ring, int head, const float * w, float * out) override {
-        conv_taps(ring, head, GDN_CONV_K, GDN_CONV_K, 1, GDN_CONV_DIM, w, out);
+    void gdn_conv_gate(const float * ring, int head, const float * w,
+                       const float * beta_raw, const float * alpha_raw,
+                       const float * dt, const float * ssm_a, float * conv_out,
+                       float * beta_sig, float * a_softplus, float * gate,
+                       float * g_exp) override {
+        conv_taps(ring, head, GDN_CONV_K, GDN_CONV_K, 1, GDN_CONV_DIM, w, conv_out);
+        for (int h = 0; h < GDN_V_HEADS; ++h) {
+            beta_sig[h]   = sigmoidf(beta_raw[h]);
+            const float sp = softplusf(alpha_raw[h] + dt[h]);
+            a_softplus[h] = sp;
+            const float g = sp * ssm_a[h];      // ssm_a already holds -exp(A_log)
+            gate[h]       = g;
+            g_exp[h]      = std::exp(g);
+        }
     }
 
     // ops.cpp:11003-11047, the K=1 / non-KDA branch of
@@ -434,11 +488,17 @@ public:
         for (int k = 0; k < N_EXPERT_USED; ++k)
             gemv_expert(down, ids[k], h + (size_t) k * N_FF_EXP, eo + (size_t) k * N_EMBD);
     }
-    void moe_combine(const float * eo, const float * w, float * out) override {
+    void moe_finish(const float * eo, const float * w, const float * sh_raw,
+                    const float * sh_gate, float * sh_gate_sig, float * moe_out,
+                    float * sh_gated, float * out) override {
+        const float g0 = sigmoidf(sh_gate[0]);
+        sh_gate_sig[0] = g0;
         for (int i = 0; i < N_EMBD; ++i) {
             float a = 0.0f;
             for (int k = 0; k < N_EXPERT_USED; ++k) a += w[k] * eo[(size_t) k * N_EMBD + i];
-            out[i] = a;
+            moe_out[i]  = a;
+            sh_gated[i] = sh_raw[i] * g0;
+            out[i]      = a + sh_gated[i];
         }
     }
 
@@ -506,8 +566,32 @@ public:
             scores[b] = acc;
         }
     }
-    void qsa_expand(const float * blk_scores, float * cell, int n_kv, int q_pos,
-                    int ratio, int tail_start) override {
+    void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
+                     const float * q_norm, const float * k_norm, const float * iq_norm,
+                     float * qcur, float * gate, float * gsig, float * kcur,
+                     float * idxq, int pos, float eps) override {
+        // the [q|gate] split of attn_q's interleaved rows (qwen4exp.cpp:726)
+        for (int h = 0; h < N_Q_HEADS; ++h) {
+            const float * row = qfull + (size_t) h * HEAD_DIM * 2;
+            std::memcpy(qcur + (size_t) h * HEAD_DIM, row, HEAD_DIM * sizeof(float));
+            for (int i = 0; i < HEAD_DIM; ++i) {
+                const float v = row[HEAD_DIM + i];
+                gate[(size_t) h * HEAD_DIM + i] = v;
+                gsig[(size_t) h * HEAD_DIM + i] = sigmoidf(v);
+            }
+        }
+        std::memcpy(kcur, kraw,   (size_t) N_KV_HEADS  * HEAD_DIM * sizeof(float));
+        std::memcpy(idxq, idxraw, (size_t) IDX_N_HEADS * IDX_DIM  * sizeof(float));
+
+        rms_norm_mul(qcur, q_norm,  qcur, HEAD_DIM, N_Q_HEADS,   HEAD_DIM, eps);
+        rms_norm_mul(kcur, k_norm,  kcur, HEAD_DIM, N_KV_HEADS,  HEAD_DIM, eps);
+        rms_norm_mul(idxq, iq_norm, idxq, IDX_DIM,  IDX_N_HEADS, IDX_DIM,  eps);
+        rope_imrope(qcur, N_Q_HEADS,   HEAD_DIM, N_ROT, pos);
+        rope_imrope(kcur, N_KV_HEADS,  HEAD_DIM, N_ROT, pos);
+        rope_imrope(idxq, IDX_N_HEADS, IDX_DIM,  N_ROT, pos);
+    }
+    void qsa_expand(const float * blk_scores, float * cell, int * sel, int n_kv,
+                    int q_pos, int ratio, int tail_start, int sel_identity) override {
         const int n_blocks = (n_kv + ratio - 1) / ratio;
         for (int j = 0; j < n_kv; ++j) {
             const int b      = j / ratio;
@@ -515,6 +599,7 @@ public:
             const float bias = (b * ratio >= tail_start) ? 1e9f
                              : (filled < ratio ? -INFINITY : 0.0f);
             cell[j] = (j <= q_pos) ? blk_scores[b] + bias : -INFINITY;
+            if (sel_identity) sel[j] = j;
         }
         (void) n_blocks;
     }
@@ -530,7 +615,7 @@ public:
     }
     void attn_qsa(const int8_t * kqs, const uint16_t * ksc, const int8_t * vqs,
                   const uint16_t * vsc, const float * q, const int * sel, int n_sel,
-                  float * out) override {
+                  const float * gsig, float * out, float * out_gated) override {
         const float scale = 1.0f / std::sqrt((float) HEAD_DIM);
         std::vector<float> p(n_sel);
         for (int h = 0; h < N_Q_HEADS; ++h) {
@@ -556,7 +641,9 @@ public:
                     const size_t sb = ((size_t) sel[j] * N_KV_HEADS + kvh) * (HEAD_DIM / 32);
                     a += (double) p[j] * (fk_cpu_half_to_f32(vsc[sb + (d >> 5)]) * (float) vqs[e + d]);
                 }
-                out[(size_t) h * HEAD_DIM + d] = (float) a;
+                const float v = (float) a;
+                out[(size_t) h * HEAD_DIM + d]       = v;
+                out_gated[(size_t) h * HEAD_DIM + d] = v * gsig[(size_t) h * HEAD_DIM + d];
             }
         }
     }

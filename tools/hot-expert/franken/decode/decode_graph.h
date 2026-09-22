@@ -112,7 +112,7 @@ private:
     void hc_mix(const LayerWeights & L, const float * w_norm, const Mat & down,
                 const Mat & up, const Mat & inj, const float * x,
                 float * out_mixed, float * out_inject, int il, Recorder & rec,
-                const char * suffix);
+                const char * suffix, bool xn_ready);
     void layer_ple(const LayerWeights & L, Recorder & rec);
     void layer_gdn(const LayerWeights & L, LayerState & st, int il, Recorder & rec);
     void layer_qsa(const LayerWeights & L, LayerState & st, int il, Recorder & rec);
@@ -136,17 +136,20 @@ private:
 
     // scratch (all backend buffers)
     float *x_, *res_hc_, *xn_, *lo_, *hgate_, *mixed_, *inject_, *blk_;
-    float *qkv_, *z_, *conv_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *bsig_, *gate_raw_, *gdn_, *gnorm_;
-    float *qfull_, *qcur_, *gate_, *gsig_, *kcur_, *vcur_, *kqv_;
+    float *qkv_, *z_, *conv_, *qkn_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *bsig_, *gate_raw_, *gdn_, *gnorm_;
+    float *qfull_, *qcur_, *gate_, *gsig_, *kcur_, *vcur_, *kqv_, *kqvg_;
+    float *kraw_, *idxraw_;
     float *idxq_, *idxk_, *blkscore_, *cellscore_, *pool_raw_, *pool_rope_;
     int   *sel_;
     float *logits_, *wts_, *ygate_, *yup_, *hmoe_, *eo_, *moeout_;
-    float *shg_, *shu_, *shh_, *shout_, *shgate_;
+    float *shg_, *shu_, *shh_, *shout_, *shgated_, *shgate_, *shgsig_;
     float *plek_, *plev_, *pleq_, *plegated_, *plegate_, *plenorm_, *pleconv_, *pleemb_;
     int   *ids_;
     int   *ids_log_ = nullptr;   // per-layer routed ids, read back AFTER the body
     float *wts_log_ = nullptr;
     bool   need_ple_ = false;
+    // set when the preceding hc_combine already produced xn for the next mix
+    bool   xn_ready_ = false;
 };
 
 } // namespace fk

@@ -437,13 +437,27 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
-    // --no-expert-gather: run the chunk's expert assignments one at a time,
-    // the way a decode token does, instead of through the device-side sort
-    // and the row-gather kernels (design 9.4 item 5). The two must agree bit
-    // for bit -- every column accumulates in the same order either way -- so
-    // this is the arm that says whether they do, on a path that only exists
-    // at T > 1 and that no CPU gate can reach.
-    virtual void set_expert_gather(bool) {}
+    // --expert-gather MASK: which expert stages take design 9.4 item 5's
+    // device-side sort and row-gather at T > 1. Bit 0 is gate/up, bit 1 is
+    // down; 0 (THE DEFAULT) runs every assignment on its own, exactly as a
+    // decode token does.
+    //
+    // OFF BY DEFAULT BECAUSE IT IS NOT BIT-IDENTICAL AND WE DO NOT YET KNOW
+    // WHY. Measured on three cards 2026-09-22: with the gather on, a chunk of
+    // 6 diverges from six single-token steps from layer 1 onwards (Kcur-3
+    // maxabs 1.2e-6 growing to Kcur-27 1.0e-3, greedy id 7 flipping); with it
+    // off, ZERO taps differ. Every other T-dependence in the engine was
+    // cleared by that same bisection, including the LDS staging flip
+    // (--gemv-lds 0 on both arms changes nothing). The accumulation order
+    // inside each gather kernel reproduces its per-assignment kernel block
+    // for block and accumulator for accumulator, and the counting sort's
+    // invariants hold on inspection, so the cause is not yet identified --
+    // which is exactly why this is a knob and not the default.
+    //
+    // The mask is per STAGE so one run each says whether the fault is in
+    // gate/up or in down: they write different tensors and the first
+    // differing tap distinguishes them.
+    virtual void set_expert_gather(int) {}
     // --sync-debug: drain and check after every launch and copy, so the op
     // named in a fault message is the one that faulted rather than whichever
     // launch was in flight when the queue drained.

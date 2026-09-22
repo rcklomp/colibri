@@ -139,7 +139,56 @@ carrying the old one-column kernel's accumulator structure, because two
 kernels would mean the decode path and the prefill path could disagree in
 the last bit and this gate would be comparing two different things.
 
-**Not measured here:** anything on a GPU. The device arm of the oracle, the
-`--time-prefill` numbers and whether the IQ3_S gather's occupancy 7 (213
-VGPR, against 94 and occupancy 16 for the kernel it replaces on the `T > 1`
-path) is a win are all for the session that holds the rig lock.
+## 8. The GPU arm, and why item 5 is off by default (2026-09-22, three cards)
+
+The device oracle at first FAILED where the CPU one passed: `--chunk 6`
+against `--chunk 1` diverged from layer 1 onwards, `Kcur-3` at maxabs 1.2e-6
+growing to `Kcur-27` at 1.0e-3, and greedy id 7 flipping. The bisection that
+localised it, in the order it was run:
+
+| arm | result |
+|---|---|
+| `--chunk 1` against its own dump | identical — the engine is deterministic |
+| `--chunk 6` against `--chunk 1` | differs from layer 1, then every layer |
+| `--gemv-lds 0` on **both** arms | unchanged — the LDS staging flip is NOT it |
+| `--chunk 6` with the expert gather OFF | **zero differing taps: bit-identical** |
+
+So the whole divergence is design 9.4 item 5, the device-side expert sort and
+the row-gather kernels — the only code in the engine that runs at `T > 1` and
+not at `T = 1`. **It is therefore a knob, `--expert-gather MASK`, and the
+default is 0.** Bit 0 is gate/up and bit 1 is down, so one run each says which
+stage is at fault; they write different tensors and the first differing tap
+distinguishes them.
+
+**The cause is not yet identified, and that is stated rather than guessed at.**
+What has been checked and is NOT the cause: each gather kernel reproduces its
+per-assignment kernel's accumulation block for block and accumulator for
+accumulator (four for IQ3_S closing on `(a0+a1)+(a2+a3)`, two for IQ4_XS, the
+`lo`/`hi` pair for IQ4_NL, the hoisted `(d*q)*h` for Q8_0); the counting
+sort's invariants hold on inspection (buckets are contiguous and disjoint,
+`tile_exp` is the bucket's expert, the tile-grid bound
+`min(n,512) + ceil(n/8)` dominates `sum ceil(c_e/8)`); every assignment writes
+its own output column so the scatter order inside a bucket cannot matter; and
+`moe_finish` still sums a token's ten contributions in rank order because the
+column index is `t*K_TOP + k` either way. No spills and no scratch in any of
+the four kernels.
+
+**What it costs to have it off:** the chunk reads a chosen expert's row once
+per assignment rather than once per group — at `T = 256`, 2 560 reads a layer
+instead of ~512. The 7.48 ms/token first prefill number was measured with the
+gather ON, so it needs re-taking, and `prof_expert_gate_up_us` /
+`prof_expert_down_us` will now carry the unamortised cost.
+
+**Not measured here:** anything on a GPU by the agent that wrote this.
+
+## 9. What a later change must not undo
+
+Two invariants, and a third the hard way:
+
+- the split-K count of a GEMM is chosen from the MATRIX alone, never from T;
+- there is ONE GEMV/GEMM kernel, `k_gemm_batch<TILE>`, and `T == 1`
+  instantiates `TILE = 1` — same source, so decode and prefill cannot drift;
+- **every method of `GpuBackend` that allocates, copies, creates an event or
+  launches calls `dev_ensure(dev_)` first.** `set_profile`'s has now been lost
+  three times and the symptom is always "invalid resource handle" from
+  `mark()`, because `hipEventCreate` acts on the process-wide current device.

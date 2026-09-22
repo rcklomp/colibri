@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 9)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 10)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -281,7 +281,11 @@ llama.cpp is not the reference to beat, the 5-minute target of §6 is.
    ≤ 15 launches a layer and the trunk GEMV at the bytes; gate = routing
    set match per layer + greedy text on real prompts, not cos at layer 15.**
 3. Three cards, the two boundaries, lm_head; oracle: greedy text identical
-   on the F11 prompts, last-token logits cosine/argmax.
+   on the F11 prompts, last-token logits cosine/argmax. **Done 2026-09-22
+   (§L0-STEP3): 12 of 16 greedy tokens identical to llama.cpp, routing 0.92;
+   22.9 ms a token = 43.7 tok/s at short context with 256k allocated
+   (llama.cpp 34-40 / 66 ms). Next: host issue cost, small-matrix GEMVs,
+   then the depth ladder.**
 4. Gateway protocol, `serve_alt.sh franken`, `accept_live`, the depth
    ladder at 19k and 256k (the number), the quality harness at the L0
    format (the quality number). Gate: tok/s ≥ 40 at 256k, quality within the

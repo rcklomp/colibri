@@ -14,6 +14,19 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 54 (2026-09-22 19:10 CEST, 17:10 UTC) -- L0 STEP 3: THE WHOLE MODEL ON
+> THREE CARDS (record §L0-STEP3, design rev 10).** Qwen3.8-Flash-Next, 256k
+> allocated (23.1/22.5/23.4 GB used, 2.4-3.3 GB free per card), P2P
+> boundaries, Q6_K head, device argmax. Greedy: 12 of 16 tokens identical to
+> llama.cpp's CPU reference ("It sounds like you might be having a
+> frustrating moment! 😤 ..."), routing overlap 0.92. **22.9 ms a token =
+> 43.7 tok/s at short context** -- llama.cpp is 34-40 ms there and 66 ms
+> with a 256k window. Four placement/addressing bugs found and fixed from
+> the failure text (device-wide current device, indexer cache 8x, Q6_K row
+> stride in elements, events on the wrong device). Not measured yet: the
+> depth ladder to 256k (next), quality; known cost: the first card is
+> CPU-issue-bound (agent removing per-launch host cost now).**
+>
 > **Rev 53 (2026-09-22 18:30 CEST, 16:30 UTC) -- STEP 2b: 11.7 -> 7.6 ms for 16
 > layers on one card (record §L0-STEP2, commit c0633eb).** Batched GEMVs
 > over shared activations, epilogue fusions, no top-k when the context fits

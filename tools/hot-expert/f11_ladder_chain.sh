@@ -454,7 +454,7 @@ start_f11() {   # start_f11 <model> <ncmoe> <name> <alias>
     -m "$model" "${place[@]}" \
     --split-mode layer --device ROCm0,ROCm1,ROCm2 \
     -fa on -ctk q8_0 -ctv q8_0 -t 16 -tb 8 \
-    --reasoning-effort low \
+    --reasoning-effort low -lv 4 \
     --host 0.0.0.0 --port "$F11_PORT" \
     --parallel 1 --ctx-size "$F11_CTX" --alias "$alias" \
     >> "$GOUT/${TAG}_${name}.log" 2>&1 < /dev/null &

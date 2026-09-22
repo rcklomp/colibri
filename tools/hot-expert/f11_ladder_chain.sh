@@ -428,7 +428,18 @@ start_f11() {   # start_f11 <model> <ncmoe> <name> <alias>
   # above did. "fit" therefore passes none of them.
   local -a place
   if [ "$ncmoe" = fit ]; then
-    place=(--fit on --fit-print on --fit-target "$FIT_MARGIN_MIB" --fit-ctx "$F11_CTX")
+    # What fit will decide, printed by llama.cpp's own estimator (llama-fit-params; the
+    # --fit-print flag belongs to that tool only, NOT to llama-server -- 2026-09-22, two runs
+    # lost to it). Same image, devices free at this point, seconds, no server.
+    echo "--- llama-fit-params estimate for $label at ctx=$F11_CTX"
+    docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
+      --security-opt seccomp=unconfined --ipc=host \
+      -e "LD_LIBRARY_PATH=/opt/rocm/lib:${F11_BIN_DIR}" -v /home/ronald:/home/ronald \
+      "$F11_IMAGE" "${F11_BIN_DIR}/llama-fit-params" -m "$model" --fit-print on \
+      --fit-target "$FIT_MARGIN_MIB" --fit-ctx "$F11_CTX" --ctx-size "$F11_CTX" \
+      --split-mode layer --device ROCm0,ROCm1,ROCm2 -fa on -ctk q8_0 -ctv q8_0 \
+      2>&1 | grep -viE "^\s*$" | tail -40 | cut -c1-200 || true
+    place=(--fit on --fit-target "$FIT_MARGIN_MIB" --fit-ctx "$F11_CTX")
   else
     place=(-ngl 999 --n-cpu-moe "$ncmoe" --tensor-split 1,1,1)
   fi

@@ -91,7 +91,8 @@ conversation; the ledger logic is unchanged.
 3.5 **Pipeline bubbles (rev 2).** A layer-range pipeline is sequential per
 token; decode for ONE conversation has exactly one token in flight, so
 micro-batching across stages cannot hide a stalled stage (it helps only with
-concurrent slots, which this owner rarely has). The bubble is therefore the
+concurrent slots, which this owner rarely has, and in prefill, which is
+already batched). The bubble is therefore the
 slowest stage's miss cost, and the only levers are placement (fewer misses on
 any one stage), lookahead (§3.1) and the miss wave's own latency. M5 measures
 the boundary cost; the MVP ladder (§7) measures the bubble before anything

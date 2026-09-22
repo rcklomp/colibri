@@ -802,6 +802,7 @@ static void bench_p2p(int ndev) {
                 HIP_CHECK(hipSetDevice(j));
                 HIP_CHECK(hipMalloc(&d_dst_big, BIG));
                 hipEvent_t bstart, bend;
+                HIP_CHECK(hipSetDevice(i));   // events belong to the stream's device (was: created with j current -> invalid resource handle)
                 HIP_CHECK(hipEventCreate(&bstart));
                 HIP_CHECK(hipEventCreate(&bend));
                 std::vector<double> bw_times_us(10);

@@ -2,6 +2,7 @@
 
 #include "decode_model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -31,6 +32,7 @@ int fk_type_of(ggml_type t) {
         case GGML_TYPE_IQ4_NL: return FK_Q_IQ4_NL;
         case GGML_TYPE_IQ4_XS: return FK_Q_IQ4_XS;
         case GGML_TYPE_IQ3_S:  return FK_Q_IQ3_S;
+        case GGML_TYPE_Q6_K:   return FK_Q_Q6_K;
         default:
             throw std::runtime_error(std::string("unsupported tensor type for L0 step 2: ") +
                                      ggml_type_name(t));
@@ -93,8 +95,10 @@ const float * DecodeModel::place_f32(Backend & be, const std::string & name, int
     return (const float *) be.place(t->data, t->nbytes, name.c_str());
 }
 
-DecodeModel::DecodeModel(const std::string & path, Backend & be, int il0, int il1)
-    : il0_(il0), il1_(il1) {
+DecodeModel::DecodeModel(const std::string & path, std::vector<Backend *> devs,
+                         int il0, int il1, bool with_head)
+    : devs_(std::move(devs)), il0_(il0), il1_(il1) {
+    if (devs_.empty()) throw std::runtime_error("DecodeModel needs at least one backend");
     model_ = GgufModel::open(path);
     const HParams & h = model_->hparams();
 
@@ -144,10 +148,20 @@ DecodeModel::DecodeModel(const std::string & path, Backend & be, int il0, int il
         throw std::runtime_error("token_embd.weight is not [2560, n_vocab] Q8_0");
     }
 
-    layers_.resize(il1 - il0 + 1);
+    // Even split of the span across the devices: 48 layers over 3 cards is
+    // design 9.1's 0-15 / 16-31 / 32-47. The design calls the balance
+    // PROJECTED and says L0 measures and rebalances it, so this is the
+    // starting point, not a fixed law.
+    const int n_span = il1 - il0 + 1;
+    const int n_dev  = (int) devs_.size();
+    const int per_dev = (n_span + n_dev - 1) / n_dev;
+
+    layers_.resize(n_span);
     for (int il = il0; il <= il1; ++il) {
         LayerWeights & L = layers_[il - il0];
         const std::string p = "blk." + std::to_string(il) + ".";
+        L.dev = std::min(n_dev - 1, (il - il0) / per_dev);
+        Backend & be = *devs_[L.dev];
 
         L.il        = il;
         L.recurrent = is_recurrent_layer(il);
@@ -226,6 +240,22 @@ DecodeModel::DecodeModel(const std::string & path, Backend & be, int il0, int il
             L.ple_norm_conv  = place_f32(be, p + "ple_norm_conv.weight",  HC_DIM);
             L.ple_conv1d     = place_f32(be, p + "ple_conv1d.weight", (int64_t) PLE_CONV_K * HC_DIM);
         }
+    }
+
+    // The head lives with the last layer range. There is no separate output
+    // norm: build_hc_mix on output_hc_* IS it (qwen4exp.cpp:380-386), and it
+    // takes no inject, so only down/up are needed.
+    if (with_head) {
+        Backend & be = *devs_.back();
+        head_norm_ = place_f32(be, "output_hc_norm.weight", HC_DIM);
+        head_down_ = place_mat(be, "output_hc_down.weight", 1);
+        head_up_   = place_mat(be, "output_hc_up.weight",   1);
+        lm_head_   = place_mat(be, "output.weight",         1);
+        // n_vocab comes from the tokenizer array, which this loader does not
+        // parse, so token_embd's own row count is the reference.
+        if (lm_head_.K != N_EMBD || lm_head_.rows != tok_embd_->ne1())
+            throw std::runtime_error("output.weight is not [n_embd, n_vocab]");
+        have_head_ = true;
     }
 }
 

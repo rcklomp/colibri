@@ -101,6 +101,7 @@ enum GemvGroup {
     GG_QSA_PROJ,        // wq + wk + wv + indexer q/k
     GG_ATTN_OUT,
     GG_PLE,
+    GG_LM_HEAD,         // output.weight, Q6_K, 248 320 rows
     GG_N
 };
 const char * gemv_group_name(int g);
@@ -127,6 +128,24 @@ public:
     virtual void    upload(void * dst, const void * src, size_t bytes) = 0;
     virtual void    download(void * dst, const void * src, size_t bytes) = 0;
     virtual void    sync() = 0;
+
+    // -- device boundaries (step 3, design 9.1/9.2) -------------------------
+    //
+    // Everything the next layer range needs is the wide residual: the
+    // hyper-connection streams, hc_count * n_embd f32 = 40 KB. Nothing else
+    // survives a layer, so that is the whole boundary payload.
+    //
+    // `boundary_recv` is a method of the DESTINATION: it records an event on
+    // the source's stream, makes its own stream wait on it, and issues the
+    // peer copy on its own stream. No host call is involved, so a boundary
+    // costs the ~30 us of P2P that M5 measured and nothing else.
+    virtual int  device() const { return -1; }
+    virtual void boundary_recv(void * dst, Backend & src, const void * src_ptr,
+                               size_t bytes) = 0;
+    // Greedy sampling on the device: a reduction over the 248 320 logits, so
+    // the only thing that crosses to the host per token is one int.
+    virtual void argmax(const float * logits, int n, int * out_id) = 0;
+    virtual void vram_report(FILE * out, const char * tag) { (void) out; (void) tag; }
 
     // Make a host (mmap) tensor readable by this backend's kernels. CpuBackend
     // returns the pointer unchanged (nothing is copied, nothing is paged in
@@ -241,15 +260,29 @@ public:
     virtual void kv_store_q8_0(const float * k, const float * v,
                                int8_t * kqs, uint16_t * ksc,
                                int8_t * vqs, uint16_t * vsc, int cell) = 0;
-    virtual void idx_raw_store(const float * k_raw, float * raw_cache, int cell) = 0;
+    virtual bool verify_placement(FILE *) { return true; }
     // Mean-pool cells [blk*r, blk*r+r) (missing slots read cell 0, as
     // set_input_qsa's zero-filled blk_cells does), rms-norm with k_norm,
     // IMRoPE at position blk*r, store bf16 into the pooled cache.
+    // Mean-pool the block this token joined, norm, IMRoPE at the block's
+    // first position, store bf16.
+    //
+    // It used to keep every token's RAW indexer key in f32 to re-pool from --
+    // 512 B a token a layer, EIGHT TIMES the 64 B design 9.1 budgets for the
+    // pooled bf16 key, and 134 MB a layer at 256k. It does not need them: a
+    // block's members arrive in order, so a running SUM plus cell 0's key (the
+    // value set_input_qsa's zero-filled blk_cells gives every unset slot) is
+    // all the reference's formula reads:
+    //
+    //   pooled = (sum_of_members_so_far + (r - n_filled) * key_of_cell_0) / r
+    //
+    // `sum` and `raw0` are IDX_DIM floats a layer, not a cache.
     // `dbg_pooled` / `dbg_roped` receive this block's value before and after
-    // the norm+rotation, which are the reference's `indexer_k_pooled` and
-    // `indexer_k` taps; pass nullptr to skip them.
-    virtual void idx_pool_block(const float * raw_cache, int blk, int n_filled,
-                                const float * k_norm, float eps, uint16_t * pooled,
+    // the norm+rotation -- the reference's `indexer_k_pooled` and `indexer_k`
+    // taps, both of which are incomparable across cache depths anyway.
+    virtual void idx_pool_block(const float * k_new, float * sum, float * raw0,
+                                int blk, int n_filled, const float * k_norm,
+                                float eps, uint16_t * pooled,
                                 float * dbg_pooled, float * dbg_roped) = 0;
     virtual void idx_scan(const uint16_t * pooled, const float * q, float * scores, int n_blocks) = 0;
     // cell_scores[j] = (j <= q_pos) ? blk_scores[j/r] + bias(j/r) : -inf, with
@@ -316,6 +349,11 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
+    // --sync-debug: drain and check after every launch and copy, so the op
+    // named in a fault message is the one that faulted rather than whichever
+    // launch was in flight when the queue drained.
+    virtual void set_sync_debug(bool) {}
+    virtual void set_debug_context(const char * phase, int layer) { (void) phase; (void) layer; }
     virtual void prof_reset() {}
     virtual void prof_end_token() {}
     virtual void prof_report(FILE * out, int n_tokens) { (void) out; (void) n_tokens; }
@@ -323,5 +361,7 @@ public:
 
 Backend * make_cpu_backend(int n_threads);
 Backend * make_gpu_backend(int device);
+// Must run before anything is placed; a no-op in the CPU-only build.
+void enable_peer_access(int n_devices);
 
 } // namespace fk

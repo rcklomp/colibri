@@ -76,17 +76,35 @@ struct DecodeConfig {
     // raw cosine bar cannot: how far apart do two EQUALLY CORRECT summation
     // orders of this architecture end up? Off by default.
     float jitter  = 0.0f;
+    // read the routed ids back after the body even without --verbose (the
+    // routing oracle needs them; it is one download a device a token)
+    bool  log_routing = false;
+    bool  sync_debug   = false;
+    // print a line per layer range on the first token, so an abort says how
+    // far it got (stdout is line-buffered by main for the same reason)
+    bool  progress     = true;
 };
 
+// Step 3: one runner over all the devices the model was placed on. Every
+// scratch buffer exists ONCE PER DEVICE (a layer may not read another card's
+// memory), and `bind()` swaps the active set at a layer. The only thing that
+// actually crosses a boundary is the hyper-connection residual.
 class DecodeRunner {
 public:
-    DecodeRunner(Backend & be, DecodeModel & model, const DecodeConfig & cfg);
+    DecodeRunner(DecodeModel & model, const DecodeConfig & cfg);
     ~DecodeRunner();
 
     // Feeds one token at position `pos` (which must be the next position).
     // `ple_emb` is the host-side PLE gather for this token (N_EMBD floats),
     // or nullptr if the layer range does not include the PLE layer.
-    void step(int32_t token, const float * ple_emb, Recorder & rec);
+    // With a head placed, returns the greedy id; otherwise -1.
+    int  step(int32_t token, const float * ple_emb, Recorder & rec);
+
+    // The last step's logits, on the host (only with a head placed).
+    std::vector<float> logits_host();
+
+    // Per-layer routed expert ids of the last step, [n_layers][N_EXPERT_USED].
+    const std::vector<int> & routed_ids() const { return routed_ids_; }
 
     // The wide residual after the last layer of the range, on the host.
     std::vector<float> residual_host();
@@ -95,6 +113,10 @@ public:
 
     // Wall/GPU time of the last step's layer body, milliseconds.
     double last_body_ms() const { return last_body_ms_; }
+
+    // Bytes of QSA cache this device holds, and the per-token rate, so the
+    // sizing is a printed number rather than a belief (`kv_bytes_dev<i>=`).
+    void report_cache_bytes(FILE * out) const;
 
 private:
     struct LayerState {
@@ -105,7 +127,12 @@ private:
         uint16_t * ksc        = nullptr;
         int8_t *   vqs        = nullptr;
         uint16_t * vsc        = nullptr;
-        float *    idx_raw    = nullptr;  // [ctx][IDX_DIM] raw indexer keys
+        // No raw-key cache: a running sum plus cell 0's key is all the
+        // reference's pooling formula reads (decode_backend.h), so the
+        // indexer costs the 64 B a token design 9.1 budgets, not 576.
+        float *    idx_new    = nullptr;  // [IDX_DIM] this token's key
+        float *    idx_sum    = nullptr;  // [IDX_DIM] members of the current block
+        float *    idx_raw0   = nullptr;  // [IDX_DIM] cell 0's key, the fill value
         uint16_t * idx_pooled = nullptr;  // [ctx/ratio][IDX_DIM] bf16 pooled keys
     };
 
@@ -119,7 +146,36 @@ private:
     void layer_ffn(const LayerWeights & L, int il, Recorder & rec);
     void jitter(float * buf, size_t n);
 
-    Backend &     be_;
+    // One set of scratch per device; `bind()` points the active members at
+    // one of them. The body code below is written against the active set and
+    // never has to know which card it is on.
+    struct Scratch {
+        float *x, *res_hc, *xn, *lo, *hgate, *mixed, *inject, *blk;
+        float *z, *conv, *qkn, *alpha, *beta, *gexp, *abuf, *bsig, *gate_raw, *gdn, *gnorm;
+        float *qfull, *qcur, *gate, *gsig, *kcur, *vcur, *kqv, *kqvg, *kraw, *idxraw;
+        float *idxq, *blkscore, *cellscore, *pool_raw, *pool_rope;
+        int   *sel;
+        float *logits, *wts, *ygate, *yup, *hmoe, *eo, *moeout;
+        float *shg, *shu, *shh, *shout, *shgated, *shgate, *shgsig;
+        float *plek, *plev, *pleq, *plegated, *plegate, *plenorm, *pleconv, *pleemb, *ple_ring;
+        int   *ids, *ids_log;
+        float *wts_log;
+    };
+    void bind(int dev);
+
+    std::vector<Scratch> pool_;
+    int                  cur_dev_ = -1;
+    Backend *            bep_ = nullptr;
+
+    // head scratch, on the last device only
+    float * head_xn_   = nullptr;
+    float * head_lo_   = nullptr;
+    float * head_gate_ = nullptr;
+    float * head_out_  = nullptr;
+    float * logits_all_ = nullptr;
+    int   * greedy_id_  = nullptr;
+    std::vector<int> routed_ids_;
+
     DecodeModel & model_;
     DecodeConfig  cfg_;
     float         eps_;
@@ -134,12 +190,12 @@ private:
     float * ple_ring_ = nullptr;
     int     ple_head_ = 0;
 
-    // scratch (all backend buffers)
+    // the ACTIVE scratch set, rebound by bind() at every layer
     float *x_, *res_hc_, *xn_, *lo_, *hgate_, *mixed_, *inject_, *blk_;
-    float *qkv_, *z_, *conv_, *qkn_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *bsig_, *gate_raw_, *gdn_, *gnorm_;
+    float *z_, *conv_, *qkn_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *bsig_, *gate_raw_, *gdn_, *gnorm_;
     float *qfull_, *qcur_, *gate_, *gsig_, *kcur_, *vcur_, *kqv_, *kqvg_;
     float *kraw_, *idxraw_;
-    float *idxq_, *idxk_, *blkscore_, *cellscore_, *pool_raw_, *pool_rope_;
+    float *idxq_, *blkscore_, *cellscore_, *pool_raw_, *pool_rope_;
     int   *sel_;
     float *logits_, *wts_, *ygate_, *yup_, *hmoe_, *eo_, *moeout_;
     float *shg_, *shu_, *shh_, *shout_, *shgated_, *shgate_, *shgsig_;

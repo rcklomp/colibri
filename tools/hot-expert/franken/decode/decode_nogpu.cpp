@@ -12,6 +12,8 @@
 
 namespace fk {
 
+void enable_peer_access(int) {}
+
 Backend * make_gpu_backend(int) {
     throw std::runtime_error(
         "this binary was built without HIP (franken_decode_cpu); use franken_decode for device 0");

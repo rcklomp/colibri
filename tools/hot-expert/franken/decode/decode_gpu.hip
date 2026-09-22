@@ -205,6 +205,7 @@ struct GemvBatchD {
     int K;
     int total_rows;
     int x_mode;
+    int has_q6k;
 };
 
 __device__ __forceinline__ float apply_epi(float v, int epi, float arg) {
@@ -236,10 +237,13 @@ void k_gemv_batch(GemvBatchD b, const float * __restrict__ x,
     const int grow = blockIdx.x * GEMV_WAVES + wave;   // concatenated row index
 
     // Element range of this split, in units of 32 so every lane stays in step.
+    // Q6_K super-blocks are 256 weights, so a batch containing one splits on
+    // 256-element boundaries; everything else splits on 32.
+    const int gran = (b.has_q6k ? 256 : WAVE);
     int c0, c1;
-    split_range((b.K + WAVE - 1) / WAVE, nsplit, blockIdx.y, &c0, &c1);
-    const int e0 = c0 * WAVE;
-    const int e1 = min(b.K, c1 * WAVE);
+    split_range((b.K + gran - 1) / gran, nsplit, blockIdx.y, &c0, &c1);
+    const int e0 = c0 * gran;
+    const int e1 = min(b.K, c1 * gran);
 
     const float * xs = x + e0;
     if (stage_x) {
@@ -271,6 +275,21 @@ void k_gemv_batch(GemvBatchD b, const float * __restrict__ x,
         for (; bl < bend; ++bl)
             a0 += fk_q8_0_lane_dot(rp + (size_t) bl * FK_Q8_0_BLOCK_BYTES, xs + (bl << 5) - e0, lane);
         acc = (a0 + a1) + (a2 + a3);
+    } else if (d.type == FK_Q_Q6_K) {
+        const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
+        int bl = e0 >> 8, bend = e1 >> 8;          // 256 weights a super-block
+        const int xoff = lane << 3;
+        float a0 = 0.0f, a1 = 0.0f;
+        for (; bl + 1 < bend; bl += 2) {
+            a0 += fk_q6k_block_dot(rp + (size_t)(bl+0) * FK_Q6K_BLOCK_BYTES,
+                                   xs + ((bl+0) << 8) - e0 + xoff, lane);
+            a1 += fk_q6k_block_dot(rp + (size_t)(bl+1) * FK_Q6K_BLOCK_BYTES,
+                                   xs + ((bl+1) << 8) - e0 + xoff, lane);
+        }
+        for (; bl < bend; ++bl)
+            a0 += fk_q6k_block_dot(rp + (size_t) bl * FK_Q6K_BLOCK_BYTES,
+                                   xs + (bl << 8) - e0 + xoff, lane);
+        acc = a0 + a1;
     } else if (d.type == FK_Q_BF16) {
         const unsigned short * rp = (const unsigned short *) d.base + (size_t) row * d.row_stride;
         for (int i = e0 + lane; i < e1; i += WAVE)
@@ -923,18 +942,14 @@ __global__ void k_kv_store_q8_0(const float * __restrict__ k, const float * __re
     else       { kqs[e] = (int8_t) q; if (lane == 0) ksc[sb] = sc; }
 }
 
-__global__ void k_idx_raw_store(const float * __restrict__ kr, float * __restrict__ raw, int cell) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < IDX_DIM) raw[(size_t) cell * IDX_DIM + i] = kr[i];
-}
-
-// One workgroup of IDX_DIM threads: mean-pool the block's members, rms-norm
-// with index_k_norm, IMRoPE at the block's first token position, store bf16.
-// Missing members read cell 0 -- set_input_qsa zero-fills blk_cells
-// (llama-memory-hybrid-idx.cpp:395) and never revisits an incomplete block's
-// pooled value, because the tail block's +1e9 bias selects it regardless.
+// One workgroup of IDX_DIM threads. A block's members arrive in order, so a
+// running SUM plus cell 0's key reproduces set_input_qsa's formula exactly --
+// unset slots read cell 0 (llama-memory-hybrid-idx.cpp:395) -- without keeping
+// every token's raw key. That f32 cache was 512 B a token a layer, eight times
+// what design 9.1 budgets for the pooled bf16 key and 134 MB a layer at 256k.
 __global__ __launch_bounds__(IDX_DIM)
-void k_idx_pool_block(const float * __restrict__ raw, int blk, int n_filled,
+void k_idx_pool_block(const float * __restrict__ k_new, float * __restrict__ sum,
+                      float * __restrict__ raw0, int blk, int n_filled,
                       const float * __restrict__ k_norm, float eps,
                       unsigned short * __restrict__ pooled,
                       float * __restrict__ dbg_pooled, float * __restrict__ dbg_roped) {
@@ -942,12 +957,11 @@ void k_idx_pool_block(const float * __restrict__ raw, int blk, int n_filled,
     __shared__ float s_r[IDX_DIM];
     const int i = threadIdx.x;
 
-    float p = 0.0f;
-    for (int m = 0; m < QSA_RATIO; ++m) {
-        const int cell = (m < n_filled) ? blk * QSA_RATIO + m : 0;
-        p += raw[(size_t) cell * IDX_DIM + i];
-    }
-    p *= 1.0f / (float) QSA_RATIO;
+    const float kv = k_new[i];
+    if (blk == 0 && n_filled == 1) raw0[i] = kv;      // cell 0 is the fill value
+    const float s = (n_filled == 1) ? kv : sum[i] + kv;
+    sum[i] = s;
+    float p = (s + (float)(QSA_RATIO - n_filled) * raw0[i]) * (1.0f / (float) QSA_RATIO);
     if (dbg_pooled) dbg_pooled[i] = p;
 
     s_v[i] = p * p;
@@ -1315,9 +1329,76 @@ void k_attn_combine(const float * __restrict__ partial, const float * __restrict
     out_gated[(size_t) h * HEAD_DIM + d] = v * gsig[(size_t) h * HEAD_DIM + d];
 }
 
+// Greedy sampling on the device. Two stages so the 248 320 logits are read
+// once by a full grid: each workgroup reduces its slice to one (value, index)
+// pair, then one workgroup reduces those. Ties go to the LOWEST index, which
+// is what a scan of ggml's logits with `>` does.
+#define ARGMAX_THREADS 256
+#define ARGMAX_BLOCKS  256
+
+__device__ __forceinline__ void argmax_reduce(float * sv, int * si, int t, int n) {
+    for (int stride = n / 2; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            const bool better = sv[t + stride] > sv[t] ||
+                                (sv[t + stride] == sv[t] && si[t + stride] < si[t]);
+            if (better) { sv[t] = sv[t + stride]; si[t] = si[t + stride]; }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ __launch_bounds__(ARGMAX_THREADS)
+void k_argmax_partial(const float * __restrict__ x, int n,
+                      float * __restrict__ pv, int * __restrict__ pi) {
+    __shared__ float sv[ARGMAX_THREADS];
+    __shared__ int   si[ARGMAX_THREADS];
+    const int t = threadIdx.x;
+    float best = -INFINITY; int bi = 0;
+    for (int i = blockIdx.x * ARGMAX_THREADS + t; i < n; i += ARGMAX_BLOCKS * ARGMAX_THREADS) {
+        const float v = x[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    sv[t] = best; si[t] = bi;
+    __syncthreads();
+    argmax_reduce(sv, si, t, ARGMAX_THREADS);
+    if (t == 0) { pv[blockIdx.x] = sv[0]; pi[blockIdx.x] = si[0]; }
+}
+
+__global__ __launch_bounds__(ARGMAX_BLOCKS)
+void k_argmax_final(const float * __restrict__ pv, const int * __restrict__ pi,
+                    int * __restrict__ out) {
+    __shared__ float sv[ARGMAX_BLOCKS];
+    __shared__ int   si[ARGMAX_BLOCKS];
+    const int t = threadIdx.x;
+    sv[t] = pv[t]; si[t] = pi[t];
+    __syncthreads();
+    argmax_reduce(sv, si, t, ARGMAX_BLOCKS);
+    if (t == 0) out[0] = si[0];
+}
+
 // ========================================================== backend ======
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
+
+// THE STEP-3 CRASH, and why it looked like a cache-sizing bug.
+//
+// hipMalloc, hipMemcpy and a kernel launch all act on the CURRENT device, and
+// the current device is process-wide state -- not something a stream carries.
+// GpuBackend set it once in its constructor, so after `make_gpu_backend(0..2)`
+// the current device was 2 and EVERY later allocation went there, whichever
+// backend was asked. Placement then filled one card with all 48 layers and
+// died at layer 18: 24 GB / ~1.34 GB a layer is 17.9. Step 2 never saw it
+// because with one backend the constructor's hipSetDevice was also the right
+// one for everything after it.
+//
+// So every entry point that allocates, copies or launches now ensures its own
+// device first. The check is a compare against a process-global, so the cost
+// is one predictable branch on the ~1 160 launches a token that do not switch.
+inline int & cur_device_slot() { static int d = -1; return d; }
+inline void dev_ensure(int d) {
+    int & cur = cur_device_slot();
+    if (cur != d) { HIP_CHECK(hipSetDevice(d)); cur = d; }
+}
 
 // A reduction workgroup wide enough to walk ne0 in a few steps, capped at the
 // hardware maximum; the LDS is sized to match.
@@ -1345,6 +1426,8 @@ enum ProfClass {
     PC_EXP_DOWN,
     PC_EXP_COMBINE,
     PC_COPY,        // device-to-device copies
+    PC_BOUNDARY,    // the hyper-connection residual crossing to the next card
+    PC_ARGMAX,      // greedy sampling on the device
     PC_N
 };
 const char * prof_name(int c) {
@@ -1358,6 +1441,9 @@ const char * prof_name(int c) {
         case PC_EXP_GATE_UP:  return "expert_gate_up";
         case PC_EXP_DOWN:     return "expert_down";
         case PC_EXP_COMBINE:  return "expert_combine";
+        case PC_COPY:         return "copy";
+        case PC_BOUNDARY:     return "boundary_p2p";
+        case PC_ARGMAX:       return "argmax";
         default:              return "copy";
     }
 }
@@ -1365,8 +1451,12 @@ constexpr int PROF_MAX_EVENTS = 8192;
 
 class GpuBackend : public Backend {
 public:
-    explicit GpuBackend(int dev) {
+    explicit GpuBackend(int dev) : dev_(dev) {
         HIP_CHECK(hipSetDevice(dev));
+        cur_device_slot() = dev;   // keep dev_ensure's tracker true: a raw hipSetDevice left it stale,
+                                   // so dev_ensure(0) did nothing and set_profile made device-0 events on device 2
+        HIP_CHECK(hipStreamCreate(&stream_));
+        std::snprintf(name_, sizeof(name_), "gpu(device %d)", dev_);
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_iq3s_grid),  iq3s_grid,      sizeof(uint32_t) * 512));
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_kvals_iq4nl), kvalues_iq4nl, sizeof(int8_t) * 16));
         HIP_CHECK(hipEventCreate(&ev0_));
@@ -1383,54 +1473,133 @@ public:
         HIP_CHECK(hipMalloc(&mbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
         HIP_CHECK(hipMalloc(&lbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
         HIP_CHECK(hipMalloc(&gemv_part_, GEMV_PART_FLOATS * sizeof(float)));
+        HIP_CHECK(hipMalloc(&amax_v_, ARGMAX_BLOCKS * sizeof(float)));
+        HIP_CHECK(hipMalloc(&amax_i_, ARGMAX_BLOCKS * sizeof(int)));
+        HIP_CHECK(hipEventCreateWithFlags(&bnd_, hipEventDisableTiming));
         // the candidate lists are sized by the CACHE depth, not the budget,
         // and grown on demand by topk_select()
     }
     ~GpuBackend() override {
+        dev_ensure(dev_);
         HIP_IGNORE(hipFree(partial_)); HIP_IGNORE(hipFree(mbuf_)); HIP_IGNORE(hipFree(lbuf_));
         HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
         HIP_IGNORE(hipFree(gemv_part_));
         for (int i = 0; i < STAGE_SLOTS; ++i) if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+        HIP_IGNORE(hipFree(amax_v_)); HIP_IGNORE(hipFree(amax_i_));
+        HIP_IGNORE(hipEventDestroy(bnd_)); HIP_IGNORE(hipStreamDestroy(stream_));
         for (auto & e : ev_) HIP_IGNORE(hipEventDestroy(e));
         HIP_IGNORE(hipEventDestroy(ev0_)); HIP_IGNORE(hipEventDestroy(ev1_));
     }
 
-    const char * name() const override { return "gpu(device 0)"; }
+    const char * name() const override { return name_; }
+    int device() const override { return dev_; }
+
+    // The destination records nothing of its own: it waits on an event the
+    // SOURCE stream recorded, then pulls the bytes on its own stream. No host
+    // call, so a boundary costs the P2P time M5 measured and nothing else.
+    void boundary_recv(void * dst, Backend & src, const void * src_ptr, size_t bytes) override {
+        GpuBackend & s = static_cast<GpuBackend &>(src);
+        // The event belongs to the SOURCE's device, so record it with that
+        // device current; the wait and the copy belong to the destination.
+        dev_ensure(s.dev_);
+        s.debug_check("boundary source drain");
+        HIP_CHECK(hipEventRecord(s.bnd_, s.stream_));
+        mark(PC_BOUNDARY);                 // ensures THIS device
+        last_op_ = "boundary_recv";
+        if (sync_debug_) {
+            std::fprintf(stderr, "sync-debug boundary: dev%d[%p .. %p) <- dev%d[%p .. %p) %zu B\n",
+                         dev_, dst, (const void *)((const char *) dst + bytes),
+                         s.dev_, src_ptr, (const void *)((const char *) src_ptr + bytes), bytes);
+        }
+        HIP_CHECK(hipStreamWaitEvent(stream_, s.bnd_, 0));
+        HIP_CHECK(hipMemcpyPeerAsync(dst, dev_, src_ptr, s.dev_, bytes, stream_));
+    }
+
+    void argmax(const float * logits, int n, int * out_id) override {
+        mark(PC_ARGMAX);
+        last_op_ = "argmax";
+        k_argmax_partial<<<ARGMAX_BLOCKS, ARGMAX_THREADS, 0, stream_>>>(logits, n, amax_v_, amax_i_);
+        ++launches_;
+        k_argmax_final<<<1, ARGMAX_BLOCKS, 0, stream_>>>(amax_v_, amax_i_, out_id);
+    }
+
+    void vram_report(FILE * out, const char * tag) override {
+        size_t freeb = 0, totalb = 0;
+        dev_ensure(dev_);
+        HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
+        std::fprintf(out, "vram_dev%d_used_gb=%.2f free_gb=%.2f total_gb=%.2f placed_gb=%.2f  (%s)\n",
+                     dev_, (totalb - freeb) / 1e9, freeb / 1e9, totalb / 1e9,
+                     placed_ / 1e9, tag);
+    }
+
+    // Fails EARLY and loudly when a device holds far less than it was asked to
+    // place -- the signature of the bug above, where every card but one came
+    // out near-empty and the run died a dozen layers later with a message
+    // about the wrong thing.
+    bool verify_placement(FILE * out) override {
+        size_t freeb = 0, totalb = 0;
+        dev_ensure(dev_);
+        HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
+        const double used = (totalb - freeb) / 1e9, want = placed_ / 1e9;
+        if (want > 1.0 && used < want * 0.8) {
+            std::fprintf(out, "PLACEMENT ERROR dev%d: %.2f GB was placed here but the card "
+                              "reports only %.2f GB used -- the allocations went to another "
+                              "device (check hipSetDevice before hipMalloc)\n",
+                         dev_, want, used);
+            return false;
+        }
+        return true;
+    }
     bool is_gpu() const override { return true; }
 
     float * alloc_f32(size_t n) override { return (float *) alloc_raw(n * sizeof(float)); }
     int *   alloc_i32(size_t n) override { return (int   *) alloc_raw(n * sizeof(int)); }
     void *  alloc_raw(size_t b) override {
+        dev_ensure(dev_);
         void * p = nullptr;
         if (b == 0) b = 4;
         HIP_CHECK(hipMalloc(&p, b));
         HIP_CHECK(hipMemset(p, 0, b));
         return p;
     }
-    void free_buf(void * p) override { HIP_IGNORE(hipFree(p)); }
+    void free_buf(void * p) override { dev_ensure(dev_); HIP_IGNORE(hipFree(p)); }
     void upload(void * d, const void * s, size_t b) override {
+        dev_ensure(dev_);
         if (b <= STAGE_BYTES) {
             void * st = stage_[stage_next_];
             stage_next_ = (stage_next_ + 1) % STAGE_SLOTS;
             std::memcpy(st, s, b);
-            HIP_CHECK(hipMemcpyAsync(d, st, b, hipMemcpyHostToDevice, 0));
+            HIP_CHECK(hipMemcpyAsync(d, st, b, hipMemcpyHostToDevice, stream_));
             return;                        // stream-ordered, does NOT block the host
         }
         ++blocking_;
         HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyHostToDevice));
     }
     void download(void * d, const void * s, size_t b) override {
+        dev_ensure(dev_);
+        debug_check("download()");
         ++blocking_;                       // the host reads it: this always blocks
+        HIP_CHECK(hipStreamSynchronize(stream_));
         HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyDeviceToHost));
     }
-    void sync() override { ++blocking_; HIP_CHECK(hipDeviceSynchronize()); }
+    void sync() override {
+        dev_ensure(dev_);
+        debug_check("sync()");
+        ++blocking_;
+        HIP_CHECK(hipStreamSynchronize(stream_));
+    }
 
     const void * place(const void * host, size_t bytes, const char * what) override {
+        dev_ensure(dev_);                  // or the bytes land on another card
         void * p = nullptr;
         const hipError_t e = hipMalloc(&p, bytes);
         if (e != hipSuccess) {
-            std::fprintf(stderr, "out of VRAM placing %s (%.2f MB): %s\n",
-                         what, bytes / 1e6, hipGetErrorString(e));
+            size_t fb = 0, tb = 0;
+            HIP_IGNORE(hipMemGetInfo(&fb, &tb));
+            std::fprintf(stderr, "out of VRAM placing %s (%.2f MB) on device %d: %s\n"
+                                 "  this card: %.2f GB free of %.2f GB, %.2f GB placed here so far\n",
+                         what, bytes / 1e6, dev_, hipGetErrorString(e),
+                         fb / 1e9, tb / 1e9, placed_ / 1e9);
             std::abort();
         }
         HIP_CHECK(hipMemcpy(p, host, bytes, hipMemcpyHostToDevice));
@@ -1454,13 +1623,24 @@ public:
         b.x_mode = x_mode;
         size_t bytes = 0;
         int off = 0;
+        b.has_q6k = 0;
         for (int i = 0; i < b.n; ++i) {
             const Mat & W = *jobs[i].W;
             if ((int) W.K != b.K) { std::fprintf(stderr, "gemv_batch: %s has a different K\n", W.name); std::abort(); }
             b.d[i].base       = W.base;
             b.d[i].out        = jobs[i].out;
-            b.d[i].row_stride = (W.type == FK_Q_Q8_0) ? W.row_bytes : (size_t) W.K;
+            // A QUANTISED row is addressed in BYTES, an f32/bf16 row in
+            // ELEMENTS -- see the two pointer casts in k_gemv_batch. This
+            // used to test only for Q8_0, which was accidentally right while
+            // Q8_0, BF16 and F32 were the only formats a batch ever saw.
+            // Q6_K (lm_head) broke it: its rows are 2 100 B but W.K is 2 560,
+            // so every row past 203 700 of 248 320 addressed beyond the
+            // 521 MB allocation, up to 114 MB past its end -- the "page not
+            // present" fault on the card that holds lm_head.
+            b.d[i].row_stride = (W.type == FK_Q_F32 || W.type == FK_Q_BF16)
+                              ? (size_t) W.K : W.row_bytes;
             b.d[i].type       = W.type;
+            if (W.type == FK_Q_Q6_K) b.has_q6k = 1;
             b.d[i].rows       = (int) W.rows;
             b.d[i].row_off    = off;
             b.d[i].epi        = jobs[i].epi;
@@ -1473,7 +1653,8 @@ public:
         // total waves == total rows, so wider workgroups never add
         // parallelism; splitting K is the only thing that does.
         const int row_groups = ceil_div(b.total_rows, GEMV_WAVES);
-        const int units = ceil_div(b.K, WAVE);
+        const int gran  = b.has_q6k ? 256 : WAVE;
+        const int units = ceil_div(b.K, gran);
         // total waves == total rows, so the test is on ROWS: a matrix with
         // enough rows already fills the card and a split would only add a
         // reduce launch.
@@ -1482,19 +1663,27 @@ public:
         if (nsplit < 1) nsplit = 1;
         while (nsplit > 1 && (size_t) nsplit * b.total_rows > GEMV_PART_FLOATS) nsplit >>= 1;
 
-        const int slice = ceil_div(units, nsplit) * WAVE;
+        // `units` counts granules, so the slice is granules * gran -- not
+        // * WAVE, which under-sized the LDS 8x for a Q6_K batch and let the
+        // staging loop write past the allocation.
+        const int slice = ceil_div(units, nsplit) * gran;
         const int stage = (gemv_lds_ && slice <= GEMV_LDS_MAX_FLOATS) ? 1 : 0;
         const size_t lds = stage ? (size_t) slice * sizeof(float) : 0;
 
         mark(PC_TRUNK, group, bytes);
-        k_gemv_batch<<<dim3((unsigned) row_groups, (unsigned) nsplit), GEMV_THREADS, lds>>>(
+        last_op_ = "gemv_batch";
+        k_gemv_batch<<<dim3((unsigned) row_groups, (unsigned) nsplit), GEMV_THREADS, lds, stream_>>>(
             b, x, x2, nsplit, gemv_part_, stage);
         if (nsplit > 1) {
             ++launches_;
-            k_reduce_splits_batch<<<ceil_div(b.total_rows, BLK), BLK>>>(b, gemv_part_, nsplit);
+            k_reduce_splits_batch<<<ceil_div(b.total_rows, BLK), BLK, 0, stream_>>>(b, gemv_part_, nsplit);
         }
     }
     void set_gemv_lds(int on) override { gemv_lds_ = on; }
+    void set_sync_debug(bool on) override { sync_debug_ = on; }
+    void set_debug_context(const char * phase, int layer) override {
+        dbg_phase_ = phase; dbg_layer_ = layer;
+    }
     void set_gemv_min_rows(int r) override { gemv_min_rows_ = r > 0 ? r : 1; }
     void gemv_expert(const Mat & W, int e, const float * x, float * y) override {
         Mat slice = W;
@@ -1505,53 +1694,64 @@ public:
 
     void copy(float * d, const float * s, size_t n) override {
         mark(PC_COPY);
+        last_op_ = "copy";
         HIP_CHECK(hipMemcpyAsync(d, s, n * sizeof(float), hipMemcpyDeviceToDevice, 0));
     }
     void unary(int op, const float * x, float * y, size_t n) override {
         mark(PC_ELEM);
-        k_unary<<<ceil_div((int) n, BLK), BLK>>>(op, x, y, (int) n);
+        last_op_ = "unary";
+        k_unary<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(op, x, y, (int) n);
     }
     void binary(int op, const float * a, const float * b, float * y, size_t n) override {
         mark(PC_ELEM);
-        k_binary<<<ceil_div((int) n, BLK), BLK>>>(op, a, b, y, (int) n);
+        last_op_ = "binary";
+        k_binary<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(op, a, b, y, (int) n);
     }
     void scale(const float * x, float s, float * y, size_t n) override {
         mark(PC_ELEM);
-        k_scale<<<ceil_div((int) n, BLK), BLK>>>(x, s, y, (int) n);
+        last_op_ = "scale";
+        k_scale<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(x, s, y, (int) n);
     }
     void binary3_add(const float * a, const float * b, const float * c,
                      float * y, size_t n) override {
         mark(PC_ELEM);
-        k_binary3_add<<<ceil_div((int) n, BLK), BLK>>>(a, b, c, y, (int) n);
+        last_op_ = "binary3_add";
+        k_binary3_add<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(a, b, c, y, (int) n);
     }
     void mul_tiled(const float * x, const float * w, float * y, size_t n, size_t ne0_w) override {
         mark(PC_ELEM);
-        k_mul_tiled<<<ceil_div((int) n, BLK), BLK>>>(x, w, y, (int) n, (int) ne0_w);
+        last_op_ = "mul_tiled";
+        k_mul_tiled<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(x, w, y, (int) n, (int) ne0_w);
     }
     void gather_strided(const float * src, float * dst, int n_rows, int row_len,
                         int src_stride, int src_off) override {
         mark(PC_ELEM);
-        k_gather_strided<<<ceil_div(n_rows * row_len, BLK), BLK>>>(src, dst, n_rows, row_len, src_stride, src_off);
+        last_op_ = "gather_strided";
+        k_gather_strided<<<ceil_div(n_rows * row_len, BLK), BLK, 0, stream_>>>(src, dst, n_rows, row_len, src_stride, src_off);
     }
     void rms_norm_mul(const float * x, const float * w, float * y,
                       int ne0, int n_groups, size_t w_len, float eps) override {
         mark(PC_NORM);
+        last_op_ = "rms_norm_mul";
         const int t = red_threads(ne0);
-        k_rms_norm_mul<<<n_groups, t, t * sizeof(float)>>>(x, w, y, ne0, eps,
+        k_rms_norm_mul<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, y, ne0, eps,
                                           w_len == (size_t) ne0 ? 1 : 0, w ? 1 : 0);
     }
     void l2_norm(const float * x, float * y, int ne0, int n_groups, float eps) override {
         mark(PC_NORM);
+        last_op_ = "l2_norm";
         const int t = red_threads(ne0);
-        k_l2_norm<<<n_groups, t, t * sizeof(float)>>>(x, y, ne0, eps);
+        k_l2_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, y, ne0, eps);
     }
     void hc_broadcast(const float * x, float * r) override {
         mark(PC_ELEM);
-        k_hc_broadcast<<<ceil_div(N_EMBD, BLK), BLK>>>(x, r);
+        last_op_ = "hc_broadcast";
+        k_hc_broadcast<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(x, r);
     }
     void hc_collapse(const float * xn, const float * g, float * o) override {
         mark(PC_ELEM);
-        k_hc_collapse<<<ceil_div(N_EMBD, BLK), BLK>>>(xn, g, o);
+        last_op_ = "hc_collapse";
+        k_hc_collapse<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(xn, g, o);
     }
     void hc_combine(float * r, const float * b, const float * inj) override {
         hc_combine_norm(r, b, inj, nullptr, nullptr, 0.0f);
@@ -1559,17 +1759,20 @@ public:
     void hc_combine_norm(float * r, const float * b, const float * inj,
                          const float * w_norm, float * xn, float eps) override {
         mark(PC_ELEM);
+        last_op_ = "hc_combine_norm";
         const int t = red_threads(N_EMBD);
-        k_hc_combine_norm<<<HC, t, t * sizeof(float)>>>(r, b, inj, w_norm, xn, eps);
+        k_hc_combine_norm<<<HC, t, t * sizeof(float), stream_>>>(r, b, inj, w_norm, xn, eps);
     }
     void ple_gate(const float * k, const float * q, const float * v, float * g, float * go) override {
         mark(PC_ELEM);
+        last_op_ = "ple_gate";
         const int t = red_threads(N_EMBD);
-        k_ple_gate<<<HC, t, t * sizeof(float)>>>(k, q, v, g, go);
+        k_ple_gate<<<HC, t, t * sizeof(float), stream_>>>(k, q, v, g, go);
     }
     void ple_conv_silu(const float * ring, int head, const float * w, float * out) override {
         mark(PC_ELEM);
-        k_conv_taps<<<ceil_div(HC_DIM, BLK), BLK>>>(ring, head, PLE_CONV_HIST + 1,
+        last_op_ = "ple_conv_silu";
+        k_conv_taps<<<ceil_div(HC_DIM, BLK), BLK, 0, stream_>>>(ring, head, PLE_CONV_HIST + 1,
                                                     PLE_CONV_K, PLE_CONV_DIL, HC_DIM, w, out);
     }
     void gdn_conv_gate(const float * ring, int head, const float * w,
@@ -1578,51 +1781,58 @@ public:
                        float * beta_sig, float * a_softplus, float * gate,
                        float * g_exp) override {
         mark(PC_ELEM);
-        k_gdn_conv_gate<<<ceil_div(GDN_CONV_DIM + GDN_V_HEADS, BLK), BLK>>>(
+        last_op_ = "gdn_conv_gate";
+        k_gdn_conv_gate<<<ceil_div(GDN_CONV_DIM + GDN_V_HEADS, BLK), BLK, 0, stream_>>>(
             ring, head, w, beta_raw, alpha_raw, dt, ssm_a,
             conv_out, beta_sig, a_softplus, gate, g_exp);
     }
     void gdn_step(float * S, const float * q, const float * k, const float * v,
                   const float * g, const float * b, float * o) override {
         mark(PC_GDN);
-        k_gdn_step<<<GDN_V_HEADS * GDN_STATE, WAVE>>>(S, q, k, v, g, b, o);
+        last_op_ = "gdn_step";
+        k_gdn_step<<<GDN_V_HEADS * GDN_STATE, WAVE, 0, stream_>>>(S, q, k, v, g, b, o);
     }
     void gated_rms_norm(const float * x, const float * w, const float * z, float * y,
                         int ne0, int n_groups, float eps) override {
         mark(PC_NORM);
+        last_op_ = "gated_rms_norm";
         const int t = red_threads(ne0);
-        k_gated_rms_norm<<<n_groups, t, t * sizeof(float)>>>(x, w, z, y, ne0, eps);
+        k_gated_rms_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, z, y, ne0, eps);
     }
     void router(const float * logits, int * ids, float * w) override {
         mark(PC_ROUTER);
-        k_router<<<1, N_EXPERT>>>(logits, ids, w);
+        last_op_ = "router";
+        k_router<<<1, N_EXPERT, 0, stream_>>>(logits, ids, w);
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu) override {
         const dim3 grid((unsigned) g.rows, N_EXPERT_USED, 2);
         mark(PC_EXP_GATE_UP);
+        last_op_ = "moe_gate_up";
         if (g.type == FK_Q_IQ3_S) {
-            k_moe_gate_up_iq3s<<<grid, WAVE>>>((const unsigned char *) g.base,
+            k_moe_gate_up_iq3s<<<grid, WAVE, 0, stream_>>>((const unsigned char *) g.base,
                 (const unsigned char *) u.base, g.expert_stride, g.row_bytes, ids, x, yg, yu,
                 (int) g.rows, (int) g.K, N_EXPERT_USED);
         } else {
-            k_moe_gate_up_iq4xs<<<grid, WAVE>>>((const unsigned char *) g.base,
+            k_moe_gate_up_iq4xs<<<grid, WAVE, 0, stream_>>>((const unsigned char *) g.base,
                 (const unsigned char *) u.base, g.expert_stride, g.row_bytes, ids, x, yg, yu,
                 (int) g.rows, (int) g.K, N_EXPERT_USED);
         }
     }
     void silu_mul(const float * g, const float * u, float * h, size_t n) override {
         mark(PC_ELEM);
-        k_silu_mul<<<ceil_div((int) n, BLK), BLK>>>(g, u, h, (int) n);
+        last_op_ = "silu_mul";
+        k_silu_mul<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(g, u, h, (int) n);
     }
     void moe_down(const Mat & d, const int * ids, const float * h, float * eo) override {
         const dim3 grid((unsigned) d.rows, N_EXPERT_USED, 1);
         mark(PC_EXP_DOWN);
+        last_op_ = "moe_down";
         if (d.type == FK_Q_IQ4_NL) {
-            k_moe_down_iq4nl<<<grid, WAVE>>>((const unsigned char *) d.base, d.expert_stride,
+            k_moe_down_iq4nl<<<grid, WAVE, 0, stream_>>>((const unsigned char *) d.base, d.expert_stride,
                 d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
         } else {
-            k_moe_down_q8_0<<<grid, WAVE>>>((const unsigned char *) d.base, d.expert_stride,
+            k_moe_down_q8_0<<<grid, WAVE, 0, stream_>>>((const unsigned char *) d.base, d.expert_stride,
                 d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
         }
     }
@@ -1630,29 +1840,30 @@ public:
                     const float * sh_gate, float * sh_gate_sig, float * moe_out,
                     float * sh_gated, float * out) override {
         mark(PC_EXP_COMBINE);
-        k_moe_finish<<<ceil_div(N_EMBD, BLK), BLK>>>(eo, w, sh_raw, sh_gate,
+        last_op_ = "moe_finish";
+        k_moe_finish<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(eo, w, sh_raw, sh_gate,
                                                      sh_gate_sig, moe_out, sh_gated,
                                                      out, N_EMBD, N_EXPERT_USED);
     }
     void rope_imrope(float * x, int n_heads, int head_dim, int n_rot, int pos) override {
         mark(PC_QSA);
-        k_rope_imrope<<<n_heads, n_rot / 2>>>(x, head_dim, n_rot, pos);
+        last_op_ = "rope_imrope";
+        k_rope_imrope<<<n_heads, n_rot / 2, 0, stream_>>>(x, head_dim, n_rot, pos);
     }
     void kv_store_q8_0(const float * k, const float * v, int8_t * kqs, uint16_t * ksc,
                        int8_t * vqs, uint16_t * vsc, int cell) override {
         const dim3 grid(HEAD_DIM / 32, N_KV_HEADS, 2);
         mark(PC_QSA);
-        k_kv_store_q8_0<<<grid, WAVE>>>(k, v, kqs, (__half *) ksc, vqs, (__half *) vsc, cell);
+        last_op_ = "kv_store_q8_0";
+        k_kv_store_q8_0<<<grid, WAVE, 0, stream_>>>(k, v, kqs, (__half *) ksc, vqs, (__half *) vsc, cell);
     }
-    void idx_raw_store(const float * kr, float * raw, int cell) override {
+    void idx_pool_block(const float * k_new, float * sum, float * raw0, int blk,
+                        int n_filled, const float * kn, float eps, uint16_t * pooled,
+                        float * dbg_p, float * dbg_r) override {
         mark(PC_QSA);
-        k_idx_raw_store<<<ceil_div(IDX_DIM, BLK), BLK>>>(kr, raw, cell);
-    }
-    void idx_pool_block(const float * raw, int blk, int n_filled, const float * kn,
-                        float eps, uint16_t * pooled, float * dbg_p, float * dbg_r) override {
-        mark(PC_QSA);
-        k_idx_pool_block<<<1, IDX_DIM>>>(raw, blk, n_filled, kn, eps,
-                                         (unsigned short *) pooled, dbg_p, dbg_r);
+        last_op_ = "idx_pool_block";
+        k_idx_pool_block<<<1, IDX_DIM, 0, stream_>>>(k_new, sum, raw0, blk, n_filled,
+                                         kn, eps, (unsigned short *) pooled, dbg_p, dbg_r);
     }
     void idx_scan(const uint16_t * pooled, const float * q, float * s, int n_blocks) override {
         const int nsub = IDXS_THREADS / WAVE;
@@ -1660,23 +1871,27 @@ public:
         if (wgs > 4096) wgs = 4096;
         if (wgs < 1) wgs = 1;
         mark(PC_QSA);
-        k_idx_scan<<<wgs, IDXS_THREADS>>>((const unsigned short *) pooled, q, s, n_blocks);
+        last_op_ = "idx_scan";
+        k_idx_scan<<<wgs, IDXS_THREADS, 0, stream_>>>((const unsigned short *) pooled, q, s, n_blocks);
     }
     void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
                      const float * q_norm, const float * k_norm, const float * iq_norm,
                      float * qcur, float * gate, float * gsig, float * kcur,
                      float * idxq, int pos, float eps) override {
         mark(PC_QSA);
-        k_qsa_qk_post<<<N_Q_HEADS + N_KV_HEADS + IDX_N_HEADS, QKPOST_THREADS>>>(
+        last_op_ = "qsa_qk_post";
+        k_qsa_qk_post<<<N_Q_HEADS + N_KV_HEADS + IDX_N_HEADS, QKPOST_THREADS, 0, stream_>>>(
             qfull, kraw, idxraw, q_norm, k_norm, iq_norm,
             qcur, gate, gsig, kcur, idxq, pos, eps);
     }
     void qsa_expand(const float * bs, float * c, int * sel, int n_kv, int q, int r,
                     int tail, int sel_identity) override {
         mark(PC_QSA);
-        k_qsa_expand<<<ceil_div(n_kv, BLK), BLK>>>(bs, c, sel, n_kv, q, r, tail, sel_identity);
+        last_op_ = "qsa_expand";
+        k_qsa_expand<<<ceil_div(n_kv, BLK), BLK, 0, stream_>>>(bs, c, sel, n_kv, q, r, tail, sel_identity);
     }
     int topk_select(const float * scores, int n, int width, int * out) override {
+        dev_ensure(dev_);
         if (n > cand_cap_) {
             HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
             cand_cap_ = n;
@@ -1685,7 +1900,8 @@ public:
         }
         const int k = width < n ? width : n;
         mark(PC_QSA);
-        k_topk_radix_select<<<1, TOPK_THREADS>>>(scores, n, k, cand_key_, cand_idx_, out);
+        last_op_ = "topk_select";
+        k_topk_radix_select<<<1, TOPK_THREADS, 0, stream_>>>(scores, n, k, cand_key_, cand_idx_, out);
         return k;
     }
     void attn_qsa(const int8_t * kqs, const uint16_t * ksc, const int8_t * vqs,
@@ -1693,16 +1909,19 @@ public:
                   const float * gsig, float * out, float * out_gated) override {
         const int n_chunks = ceil_div(n_sel, ATTN_CHUNK);
         mark(PC_QSA);
-        k_attn_flash_split<<<dim3(n_chunks, N_KV_HEADS), ATTN_THREADS>>>(
+        last_op_ = "attn_qsa";
+        k_attn_flash_split<<<dim3(n_chunks, N_KV_HEADS), ATTN_THREADS, 0, stream_>>>(
             kqs, (const __half *) ksc, vqs, (const __half *) vsc, q, sel,
             partial_, mbuf_, lbuf_, n_sel);
         mark(PC_QSA);
-        k_attn_combine<<<N_Q_HEADS, HEAD_DIM>>>(partial_, mbuf_, lbuf_, gsig,
+        last_op_ = "attn_qsa";
+        k_attn_combine<<<N_Q_HEADS, HEAD_DIM, 0, stream_>>>(partial_, mbuf_, lbuf_, gsig,
                                                 out, out_gated, n_chunks);
     }
 
     void set_profile(bool on) override {
         prof_ = on;
+        dev_ensure(dev_);   // the events must be created on THIS backend's device (lost once in a rebase; invalid resource handle at mark())
         if (on && ev_.empty()) {
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);
@@ -1718,12 +1937,14 @@ public:
         launches_in_body_ = 0;
     }
     void prof_end_token() override {
+        dev_ensure(dev_);
+        debug_check("end of token");
         blocking_in_body_ += blocking_ - blocking_at_token_start_;
         launches_in_body_ += launches_ - launches_at_token_start_;
         ++tokens_profiled_;
         if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
         // one closing event, then ONE synchronisation for the whole token
-        HIP_CHECK(hipEventRecord(ev_[n_ev_], 0));
+        HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         HIP_CHECK(hipEventSynchronize(ev_[n_ev_]));
         for (int i = 0; i < n_ev_; ++i) {
             float ms = 0.0f;
@@ -1758,12 +1979,14 @@ public:
     }
 
     void   timer_start() override {
+        dev_ensure(dev_);
         blocking_at_token_start_ = blocking_;
         launches_at_token_start_ = launches_;
-        HIP_CHECK(hipEventRecord(ev0_, 0));
+        HIP_CHECK(hipEventRecord(ev0_, stream_));
     }
     double timer_stop_ms() override {
-        HIP_CHECK(hipEventRecord(ev1_, 0));
+        dev_ensure(dev_);
+        HIP_CHECK(hipEventRecord(ev1_, stream_));
         HIP_CHECK(hipEventSynchronize(ev1_));
         float ms = 0.0f;
         HIP_CHECK(hipEventElapsedTime(&ms, ev0_, ev1_));
@@ -1772,17 +1995,47 @@ public:
 
 private:
     // ---- profiling state ----
+    // --sync-debug: validate everything enqueued since the PREVIOUS mark, so
+    // the op named in the message is the one that actually faulted rather
+    // than whichever launch happened to be in flight when the queue drained.
+    void debug_check(const char * where) {
+        if (!sync_debug_) return;
+        const hipError_t es = hipStreamSynchronize(stream_);
+        const hipError_t el = hipGetLastError();
+        if (es == hipSuccess && el == hipSuccess) return;
+        std::fprintf(stderr,
+            "\nSYNC-DEBUG FAULT on device %d\n"
+            "  failing op   : %s (class %s)\n"
+            "  reached at   : %s\n"
+            "  context      : %s layer %d\n"
+            "  sync says    : %s\n"
+            "  lasterr says : %s\n",
+            dev_, last_op_ ? last_op_ : "(none)", prof_name(last_cls_), where,
+            dbg_phase_ ? dbg_phase_ : "(none)", dbg_layer_,
+            hipGetErrorString(es), hipGetErrorString(el));
+        std::fflush(stderr);
+        std::abort();
+    }
+
     void mark(int cls, int gemv_group = -1, size_t bytes = 0) {
+        dev_ensure(dev_);                  // every op runs on its OWN card
+        debug_check("the next op's mark()");
+        last_cls_ = cls;
         ++launches_;                       // one op == one launch, except where noted
         if (gemv_group >= 0 && gemv_group < GG_N) gemv_bytes_[gemv_group] += (double) bytes;
         if (!prof_ || n_ev_ >= PROF_MAX_EVENTS) return;
-        HIP_CHECK(hipEventRecord(ev_[n_ev_], 0));
+        HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         ev_cls_[n_ev_] = cls;
         ev_grp_[n_ev_] = gemv_group;
         ++n_ev_;
     }
 
     bool       prof_ = false;
+    bool       sync_debug_ = false;
+    const char * last_op_   = nullptr;
+    const char * dbg_phase_ = nullptr;
+    int        last_cls_ = 0;
+    int        dbg_layer_ = -1;
     int        n_ev_ = 0;
     long long  launches_ = 0;
     long long  blocking_ = 0;              // host-blocking calls, counted always
@@ -1807,6 +2060,12 @@ private:
     int        cand_cap_ = 0;
     int        gemv_lds_ = 1;
     int        gemv_min_rows_ = 1024;
+    int        dev_ = 0;
+    char       name_[24] = {0};
+    hipStream_t stream_{};
+    hipEvent_t  bnd_{};
+    float *     amax_v_ = nullptr;
+    int *       amax_i_ = nullptr;
     // split-K partials: nsplit*rows stays near GEMV_TARGET_WGS*GEMV_WAVES by
     // construction (nsplit rises only as rows falls), so this is small.
     float *    gemv_part_ = nullptr;
@@ -1821,5 +2080,28 @@ private:
 } // namespace
 
 Backend * make_gpu_backend(int device) { return new GpuBackend(device); }
+
+// P2P between every pair, once, before anything is placed. All six pairs can
+// and do on this box (M5: 16-24 GB/s, 28-32 us for a 10 KB hidden vector).
+void enable_peer_access(int n_devices) {
+    for (int a = 0; a < n_devices; ++a) {
+        HIP_CHECK(hipSetDevice(a));
+        for (int b = 0; b < n_devices; ++b) {
+            if (a == b) continue;
+            int can = 0;
+            HIP_CHECK(hipDeviceCanAccessPeer(&can, a, b));
+            if (!can) {
+                std::fprintf(stderr, "device %d cannot peer-access %d; boundaries would "
+                                     "stage through the host\n", a, b);
+                continue;
+            }
+            const hipError_t e = hipDeviceEnablePeerAccess(b, 0);
+            if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
+                std::fprintf(stderr, "hipDeviceEnablePeerAccess(%d->%d): %s\n",
+                             a, b, hipGetErrorString(e));
+            }
+        }
+    }
+}
 
 } // namespace fk

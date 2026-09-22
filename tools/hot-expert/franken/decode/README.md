@@ -338,3 +338,208 @@ before it — 538 of 538 taps `cos=1.000000` against the pre-rewrite dump,
 0.999993, `l_last-3` 0.999407 under `--quant-act`). 35 kernels, still zero
 scratch and zero spills, occupancy 16 except `attn_flash_split` at 15;
 `k_gemv_batch` is 46 VGPR. Not run: no GPU was touched.
+
+## Step 3 (2026-09-22): the whole model on three cards, and a real oracle
+
+Step 2b measured `layers0_15_ms_median=7.6204` (from 11.73) at 389 launches
+and 0 host syncs, with the GPU kernels matching the CPU graph 534/534.
+Step 3 is design §9.5 step 3: all 48 layers, three cards, `lm_head`, and an
+oracle that tests the MODEL rather than the arithmetic.
+
+### What crosses a card boundary
+
+Exactly one thing: the wide residual, `hc_count × n_embd` f32 = **40 KB**.
+Nothing else survives a layer. `Backend::boundary_recv` is a method of the
+*destination*: it records an event on the source's stream, makes its own
+stream wait on it, and issues `hipMemcpyPeerAsync` on its own stream. No host
+call, so a boundary is M5's ~30 µs of P2P and nothing else.
+`enable_peer_access()` runs before anything is placed.
+
+Each device has its own stream, its own scratch set (`bind()` swaps the
+active pointers at a layer, so the body code never knows which card it is
+on), and owns the QSA caches and GDN/conv state of its own layers.
+
+The token time is taken on the **last** device, whose stream is idle when the
+start event is recorded, so its start timestamp is the token's start. Each
+token fully drains before the next begins — which costs nothing, because a
+decode token depends on the previous one's argmax.
+
+### The head
+
+`output_hc_*` is the final hyper-connection mixer and there is no separate
+output norm — "the final mixer IS the output norm" (qwen4exp.cpp:380). It
+takes no inject, so only down/up are placed. `lm_head` is Q6_K, the one
+tensor in that format; `fk_q6k_block_dot` ports ggml's
+`dequantize_row_q6_K`. Its super-blocks are 256 weights, so a batch
+containing it splits K on 256-element boundaries rather than 32.
+
+Greedy sampling is a **device-side** two-stage argmax over the 248 320
+logits, so the only thing crossing to the host per token is one int. The
+full logits stay downloadable for the last token.
+
+### The three oracles
+
+- `--oracle` still compares every tap, now on any device.
+- `--expect-ids F` compares the greedy ids with llama.cpp at temperature 0
+  and prints the first mismatch.
+- `--routing DIR` compares the routed expert set per layer per position
+  against `DIR/moe_ids.txt` and reports the mean `|A ∩ B| / 10`.
+
+Two things the comparator learned doing this, both of which would otherwise
+have read as engine failures:
+
+- **The dump writes the last ne1 column when ne2 == 1.** After llama.cpp
+  applies `inp_out_ids` the final layer's `l_last-47` is `[2560, 4, 1]` and
+  its file holds hyper-connection stream **3** alone. Comparing it against
+  stream 0 read `cos=0.579`; comparing like with like reads **0.9787**.
+- **`result_norm` and `result_output` are 4 bytes each** in this dump — one
+  float for a 2 560- and a 248 320-long tensor. A one-element cosine is ±1
+  whatever the values, so those are now REFUSED rather than reported as a
+  spectacular failure. Worth fixing in the dump tool; until then the head is
+  checked by the greedy ids, not by a tap.
+
+And one the routing oracle needed: beyond the first greedy mismatch the two
+engines are decoding **different text**, so a routing difference there is a
+consequence of the sequence having diverged, not evidence about the router.
+The report gives both numbers and the same-input one is the headline.
+
+### What `--cpu` shows over all 48 layers
+
+Six prompt ids then 16 greedy, `--devices 3`, against
+`~/bench/franken/oracle`:
+
+- **greedy: 7 of 16 ids identical to llama.cpp** — `271 2064 10054 1040 488
+  2493 381` — then position 7 diverges (mine 8008, ref 3322).
+- **routing: mean set overlap 0.909** across all 48 layers over the 13
+  positions whose input token is the reference's own. Layer 0 is **0.992**,
+  falling to ~0.85 by layer 47. (Over all 22 positions it reads 0.713, but
+  that number mixes in positions where the sequences had already parted.)
+- taps: `l_last-0` 0.99996, `l_last-15` 0.98955, `l_last-16` 0.98579,
+  `l_last-31` 0.94168, `l_last-32` 0.93344, `l_last-47` 0.97872. 1 184
+  compared, 410 with no dump entry, 60 incomparable, 10 refused.
+
+So the compounding of step 2's routing divergence is now quantified at both
+ends: ~9 of 10 experts agree per layer per position, and the model says the
+same thing for seven tokens.
+
+### What the GPU run needs
+
+```
+franken_decode --model <shard> --tokens 248044 785 10945 315 1495 374 \
+               --devices 3 --layers 0-47 --ctx <N> \
+               --greedy 16 --expect-ids ~/bench/franken/oracle/greedy.txt \
+               --routing ~/bench/franken/oracle --oracle ~/bench/franken/oracle \
+               --dump <dir> --time 32 --profile
+```
+under the rig lock with the gateway stopped. `--ctx` sizes the QSA caches
+**per device**; each card holds 4 QSA layers, so 256k costs
+4 × 256k × (2 heads × 256 dims × 2 tensors q8_0 + indexer) ≈ 1.5 GB — design
+§9.1's figure. `vram_report` prints used/free/total per card after placement
+and again after the scratch, so the fullest card's headroom is a measurement
+rather than an estimate. Nothing here has been run on a GPU.
+
+### Step 3 fix (2026-09-22): the placement bug, and the cache budget
+
+The first GPU run died at `--ctx 262144` **and again at `--ctx 4096`** with
+`out of VRAM placing blk.18.ffn_down_exps.weight` on empty cards. It was not
+the caches.
+
+**`hipMalloc`, `hipMemcpy` and a kernel launch all act on the CURRENT device,
+and the current device is process-wide state — not something a stream
+carries.** `GpuBackend` set it once in its constructor, so after
+`make_gpu_backend(0..2)` the current device was 2 and every later allocation
+went there whichever backend was asked. Placement filled one card with all 48
+layers and died at layer 18: 24 GB / ~1.34 GB a layer is 17.9. Step 2 never
+saw it because with a single backend the constructor's `hipSetDevice` was also
+the right one for everything after it.
+
+Every entry point that allocates, copies or launches now ensures its own
+device first (`dev_ensure`, a compare against a process-global, so the cost is
+one predictable branch on the launches that do not switch). And the failure is
+caught where it happens: `verify_placement` fails early and says so when a card
+holds under 80 % of what it was asked to place, instead of a message about the
+wrong tensor a dozen layers later. `vram_dev<i>_used_gb=` is printed **before**
+placement, after it, and after the caches.
+
+**The cache sizing was also wrong, and is now the design's.** The indexer kept
+every token's RAW key in f32 to re-pool from — 512 B a token a layer, *eight
+times* the 64 B design §9.1 budgets for the pooled bf16 key, and 134 MB a layer
+at 256k. It does not need them: a block's members arrive in order, so
+
+```
+pooled = (sum_of_members_so_far + (r - n_filled) * key_of_cell_0) / r
+```
+
+is the reference's formula exactly — unset slots read cell 0
+(`llama-memory-hybrid-idx.cpp:395`) — from a running sum and one saved key,
+`IDX_DIM` floats each. Two more buffers stopped scaling with `ctx`: the f32
+shadows of the pooled cache (67 MB a device, for two taps the comparator marks
+INCOMPARABLE at any other cache depth anyway) and the selection array, which is
+capped by the *budget*, not the cache. The attention split scratch was already
+independent of `ctx` (33 chunks × 24 heads × 256 dims = 811 KB).
+
+Measured by the new `kv_bytes_dev<i>=` line at `--ctx 262144`:
+
+```
+kv_bytes_dev0=1.208 GB  (qsa_layers=4 x 302.0 MB, 1152 B/token/layer)
+gdn_state_dev0=0.040 GB (gdn_layers=12)
+```
+
+1152 B/token/layer is 1088 (K and V, 2 heads × 256 dims in q8_0) + 64 (one
+pooled bf16 indexer key per 4 cells) — design §9.1's number, and 1.208 GB a
+device against its ~1.2 GB. With ~21.5 GB of weights the fullest card sits at
+~22.8 GB of 25.77.
+
+The CPU graph is **bit-identical** after the rework: 538 of 538 taps
+`cos=1.000000` against the step-2 dump.
+
+### Step 3 fix 2 (2026-09-22): the device-2 page fault
+
+`Memory access fault by GPU node-3 ... Page not present` was **`lm_head`
+reading past its own allocation**, and it was one line:
+
+```c
+b.d[i].row_stride = (W.type == FK_Q_Q8_0) ? W.row_bytes : (size_t) W.K;
+```
+
+`k_gemv_batch` addresses a **quantised** row in BYTES and an f32/bf16 row in
+ELEMENTS — the two pointer casts in the kernel. The test above was
+accidentally right while Q8_0, BF16 and F32 were the only formats a batch
+ever saw. Q6_K is the first quantised format other than Q8_0 to go through
+it: its rows are **2 100 B** but `W.K` is **2 560**, so
+
+```
+row 203 700 of 248 320 first addresses past the 521.5 MB tensor
+the last row addresses 635.7 MB — 114 MB past the end
+```
+
+on exactly the card that holds `lm_head`. `place_mat` had already validated
+`row_bytes × rows == nbytes` at load; the wrong field was passed at launch.
+
+A second bug in the same launcher, found looking for the first: the LDS slice
+was `ceil_div(units, nsplit) * WAVE`, but `units` counts *granules*, which are
+256 for a Q6_K batch and 32 otherwise. That under-sized the staging buffer 8×
+and let the staging loop write past it. It is `* gran` now.
+
+**`--sync-debug`** drains the stream and checks `hipGetLastError` after every
+launch and copy. The check runs at the *next* op's `mark()`, so the op named
+in the message is the one that faulted rather than whichever launch was in
+flight when the queue drained; it prints the op, its class, the phase and
+layer, and for a boundary the pointer ranges and both device ids.
+
+**stdout is line-buffered** (`setvbuf` at the top of `main`) because a GPU
+memory fault kills the process and takes a full stdout buffer with it — which
+is why the first three-card run produced no output at all. Progress lines now
+mark placement, cache allocation, the first token, each layer range as it
+finishes on its device, and the head.
+
+**Audited for buffers used off their owner**, all clean: the boundary
+destination is the destination device's `res_hc` and the event is now recorded
+with the *source* device current; the cross-layer norm fusion is off whenever
+`layer(il+1).dev != layer(il).dev`, so layers 16 and 32 normalise the local
+copy they just received; all 61 `Scratch` members are rebound by `bind()`;
+the embedding and PLE uploads target device 0's buffers through device 0's
+backend; the argmax scratch, logits and head scratch are the last device's;
+the `__constant__` decode tables are filled per device in each constructor
+after its `hipSetDevice`; and every `Mat` and `LayerState` buffer is placed
+through `dev_for(il)`.

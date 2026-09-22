@@ -168,7 +168,7 @@ element is added one at a time against that number:
 
 | rung | what | adds |
 |---|---|---|
-| L0 | ONE model (Qwen3.8-Flash-Next: lightest active set, fastest today, and at this quant fully resident on THREE cards -- rev 4), layer-range pipeline over the three cards, hipFire-class trunk and expert kernels in one command stream per card, the per-layer embedding gather from host RAM, no streaming, no replication, no lookahead, Colibri's gateway in front | the first real number for §1(b)-(c): the resident token against llama.cpp's 34–40 ms |
+| L0 | ONE model (Qwen3.8-Flash-Next: lightest active set, fastest today, and at this quant fully resident on THREE cards -- rev 4), layer-range pipeline over the three cards, hipFire-class trunk and expert kernels in one command stream per card, the per-layer embedding gather from host RAM, no streaming, no replication, no lookahead, Colibri's gateway in front; **specified in §9 (rev 7)** | the first real number for §1(b)-(c): the resident token against llama.cpp's 34–40 ms |
 | L0b | the same on TWO cards (the pair that does NOT share a link + one) with Colibri's ring for the experts that no longer fit | the first real number for §1(a) on this model |
 | L1 | the shared-link pair under the stream (L0b on the sharing pair) | the shared-link contention, measured |
 | L2 | histogram placement with the PCIe budget (§3.3) | fewer misses per stage |
@@ -191,3 +191,87 @@ micro-batches to hide bubbles (single-stream decode has one token in flight,
 §3.5). Not adopted: the review's model parameter counts and its community
 prefill figures -- nothing on this rig verifies them, and the design uses
 only numbers measured here.
+
+## 9. L0 specification (rev 7, 2026-09-22): Qwen3.8-Flash-Next resident on three cards
+
+Everything below rests on a measured number (§F11-M0, §M1, §M3, §M5) or is
+marked projected. L0 is one gated item: it is done when the engine decodes
+greedily-identical text to llama.cpp on the oracle prompts (last-token logits
+compared), serves through Colibri's gateway with `accept_live` passing, and
+has a measured tok/s at 19k and 256k on the depth ladder.
+
+**9.1 Process and memory model.** One process, three HIP devices, one
+command stream per device, no host work between layers. Layer ranges
+(projected balance from the per-layer bytes; L0 measures and rebalances):
+card 83:00.0 layers 0–15, 86:00.0 16–31, 48:00.0 32–47 plus lm_head; the
+shared-link pair (83↔86) gets the one boundary that carries only a hidden
+vector. Per card: its layers' trunk (Q8_0 as in the file, ~1.7 GB), its
+experts (512 × 16 layers in the L0 expert format, ~20 GB at 4.25 bpw or
+~16 GB at IQ3_S-class bytes — the format decision is 9.3), KV for its 4 QSA
+layers at 256k (1.1 GB q8_0 K/V + 0.4 GB indexer keys, §M0d), GDN state
+(37 MB), scratch ≤ 256 MB. The per-layer n-gram embedding table (28.8 GB,
+IQ4_NL, `ple.layers [1]`) stays in host RAM, mmap'd; its per-token gather
+(16 heads × 160 values) is done on the CPU and uploaded with the token — it
+is the only host work per token besides sampling.
+
+**9.2 The token.** Card 0: embed (CPU gather + token_embd row) → layers 0–15
+→ P2P copy of the hidden vector (2 560 f32 + the hyper-connection residual
+streams, `hc_count` × 2 560) to card 1 → layers 16–31 → card 2 → layers
+32–47 → lm_head → logits to host → sample. Every layer: hc mix, norm,
+attention (GDN or QSA), hc mix, norm, shared expert + router + 10 routed
+experts, residual. Launch count per layer ≈ 12–18 plain kernels; §M5 says
+240 launches a token cost nothing observable when queued asynchronously, so
+no fusion is required for L0 beyond what the source kernels already do
+(hipFire's gate+up in one launch; M3's three attention kernels).
+
+**9.3 Kernels and formats (the parts, by source).**
+- Trunk GEMVs (Q8_0 weights, f32 activations): hipFire's Q8-class GEMV or
+  the plain wave-per-row kernel of `m5_bench.hip` (794 GB/s on the synthetic
+  token) — L0 takes the simpler one and measures; the trunk is ~5 GB a token
+  and bandwidth is what matters.
+- Routed experts: hipFire's `gemv_mq4g256v2_moe_*` shape (§M1, 452 GB/s at
+  batch 1) with two changes: K_TOP a runtime grid parameter (10), and a
+  **group-128 variant of the format** so the down projection's K=640 needs
+  no padding (five 128-groups; the gate/up's K=2 560 is twenty). Format
+  decision: L0 requantises the file's experts at load into that 4.25 bpw
+  affine format (f16 scale+zero per 128) — a lossless-enough re-encoding of
+  IQ3_S/IQ4_NL has to be MEASURED (quality harness, KL vs the FP8 reference,
+  M5-quality) before L0's gate; if it loses, the alternative is a native
+  IQ3_S/IQ4_NL GEMV in hipFire's launch shape (table dequant, 19 % fewer
+  bytes), which is a kernel item, not a design change.
+- QSA attention: `m3_attn.hip` v2 kernels as they are (scan, radix top-k,
+  flash split + combine), plus the q/k/v projections, QK-norm, IMRoPE and
+  the indexer q/k projections as GEMVs from the trunk set; the indexer key
+  cache is written per token (pooled per 4-token block as llama.cpp does).
+- GDN layers: the `m3_attn.hip` delta-rule step for the state update; the
+  QKVZ projection, conv1d (kernel 4, a 4-token ring per layer), alpha/beta
+  gates, L2-norm and gated RMSNorm as small kernels ported from llama.cpp's
+  `build_layer_attn_linear` (the reference for the math) — Sonnet-tier
+  ports with an oracle against llama.cpp's dumped intermediates.
+- Hyper-connections (`hc_*`, 4-wide inject/mix) and the shared expert with
+  its sigmoid gate: small GEMVs and elementwise kernels, from the same
+  reference.
+- Sampling, tokenizer, chat template, prefix checkpoints, slots, ledger:
+  Colibri's gateway unchanged in front; the engine speaks the gateway's
+  engine protocol (what `glm53` speaks today).
+
+**9.4 Prefill.** L0 prefill is the decode path batched over rows (hipFire's
+batched expert kernels reach the bound at 32 rows, §M1; the M3 attention
+runs per query row over the cache built so far, with the causal top-k
+selection restricted to earlier blocks). No streaming, no ring: the model is
+resident. Projected: at the bound, a 256k prompt reads the weights once per
+32-row chunk → 8 192 chunks × ~8 ms ≈ 65 s plus attention; the 17 min of
+llama.cpp is not the reference to beat, the 5-minute target of §6 is.
+
+**9.5 Build order inside L0 (each step has an oracle before the next).**
+1. Loader: GGUF tensors → device buffers per card by layer range; expert
+   requantisation to the L0 format; the CPU-side PLE gather. Oracle: a
+   layer-0 forward on one token against llama.cpp's dumped activations.
+2. One card, layers 0–15, decode loop with GDN + QSA + MoE; oracle per
+   layer against the dumps; timing per layer (§M5's harness pattern).
+3. Three cards, the two boundaries, lm_head; oracle: greedy text identical
+   on the F11 prompts, last-token logits cosine/argmax.
+4. Gateway protocol, `serve_alt.sh franken`, `accept_live`, the depth
+   ladder at 19k and 256k (the number), the quality harness at the L0
+   format (the quality number). Gate: tok/s ≥ 40 at 256k, quality within the
+   measured spread of llama.cpp's IQ3_S/IQ4_NL serving (record §F11-QUALITY).

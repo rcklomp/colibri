@@ -108,9 +108,19 @@ public:
     //
     // A chunk produces exactly what T single-token steps produce (PREFILL.md
     // section 2), so this is the decode path at T = 1 and nothing else.
-    int  step(const int32_t * tokens, int T, const float * ple_emb, Recorder & rec);
+    //
+    // `flush` false ENQUEUES the chunk and returns without waiting for it: no
+    // timer read, no greedy download, no routing read-back. That is design
+    // 3.5's pipeline -- the host runs ahead and chunk n+1's work reaches card
+    // 0 while chunk n is still on cards 1 and 2 -- and it is why the return
+    // value is -1 there. The cross-card safety is NOT the host's doing: it is
+    // the two residual banks and the drain events (Backend::boundary_recv).
+    // A chunk that the recorder is capturing always flushes, because a tap is
+    // a download.
+    int  step(const int32_t * tokens, int T, const float * ple_emb, Recorder & rec,
+              bool flush = true);
     int  step(int32_t token, const float * ple_emb, Recorder & rec) {
-        return step(&token, 1, ple_emb, rec);
+        return step(&token, 1, ple_emb, rec, true);
     }
 
     // The last step's logits, on the host (only with a head placed).
@@ -124,8 +134,15 @@ public:
 
     int pos() const { return pos_; }
 
-    // Wall/GPU time of the last step's layer body, milliseconds.
+    // Wall/GPU time of the last step's layer body, milliseconds. ZERO after a
+    // step that did not flush: there is nothing to read without waiting.
     double last_body_ms() const { return last_body_ms_; }
+
+    // Whether the last step actually waited. step() can OVERRIDE a caller's
+    // `flush=false` (a captured chunk, --jitter, --sync-debug), so a caller
+    // that wants the greedy id or the routed ids must ask this rather than
+    // re-deriving the condition -- which is how the two would drift apart.
+    bool last_flushed() const { return last_flushed_; }
 
     // HOST wall time to ENQUEUE one token's whole body -- no waits, no syncs,
     // nothing read back. A card with its work pre-queued runs at its own
@@ -175,8 +192,16 @@ private:
     // One set of scratch per device; `bind()` points the active members at
     // one of them. The body code below is written against the active set and
     // never has to know which card it is on.
+    // Two residual banks a device, picked by chunk parity. The ONLY buffer
+    // that crosses a card, so the only one a pipelined chunk n+1 could race:
+    // card 0 writes bank (n+1)&1 while card 1 still reads bank n&1 out of it.
+    // Two is enough and self-limiting -- writing bank (n+2)&1 == n&1 waits on
+    // the drain event of the copy that read it at chunk n, which in the steady
+    // state (card 0 on n+2, card 1 on n+1, card 2 on n) has long finished.
+    static constexpr int N_RES_BANKS = 2;
+
     struct Scratch {
-        float *x, *res_hc, *xn, *lo, *hgate, *mixed, *inject, *blk;
+        float *x, *res_hc[N_RES_BANKS], *xn, *lo, *hgate, *mixed, *inject, *blk;
         float *z, *conv, *convqk, *qkn, *alpha, *beta, *gexp, *abuf, *bsig, *gate_raw, *gdn, *gnorm;
         float *qfull, *qcur, *gate, *gsig, *kcur, *vcur, *kqv, *kqvg, *kraw, *idxraw;
         float *idxq, *blkscore, *cellscore, *pool_raw, *pool_rope;
@@ -208,6 +233,7 @@ private:
     int           pos_ = 0;
     double        last_body_ms_ = 0.0;
     double        last_issue_ms_ = 0.0;
+    bool          last_flushed_ = true;
     bool          capture_ = true;
     std::vector<float> emb_;          // hoisted: a per-token heap allocation
                                       // in the issue path is host time too
@@ -222,6 +248,8 @@ private:
 
     int     T_ = 1;        // tokens in the chunk being run
     int     max_T_ = 1;
+    int     bank_ = 0;     // this chunk's residual bank, chunk index & 1
+    long long chunks_ = 0; // chunks fed since construction
 
     // the ACTIVE scratch set, rebound by bind() at every layer
     float *x_, *res_hc_, *xn_, *lo_, *hgate_, *mixed_, *inject_, *blk_;

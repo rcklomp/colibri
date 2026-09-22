@@ -420,6 +420,300 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     }
 }
 
+// =============================================== LDS-tiled trunk GEMM =====
+//
+// WHY A SECOND GEMM EXISTS AT ALL, when PREFILL.md section 9 says there is
+// exactly one. Because the profile said so, and the invariant it is protecting
+// is "decode and prefill cannot drift", which a knob that is OFF by default
+// does not break: at --gemm-lds 0 nothing below is reachable.
+//
+// Measured (record §L0-PREFILL, `g.txt`, 8 192 tokens at chunk 256, per prompt
+// token per card): the trunk GEMM is 1.69-1.76 ms. Its weights are ~1.7 GB a
+// card and k_gemm_batch<8> reads all of them once per TILE of 8 token columns,
+// so at T = 256 that is 32 passes = 54 GB a chunk = 0.27 ms a token at the
+// 800 GB/s bound. It takes 1.7. So it is neither bandwidth- nor compute-bound:
+// at 135 VGPR it gets 10 waves/SIMD, and every wave re-decodes the same Q8_0
+// block for each group of 8 columns.
+//
+// This kernel attacks both halves of that:
+//
+//   * a workgroup owns a 64 x 64 tile (rows x tokens) and stages K in steps of
+//     32 through LDS, so a weight element is read from VRAM and decoded ONCE
+//     per 64 columns instead of once per 8: 4 passes at T = 256, 6.8 GB a
+//     chunk, 0.033 ms a token at the bound.
+//   * the activation tile is re-read once per 64 ROWS, which looks like a lot
+//     (10 240 rows / 64 = 160 passes over 2.6 MB) and is not: 2.6 MB lives in
+//     the 96 MB Infinity Cache, so those passes never reach VRAM.
+//
+// NUMERICS, and why this is a knob. Each thread accumulates its own (row,
+// column) over the WHOLE of K in one f32 register, in K order. k_gemm_batch
+// accumulates across a wave's 32 lanes and closes with a butterfly, and the
+// decode token does the same. Those are different summation orders, so the
+// results differ in the last bits -- legitimately, the way F7's reordered
+// attention kernel did -- and the oracle's meaning is preserved by keeping
+// this OFF by default and measuring the divergence with it on.
+//
+// LDS layout: `ws[k][row]` and `as[k][col]`, stride 68 floats. k is the
+// staging axis and (row, col) the reading axis, so the inner loop reads four
+// CONSECUTIVE floats per operand -- one 16-byte LDS request, and the 16
+// distinct columns of a wave cover 256 contiguous bytes, which is
+// conflict-free. The 4-element padding keeps the float4s 16-byte aligned.
+// 2 x 32 x 68 floats = 17.4 KB, so three workgroups fit a CU's 64 KB.
+
+#define GEMM_LDS_R       64     // output rows a workgroup owns
+#define GEMM_LDS_C       64     // activation columns (tokens) a workgroup owns
+#define GEMM_LDS_KB      32     // K staged per step == exactly one Q8_0 block
+#define GEMM_LDS_THREADS 256
+#define GEMM_LDS_RT      4      // rows a thread owns    (64 / 16)
+#define GEMM_LDS_CT      4      // columns a thread owns (64 / 16)
+#define GEMM_LDS_STRIDE  (GEMM_LDS_R + 4)   // == GEMM_LDS_C + 4; 16 B aligned
+// Below this many rows the old split-K path is better (a 64-row tile wastes
+// most of its lanes on a 4-row or 48-row matrix) AND it is bit-identical, so
+// small matrices keep it whatever the knob says.
+#define GEMM_LDS_MIN_ROWS 256
+
+// The row's weight element at global index `e`, decoded to f32. `e` is in
+// [0, K) and, for Q8_0, kbase is a multiple of 32 so `e >> 5` is the block and
+// `e & 31` the lane -- the SAME decode expression k_gemm_batch uses.
+__device__ __forceinline__ float gemm_lds_w(const GemvDesc & d, int row, int e) {
+    if (d.type == FK_Q_Q8_0) {
+        const unsigned char * bp = (const unsigned char *) d.base +
+                                   (size_t) row * d.row_stride +
+                                   (size_t)(e >> 5) * FK_Q8_0_BLOCK_BYTES;
+        return fk_q8_0_block_d(bp) *
+               (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[e & 31];
+    }
+    if (d.type == FK_Q_BF16) {
+        const unsigned short * rp = (const unsigned short *) d.base + (size_t) row * d.row_stride;
+        return fk_bf16_to_f32(rp[e]);
+    }
+    const float * rp = (const float *) d.base + (size_t) row * d.row_stride;
+    return rp[e];
+}
+
+// The activation of column `t` at element `e`, with the GX_SILU_MUL form
+// written out exactly as GEMM_X does it so both kernels see the same value.
+__device__ __forceinline__ float gemm_lds_x(const GemvBatchD & b, const float * x,
+                                            const float * x2, int t, int e) {
+    const float v = x[(size_t) t * b.K + e];
+    return (b.x_mode == GX_SILU_MUL) ? d_silu(v) * x2[(size_t) t * b.K + e] : v;
+}
+
+__global__ __launch_bounds__(GEMM_LDS_THREADS)
+void k_gemm_lds(GemvBatchD b, const float * __restrict__ x,
+                const float * __restrict__ x2, int T) {
+    __shared__ __align__(16) float ws[GEMM_LDS_KB * GEMM_LDS_STRIDE];
+    __shared__ __align__(16) float as[GEMM_LDS_KB * GEMM_LDS_STRIDE];
+
+    const int tid  = threadIdx.x;
+    const int row0 = blockIdx.x * GEMM_LDS_R;
+    const int col0 = blockIdx.y * GEMM_LDS_C;
+    if (row0 >= b.total_rows || col0 >= T) return;
+
+    const int tr = tid / 16;                 // 16 row groups of GEMM_LDS_RT
+    const int tc = tid % 16;                 // 16 column groups of GEMM_LDS_CT
+    const int sr = tid / 32;                 // staging: 8 rows/cols at a time,
+    const int sl = tid % 32;                 // one 32-lane wave each
+
+    float acc[GEMM_LDS_RT][GEMM_LDS_CT];
+#pragma unroll
+    for (int i = 0; i < GEMM_LDS_RT; ++i)
+#pragma unroll
+        for (int j = 0; j < GEMM_LDS_CT; ++j) acc[i][j] = 0.0f;
+
+    for (int kbase = 0; kbase < b.K; kbase += GEMM_LDS_KB) {
+        __syncthreads();                     // the previous step's reads are done
+        const int e = kbase + sl;
+        const bool in_k = (e < b.K);
+        // Weights: one wave per row, 32 contiguous elements -- for Q8_0 that
+        // is one block's 32 qs bytes in one request, the widest the 34-byte
+        // AoS stride allows (see k_gemm_batch's header).
+        for (int rr = sr; rr < GEMM_LDS_R; rr += GEMM_LDS_THREADS / 32) {
+            const int grow = row0 + rr;
+            float w = 0.0f;
+            if (grow < b.total_rows && in_k) {
+                const GemvDesc & d = b.d[desc_of(b, grow)];
+                w = gemm_lds_w(d, grow - d.row_off, e);
+            }
+            ws[sl * GEMM_LDS_STRIDE + rr] = w;
+        }
+        for (int cc = sr; cc < GEMM_LDS_C; cc += GEMM_LDS_THREADS / 32) {
+            const int t = col0 + cc;
+            float a = 0.0f;
+            if (t < T && in_k) a = gemm_lds_x(b, x, x2, t, e);
+            as[sl * GEMM_LDS_STRIDE + cc] = a;
+        }
+        __syncthreads();
+
+#pragma unroll 4
+        for (int k = 0; k < GEMM_LDS_KB; ++k) {
+            const float * wp = ws + k * GEMM_LDS_STRIDE + tr * GEMM_LDS_RT;
+            const float * ap = as + k * GEMM_LDS_STRIDE + tc * GEMM_LDS_CT;
+            float wv[GEMM_LDS_RT], av[GEMM_LDS_CT];
+#pragma unroll
+            for (int i = 0; i < GEMM_LDS_RT; ++i) wv[i] = wp[i];
+#pragma unroll
+            for (int j = 0; j < GEMM_LDS_CT; ++j) av[j] = ap[j];
+#pragma unroll
+            for (int i = 0; i < GEMM_LDS_RT; ++i)
+#pragma unroll
+                for (int j = 0; j < GEMM_LDS_CT; ++j)
+                    acc[i][j] = fmaf(wv[i], av[j], acc[i][j]);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < GEMM_LDS_RT; ++i) {
+        const int grow = row0 + tr * GEMM_LDS_RT + i;
+        if (grow >= b.total_rows) break;
+        const GemvDesc d = b.d[desc_of(b, grow)];
+        const int row = grow - d.row_off;
+#pragma unroll
+        for (int j = 0; j < GEMM_LDS_CT; ++j) {
+            const int t = col0 + tc * GEMM_LDS_CT + j;
+            if (t >= T) break;
+            d.out[(size_t) t * d.rows + row] = apply_epi(acc[i][j], d.epi, d.arg);
+        }
+    }
+}
+
+// ------------------------------- the int8 arm (--gemm-lds 2) --------------
+//
+// RDNA3 HAS a packed int8 dot product and this toolchain DOES expose it for
+// gfx1100 -- just not under the name the Makefile's note tried:
+// `__builtin_amdgcn_sdot4` wants the `dot1-insts` feature and is rejected,
+// while `__builtin_amdgcn_sudot4(signed_a, a, signed_b, b, acc, clamp)`
+// compiles and emits `v_dot4_i32_iu8 ... neg_lo:[1,1,0]` (verified by reading
+// the ISA out of hipcc -S, not by hoping).
+//
+// The WEIGHTS are already int8: Q8_0 is 32 int8 and one f16 scale, and this
+// kernel's K step is exactly that block, so the weight side is EXACT -- no
+// requantisation at all. The ACTIVATION tile is quantised per column per
+// 32-block, which is ggml's own Q8_1 recipe and is what llama.cpp's CPU
+// mul_mat does to every activation it dots against a quantised weight
+// (decode_backend.h set_quant_act). It is a real accuracy change, not a
+// reassociation, which is why it is a SEPARATE knob value from mode 1 and why
+// the gate has to report its divergence separately.
+//
+// Per 32-block: eight v_dot4 into an int accumulator, then one f32 multiply
+// by (weight scale * activation scale) into the f32 accumulator. So the f32
+// accumulation granularity is the same block the T = 1 kernel uses.
+//
+// LDS: int8 tiles at stride GEMM_LDS_KB+4 = 36 bytes (a multiple of 4, so the
+// packed int loads are aligned) plus the two scale vectors -- 5.1 KB, which is
+// why this arm can keep far more workgroups in flight than the f32 one.
+#define GEMM_LDS_I8_STRIDE 36
+
+__global__ __launch_bounds__(GEMM_LDS_THREADS)
+void k_gemm_lds_i8(GemvBatchD b, const float * __restrict__ x,
+                   const float * __restrict__ x2, int T) {
+    // DECLARED as int and written through a char view, not the other way
+    // round: v_dot4 wants four packed bytes as one int, so the int reads are
+    // the ones that must be the declared type, and a char* may alias anything.
+    // The stride is 9 ints = 36 bytes, so every packed read is 4-aligned.
+    __shared__ int         wq_i[GEMM_LDS_R * (GEMM_LDS_I8_STRIDE / 4)];
+    __shared__ int         aq_i[GEMM_LDS_C * (GEMM_LDS_I8_STRIDE / 4)];
+    __shared__ float       wd[GEMM_LDS_R];
+    __shared__ float       ad[GEMM_LDS_C];
+    signed char * const wq = (signed char *) wq_i;
+    signed char * const aq = (signed char *) aq_i;
+
+    const int tid  = threadIdx.x;
+    const int row0 = blockIdx.x * GEMM_LDS_R;
+    const int col0 = blockIdx.y * GEMM_LDS_C;
+    if (row0 >= b.total_rows || col0 >= T) return;
+
+    const int tr = tid / 16, tc = tid % 16;
+    const int sr = tid / 32, sl = tid % 32;
+
+    float acc[GEMM_LDS_RT][GEMM_LDS_CT];
+#pragma unroll
+    for (int i = 0; i < GEMM_LDS_RT; ++i)
+#pragma unroll
+        for (int j = 0; j < GEMM_LDS_CT; ++j) acc[i][j] = 0.0f;
+
+    for (int kbase = 0; kbase < b.K; kbase += GEMM_LDS_KB) {
+        __syncthreads();
+        const int e = kbase + sl;
+        const bool in_k = (e < b.K);
+        for (int rr = sr; rr < GEMM_LDS_R; rr += GEMM_LDS_THREADS / 32) {
+            const int grow = row0 + rr;
+            signed char q = 0;
+            float d0 = 0.0f;
+            if (grow < b.total_rows && in_k) {
+                const GemvDesc & d = b.d[desc_of(b, grow)];
+                const unsigned char * bp = (const unsigned char *) d.base +
+                                           (size_t)(grow - d.row_off) * d.row_stride +
+                                           (size_t)(e >> 5) * FK_Q8_0_BLOCK_BYTES;
+                q  = ((const signed char *)(bp + FK_Q8_0_OFF_QS))[e & 31];
+                d0 = fk_q8_0_block_d(bp);
+            }
+            wq[rr * GEMM_LDS_I8_STRIDE + sl] = q;
+            if (sl == 0) wd[rr] = d0;
+        }
+        for (int cc = sr; cc < GEMM_LDS_C; cc += GEMM_LDS_THREADS / 32) {
+            const int t = col0 + cc;
+            float a = 0.0f;
+            if (t < T && in_k) a = gemm_lds_x(b, x, x2, t, e);
+            // ggml's Q8_1 amax over exactly these 32 values. The 32 lanes
+            // staging this column ARE one wave, so the butterfly is the whole
+            // block's max and costs no LDS.
+            float m = fabsf(a);
+#pragma unroll
+            for (int off = WAVE / 2; off > 0; off >>= 1)
+                m = fmaxf(m, __shfl_xor(m, off, WAVE));
+            const float inv = (m > 0.0f) ? 127.0f / m : 0.0f;
+            aq[cc * GEMM_LDS_I8_STRIDE + sl] = (signed char) __float2int_rn(a * inv);
+            if (sl == 0) ad[cc] = m * (1.0f / 127.0f);
+        }
+        __syncthreads();
+
+        int iacc[GEMM_LDS_RT][GEMM_LDS_CT];
+#pragma unroll
+        for (int i = 0; i < GEMM_LDS_RT; ++i)
+#pragma unroll
+            for (int j = 0; j < GEMM_LDS_CT; ++j) iacc[i][j] = 0;
+        const int wstep = GEMM_LDS_I8_STRIDE / 4;      // 9 ints a row
+        const int * wi4 = wq_i + (tr * GEMM_LDS_RT) * wstep;
+        const int * ai4 = aq_i + (tc * GEMM_LDS_CT) * wstep;
+#pragma unroll
+        for (int kg = 0; kg < GEMM_LDS_KB / 4; ++kg) {
+            int wv[GEMM_LDS_RT], av[GEMM_LDS_CT];
+#pragma unroll
+            for (int i = 0; i < GEMM_LDS_RT; ++i) wv[i] = wi4[i * wstep + kg];
+#pragma unroll
+            for (int j = 0; j < GEMM_LDS_CT; ++j) av[j] = ai4[j * wstep + kg];
+#pragma unroll
+            for (int i = 0; i < GEMM_LDS_RT; ++i)
+#pragma unroll
+                for (int j = 0; j < GEMM_LDS_CT; ++j)
+                    iacc[i][j] = __builtin_amdgcn_sudot4(true, wv[i], true, av[j],
+                                                         iacc[i][j], false);
+        }
+#pragma unroll
+        for (int i = 0; i < GEMM_LDS_RT; ++i) {
+            const float dwi = wd[tr * GEMM_LDS_RT + i];
+#pragma unroll
+            for (int j = 0; j < GEMM_LDS_CT; ++j)
+                acc[i][j] = fmaf((float) iacc[i][j] * dwi, ad[tc * GEMM_LDS_CT + j], acc[i][j]);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < GEMM_LDS_RT; ++i) {
+        const int grow = row0 + tr * GEMM_LDS_RT + i;
+        if (grow >= b.total_rows) break;
+        const GemvDesc d = b.d[desc_of(b, grow)];
+        const int row = grow - d.row_off;
+#pragma unroll
+        for (int j = 0; j < GEMM_LDS_CT; ++j) {
+            const int t = col0 + tc * GEMM_LDS_CT + j;
+            if (t >= T) break;
+            d.out[(size_t) t * d.rows + row] = apply_epi(acc[i][j], d.epi, d.arg);
+        }
+    }
+}
+
 // Fixed-order sum of the split partials, then each matrix's epilogue and its
 // own destination. Reproducible, unlike an atomicAdd -- the oracle needs it.
 __global__ void k_reduce_splits_gemm(GemvBatchD b, const float * __restrict__ part,
@@ -1949,6 +2243,12 @@ enum ProfClass {
     PC_COPY,        // device-to-device copies
     PC_BOUNDARY,    // the hyper-connection residual crossing to the next card
     PC_ARGMAX,      // greedy sampling on the device
+    // Only with a deferred profile (--prefill-pipeline): the interval from
+    // the end of one chunk's enqueued work on this card to the first op of
+    // the next. It IS this card's idle time, so `total - gap` is its busy
+    // time and three cards whose busy times add up to more than the wall
+    // clock are overlapping.
+    PC_GAP,
     PC_N
 };
 const char * prof_name(int c) {
@@ -1965,6 +2265,7 @@ const char * prof_name(int c) {
         case PC_COPY:         return "copy";
         case PC_BOUNDARY:     return "boundary_p2p";
         case PC_ARGMAX:       return "argmax";
+        case PC_GAP:          return "gap_idle";
         default:              return "copy";
     }
 }
@@ -1984,7 +2285,7 @@ public:
         // engine's own stream rather than a blocking hipMemcpy: a pageable
         // hipMemcpyAsync degrades to a synchronous one.
         for (int i = 0; i < STAGE_SLOTS; ++i)
-            HIP_CHECK(hipHostMalloc(&stage_[i], STAGE_BYTES, hipHostMallocDefault));
+            HIP_CHECK(hipHostMalloc(&stage_[i], stage_bytes_, hipHostMallocDefault));
         // the attention/top-k scratch is sized for the worst case the runner
         // can present; both are small and allocated once
         const int max_chunks = ceil_div(MAX_SEL, ATTN_CHUNK);
@@ -1996,6 +2297,10 @@ public:
         HIP_CHECK(hipMalloc(&amax_v_, ARGMAX_BLOCKS * sizeof(float)));
         HIP_CHECK(hipMalloc(&amax_i_, ARGMAX_BLOCKS * sizeof(int)));
         HIP_CHECK(hipEventCreateWithFlags(&bnd_, hipEventDisableTiming));
+        for (int i = 0; i < N_BANKS; ++i)
+            HIP_CHECK(hipEventCreateWithFlags(&drained_[i], hipEventDisableTiming));
+        for (int i = 0; i < STAGE_SLOTS; ++i)
+            HIP_CHECK(hipEventCreateWithFlags(&stage_ev_[i], hipEventDisableTiming));
         // the candidate lists are sized by the CACHE depth, not the budget,
         // and grown on demand by topk_select()
     }
@@ -2006,8 +2311,12 @@ public:
         HIP_IGNORE(hipFree(gemv_part_));
         HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
         HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
-        for (int i = 0; i < STAGE_SLOTS; ++i) if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+        for (int i = 0; i < STAGE_SLOTS; ++i) {
+            if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+            HIP_IGNORE(hipEventDestroy(stage_ev_[i]));
+        }
         HIP_IGNORE(hipFree(amax_v_)); HIP_IGNORE(hipFree(amax_i_));
+        for (int i = 0; i < N_BANKS; ++i) HIP_IGNORE(hipEventDestroy(drained_[i]));
         HIP_IGNORE(hipEventDestroy(bnd_)); HIP_IGNORE(hipStreamDestroy(stream_));
         for (auto & e : ev_) HIP_IGNORE(hipEventDestroy(e));
         HIP_IGNORE(hipEventDestroy(ev0_)); HIP_IGNORE(hipEventDestroy(ev1_));
@@ -2019,8 +2328,18 @@ public:
     // The destination records nothing of its own: it waits on an event the
     // SOURCE stream recorded, then pulls the bytes on its own stream. No host
     // call, so a boundary costs the P2P time M5 measured and nothing else.
-    void boundary_recv(void * dst, Backend & src, const void * src_ptr, size_t bytes) override {
+    //
+    // The pipeline adds the OTHER half of the handshake. After the copy this
+    // device records `drained_[bank]` on its own stream and registers itself
+    // as the source's consumer of that bank; the source then waits on that
+    // event (boundary_wait_free) before it overwrites the bank for a later
+    // chunk. Both halves are stream events -- the host never waits, which is
+    // the whole point -- and together they bound the pipeline at two chunks
+    // of run-ahead per boundary without any explicit depth counter.
+    void boundary_recv(void * dst, Backend & src, const void * src_ptr, size_t bytes,
+                       int bank) override {
         GpuBackend & s = static_cast<GpuBackend &>(src);
+        if (bank < 0 || bank >= N_BANKS) bank = 0;
         // The event belongs to the SOURCE's device, so record it with that
         // device current; the wait and the copy belong to the destination.
         dev_ensure(s.dev_);
@@ -2029,12 +2348,28 @@ public:
         mark(PC_BOUNDARY);                 // ensures THIS device
         last_op_ = "boundary_recv";
         if (sync_debug_) {
-            std::fprintf(stderr, "sync-debug boundary: dev%d[%p .. %p) <- dev%d[%p .. %p) %zu B\n",
+            std::fprintf(stderr, "sync-debug boundary: dev%d[%p .. %p) <- dev%d[%p .. %p) %zu B bank %d\n",
                          dev_, dst, (const void *)((const char *) dst + bytes),
-                         s.dev_, src_ptr, (const void *)((const char *) src_ptr + bytes), bytes);
+                         s.dev_, src_ptr, (const void *)((const char *) src_ptr + bytes),
+                         bytes, bank);
         }
         HIP_CHECK(hipStreamWaitEvent(stream_, s.bnd_, 0));
         HIP_CHECK(hipMemcpyPeerAsync(dst, dev_, src_ptr, s.dev_, bytes, stream_));
+        // "this bank has been read out of you": recorded on the DESTINATION's
+        // stream, after the copy, and handed to the source.
+        HIP_CHECK(hipEventRecord(drained_[bank], stream_));
+        s.sink_[bank] = this;
+    }
+
+    void boundary_wait_free(int bank) override {
+        if (bank < 0 || bank >= N_BANKS) return;
+        GpuBackend * c = sink_[bank];
+        if (!c) return;                    // nobody has ever consumed it
+        dev_ensure(dev_);
+        // hipStreamWaitEvent binds to the event's MOST RECENT record at the
+        // time of this host call, and the host issues chunks in order, so
+        // this is the drain of the last chunk that used this bank.
+        HIP_CHECK(hipStreamWaitEvent(stream_, c->drained_[bank], 0));
     }
 
     void argmax(const float * logits, int n, int * out_id) override {
@@ -2085,17 +2420,39 @@ public:
         return p;
     }
     void free_buf(void * p) override { dev_ensure(dev_); HIP_IGNORE(hipFree(p)); }
+    // THE STAGING RING GROWS, and that is what lets a chunk be pipelined.
+    //
+    // A chunk uploads the embedding gather and the PLE gather: T x 2 560 f32,
+    // which is 2.6 MB at T = 256 and 5.2 MB at 512. Against a FIXED 64 KB
+    // ring both fell through to the blocking `hipMemcpy` below -- and a
+    // blocking copy on the default stream drains a blocking stream, so every
+    // chunk started by emptying card 0's queue. Nothing would have overlapped.
+    // So the ring is sized to the largest upload it is ever handed, once, and
+    // a slot is only reused after the event that says its previous copy has
+    // left it (with STAGE_SLOTS slots and two uploads a chunk that is four
+    // chunks of slack, so the wait is normally already satisfied).
+    void ensure_stage(size_t bytes) {
+        if (bytes <= stage_bytes_) return;
+        HIP_CHECK(hipStreamSynchronize(stream_));   // once, before the swap
+        size_t want = stage_bytes_;
+        while (want < bytes) want <<= 1;
+        for (int i = 0; i < STAGE_SLOTS; ++i) {
+            if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+            HIP_CHECK(hipHostMalloc(&stage_[i], want, hipHostMallocDefault));
+            stage_used_[i] = false;
+        }
+        stage_bytes_ = want;
+    }
     void upload(void * d, const void * s, size_t b) override {
         dev_ensure(dev_);
-        if (b <= STAGE_BYTES) {
-            void * st = stage_[stage_next_];
-            stage_next_ = (stage_next_ + 1) % STAGE_SLOTS;
-            std::memcpy(st, s, b);
-            HIP_CHECK(hipMemcpyAsync(d, st, b, hipMemcpyHostToDevice, stream_));
-            return;                        // stream-ordered, does NOT block the host
-        }
-        ++blocking_;
-        HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyHostToDevice));
+        ensure_stage(b);
+        const int sl = stage_next_;
+        stage_next_ = (stage_next_ + 1) % STAGE_SLOTS;
+        if (stage_used_[sl]) HIP_CHECK(hipEventSynchronize(stage_ev_[sl]));
+        std::memcpy(stage_[sl], s, b);
+        HIP_CHECK(hipMemcpyAsync(d, stage_[sl], b, hipMemcpyHostToDevice, stream_));
+        HIP_CHECK(hipEventRecord(stage_ev_[sl], stream_));
+        stage_used_[sl] = true;            // stream-ordered, does NOT block the host
     }
     void download(void * d, const void * s, size_t b) override {
         dev_ensure(dev_);
@@ -2172,6 +2529,45 @@ public:
             bytes += W.row_bytes * (size_t) W.rows;
         }
         b.total_rows = off;
+
+        // ---- the LDS-tiled arm (--gemm-lds), T > 1 only -------------------
+        //
+        // ALL-OR-NOTHING PER BATCH, and that is not fastidiousness: nsplit
+        // below is a function of the CONCATENATION's row count, so routing
+        // half a batch here and half to k_gemm_batch would silently change
+        // the other half's split -- and therefore its summation order -- for
+        // a reason that has nothing to do with this kernel. A batch either
+        // qualifies whole or is untouched.
+        //
+        // It has to be wide enough to fill the card from the ROW axis (a
+        // 64-row tile on a 4-row inject matrix is 60 idle lanes, and those
+        // matrices are the ones split-K exists for), it must carry no Q6_K
+        // (lm_head, which only ever runs at T = 1 anyway) and no expert
+        // format, and mode 2 additionally needs every matrix to be Q8_0
+        // because v_dot4 has nothing to chew on otherwise.
+        int lds_mode = 0;
+        if (gemm_lds_ > 0 && T > 1 && !b.has_q6k && b.total_rows >= GEMM_LDS_MIN_ROWS) {
+            bool ok = true, all_q8 = true;
+            for (int i = 0; i < b.n; ++i) {
+                const int ty = b.d[i].type;
+                if (ty != FK_Q_Q8_0 && ty != FK_Q_BF16 && ty != FK_Q_F32) ok = false;
+                if (ty != FK_Q_Q8_0) all_q8 = false;
+            }
+            if (ok) lds_mode = (gemm_lds_ >= 2 && all_q8) ? 2 : 1;
+        }
+        if (lds_mode) {
+            mark(PC_TRUNK, group, bytes * (size_t) T);
+            last_op_ = "gemm_lds";
+            ++gemm_lds_calls_;
+            const dim3 grid((unsigned) ceil_div(b.total_rows, GEMM_LDS_R),
+                            (unsigned) ceil_div(T, GEMM_LDS_C));
+            if (lds_mode == 2)
+                k_gemm_lds_i8<<<grid, GEMM_LDS_THREADS, 0, stream_>>>(b, x, x2, T);
+            else
+                k_gemm_lds<<<grid, GEMM_LDS_THREADS, 0, stream_>>>(b, x, x2, T);
+            return;
+        }
+        if (T > 1) ++gemm_tile_calls_;
 
         // total waves == total rows, so wider workgroups never add
         // parallelism; splitting K is the only thing that does.
@@ -2282,6 +2678,7 @@ public:
         dbg_phase_ = phase; dbg_layer_ = layer;
     }
     void set_gemv_min_rows(int r) override { gemv_min_rows_ = r > 0 ? r : 1; }
+    void set_gemm_lds(int m) override { gemm_lds_ = m; }
     void set_expert_gather(int mask) override { expert_gather_ = mask; }
     void gemv_expert(const Mat & W, int e, const float * x, float * y) override {
         Mat slice = W;
@@ -2606,21 +3003,22 @@ public:
         }
     }
     void prof_reset() override {
+        // Anything still pending belongs to the chunks being discarded.
+        if (prof_defer_ && n_ev_ > 0) prof_flush();
         for (int i = 0; i < PC_N; ++i) prof_us_[i] = 0.0;
         for (int i = 0; i < GG_N; ++i) { gemv_us_[i] = 0.0; gemv_bytes_[i] = 0.0; }
         tokens_profiled_ = 0;
         blocking_in_body_ = 0;
         launches_in_body_ = 0;
+        gemm_lds_calls_ = 0;
+        gemm_tile_calls_ = 0;
     }
-    void prof_end_token() override {
-        dev_ensure(dev_);
-        debug_check("end of token");
-        blocking_in_body_ += blocking_ - blocking_at_token_start_;
-        launches_last_ = launches_ - launches_at_token_start_;
-        launches_in_body_ += launches_last_;
-        ++tokens_profiled_;
+    void prof_defer(bool on) override { prof_defer_ = on; }
+    // Records the closing event, waits for it ONCE, and reduces every interval
+    // still in the pool. The only synchronisation the deferred profile does.
+    void prof_flush() override {
         if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
-        // one closing event, then ONE synchronisation for the whole token
+        dev_ensure(dev_);
         HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         HIP_CHECK(hipEventSynchronize(ev_[n_ev_]));
         for (int i = 0; i < n_ev_; ++i) {
@@ -2631,13 +3029,45 @@ public:
         }
         n_ev_ = 0;
     }
+    void prof_end_token() override {
+        dev_ensure(dev_);
+        debug_check("end of token");
+        blocking_in_body_ += blocking_ - blocking_at_token_start_;
+        launches_last_ = launches_ - launches_at_token_start_;
+        launches_in_body_ += launches_last_;
+        ++tokens_profiled_;
+        if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
+        if (!prof_defer_) { prof_flush(); return; }
+        // DEFERRED: close the chunk with an event of class PC_GAP and keep
+        // going. The interval from it to the next chunk's first mark() is
+        // this card's idle time, and nothing here waits -- a synchronise
+        // would serialise the pipeline the profile exists to show.
+        HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
+        ev_cls_[n_ev_] = PC_GAP;
+        ev_grp_[n_ev_] = -1;
+        ++n_ev_;
+        // Reducing costs one sync; at ~400 events a chunk this is roughly
+        // once every twenty chunks, which is why it is cheaper than the
+        // per-chunk sync it replaced and still cannot exhaust the pool.
+        if (n_ev_ >= PROF_MAX_EVENTS - 1024) prof_flush();
+    }
     void prof_report(FILE * out, int n_tokens) override {
+        prof_flush();                      // anything a pipelined run left pending
         const double n = n_tokens > 0 ? (double) n_tokens : 1.0;
         double total = 0.0;
         for (int c = 0; c < PC_N; ++c) total += prof_us_[c];
         for (int c = 0; c < PC_N; ++c)
             std::fprintf(out, "prof_%s_us=%.2f\n", prof_name(c), prof_us_[c] / n);
         std::fprintf(out, "prof_total_us=%.2f\n", total / n);
+        // THE OVERLAP NUMBER. `busy` is this card's own work; `total` is the
+        // span it covered. Three cards each busy ~2.5 ms a token inside a
+        // 7.6 ms token is the sequential picture; the same three busy ~2.5 ms
+        // inside a 2.6 ms token is the pipelined one.
+        std::fprintf(out, "prof_busy_us=%.2f prof_gap_us_explicit=%.2f prof_busy_frac=%.3f\n",
+                     (total - prof_us_[PC_GAP]) / n, prof_us_[PC_GAP] / n,
+                     total > 0.0 ? (total - prof_us_[PC_GAP]) / total : 0.0);
+        std::fprintf(out, "prof_gemm_lds_calls=%lld prof_gemm_tile_calls=%lld\n",
+                     gemm_lds_calls_, gemm_tile_calls_);
         // Achieved bandwidth per projection class: the bytes are the weight
         // bytes those launches actually read, so this is the number to hold
         // against the 800 GB/s of M5, not the lumped trunk total.
@@ -2723,6 +3153,9 @@ private:
     }
 
     bool       prof_ = false;
+    bool       prof_defer_ = false;
+    long long  gemm_lds_calls_ = 0;
+    long long  gemm_tile_calls_ = 0;
     bool       sync_debug_ = false;
     const char * last_op_   = nullptr;
     const char * dbg_phase_ = nullptr;
@@ -2754,6 +3187,8 @@ private:
     int        cand_cap_ = 0;
     int        gemv_lds_ = 1;
     int        gemv_min_rows_ = 1024;
+    // 0 = k_gemm_batch only, the ONE path that is bit-identical to decode.
+    int        gemm_lds_ = 0;
     // Bit 0 (gate/up) is MEASURED bit-exact on three cards; bit 1 (down) is
     // measured NOT to be and is off until it is. See decode_backend.h.
     int        expert_gather_ = 1;
@@ -2770,9 +3205,18 @@ private:
     size_t     part_floats_ = 0;
     static constexpr size_t GEMV_PART_FLOATS = 1u << 17;   // 128k floats = 512 KB
     static constexpr int    STAGE_SLOTS = 8;
-    static constexpr size_t STAGE_BYTES = 1u << 16;        // 64 KB
     void *     stage_[STAGE_SLOTS] = {nullptr};
+    hipEvent_t stage_ev_[STAGE_SLOTS] = {};
+    bool       stage_used_[STAGE_SLOTS] = {false};
+    size_t     stage_bytes_ = 1u << 16;                    // 64 KB, grown on demand
     int        stage_next_ = 0;
+    // The residual banks of the pipeline (decode_graph.h N_RES_BANKS).
+    // `drained_[b]` is recorded on THIS device's stream once it has copied
+    // bank b out of some other card; `sink_[b]` is the card that did that to
+    // US, so boundary_wait_free knows whose event to wait on.
+    static constexpr int N_BANKS = 2;
+    hipEvent_t   drained_[N_BANKS] = {};
+    GpuBackend * sink_[N_BANKS] = {nullptr, nullptr};
     size_t placed_ = 0;
 };
 

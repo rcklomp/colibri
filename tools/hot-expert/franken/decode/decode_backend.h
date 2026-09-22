@@ -158,9 +158,23 @@ public:
     // the source's stream, makes its own stream wait on it, and issues the
     // peer copy on its own stream. No host call is involved, so a boundary
     // costs the ~30 us of P2P that M5 measured and nothing else.
+    //
+    // PIPELINED PREFILL (design 3.5). `bank` names which of the two residual
+    // buffers is crossing. The destination ALSO records, after its peer copy,
+    // an event that says "bank `bank` has been drained out of the source", and
+    // hands it to the source; the source waits on it (on its own stream, no
+    // host call) before it overwrites that bank for a later chunk. That pair
+    // -- two banks plus a drain event -- is the whole reason chunk n+1 may run
+    // on card 0 while chunk n is still on card 1: without it card 0's writes
+    // would race card 1's read, and with a host sync instead of an event there
+    // would be no pipeline at all.
     virtual int  device() const { return -1; }
     virtual void boundary_recv(void * dst, Backend & src, const void * src_ptr,
-                               size_t bytes) = 0;
+                               size_t bytes, int bank) = 0;
+    // Called on a device that is about to WRITE residual bank `bank` (card 0
+    // before hc_broadcast, every other card before the peer copy lands in it).
+    // A no-op until some destination has actually consumed that bank.
+    virtual void boundary_wait_free(int bank) { (void) bank; }
     // Greedy sampling on the device: a reduction over the 248 320 logits, so
     // the only thing that crosses to the host per token is one int.
     virtual void argmax(const float * logits, int n, int * out_id) = 0;
@@ -437,6 +451,23 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
+    // --gemm-lds MODE: which kernel serves a T > 1 trunk GEMM.
+    //   0  k_gemm_batch<GEMM_TILE> -- the wave-per-row kernel, bit-identical
+    //      to the decode token's TILE = 1 instantiation per column. DEFAULT.
+    //   1  k_gemm_lds -- an LDS-tiled GEMM: a 64x64 (row x token) tile per
+    //      workgroup, the weight block decoded ONCE per 64 activation
+    //      columns instead of once per 8, f32 accumulation per thread over K.
+    //   2  k_gemm_lds_i8 -- the same tiling with the activation tile
+    //      quantised to int8 per 32-block and RDNA3's v_dot4_i32_iu8
+    //      (__builtin_amdgcn_sudot4, which DOES compile for gfx1100 where
+    //      __builtin_amdgcn_sdot4 does not). Falls back to mode 1 for a batch
+    //      that is not all-Q8_0.
+    // Modes 1 and 2 accumulate K linearly per thread instead of across a
+    // wave's lanes, so they are a DIFFERENT SUMMATION ORDER and cannot be
+    // bit-identical to decode. That is why they are a knob and the default is
+    // 0: the chunk-vs-decode oracle keeps its meaning unless the knob is on,
+    // and with it on the orchestrator measures how far the last bits moved.
+    virtual void set_gemm_lds(int) {}
     // --expert-gather MASK: which expert stages take design 9.4 item 5's
     // device-side sort and row-gather at T > 1. Bit 0 is gate/up, bit 1 is
     // down. A stage that is off runs every assignment on its own, exactly as
@@ -479,6 +510,14 @@ public:
     virtual void set_debug_context(const char * phase, int layer) { (void) phase; (void) layer; }
     virtual void prof_reset() {}
     virtual void prof_end_token() {}
+    // --prefill-pipeline: prof_end_token must NOT synchronise, or the profile
+    // would serialise the very overlap it is there to measure. Deferred, the
+    // closing event of a chunk stays in the pool and the interval from it to
+    // the next chunk's first op is charged to PC_GAP -- which is exactly this
+    // card's idle time, so `busy = total - gap` per device is the overlap.
+    // prof_flush() resolves everything outstanding; it is the only sync.
+    virtual void prof_defer(bool on) { (void) on; }
+    virtual void prof_flush() {}
     virtual void prof_report(FILE * out, int n_tokens) { (void) out; (void) n_tokens; }
     // Launches this device enqueued inside the last token's body. The runner
     // divides its own host wall time by this to get the per-launch issue cost,

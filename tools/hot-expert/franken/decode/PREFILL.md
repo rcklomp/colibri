@@ -213,3 +213,81 @@ Two invariants, and a third the hard way:
   launches calls `dev_ensure(dev_)` first.** `set_profile`'s has now been lost
   three times and the symptom is always "invalid resource handle" from
   `mark()`, because `hipEventCreate` acts on the process-wide current device.
+
+## 10. The pipeline and the LDS GEMM (2026-09-22, the two profile items)
+
+`g.txt` said two things about the 7.6 ms prompt token and this section is
+what was done about each.
+
+**(a) The cards were idle two thirds of the time.** Chunk n ran on card 0,
+then card 1, then card 2: card 1 waited 2.5 ms and card 2 4.9 ms per token
+for the upstream chunk, and 2.56 + 2.43 + 2.39 = 7.4 of the 7.6 ms. Design
+§3.5 allows micro-batching for prefill, so chunk n+1 now starts on card 0 as
+soon as card 0 has handed chunk n to card 1 (`--prefill-pipeline 1`, the
+default). Three parts:
+
+- the wide residual — the ONLY buffer that crosses a card — has **two banks
+  a device**, picked by chunk parity, and `boundary_recv` gained the other
+  half of its handshake: the destination records a `drained_[bank]` event
+  after its peer copy and the source waits on it before overwriting that
+  bank. Stream events, no host call. Two banks also bound the run-ahead at
+  two chunks, so there is no depth counter. Every other buffer a chunk
+  touches is written only by its own card in chunk order, and a stream is
+  in-order;
+- the pinned staging ring **grows to the largest upload it is handed**. It
+  was 64 KB, a chunk uploads 2.6 MB at T = 256, and the overflow path was a
+  blocking `hipMemcpy` on the default stream — which drains a blocking
+  stream, so every chunk started by emptying card 0's queue;
+- `step(..., flush=false)` enqueues and returns; only the last chunk is
+  awaited. It overrides `flush` whenever the recorder is capturing (a tap is
+  a download), so no caller can lose a tap by asking for the pipeline, and
+  `last_flushed()` is what a caller reads back rather than re-deriving it.
+
+`--profile` had to stop synchronising per chunk or it would have serialised
+what it measures: it defers, and the gap between a chunk's closing event and
+the next chunk's first op is charged to `PC_GAP`, which is the card's idle
+time. `prof_busy_us` / `prof_busy_frac` are the overlap.
+
+**Numerics unchanged by construction** — no kernel moved and no summation
+order changed, only an address and the host's waiting. Gated on the CPU arm
+at layers 0-11: `--chunk 1` against the pre-change binary, and `--chunk 2`,
+`4`, `5`, `6` against `--chunk 1`, all 404 float taps `cos=1.000000
+maxabs=0`, and the same 16 greedy ids at chunk 6 and chunk 1.
+
+**(b) The trunk GEMM is 6x off its bytes.** `k_gemm_batch<8>` reads its
+~1.7 GB of weights once per TILE of 8 token columns — 32 passes at T = 256,
+54 GB a chunk, 0.27 ms a token at the 800 GB/s bound — and takes 1.69-1.76.
+At 135 VGPR it gets 10 waves/SIMD and every wave re-decodes the same Q8_0
+block for each group of 8 columns. So there is now a second kernel, and
+section 9's "there is ONE GEMV/GEMM kernel" holds in the form that matters:
+**the default is still that one kernel**, and `--gemm-lds` is off unless a
+gate turns it on.
+
+`k_gemm_lds`: a workgroup owns a 64 x 64 (rows x tokens) tile and stages K in
+steps of 32 through LDS, so a weight element is read and decoded ONCE per 64
+columns — 4 passes at T = 256, 6.8 GB a chunk, 0.033 ms a token at the
+bound. The activation tile is re-read once per 64 rows, which is 160 passes
+over 2.6 MB and costs nothing because 2.6 MB lives in the 96 MB Infinity
+Cache. 60 VGPR, 17 408 B of LDS, no spills, occupancy 14 waves/SIMD before
+the LDS limit.
+
+`k_gemm_lds_i8` (`--gemm-lds 2`): the same tiling with the activation tile
+quantised to int8 per 32-block (ggml's Q8_1 recipe) and RDNA3's
+`v_dot4_i32_iu8`. **The instruction IS reachable on this toolchain**, which
+this directory's Makefile used to say it was not:
+`__builtin_amdgcn_sdot4` wants `dot1-insts` and is rejected, but
+`__builtin_amdgcn_sudot4(true, a, true, b, acc, false)` compiles and emits
+`v_dot4_i32_iu8 ... neg_lo:[1,1,0]`. The WEIGHTS are exact — Q8_0 is
+already int8 and the kernel's K step is exactly its 32-element block — so
+only the activations are requantised. 95 VGPR, 5 120 B of LDS, 128 dot4s,
+no spills.
+
+**Both modes accumulate K linearly per thread** where `k_gemm_batch`
+accumulates across a wave's lanes and closes with a butterfly. That is a
+different summation order, so neither can be bit-identical to decode; mode 2
+additionally changes the activations. Hence the knob, the default of 0, and
+a gate that measures the divergence rather than asserting there is none.
+Small matrices (< 256 rows) and anything that is not Q8_0/BF16/F32 keep the
+old path whatever the knob says — all-or-nothing per batch, because
+`nsplit` is a function of the concatenation's row count and splitting a
+batch would change the untouched half's summation order for no reason.

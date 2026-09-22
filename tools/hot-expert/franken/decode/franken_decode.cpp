@@ -56,6 +56,20 @@ void usage(const char * p) {
         "                           run of this binary must be cos 1.000000 on EVERY tap\n"
         "          [--time-prefill N] feed N synthetic ids (fixed seed) in chunks of C\n"
         "                           and print prefill_ms_per_token / prefill_tokens_per_s\n"
+        "          [--prefill-pipeline 0|1] overlap the chunks across the cards\n"
+        "                           (default 1): chunk n+1 starts on card 0 as soon as\n"
+        "                           card 0 has handed chunk n to card 1. Numerics are\n"
+        "                           UNCHANGED -- the residual gets a second bank and the\n"
+        "                           host stops waiting, no kernel moves. Forced off for\n"
+        "                           a chunk the recorder is capturing (a tap is a\n"
+        "                           download) and for --jitter / --sync-debug.\n"
+        "          [--gemm-lds M]   trunk GEMM kernel at T > 1: 0 the wave-per-row\n"
+        "                           k_gemm_batch (DEFAULT, bit-identical to decode),\n"
+        "                           1 the LDS-tiled GEMM (weight block decoded once per\n"
+        "                           64 token columns, not per 8), 2 the same with the\n"
+        "                           activation tile quantised to int8 and RDNA3's\n"
+        "                           v_dot4_i32_iu8. 1 and 2 reassociate K, so they are\n"
+        "                           a knob and their divergence is measured.\n"
         "          [--ctx N]        cells the QSA caches are sized for (default 512)\n"
         "          [--threads N]    CPU backend threads (default 4)\n"
         "          [--min-cos X]    oracle bar (default 0.999)\n"
@@ -130,6 +144,8 @@ int main(int argc, char ** argv) {
     int  gemv_min_rows = 1024;
     bool sync_debug = false;
     int expert_gather = 1;
+    int prefill_pipeline = 1;
+    int gemm_lds = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -154,6 +170,8 @@ int main(int argc, char ** argv) {
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
         else if (a == "--chunk"  && i + 1 < argc) chunk = std::atoi(argv[++i]);
         else if (a == "--time-prefill" && i + 1 < argc) time_prefill = std::atoi(argv[++i]);
+        else if (a == "--prefill-pipeline" && i + 1 < argc) prefill_pipeline = std::atoi(argv[++i]);
+        else if (a == "--gemm-lds" && i + 1 < argc) gemm_lds = std::atoi(argv[++i]);
         else if (a == "--ctx"    && i + 1 < argc) ctx = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--min-cos"&& i + 1 < argc) min_cos = std::atof(argv[++i]);
@@ -206,11 +224,18 @@ int main(int argc, char ** argv) {
             b->set_gemv_min_rows(gemv_min_rows);
             b->set_sync_debug(sync_debug);
             b->set_expert_gather(expert_gather);
+            b->set_gemm_lds(gemm_lds);
+            if (profile) b->prof_defer(prefill_pipeline != 0);
         }
         Backend * be = devs.front();
         std::printf("backend=%s devices=%d layers=%d-%d ctx=%d tokens=%zu chunk=%d head=%d quant_act=%d\n",
                     be->name(), n_devices, il0, il1, ctx, tokens.size(), chunk,
                     (int) with_head, (int) quant_act);
+        // Two lines a gate greps for. `gemm_kernel` names the kernel a T > 1
+        // trunk GEMM will take, so an oracle log says which arm produced it.
+        std::printf("prefill_pipeline=%d gemm_lds=%d gemm_kernel=%s\n",
+                    prefill_pipeline, gemm_lds,
+                    gemm_lds == 2 ? "lds_i8_dot4" : (gemm_lds == 1 ? "lds_f32" : "batch_tile"));
 
         const int n_report = use_cpu ? 1 : n_devices;
         // BEFORE the weights, so "the card was empty" is a measurement
@@ -276,12 +301,20 @@ int main(int argc, char ** argv) {
         const auto t_pf0 = std::chrono::steady_clock::now();
         for (size_t t = 0; t < tokens.size(); t += (size_t) chunk) {
             const int T = (int) std::min((size_t) chunk, tokens.size() - t);
-            rec.enable(time_prefill == 0 && t + (size_t) T == tokens.size());
+            const bool is_last = (t + (size_t) T == tokens.size());
+            rec.enable(time_prefill == 0 && is_last);
             const float * ple = need_ple ? ple_all.data() + t * N_EMBD : nullptr;
-            last_greedy = run.step(tokens.data() + t, T, ple, rec);
-            if (routing.loaded()) routing.observe(run.pos() - 1, il0, run.routed_ids());
+            // Only the LAST chunk is awaited: every other one is enqueued and
+            // left to run while the host builds the next. The cards stay
+            // correct on events alone (decode_backend.h boundary_recv).
+            const int g = run.step(tokens.data() + t, T, ple, rec,
+                                   (prefill_pipeline == 0) || is_last);
+            if (run.last_flushed()) {
+                last_greedy = g;
+                if (routing.loaded()) routing.observe(run.pos() - 1, il0, run.routed_ids());
+            }
             ++n_chunks;
-            chunk_ms.push_back(run.last_body_ms());
+            if (run.last_body_ms() > 0.0) chunk_ms.push_back(run.last_body_ms());
             chunk_issue.push_back(run.last_issue_ms());
             // The FIRST chunk pays every one-time allocation this run makes
             // (the split-K partials and the expert sort tables grow with T),
@@ -298,8 +331,11 @@ int main(int argc, char ** argv) {
         }
         if (time_prefill > 0) {
             run.set_capture(true);
-            // One sync already happened inside step() (the greedy id), so the
-            // wall time below is the whole prefill and not a queue depth.
+            // The last chunk was awaited inside step(), and every card is
+            // drained here as well, so the wall time below is the whole
+            // prefill and not a queue depth. With --prefill-pipeline 1 that
+            // is the ONLY thing that makes the number honest.
+            for (int d = 0; d < n_report; ++d) devs[d]->sync();
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t_pf0).count();
             std::printf("prefill_tokens=%d chunk=%d chunks=%d prefill_ms=%.1f "
@@ -311,10 +347,14 @@ int main(int argc, char ** argv) {
             // chunk, issue is the host's cost to enqueue one.
             for (int d = 0; d < n_report; ++d) pf_launches += devs[d]->launches_last_token();
             const double bms = median(chunk_ms), ims = median(chunk_issue);
-            std::printf("prefill_chunk_body_ms_median=%.3f prefill_chunk_issue_ms_median=%.3f "
+            // body is a device-timer read and only an AWAITED chunk has one,
+            // so with the pipeline on this is the last chunk alone (n=1) and
+            // it is a span, not a busy time -- prof_busy_us is the busy time.
+            std::printf("prefill_chunk_body_ms_median=%.3f (n=%zu) "
+                        "prefill_chunk_issue_ms_median=%.3f "
                         "prefill_launches_last_chunk_all_devices=%lld "
                         "prefill_cpu_per_launch_us=%.2f\n",
-                        bms, ims, pf_launches,
+                        bms, chunk_ms.size(), ims, pf_launches,
                         pf_launches > 0 ? ims * 1000.0 / (double) pf_launches : 0.0);
             // The hyper-connection residual is the ONLY thing that crosses a
             // card, and a chunk makes it T times bigger: 40 KB a token, so

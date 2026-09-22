@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
 # run_m1.sh — runs the M1 routed-expert-kernel binaries (candidate 1: ggml/
-# llama.cpp, candidate 2: hipFire) and records their output.
+# llama.cpp, candidate 2: hipFire, candidate 3: native IQ3_S/IQ4_NL) and
+# records their output.
 #
-# NOT run by the agent that built this harness: both binaries open the GPUs
-# the moment they run (ggml_backend_cuda_init(0) / hipMalloc). Only the
+# NOT run by the agent that built this harness: all three binaries open the
+# GPUs the moment they run (ggml_backend_cuda_init(0) / hipMalloc). Only the
 # orchestrating session, under the rig lock (tools/hot-expert/rig_lock.sh)
 # with GLM idle, runs this — see
 # tools/hot-expert/M1-M5-BRIEF-2026-09-22.md, "Build and run discipline".
 #
-# Candidate 3 (Colibri's own qmatmul_gate_up.comp / qmatmul_tile.comp via
-# c/backend_vulkan.c) is NOT built by this agent and is not run here.
+# Candidate 3 here is m1_native: hipFire's kernel shape reading the experts in
+# their NATIVE GGUF formats (gate/up IQ3_S, down IQ4_NL), K_TOP=10, no
+# requantisation and no padding (design rev 7 section 9.3, L0 step 1). It
+# links ggml's CPU libs to quantise the weights and to dequantise them for
+# the oracle, so it needs the llama.cpp lib dir on LD_LIBRARY_PATH just as
+# m1_ggml does. Colibri's own Vulkan path (qmatmul_gate_up.comp /
+# qmatmul_tile.comp via c/backend_vulkan.c) is still NOT built and NOT run
+# here.
+#
+# Note m1_native spends minutes in host-side IQ3_S quantisation before it
+# prints anything (512 experts, single-threaded inside ggml) — the same cost
+# m1_ggml pays. A silent first few minutes is expected, not a hang.
 #
 # Usage: ./run_m1.sh [path-to-this-dir]
-#   Default: the directory this script lives in (both m1_ggml and
-#   m1_hipfire are expected next to it, from `make all`).
+#   Default: the directory this script lives in (m1_ggml, m1_hipfire and
+#   m1_native are expected next to it, from `make all`).
 #
 # Writes:
 #   ~/bench/m1/m1_<timestamp>.txt   (key=value lines, both binaries' stdout,
@@ -74,6 +85,15 @@ HIPFIRE_RC=$?
     echo "# m1_hipfire exit code: ${HIPFIRE_RC}"
 } >> "$TXT"
 
+echo "running m1_native ($DIR/m1_native)..." >&2
+NATIVE_OUT="$(run_one "m1_native" "/opt/rocm/lib:${LLAMA_LIB_DIR}")"
+NATIVE_RC=$?
+{
+    echo "# --- m1_native (candidate 3: native IQ3_S/IQ4_NL, hipFire shape) ---"
+    printf '%s\n' "$NATIVE_OUT"
+    echo "# m1_native exit code: ${NATIVE_RC}"
+} >> "$TXT"
+
 echo "wrote $TXT" >&2
 
 # key=value -> a flat JSON object, dependency-free (no python/numpy on this
@@ -83,6 +103,7 @@ echo "wrote $TXT" >&2
     echo "{"
     printf '  "m1_ggml_exit_code": %d,\n' "$GGML_RC"
     printf '  "m1_hipfire_exit_code": %d,\n' "$HIPFIRE_RC"
+    printf '  "m1_native_exit_code": %d,\n' "$NATIVE_RC"
     grep -E '^[a-zA-Z_][a-zA-Z0-9_]*=' "$TXT" | while IFS='=' read -r k v; do
         # Quote the value unless it parses as a plain (possibly signed,
         # possibly decimal) number.
@@ -97,7 +118,7 @@ echo "wrote $TXT" >&2
 
 echo "wrote $JSON" >&2
 
-if [ "$GGML_RC" -ne 0 ] || [ "$HIPFIRE_RC" -ne 0 ]; then
+if [ "$GGML_RC" -ne 0 ] || [ "$HIPFIRE_RC" -ne 0 ] || [ "$NATIVE_RC" -ne 0 ]; then
     echo "one or more candidates exited non-zero (1 = CHECK_FAIL, see $TXT)" >&2
     exit 1
 fi

@@ -551,6 +551,290 @@ void k_moe_down_q8_0(const unsigned char * __restrict__ base, size_t expert_stri
     if (tid == 0) eo[(size_t) col * rows + row] = s;
 }
 
+// ------------------------------------------- the row-gather (9.4 item 5) --
+//
+// At T = 1 the ten assignments are ten DIFFERENT experts, so there is
+// nothing to share and the kernels above are the whole story. At T = 256
+// there are 2 560 assignments over at most 512 experts -- five a card on
+// average -- and the kernels above read each chosen expert's row once PER
+// ASSIGNMENT. This sorts the T x 10 assignments by expert on the device and
+// hands a wave a TILE of up to MOE_TILE_E assignments that share one, so the
+// row is walked once for all of them.
+//
+// What it deliberately does NOT do is decode the weights once and reuse the
+// decoded values: that would mean a second copy of the IQ3_S / IQ4_XS /
+// IQ4_NL decode next to decode_quant.h's, and a "faithful-looking retype" of
+// a kernel is exactly what that header exists to prevent (and what the two
+// paths would silently drift apart on). The tile calls the SAME primitive per
+// column, so the block's bytes are read from VRAM once and then served from
+// L1 for the rest of the tile, and every column accumulates in exactly the
+// order the one-assignment kernel used -- which is what keeps a chunk
+// bit-identical to T decode steps.
+#define MOE_TILE_E 8
+
+// Counting sort of the assignments by expert, plus the tile table, in one
+// workgroup of N_EXPERT threads. The scatter order inside an expert is
+// whatever the atomics give, which does not matter: every assignment writes
+// its own output column.
+__global__ __launch_bounds__(N_EXPERT)
+void k_moe_sort(const int * __restrict__ ids, int n,
+                int * __restrict__ order, int * __restrict__ tile_exp,
+                int * __restrict__ tile_off, int * __restrict__ tile_cnt,
+                int n_tiles_max) {
+    __shared__ int hist[N_EXPERT];
+    __shared__ int base[N_EXPERT];
+    __shared__ int tbase[N_EXPERT];
+    __shared__ int cur[N_EXPERT];
+    const int t = threadIdx.x;
+
+    hist[t] = 0;
+    for (int i = t; i < n_tiles_max; i += N_EXPERT) tile_cnt[i] = 0;
+    __syncthreads();
+    for (int i = t; i < n; i += N_EXPERT) atomicAdd(&hist[ids[i]], 1);
+    __syncthreads();
+
+    const int c  = hist[t];
+    const int tc = (c + MOE_TILE_E - 1) / MOE_TILE_E;
+    base[t]  = c;
+    tbase[t] = tc;
+    __syncthreads();
+    for (int off = 1; off < N_EXPERT; off <<= 1) {          // inclusive scans
+        const int a = (t >= off) ? base[t - off]  : 0;
+        const int b = (t >= off) ? tbase[t - off] : 0;
+        __syncthreads();
+        base[t]  += a;
+        tbase[t] += b;
+        __syncthreads();
+    }
+    const int start = base[t]  - c;                          // exclusive
+    const int t0    = tbase[t] - tc;
+    cur[t] = start;
+    __syncthreads();
+
+    for (int i = t; i < n; i += N_EXPERT) {
+        const int e = ids[i];
+        order[atomicAdd(&cur[e], 1)] = i;
+    }
+
+    for (int k = 0; k * MOE_TILE_E < c; ++k) {
+        const int idx = t0 + k;
+        if (idx >= n_tiles_max) break;
+        tile_exp[idx] = t;
+        tile_off[idx] = start + k * MOE_TILE_E;
+        tile_cnt[idx] = min(MOE_TILE_E, c - k * MOE_TILE_E);
+    }
+}
+
+// grid = (rows, n_tiles_max, 2). A tile past the end has tile_cnt 0.
+#define MOE_GATHER_PROLOGUE(nbits)                                                    \
+    const int row = blockIdx.x;                                                       \
+    if (row >= rows) return;                                                          \
+    const int cnt = tile_cnt[blockIdx.y];                                             \
+    if (cnt <= 0) return;                                                             \
+    const int tid = threadIdx.x;                                                      \
+    const int toff = tile_off[blockIdx.y];                                            \
+    int cols[MOE_TILE_E], xb[MOE_TILE_E];
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_gate_up_iq3s_gather(const unsigned char * __restrict__ gate_base,
+                               const unsigned char * __restrict__ up_base,
+                               size_t expert_stride, size_t row_bytes,
+                               const int * __restrict__ order,
+                               const int * __restrict__ tile_exp,
+                               const int * __restrict__ tile_off,
+                               const int * __restrict__ tile_cnt,
+                               const float * __restrict__ x,
+                               float * __restrict__ y_gate, float * __restrict__ y_up,
+                               int rows, int K, int k_top) {
+    MOE_GATHER_PROLOGUE(0)
+    if (K & (IQ3S_BLOCK_WEIGHTS - 1)) return;            // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = (cols[m] / k_top) * K;
+    }
+    const unsigned char * A = (blockIdx.z ? up_base : gate_base)
+                            + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int ib32 = tid >> 2, l = tid & 3;
+    const int sh1 = 8 - 2 * l, sh2 = 7 - 2 * l, xoff = tid << 3;
+    const int nblk = K >> 8;
+
+    float a[MOE_TILE_E][4];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m)
+#pragma unroll
+        for (int u = 0; u < 4; ++u) a[m][u] = 0.0f;
+
+    int b = 0;
+    for (; b + 3 < nblk; b += 4) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            const float * xm = x + xb[m] + xoff;
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+                a[m][u] += m1n_iq3s_block_dot(A + (size_t)(b+u)*IQ3S_BLOCK_BYTES, c_iq3s_grid,
+                                              xm + ((b+u) << 8), tid, ib32, sh1, sh2);
+        }
+    }
+    for (; b < nblk; ++b) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            a[m][0] += m1n_iq3s_block_dot(A + (size_t)b*IQ3S_BLOCK_BYTES, c_iq3s_grid,
+                                          x + xb[m] + xoff + (b << 8), tid, ib32, sh1, sh2);
+        }
+    }
+
+    float * out = blockIdx.z ? y_up : y_gate;
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum((a[m][0] + a[m][1]) + (a[m][2] + a[m][3]));
+        if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
+    }
+}
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_gate_up_iq4xs_gather(const unsigned char * __restrict__ gate_base,
+                                const unsigned char * __restrict__ up_base,
+                                size_t expert_stride, size_t row_bytes,
+                                const int * __restrict__ order,
+                                const int * __restrict__ tile_exp,
+                                const int * __restrict__ tile_off,
+                                const int * __restrict__ tile_cnt,
+                                const float * __restrict__ x,
+                                float * __restrict__ y_gate, float * __restrict__ y_up,
+                                int rows, int K, int k_top) {
+    MOE_GATHER_PROLOGUE(0)
+    if (K & (FK_IQ4XS_BLOCK_WEIGHTS - 1)) return;        // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = (cols[m] / k_top) * K;
+    }
+    const unsigned char * A = (blockIdx.z ? up_base : gate_base)
+                            + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int nblk = K >> 8;
+    const int xoff = tid << 3;
+
+    float a[MOE_TILE_E][2];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) { a[m][0] = 0.0f; a[m][1] = 0.0f; }
+
+    int b = 0;
+    for (; b + 1 < nblk; b += 2) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            const float * xm = x + xb[m] + xoff;
+            a[m][0] += fk_iq4xs_block_dot(A + (size_t)(b+0)*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
+                                          xm + ((b+0) << 8), tid);
+            a[m][1] += fk_iq4xs_block_dot(A + (size_t)(b+1)*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
+                                          xm + ((b+1) << 8), tid);
+        }
+    }
+    for (; b < nblk; ++b) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            a[m][0] += fk_iq4xs_block_dot(A + (size_t)b*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
+                                          x + xb[m] + xoff + (b << 8), tid);
+        }
+    }
+
+    float * out = blockIdx.z ? y_up : y_gate;
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum(a[m][0] + a[m][1]);
+        if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
+    }
+}
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_down_iq4nl_gather(const unsigned char * __restrict__ base, size_t expert_stride,
+                             size_t row_bytes, const int * __restrict__ order,
+                             const int * __restrict__ tile_exp,
+                             const int * __restrict__ tile_off,
+                             const int * __restrict__ tile_cnt,
+                             const float * __restrict__ h, float * __restrict__ eo,
+                             int rows, int K, int k_top) {
+    (void) k_top;
+    MOE_GATHER_PROLOGUE(0)
+    if (K & (IQ4NL_BLOCK_WEIGHTS - 1)) return;           // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = cols[m] * K;                           // h is [col][K]
+    }
+    const unsigned char * A = base + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int nchunk = (K >> 5) << 2;
+
+    float lo[MOE_TILE_E], hi[MOE_TILE_E];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) { lo[m] = 0.0f; hi[m] = 0.0f; }
+
+    for (int w = tid; w < nchunk; w += WAVE) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m)
+            if (m < cnt) m1n_iq4nl_chunk_dot(A, c_kvals_iq4nl, h + xb[m], w, &lo[m], &hi[m]);
+    }
+
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum(lo[m] + hi[m]);
+        if (tid == 0) eo[(size_t) cols[m] * rows + row] = s;
+    }
+}
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expert_stride,
+                            size_t row_bytes, const int * __restrict__ order,
+                            const int * __restrict__ tile_exp,
+                            const int * __restrict__ tile_off,
+                            const int * __restrict__ tile_cnt,
+                            const float * __restrict__ h, float * __restrict__ eo,
+                            int rows, int K, int k_top) {
+    (void) k_top;
+    MOE_GATHER_PROLOGUE(0)
+    if (K % FK_Q8_0_BLOCK_WEIGHTS) return;               // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = cols[m] * K;
+    }
+    const unsigned char * A = base + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int nblk = K / FK_Q8_0_BLOCK_WEIGHTS;
+
+    float acc[MOE_TILE_E];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) acc[m] = 0.0f;
+
+    for (int b = 0; b < nblk; ++b) {
+        const unsigned char * bp = A + (size_t) b * FK_Q8_0_BLOCK_BYTES;
+        // the one format whose lane value IS a single weight, so the decode
+        // really is hoisted here rather than served from L1
+        const float w = fk_q8_0_block_d(bp) *
+                        (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[tid];
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m)
+            if (m < cnt) acc[m] += w * h[xb[m] + b * FK_Q8_0_BLOCK_WEIGHTS + tid];
+    }
+
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum(acc[m]);
+        if (tid == 0) eo[(size_t) cols[m] * rows + row] = s;
+    }
+}
+
 __global__ void k_silu_mul(const float * __restrict__ g, const float * __restrict__ u,
                            float * __restrict__ o, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1704,6 +1988,8 @@ public:
         HIP_IGNORE(hipFree(partial_)); HIP_IGNORE(hipFree(mbuf_)); HIP_IGNORE(hipFree(lbuf_));
         HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
         HIP_IGNORE(hipFree(gemv_part_));
+        HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
+        HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
         for (int i = 0; i < STAGE_SLOTS; ++i) if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
         HIP_IGNORE(hipFree(amax_v_)); HIP_IGNORE(hipFree(amax_i_));
         HIP_IGNORE(hipEventDestroy(bnd_)); HIP_IGNORE(hipStreamDestroy(stream_));
@@ -1915,6 +2201,44 @@ public:
         }
     }
 
+    // Sort the chunk's T*10 expert assignments and build the tile table.
+    // Returns the tile-grid bound: at most one tile per expert that appears,
+    // plus one more for every MOE_TILE_E assignments. Tiles past the real
+    // count have tile_cnt 0 and their workgroups return immediately.
+    // moe_gate_up and moe_down of one layer are handed the SAME ids, so the
+    // second call reuses the first's sort rather than launching again.
+    int moe_sort(const int * ids, int T) {
+        const int n  = N_EXPERT_USED * T;
+        const int nt = (n < N_EXPERT ? n : N_EXPERT) + ceil_div(n, MOE_TILE_E);
+        if (moe_ids_ == ids && moe_n_ == n) return nt;
+        if (n > moe_cap_) {
+            dev_ensure(dev_);
+            HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
+            HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
+            moe_cap_ = n;
+            const int ntc = (moe_cap_ < N_EXPERT ? moe_cap_ : N_EXPERT) + ceil_div(moe_cap_, MOE_TILE_E);
+            HIP_CHECK(hipMalloc(&moe_order_,    (size_t) moe_cap_ * sizeof(int)));
+            HIP_CHECK(hipMalloc(&moe_tile_exp_, (size_t) ntc * sizeof(int)));
+            HIP_CHECK(hipMalloc(&moe_tile_off_, (size_t) ntc * sizeof(int)));
+            HIP_CHECK(hipMalloc(&moe_tile_cnt_, (size_t) ntc * sizeof(int)));
+        }
+        mark(PC_ROUTER);
+        last_op_ = "moe_sort";
+        k_moe_sort<<<1, N_EXPERT, 0, stream_>>>(ids, n, moe_order_, moe_tile_exp_,
+                                                moe_tile_off_, moe_tile_cnt_, nt);
+        moe_ids_ = ids;
+        moe_n_   = n;
+        return nt;
+    }
+
+    const int * moe_ids_ = nullptr;
+    int   moe_n_   = 0;
+    int   moe_cap_ = 0;
+    int * moe_order_    = nullptr;
+    int * moe_tile_exp_ = nullptr;
+    int * moe_tile_off_ = nullptr;
+    int * moe_tile_cnt_ = nullptr;
+
     // The split-K partials, [nsplit][T][total_rows]. nsplit*total_rows stays
     // near GEMV_TARGET_WGS*GEMV_WAVES by construction (nsplit rises only as
     // rows falls), so this is ~32k floats a token; T multiplies it. Grown
@@ -2064,9 +2388,31 @@ public:
         mark(PC_ROUTER);
         last_op_ = "router";
         k_router<<<T, N_EXPERT, 0, stream_>>>(logits, ids, w, ids_log, w_log);
+        // Every layer routes into the SAME scratch buffer, so pointer
+        // identity alone would make moe_sort reuse the previous layer's sort.
+        // The router is the one thing that invalidates it.
+        moe_ids_ = nullptr;
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu, int T) override {
+        if (T > 1) {
+            const int nt = moe_sort(ids, T);
+            const dim3 grid((unsigned) g.rows, (unsigned) nt, 2);
+            mark(PC_EXP_GATE_UP);
+            last_op_ = "moe_gate_up_gather";
+            if (g.type == FK_Q_IQ3_S) {
+                k_moe_gate_up_iq3s_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) g.base, (const unsigned char *) u.base,
+                    g.expert_stride, g.row_bytes, moe_order_, moe_tile_exp_, moe_tile_off_,
+                    moe_tile_cnt_, x, yg, yu, (int) g.rows, (int) g.K, N_EXPERT_USED);
+            } else {
+                k_moe_gate_up_iq4xs_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) g.base, (const unsigned char *) u.base,
+                    g.expert_stride, g.row_bytes, moe_order_, moe_tile_exp_, moe_tile_off_,
+                    moe_tile_cnt_, x, yg, yu, (int) g.rows, (int) g.K, N_EXPERT_USED);
+            }
+            return;
+        }
         const dim3 grid((unsigned) g.rows, (unsigned)(N_EXPERT_USED * T), 2);
         mark(PC_EXP_GATE_UP);
         last_op_ = "moe_gate_up";
@@ -2086,6 +2432,26 @@ public:
         k_silu_mul<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(g, u, h, (int) n);
     }
     void moe_down(const Mat & d, const int * ids, const float * h, float * eo, int T) override {
+        if (T > 1) {
+            // the layer's moe_gate_up has just sorted these very ids; the
+            // sort is reused unless something unexpected changed
+            const int nt = moe_sort(ids, T);
+            const dim3 grid((unsigned) d.rows, (unsigned) nt, 1);
+            mark(PC_EXP_DOWN);
+            last_op_ = "moe_down_gather";
+            if (d.type == FK_Q_IQ4_NL) {
+                k_moe_down_iq4nl_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) d.base, d.expert_stride, d.row_bytes,
+                    moe_order_, moe_tile_exp_, moe_tile_off_, moe_tile_cnt_,
+                    h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+            } else {
+                k_moe_down_q8_0_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) d.base, d.expert_stride, d.row_bytes,
+                    moe_order_, moe_tile_exp_, moe_tile_off_, moe_tile_cnt_,
+                    h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+            }
+            return;
+        }
         const dim3 grid((unsigned) d.rows, (unsigned)(N_EXPERT_USED * T), 1);
         mark(PC_EXP_DOWN);
         last_op_ = "moe_down";

@@ -235,7 +235,7 @@ RESERVE_PER_CARD_GIB=3
 # search only goes UP, so it starts from the LOW reserve above and climbs in
 # fine steps (1 GiB/card, up to MAX_TRIES); an overshoot would measure a
 # needlessly CPU-heavy placement. The ladder itself still stops at ~18k.
-F11_CTX=262144
+F11_CTX=${F11_CTX:-262144}   # env-overridable (2026-09-22): a smaller window leaves more experts on the cards
 MAX_TRIES=1          # placement is llama.cpp's fit (see start_f11): one load, no N search
 FIT_MARGIN_MIB=1024  # llama.cpp's default free margin per card
 VRAM_TOTAL_BYTES=$(( VRAM_PER_CARD_GIB * CARDS * GIB ))
@@ -428,7 +428,7 @@ start_f11() {   # start_f11 <model> <ncmoe> <name> <alias>
   # above did. "fit" therefore passes none of them.
   local -a place
   if [ "$ncmoe" = fit ]; then
-    place=(--fit on --fit-target "$FIT_MARGIN_MIB" --fit-ctx "$F11_CTX")
+    place=(--fit on --fit-print on --fit-target "$FIT_MARGIN_MIB" --fit-ctx "$F11_CTX")
   else
     place=(-ngl 999 --n-cpu-moe "$ncmoe" --tensor-split 1,1,1)
   fi

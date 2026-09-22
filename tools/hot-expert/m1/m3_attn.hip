@@ -95,6 +95,12 @@
 // Each kernel's own header comment carries its layout and why it is that
 // layout. No measurement is claimed here: the numbers above are the first
 // cut's, and the second cut had not been run when it was written.
+//
+// `--rotate N` (default 12) was added after the second cut ran: it reported
+// 2 314 GB/s for the indexer scan at 262 144, which is three times the card's
+// VRAM bandwidth, because a 67 MB array read a thousand times lives in the
+// 96 MB Infinity Cache and a decode token never gets that luxury. See "cache
+// rotation" below for what the option does and where its reach stops.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -103,6 +109,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -273,6 +280,50 @@ static void quantize_q8_0_row(const float* x, int n, int8_t* qs_out, __half* sca
 #define GDN_V_HEADS  48    // linear_num_value_heads
 
 static const int DEPTHS[] = {32768, 131072, 262144};
+
+// --------------------------------------------------------- cache rotation --
+//
+// `--rotate N` (default below) allocates N INDEPENDENT device copies of every
+// cache a depth kernel reads -- the pooled indexer keys, and the q8_0 K/V the
+// attention gathers from -- and iteration i of every warm-up and timed loop
+// reads copy i % N.
+//
+// It exists because the first run of these kernels reported 2 314 GB/s for the
+// indexer scan at 262 144, which is three times this card's VRAM bandwidth and
+// therefore not a VRAM number at all: the pooled-key array is 67 MB, the timed
+// loop read the SAME 67 MB a thousand times, and 67 MB fits in the 96 MB
+// Infinity Cache. A decode token does not get that. It streams the twelve QSA
+// layers' caches (12 x 67 MB of pooled keys alone) plus several GB of weights
+// between one visit to a given layer's cache and the next, so every one of
+// those reads starts cold in IC. Rotating over N >= 12 copies reproduces that:
+// by the time iteration i + N comes back to copy i, N-1 other copies have been
+// streamed through the cache.
+//
+// The copies hold IDENTICAL data (one host-side generation, uploaded N times).
+// That is deliberate and it is enough: caches are indexed by address, not by
+// content, so N distinct allocations evict each other exactly as N distinct
+// layers would -- and identical content keeps every copy valid against the one
+// CPU reference, so the oracles are unchanged (they check copy 0).
+//
+// Its reach is not equal for the three kernels, and the difference matters
+// when reading the numbers:
+//   idx_scan  fully defeated: each iteration streams a whole 67 MB copy, so N
+//             = 12 pushes 805 MB through the cache per cycle.
+//   attn      only partly: the gather touches ~2.2 MB of its 285 MB copy, so
+//             one cycle of 12 copies touches ~26 MB -- still inside a 96 MB
+//             IC. Defeating it outright would need ~44 copies (12.5 GB). The
+//             honest reading is that attn_us remains an upper bound on how
+//             cached the gather is, and qsa_layer_us -- where the indexer
+//             streams 805 MB per cycle -- is the one to trust.
+//   topk      not rotated at all, on purpose: it reads the 256 KB score array
+//             the indexer wrote microseconds earlier, which is exactly what
+//             happens in service, cache and all.
+//
+// Memory at 262 144 with N = 12: 12 x 67 MB of pooled keys plus 12 x ~285 MB
+// of K/V, about 4.3 GB on an empty 24 GB card. If a copy cannot be allocated
+// the run does not die: it backs off to the copies it already has and emits
+// the effective count as rotate_eff_n<depth>.
+#define ROTATE_DEFAULT 12
 
 // ------------------------------------------------------------- kernel 1: idx_scan --
 //
@@ -903,12 +954,17 @@ static void gdn_cpu_ref(const std::vector<float>& S_in, const std::vector<float>
 
 int main(int argc, char** argv) {
     std::string json_path;
+    int rotate_req = ROTATE_DEFAULT;
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--json" && i + 1 < argc) json_path = argv[++i];
+        std::string a(argv[i]);
+        if (a == "--json" && i + 1 < argc) json_path = argv[++i];
+        else if (a == "--rotate" && i + 1 < argc) rotate_req = atoi(argv[++i]);
     }
+    if (rotate_req < 1) rotate_req = 1;
 
     HIP_CHECK(hipSetDevice(0));
 
+    emit_int("rotate", rotate_req);
     emit_str("idx_scan_method", "wave32_block_uint4");
     emit_str("topk_method", "radix_select_11_7_7_7_1wg");
     emit_str("attn_method", "flash_split_wave_per_head");
@@ -967,11 +1023,9 @@ int main(int argc, char** argv) {
         }
 
         // ---- device buffers ----
-        uint16_t* d_kpool; float* d_q_idx; float* d_scores;
-        HIP_CHECK(hipMalloc(&d_kpool, kpool_bf16.size() * sizeof(uint16_t)));
+        float* d_q_idx; float* d_scores;
         HIP_CHECK(hipMalloc(&d_q_idx, q_idx_f.size() * sizeof(float)));
         HIP_CHECK(hipMalloc(&d_scores, (size_t)n_blocks * sizeof(float)));
-        HIP_CHECK(hipMemcpy(d_kpool, kpool_bf16.data(), kpool_bf16.size() * sizeof(uint16_t), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_q_idx, q_idx_f.data(), q_idx_f.size() * sizeof(float), hipMemcpyHostToDevice));
 
         // Radix-select scratch: worst case (every score in the same 11-bit
@@ -982,15 +1036,49 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMalloc(&d_cand_key, (size_t)n_blocks * sizeof(uint32_t)));
         HIP_CHECK(hipMalloc(&d_cand_idx, (size_t)n_blocks * sizeof(int)));
 
-        int8_t *d_Kqs, *d_Vqs; __half *d_Ksc, *d_Vsc;
-        HIP_CHECK(hipMalloc(&d_Kqs, K_qs.size()));
-        HIP_CHECK(hipMalloc(&d_Vqs, V_qs.size()));
-        HIP_CHECK(hipMalloc(&d_Ksc, K_sc.size() * sizeof(__half)));
-        HIP_CHECK(hipMalloc(&d_Vsc, V_sc.size() * sizeof(__half)));
-        HIP_CHECK(hipMemcpy(d_Kqs, K_qs.data(), K_qs.size(), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_Vqs, V_qs.data(), V_qs.size(), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_Ksc, K_sc.data(), K_sc.size() * sizeof(__half), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_Vsc, V_sc.data(), V_sc.size() * sizeof(__half), hipMemcpyHostToDevice));
+        // ---- the rotating copies of everything a depth kernel READS ----
+        // (see "cache rotation" above). Identical bytes, N distinct
+        // allocations; copy 0 is the one every oracle checks. A copy that
+        // cannot be allocated is not fatal: we keep what we have, back the
+        // rotation off, and say so in rotate_eff.
+        std::vector<uint16_t*> r_kpool;
+        std::vector<int8_t*>   r_Kqs, r_Vqs;
+        std::vector<__half*>   r_Ksc, r_Vsc;
+        for (int c = 0; c < rotate_req; c++) {
+            uint16_t* p_kpool = nullptr; int8_t* p_Kqs = nullptr; int8_t* p_Vqs = nullptr;
+            __half* p_Ksc = nullptr; __half* p_Vsc = nullptr;
+            bool ok = hipMalloc(&p_kpool, kpool_bf16.size() * sizeof(uint16_t)) == hipSuccess
+                   && hipMalloc(&p_Kqs, K_qs.size()) == hipSuccess
+                   && hipMalloc(&p_Vqs, V_qs.size()) == hipSuccess
+                   && hipMalloc(&p_Ksc, K_sc.size() * sizeof(__half)) == hipSuccess
+                   && hipMalloc(&p_Vsc, V_sc.size() * sizeof(__half)) == hipSuccess;
+            if (!ok) {
+                if (p_kpool) (void)hipFree(p_kpool);
+                if (p_Kqs) (void)hipFree(p_Kqs);
+                if (p_Vqs) (void)hipFree(p_Vqs);
+                if (p_Ksc) (void)hipFree(p_Ksc);
+                if (p_Vsc) (void)hipFree(p_Vsc);
+                (void)hipGetLastError();     // an OOM here is handled, not inherited
+                if (c == 0) {
+                    fprintf(stderr, "could not allocate even one cache copy at depth %d\n", N);
+                    if (!json_path.empty()) write_json(json_path);
+                    return 1;
+                }
+                fprintf(stderr, "rotate: only %d of %d copies fit at depth %d\n", c, rotate_req, N);
+                break;
+            }
+            HIP_CHECK(hipMemcpy(p_kpool, kpool_bf16.data(), kpool_bf16.size() * sizeof(uint16_t), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(p_Kqs, K_qs.data(), K_qs.size(), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(p_Vqs, V_qs.data(), V_qs.size(), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(p_Ksc, K_sc.data(), K_sc.size() * sizeof(__half), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(p_Vsc, V_sc.data(), V_sc.size() * sizeof(__half), hipMemcpyHostToDevice));
+            r_kpool.push_back(p_kpool); r_Kqs.push_back(p_Kqs); r_Vqs.push_back(p_Vqs);
+            r_Ksc.push_back(p_Ksc); r_Vsc.push_back(p_Vsc);
+        }
+        const int ROT = (int)r_kpool.size();
+        emit_int("rotate_eff" + tag, ROT);
+        // Iteration i reads copy i % ROT everywhere below.
+#define ROT_IDX(i) ((i) % ROT)
 
         const int n_attn_chunks = attn_chunks(QSA_TOP_K_TOKENS);
         float *d_Q_attn, *d_gate, *d_attn_partial, *d_attn_m, *d_attn_l, *d_attn_out;
@@ -1007,9 +1095,9 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipEventCreate(&ev0));
         HIP_CHECK(hipEventCreate(&ev1));
 
-        // ---- 1. idx_scan: correctness, then timing ----
+        // ---- 1. idx_scan: correctness (copy 0), then timing (rotating) ----
         {
-            run_idx_scan_once(d_kpool, d_q_idx, d_scores, n_blocks);
+            run_idx_scan_once(r_kpool[0], d_q_idx, d_scores, n_blocks);
             HIP_CHECK(hipDeviceSynchronize());
             std::vector<float> gpu_scores(n_blocks);
             HIP_CHECK(hipMemcpy(gpu_scores.data(), d_scores, (size_t)n_blocks * sizeof(float), hipMemcpyDeviceToHost));
@@ -1017,12 +1105,13 @@ int main(int argc, char** argv) {
             idx_scan_cpu_ref(kpool_for_ref, q_idx_f, cpu_scores, n_blocks);
             check_or_fail("idx_scan" + tag, gpu_scores.data(), cpu_scores.data(), (size_t)n_blocks, json_path);
 
-            for (int i = 0; i < WARMUP; i++) run_idx_scan_once(d_kpool, d_q_idx, d_scores, n_blocks);
+            for (int i = 0; i < WARMUP; i++)
+                run_idx_scan_once(r_kpool[ROT_IDX(i)], d_q_idx, d_scores, n_blocks);
             HIP_CHECK(hipDeviceSynchronize());
             std::vector<double> samples(ITERS);
             for (int i = 0; i < ITERS; i++) {
                 HIP_CHECK(hipEventRecord(ev0));
-                run_idx_scan_once(d_kpool, d_q_idx, d_scores, n_blocks);
+                run_idx_scan_once(r_kpool[ROT_IDX(i)], d_q_idx, d_scores, n_blocks);
                 HIP_CHECK(hipEventRecord(ev1));
                 HIP_CHECK(hipEventSynchronize(ev1));
                 samples[i] = event_elapsed_us(ev0, ev1);
@@ -1072,10 +1161,10 @@ int main(int argc, char** argv) {
         // ---- 3. attn: correctness, then timing (uses the token list topk just wrote) ----
         {
             int n_sel = QSA_TOP_K_TOKENS;
-#define RUN_ATTN() run_attn_once(d_Kqs, d_Ksc, d_Vqs, d_Vsc, d_Q_attn, d_sel_tokens, d_gate, \
-                                  d_attn_partial, d_attn_m, d_attn_l, d_attn_out, n_sel)
+#define RUN_ATTN(c) run_attn_once(r_Kqs[c], r_Ksc[c], r_Vqs[c], r_Vsc[c], d_Q_attn, d_sel_tokens, \
+                                   d_gate, d_attn_partial, d_attn_m, d_attn_l, d_attn_out, n_sel)
 
-            RUN_ATTN();
+            RUN_ATTN(0);
             HIP_CHECK(hipDeviceSynchronize());
             std::vector<float> gpu_out((size_t)N_Q_HEADS * HEAD_DIM);
             HIP_CHECK(hipMemcpy(gpu_out.data(), d_attn_out, gpu_out.size() * sizeof(float), hipMemcpyDeviceToHost));
@@ -1084,31 +1173,34 @@ int main(int argc, char** argv) {
             attn_cpu_ref(K_qs, K_sc, V_qs, V_sc, Q_attn_f, gate_f, gpu_sel_tokens_sorted, cpu_out);
             check_or_fail("attn" + tag, gpu_out.data(), cpu_out.data(), gpu_out.size(), json_path);
 
-            for (int i = 0; i < WARMUP; i++) RUN_ATTN();
+            for (int i = 0; i < WARMUP; i++) RUN_ATTN(ROT_IDX(i));
             HIP_CHECK(hipDeviceSynchronize());
             std::vector<double> samples(ITERS);
             for (int i = 0; i < ITERS; i++) {
                 HIP_CHECK(hipEventRecord(ev0));
-                RUN_ATTN();
+                RUN_ATTN(ROT_IDX(i));
                 HIP_CHECK(hipEventRecord(ev1));
                 HIP_CHECK(hipEventSynchronize(ev1));
                 samples[i] = event_elapsed_us(ev0, ev1);
             }
             emit_stats_us("attn" + tag, samples);
 
-            // ---- qsa_layer_us / qsa_token_ms: the whole layer in sequence, timed as one unit ----
+            // ---- qsa_layer_us / qsa_token_ms: the whole layer in sequence, timed
+            // as one unit. All three kernels of an iteration read the SAME copy,
+            // the way one layer reads its own cache, and the iteration after it
+            // moves to the next copy, the way the next token does. ----
             for (int i = 0; i < WARMUP; i++) {
-                run_idx_scan_once(d_kpool, d_q_idx, d_scores, n_blocks);
+                run_idx_scan_once(r_kpool[ROT_IDX(i)], d_q_idx, d_scores, n_blocks);
                 run_topk_once(d_scores, n_blocks, d_cand_key, d_cand_idx, d_sel_tokens);
-                RUN_ATTN();
+                RUN_ATTN(ROT_IDX(i));
             }
             HIP_CHECK(hipDeviceSynchronize());
             std::vector<double> layer_samples(ITERS);
             for (int i = 0; i < ITERS; i++) {
                 HIP_CHECK(hipEventRecord(ev0));
-                run_idx_scan_once(d_kpool, d_q_idx, d_scores, n_blocks);
+                run_idx_scan_once(r_kpool[ROT_IDX(i)], d_q_idx, d_scores, n_blocks);
                 run_topk_once(d_scores, n_blocks, d_cand_key, d_cand_idx, d_sel_tokens);
-                RUN_ATTN();
+                RUN_ATTN(ROT_IDX(i));
                 HIP_CHECK(hipEventRecord(ev1));
                 HIP_CHECK(hipEventSynchronize(ev1));
                 layer_samples[i] = event_elapsed_us(ev0, ev1);
@@ -1121,9 +1213,15 @@ int main(int argc, char** argv) {
         }
 
         hipEventDestroy(ev0); hipEventDestroy(ev1);
-        hipFree(d_kpool); hipFree(d_q_idx); hipFree(d_scores);
+        // Every rotating copy goes back before the next depth allocates its
+        // own -- at 262 144 the three depths together would not fit otherwise.
+        for (int c = 0; c < ROT; c++) {
+            hipFree(r_kpool[c]); hipFree(r_Kqs[c]); hipFree(r_Vqs[c]);
+            hipFree(r_Ksc[c]); hipFree(r_Vsc[c]);
+        }
+#undef ROT_IDX
+        hipFree(d_q_idx); hipFree(d_scores);
         hipFree(d_sel_tokens); hipFree(d_cand_key); hipFree(d_cand_idx);
-        hipFree(d_Kqs); hipFree(d_Vqs); hipFree(d_Ksc); hipFree(d_Vsc);
         hipFree(d_Q_attn); hipFree(d_gate); hipFree(d_attn_out);
         hipFree(d_attn_partial); hipFree(d_attn_m); hipFree(d_attn_l);
     }

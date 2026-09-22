@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 44, 2026-09-21)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 45, 2026-09-22)
+
+**Rev 45 (2026-09-22): the first quality run (record §F11-QUALITY-1, to be written with the second) compared configurations, not models -- GLM on Colibri with reasoning off vs the others on llama.cpp at default reasoning, a 3 500-token budget that cut off 25 of 140 answers, 70 questions. Raw: GLM 56/70, DeepSeek 53/70, Qwen3.8 51/70, all NOT DISTINGUISHABLE; needles 8/8 everywhere. Second run `f11_quality2_chain.sh`: one engine (llama.cpp, `serve_alt.sh glm-llama` added), 210 questions, 16k budget. Nothing served changed; GLM on the Colibri gateway remains the daily service between runs.**
 
 **Rev 44 (2026-09-21): quality is being measured, not asked for (Franken plan rev 43); tool calling on Qwen3.8 verified through Open WebUI (record §F11-TOOLS).** `f11_quality_chain.sh` runs Qwen3.8 -> DeepSeek -> GLM and ends with the GLM gateway in service.
 

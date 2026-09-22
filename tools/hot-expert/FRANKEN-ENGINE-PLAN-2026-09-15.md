@@ -14,6 +14,21 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 44 (2026-09-22 00:40 CEST, 22:40 UTC 09-21) -- THE FIRST QUALITY
+> RUN IS NOT A MODEL COMPARISON; THE OWNER SAID SO AND HE IS RIGHT.** It
+> compared GLM on Colibri with reasoning effectively off (median 80 answer
+> tokens) against Qwen3.8 and DeepSeek on llama.cpp at their templates'
+> default reasoning (382-488), under a 3 500-token budget that cut off 14 and
+> 11 of their 70 answers, on a sample that cannot resolve 10 points. Raw
+> scores 80.0 / 75.7 / 72.9 %, McNemar p 0.23-0.77, needles 8/8 at every
+> depth for all three (the needle test discriminates nothing here). Kept as
+> a negative result; the rev-43 decision rule is NOT applied to it. Second
+> run, `f11_quality2_chain.sh`: all three on llama.cpp (`serve_alt.sh
+> glm-llama`), each at its template default, 210 questions, 16 000-token
+> budget, no needles; ends with the Colibri gateway serving. A retry of the
+> first run's cut-off questions at 16k showed DeepSeek IQ2_M spending ~30 min
+> per hard question at 8 tok/s -- a usability fact on its own.
+>
 > **Rev 43 (2026-09-21 16:10 CEST, 14:10 UTC) -- THE OWNER WILL NOT JUDGE
 > QUALITY BY HAND AND SHOULD NOT HAVE BEEN ASKED TO: IT IS MEASURED.** He is
 > at work; "F11 waits on the owner's verdict" (rev 42) handed him the job.

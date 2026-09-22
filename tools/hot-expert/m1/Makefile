@@ -88,3 +88,16 @@ $(M1_HIPFIRE_BIN): $(M1_HIPFIRE_SRC) $(M1_HIPFIRE_DEPS)
 
 clean:
 	rm -f $(M5_BIN) $(M1_GGML_BIN) $(M1_HIPFIRE_BIN)
+
+# --- M3: QSA attention + Gated DeltaNet decode-step microbenchmark --------
+#
+# tools/hot-expert/M3-BRIEF-2026-09-22.md. Single hipcc TU, no external
+# deps (no ggml/hipFire linkage needed).
+
+M3_SRC := m3_attn.hip
+M3_BIN := m3_attn
+
+.PHONY: build-m3
+build-m3: $(M3_BIN)
+$(M3_BIN): $(M3_SRC)
+	$(DOCKER_RUN) hipcc --offload-arch=$(ARCH) -O3 -std=c++17 $(M3_SRC) -o $(M3_BIN)

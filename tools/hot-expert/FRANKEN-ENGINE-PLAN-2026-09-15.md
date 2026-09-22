@@ -14,6 +14,17 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 51 (2026-09-22 14:45 CEST, 12:45 UTC) -- L0 STEP 1 (record §L0-STEP1,
+> §M1 candidate 3; design rev 8).** The loader exists
+> (`tools/hot-expert/franken/`): 64.9 GB of Qwen3.8 on three cards by layer
+> range in 12.8 s, 22.2 / 20.9 / 21.8 GB per card, the 28.8 GB n-gram table
+> in host RAM (rule: record §PLE-GATHER, CLAUDE.md), PLE hash ported and
+> cross-checked. The expert format is decided without requantisation: a
+> native IQ3_S/IQ4_NL GEMV in hipFire's shape runs 60.5 µs a 10-expert step
+> (385 GB/s, cos 1.0) = hipFire's own step time with 19 % fewer bytes. Next:
+> step 2 -- one card, layers 0-15, decode loop with GDN + QSA + MoE, oracle
+> per layer against llama.cpp's dumped activations.**
+>
 > **Rev 50 (2026-09-22 12:30 CEST, 10:30 UTC) -- M3 CLOSED, GO/NO-GO PASSED
 > (record §M3 v2, design rev 7).** Opus-tier kernels: wave-per-block indexer
 > scan (775 GB/s streamed from VRAM at 256k), single-launch radix-select

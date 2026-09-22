@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 7)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 8)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -233,16 +233,13 @@ no fusion is required for L0 beyond what the source kernels already do
   the plain wave-per-row kernel of `m5_bench.hip` (794 GB/s on the synthetic
   token) — L0 takes the simpler one and measures; the trunk is ~5 GB a token
   and bandwidth is what matters.
-- Routed experts: hipFire's `gemv_mq4g256v2_moe_*` shape (§M1, 452 GB/s at
-  batch 1) with two changes: K_TOP a runtime grid parameter (10), and a
-  **group-128 variant of the format** so the down projection's K=640 needs
-  no padding (five 128-groups; the gate/up's K=2 560 is twenty). Format
-  decision: L0 requantises the file's experts at load into that 4.25 bpw
-  affine format (f16 scale+zero per 128) — a lossless-enough re-encoding of
-  IQ3_S/IQ4_NL has to be MEASURED (quality harness, KL vs the FP8 reference,
-  M5-quality) before L0's gate; if it loses, the alternative is a native
-  IQ3_S/IQ4_NL GEMV in hipFire's launch shape (table dequant, 19 % fewer
-  bytes), which is a kernel item, not a design change.
+- Routed experts (**decided rev 8, §M1 candidate 3**): hipFire's kernel
+  shape reading the file's own IQ3_S gate/up and IQ4_NL down
+  (`tools/hot-expert/m1/m1_native.hip`, K_TOP runtime = 10, 4 launches a
+  step, 385 GB/s at batch 1 = the same step time as hipFire's 4.25 bpw
+  kernel with 19 % fewer bytes; oracle cos 1.0). **No requantisation, no
+  format-quality question.** Open optimisation, prefill only: its batched
+  path is 484 GB/s at 32 rows against hipFire's 822.
 - QSA attention: `m3_attn.hip` v2 kernels as they are (scan, radix top-k,
   flash split + combine), plus the q/k/v projections, QK-norm, IMRoPE and
   the indexer q/k projections as GEMVs from the trunk set; the indexer key
@@ -268,9 +265,11 @@ resident. Projected: at the bound, a 256k prompt reads the weights once per
 llama.cpp is not the reference to beat, the 5-minute target of §6 is.
 
 **9.5 Build order inside L0 (each step has an oracle before the next).**
-1. Loader: GGUF tensors → device buffers per card by layer range; expert
-   requantisation to the L0 format; the CPU-side PLE gather. Oracle: a
-   layer-0 forward on one token against llama.cpp's dumped activations.
+1. Loader: GGUF tensors → device buffers per card by layer range (**done
+   2026-09-22, §L0-STEP1: 64.9 GB in 12.8 s, `tools/hot-expert/franken/`**);
+   no requantisation (rev 8); the CPU-side PLE gather (**done, hash
+   cross-checked**). Remaining oracle: a layer-0 forward on one token
+   against llama.cpp's dumped activations — the first item of step 2.
 2. One card, layers 0–15, decode loop with GDN + QSA + MoE; oracle per
    layer against the dumps; timing per layer (§M5's harness pattern).
 3. Three cards, the two boundaries, lm_head; oracle: greedy text identical

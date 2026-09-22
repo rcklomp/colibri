@@ -101,3 +101,21 @@ M3_BIN := m3_attn
 build-m3: $(M3_BIN)
 $(M3_BIN): $(M3_SRC)
 	$(DOCKER_RUN) hipcc --offload-arch=$(ARCH) -O3 -std=c++17 $(M3_SRC) -o $(M3_BIN)
+
+# The host-only emulation of m3_attn.hip's three depth kernels
+# (m3_emul_check.cpp's own header says what it is and what it is not). No HIP
+# and no GPU: an ordinary C++ compile, run straight from `make`, so a session
+# that may not touch the cards can still check the index arithmetic, the LDS
+# scans and the tail handling. Deliberately NOT part of `all` and not a
+# prerequisite of $(M3_BIN): it must never stand between a kernel edit and a
+# build of the real binary.
+M3_EMUL_SRC := m3_emul_check.cpp
+M3_EMUL_BIN := m3_emul_check
+
+.PHONY: build-m3-emul check-m3-emul
+build-m3-emul: $(M3_EMUL_BIN)
+$(M3_EMUL_BIN): $(M3_EMUL_SRC)
+	$(DOCKER_RUN) c++ -O2 -std=c++17 -Wall $(M3_EMUL_SRC) -o $(M3_EMUL_BIN)
+
+check-m3-emul: $(M3_EMUL_BIN)
+	./$(M3_EMUL_BIN)

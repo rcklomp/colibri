@@ -210,9 +210,13 @@ experts (512 × 16 layers in the L0 expert format, ~20 GB at 4.25 bpw or
 ~16 GB at IQ3_S-class bytes — the format decision is 9.3), KV for its 4 QSA
 layers at 256k (1.1 GB q8_0 K/V + 0.4 GB indexer keys, §M0d), GDN state
 (37 MB), scratch ≤ 256 MB. The per-layer n-gram embedding table (28.8 GB,
-IQ4_NL, `ple.layers [1]`) stays in host RAM, mmap'd; its per-token gather
-(16 heads × 160 values) is done on the CPU and uploaded with the token — it
-is the only host work per token besides sampling.
+IQ4_NL, `ple.layers [1]`) stays in host RAM in a pinned buffer the engine
+fills at start (NOT lazy mmap: uncached rows cost 4.2 ms a token from the
+NVMe, cached 9.5 µs -- record §PLE-GATHER); its per-token gather (16 heads
+× 160 values, ~1.4 KB) is done on the CPU and uploaded with the token — it
+is the only host work per token besides sampling. **General rule: any
+tensor read by a per-token row gather lives in host RAM; VRAM is for
+tensors read wholesale per token.**
 
 **9.2 The token.** Card 0: embed (CPU gather + token_embd row) → layers 0–15
 → P2P copy of the hidden vector (2 560 f32 + the hyper-connection residual

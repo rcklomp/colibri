@@ -213,6 +213,15 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `datapoint.py` run with a second `glm53` starting underneath it).
   `tools/rome_bench.sh` now takes the lock and handles the stop/restart
   itself; if you ever stop the gateway some other way, take the lock first.
+- **Per-token gather tables live in host RAM, never on the cards (rule since
+  2026-09-22, record §PLE-GATHER).** Qwen3.8-Flash-Next's 28.8 GB n-gram
+  embedding table (`per_layer_token_embd`) is read 16 rows (~1.4 KB) a token:
+  page-cached that costs 9.5 µs a token, uncached 4.2 ms (NVMe page faults).
+  llama.cpp already keeps it on the CPU; the Franken engine pins it in RAM at
+  start. Any `get_rows`-style tensor (token embeddings, PLE/n-gram tables of
+  Gemma-style models) follows the same rule; VRAM is for tensors read
+  wholesale per token. Do not spend a session re-deriving this: it is why
+  Qwen3.8 (93.7 GB on disk) is resident on three cards.
 - **Port 8081 may not be GLM (since 2026-09-21).** `tools/hot-expert/serve_alt.sh
   qwen38|deepseek|glm|status` swaps the model behind Open WebUI: llama-server
   (HIP build `~/src/llama-glm53/build-hip`, docker, `--fit on`, 262144 window)

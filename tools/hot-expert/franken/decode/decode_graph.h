@@ -69,6 +69,11 @@ private:
 
 struct DecodeConfig {
     int   ctx     = 512;   // cells the QSA caches are sized for
+    // The largest chunk step() will be handed (design 9.4's --chunk). Every
+    // per-token scratch buffer is sized for it ONCE, at construction: the
+    // MoE intermediates dominate (T x 10 x 3 840 floats) and at T = 512 that
+    // is 78 MB a device, which is why the cap is 512 and the default 256.
+    int   max_tokens = 1;
     bool  verbose = false;
     // A random fp32-rounding-sized perturbation of every block input, oracle
     // only (CLAUDE.md, F7: "a float64 arm is not the yardstick for a
@@ -94,11 +99,19 @@ public:
     DecodeRunner(DecodeModel & model, const DecodeConfig & cfg);
     ~DecodeRunner();
 
-    // Feeds one token at position `pos` (which must be the next position).
-    // `ple_emb` is the host-side PLE gather for this token (N_EMBD floats),
-    // or nullptr if the layer range does not include the PLE layer.
-    // With a head placed, returns the greedy id; otherwise -1.
-    int  step(int32_t token, const float * ple_emb, Recorder & rec);
+    // Feeds a CHUNK of `T` tokens starting at the next position (T <= the
+    // configured max_tokens). `ple_emb` is the host-side PLE gather for the
+    // chunk, T*N_EMBD floats token-major, or nullptr if the layer range does
+    // not include the PLE layer. With a head placed, returns the greedy id
+    // of the LAST row -- the prompt needs one logit vector, so the head and
+    // the argmax run on that row alone.
+    //
+    // A chunk produces exactly what T single-token steps produce (PREFILL.md
+    // section 2), so this is the decode path at T = 1 and nothing else.
+    int  step(const int32_t * tokens, int T, const float * ple_emb, Recorder & rec);
+    int  step(int32_t token, const float * ple_emb, Recorder & rec) {
+        return step(&token, 1, ple_emb, rec);
+    }
 
     // The last step's logits, on the host (only with a head placed).
     std::vector<float> logits_host();
@@ -130,8 +143,11 @@ public:
 
 private:
     struct LayerState {
-        float *    conv_ring  = nullptr;  // GDN: [GDN_CONV_K][GDN_CONV_DIM]
-        int        conv_head  = 0;
+        // GDN conv WINDOW: (GDN_CONV_K-1) history slots + max_tokens chunk
+        // slots of GDN_CONV_DIM. Token t of the chunk is at slot
+        // GDN_CONV_HIST+t and its tap k at slot t+k; conv_slide() carries the
+        // tail across the chunk boundary.
+        float *    conv_win   = nullptr;
         float *    gdn_state  = nullptr;  // [GDN_V_HEADS][GDN_STATE][GDN_STATE], ggml order
         int8_t *   kqs        = nullptr;  // q8_0 K cache, M3's planar layout
         uint16_t * ksc        = nullptr;
@@ -140,7 +156,7 @@ private:
         // No raw-key cache: a running sum plus cell 0's key is all the
         // reference's pooling formula reads (decode_backend.h), so the
         // indexer costs the 64 B a token design 9.1 budgets, not 576.
-        float *    idx_new    = nullptr;  // [IDX_DIM] this token's key
+        float *    idx_new    = nullptr;  // [T][IDX_DIM] the chunk's raw keys
         float *    idx_sum    = nullptr;  // [IDX_DIM] members of the current block
         float *    idx_raw0   = nullptr;  // [IDX_DIM] cell 0's key, the fill value
         uint16_t * idx_pooled = nullptr;  // [ctx/ratio][IDX_DIM] bf16 pooled keys
@@ -161,13 +177,13 @@ private:
     // never has to know which card it is on.
     struct Scratch {
         float *x, *res_hc, *xn, *lo, *hgate, *mixed, *inject, *blk;
-        float *z, *conv, *qkn, *alpha, *beta, *gexp, *abuf, *bsig, *gate_raw, *gdn, *gnorm;
+        float *z, *conv, *convqk, *qkn, *alpha, *beta, *gexp, *abuf, *bsig, *gate_raw, *gdn, *gnorm;
         float *qfull, *qcur, *gate, *gsig, *kcur, *vcur, *kqv, *kqvg, *kraw, *idxraw;
         float *idxq, *blkscore, *cellscore, *pool_raw, *pool_rope;
         int   *sel;
         float *logits, *wts, *ygate, *yup, *hmoe, *eo, *moeout;
         float *shg, *shu, *shh, *shout, *shgated, *shgate, *shgsig;
-        float *plek, *plev, *pleq, *plegated, *plegate, *plenorm, *pleconv, *pleemb, *ple_ring;
+        float *plek, *plev, *pleq, *plegated, *plegate, *plenorm, *pleconv, *pleemb, *ple_win;
         int   *ids, *ids_log;
         float *wts_log;
     };
@@ -200,13 +216,16 @@ private:
     std::vector<LayerState> lstate_;
     std::vector<void *>     owned_;
 
-    // PLE conv ring, one for the whole range (there is exactly one PLE layer)
-    float * ple_ring_ = nullptr;
-    int     ple_head_ = 0;
+    // PLE conv WINDOW, one for the whole range (there is exactly one PLE
+    // layer): PLE_CONV_HIST history slots + max_tokens chunk slots.
+    float * ple_win_ = nullptr;
+
+    int     T_ = 1;        // tokens in the chunk being run
+    int     max_T_ = 1;
 
     // the ACTIVE scratch set, rebound by bind() at every layer
     float *x_, *res_hc_, *xn_, *lo_, *hgate_, *mixed_, *inject_, *blk_;
-    float *z_, *conv_, *qkn_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *bsig_, *gate_raw_, *gdn_, *gnorm_;
+    float *z_, *conv_, *convqk_, *qkn_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *bsig_, *gate_raw_, *gdn_, *gnorm_;
     float *qfull_, *qcur_, *gate_, *gsig_, *kcur_, *vcur_, *kqv_, *kqvg_;
     float *kraw_, *idxraw_;
     float *idxq_, *blkscore_, *cellscore_, *pool_raw_, *pool_rope_;

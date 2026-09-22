@@ -16,11 +16,13 @@
 // runs it.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -47,6 +49,13 @@ void usage(const char * p) {
         "          [--oracle DIR]   compare every tap against llama.cpp's dump\n"
         "          [--cpu]          run the same graph on the host (no GPU at all)\n"
         "          [--time N]       decode N further tokens and time the layer body\n"
+        "          [--chunk C]      feed the prompt C tokens at a time (default 256,\n"
+        "                           cap 512). C=1 is the decode path. A chunk produces\n"
+        "                           exactly what C single-token steps produce, so\n"
+        "                           `--chunk 6 --oracle A` against a `--chunk 1 --dump A`\n"
+        "                           run of this binary must be cos 1.000000 on EVERY tap\n"
+        "          [--time-prefill N] feed N synthetic ids (fixed seed) in chunks of C\n"
+        "                           and print prefill_ms_per_token / prefill_tokens_per_s\n"
         "          [--ctx N]        cells the QSA caches are sized for (default 512)\n"
         "          [--threads N]    CPU backend threads (default 4)\n"
         "          [--min-cos X]    oracle bar (default 0.999)\n"
@@ -100,6 +109,7 @@ int main(int argc, char ** argv) {
     bool with_head = true;
     std::string expect_ids_path, routing_dir;
     int time_n = 0, ctx = 512, threads = 4;
+    int chunk = 256, time_prefill = 0;
     // franken_decode_cpu is built with -DFRANKEN_NO_HIP and has no GPU
     // backend to fall back to, so --cpu is its only mode and its default.
 #ifdef FRANKEN_NO_HIP
@@ -134,6 +144,8 @@ int main(int argc, char ** argv) {
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--jitter" && i + 1 < argc) jitter = (float) std::atof(argv[++i]);
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
+        else if (a == "--chunk"  && i + 1 < argc) chunk = std::atoi(argv[++i]);
+        else if (a == "--time-prefill" && i + 1 < argc) time_prefill = std::atoi(argv[++i]);
         else if (a == "--ctx"    && i + 1 < argc) ctx = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--min-cos"&& i + 1 < argc) min_cos = std::atof(argv[++i]);
@@ -144,6 +156,20 @@ int main(int argc, char ** argv) {
         } else { std::fprintf(stderr, "unrecognised argument: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }
     if (model_path.empty() || tokens.empty()) { usage(argv[0]); return 2; }
+    // The cap is the MoE scratch: T x 10 x 3 840 floats a device is 78 MB at
+    // 512 (PREFILL.md section 5), and everything else is under 20 MB.
+    if (chunk < 1)   chunk = 1;
+    if (chunk > 512) { std::fprintf(stderr, "--chunk capped at 512 (was %d)\n", chunk); chunk = 512; }
+
+    // The synthetic prefill feed. A fixed seed so two runs on two binaries
+    // see the same ids, and ids well inside the vocabulary so the embedding
+    // gather is the real one.
+    if (time_prefill > 0) {
+        std::mt19937 rng(0x5EEDF00Du);
+        tokens.clear();
+        for (int i = 0; i < time_prefill; ++i) tokens.push_back((int32_t)(rng() % 100000u));
+        greedy_n = 0;
+    }
     if ((int) tokens.size() + time_n > ctx) {
         std::fprintf(stderr, "--ctx %d is too small for %zu + %d tokens\n", ctx, tokens.size(), time_n);
         return 2;
@@ -173,8 +199,8 @@ int main(int argc, char ** argv) {
             b->set_sync_debug(sync_debug);
         }
         Backend * be = devs.front();
-        std::printf("backend=%s devices=%d layers=%d-%d ctx=%d tokens=%zu head=%d quant_act=%d\n",
-                    be->name(), n_devices, il0, il1, ctx, tokens.size(),
+        std::printf("backend=%s devices=%d layers=%d-%d ctx=%d tokens=%zu chunk=%d head=%d quant_act=%d\n",
+                    be->name(), n_devices, il0, il1, ctx, tokens.size(), chunk,
                     (int) with_head, (int) quant_act);
 
         const int n_report = use_cpu ? 1 : n_devices;
@@ -206,6 +232,7 @@ int main(int argc, char ** argv) {
 
         DecodeConfig cfg;
         cfg.ctx = ctx;
+        cfg.max_tokens = chunk;
         cfg.verbose = verbose;
         cfg.jitter  = jitter;
         cfg.log_routing = !routing_dir.empty();
@@ -227,15 +254,31 @@ int main(int argc, char ** argv) {
         std::vector<int> greedy_ids;
         int last_greedy = -1;
         int greedy_first_mismatch = -1;
-        for (size_t t = 0; t < tokens.size(); ++t) {
-            // only the LAST prompt token is recorded: that is the column the
-            // oracle dump writes.
-            rec.enable(t + 1 == tokens.size());
+        // The prompt in chunks of `chunk`. Every tap the recorder keeps is
+        // the LAST ROW of the LAST chunk -- the column the oracle dump
+        // writes -- whatever the chunking, which is what makes two runs at
+        // different --chunk comparable tap for tap.
+        const auto t_pf0 = std::chrono::steady_clock::now();
+        for (size_t t = 0; t < tokens.size(); t += (size_t) chunk) {
+            const int T = (int) std::min((size_t) chunk, tokens.size() - t);
+            rec.enable(t + (size_t) T == tokens.size());
             const float * ple = need_ple ? ple_all.data() + t * N_EMBD : nullptr;
-            last_greedy = run.step(tokens[t], ple, rec);
+            last_greedy = run.step(tokens.data() + t, T, ple, rec);
             if (routing.loaded()) routing.observe(run.pos() - 1, il0, run.routed_ids());
-            std::printf("token %zu id=%d pos=%d done\n", t, tokens[t], run.pos() - 1);
-            std::fflush(stdout);
+            if (time_prefill == 0 || t == 0 || t + (size_t) T == tokens.size()) {
+                std::printf("chunk at %zu T=%d id=%d pos=%d done\n", t, T, tokens[t], run.pos() - 1);
+                std::fflush(stdout);
+            }
+        }
+        if (time_prefill > 0) {
+            // One sync already happened inside step() (the greedy id), so the
+            // wall time below is the whole prefill and not a queue depth.
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t_pf0).count();
+            std::printf("prefill_tokens=%d chunk=%d prefill_ms=%.1f "
+                        "prefill_ms_per_token=%.4f prefill_tokens_per_s=%.2f\n",
+                        time_prefill, chunk, ms, ms / (double) time_prefill,
+                        1000.0 * (double) time_prefill / ms);
         }
 
         // ---- greedy continuation -------------------------------------------

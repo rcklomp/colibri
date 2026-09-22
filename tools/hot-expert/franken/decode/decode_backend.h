@@ -24,6 +24,25 @@
 // pointer. For CpuBackend it happens to be host memory; for GpuBackend it is
 // a device address. decode_graph.cpp must never dereference one -- it reads a
 // buffer only through download(), which both backends implement.
+//
+// ------------------------------------------------------------------------
+// BATCHED PREFILL (design 9.4, PREFILL.md). Every op below that can see more
+// than one token takes a `T` and reads/writes TOKEN-MAJOR buffers: token t's
+// row of an `n`-wide activation is `buf + t*n`, so a row is contiguous and a
+// tiled GEMM's loads stay coalesced. T == 1 is the decode path and must stay
+// BIT-IDENTICAL to it -- every kernel here is written so that the arithmetic
+// of one row does not depend on how many rows travel with it:
+//
+//   * the GEMM accumulates each column in exactly the order the one-column
+//     GEMV did (four Q8_0 accumulators, two Q6_K, one otherwise), and its
+//     split-K count is chosen from the MATRIX alone, never from T;
+//   * every row-wise kernel is the same kernel with a grid axis over T;
+//   * the GDN recurrence walks the chunk in order with the state carried
+//     in registers, which is the same sequence of updates T steps make;
+//   * the QSA per-query stage loops, because its scratch is O(n_kv).
+//
+// That is what makes `--chunk 6` against `--chunk 1` a bit-for-bit oracle
+// rather than a tolerance test.
 
 #pragma once
 
@@ -157,8 +176,15 @@ public:
     virtual void gemv(const Mat & W, const float * x, float * y) = 0;
     // One kernel for `n` matrices sharing `x`. `x2` is used only by
     // GX_SILU_MUL, where the activation is silu(x[i])*x2[i].
+    //
+    // With T > 1 this is a GEMM: `x` is [T][K] token-major and every job's
+    // `out` is [T][rows] token-major. The kernel loads a weight block once
+    // per tile of GEMM_TILE columns, which is the whole point of batching a
+    // prompt -- the trunk is ~5 GB a token and a tile of 8 reads it an
+    // eighth as often.
     virtual void gemv_batch(const GemvJob * jobs, int n, const float * x,
-                            int group, int x_mode = GX_PLAIN, const float * x2 = nullptr) = 0;
+                            int group, int x_mode = GX_PLAIN, const float * x2 = nullptr,
+                            int T = 1) = 0;
     // W with expert_stride != 0, one expert chosen by `expert`.
     virtual void gemv_expert(const Mat & W, int expert, const float * x, float * y) = 0;
 
@@ -179,9 +205,16 @@ public:
     virtual void gather_strided(const float * src, float * dst,
                                 int n_rows, int row_len, int src_stride, int src_off) = 0;
 
-    // ggml_rms_norm over ne0, per group, then (optionally) * w[n_groups*ne0]
-    // or * w[ne0] tiled across groups -- build_norm(LLM_NORM_RMS) and
-    // build_hc_mix's "grouped RMSNorm" are both this call.
+    // ggml_rms_norm over ne0, per group, then (optionally) * w -- both
+    // build_norm(LLM_NORM_RMS) and build_hc_mix's "grouped RMSNorm".
+    //
+    // The gamma is PERIODIC with period `w_len / ne0` groups: group g reads
+    // `w + (g % (w_len/ne0))*ne0`. That is the batched-prefill
+    // generalisation of what used to be a `w_tiled` flag, and it is the same
+    // thing at T == 1: w_len == ne0 gives period 1 (one gamma reused by
+    // every group) and w_len == HC*ne0 with n_groups == HC*T gives period HC,
+    // which is exactly "hc stream g % HC of token g / HC" for a token-major
+    // [T][HC][ne0] buffer.
     virtual void rms_norm_mul(const float * x, const float * w, float * y,
                               int ne0, int n_groups, size_t w_len, float eps) = 0;
     // ggml_l2_norm: scale = 1/max(sqrt(sum x^2), eps)  (ops.cpp:4333 -- NOT
@@ -189,40 +222,68 @@ public:
     virtual void l2_norm(const float * x, float * y, int ne0, int n_groups, float eps) = 0;
 
     // -- hyper-connections (qwen4exp.cpp:218-286) ---------------------------
-    virtual void hc_broadcast(const float * x, float * res_hc) = 0;              // [2560] -> [4][2560]
-    virtual void hc_collapse(const float * xn, const float * gate, float * out) = 0;
-    virtual void hc_combine(float * res_hc, const float * blk, const float * inject) = 0;
+    // Token-major throughout: x is [T][2560], res_hc / xn are [T][4][2560],
+    // inject is [T][4].
+    virtual void hc_broadcast(const float * x, float * res_hc, int T = 1) = 0;   // [2560] -> [4][2560]
+    virtual void hc_collapse(const float * xn, const float * gate, float * out, int T = 1) = 0;
+    virtual void hc_combine(float * res_hc, const float * blk, const float * inject, int T = 1) = 0;
     // hc_combine followed by the grouped RMSNorm the next hc_mix would have
     // launched on its own; `w_norm == nullptr` does the combine alone. Both
     // reduce over the same 2 560 elements of one hc stream, so they fuse for
     // free.
     virtual void hc_combine_norm(float * res_hc, const float * blk, const float * inject,
-                                 const float * w_norm, float * xn, float eps) = 0;
+                                 const float * w_norm, float * xn, float eps, int T = 1) = 0;
 
     // -- PLE (qwen4exp.cpp:1137-1227) ---------------------------------------
     // s[c] = sum_i key[c][i]*query[c][i] / sqrt(n_embd);
     // gate[c] = sigmoid(sgn(s)*sqrt(clamp(|s|,1e-6,inf)));
     // gated[c][i] = value[i]*gate[c]
     virtual void ple_gate(const float * key, const float * query, const float * value,
-                          float * gated, float * gate_out) = 0;
-    // Dilated depthwise causal conv over the ring, then silu.
-    // ring holds PLE_CONV_HIST+1 slots of HC_DIM; slot `head` is this token.
-    virtual void ple_conv_silu(const float * ring, int head, const float * w, float * out) = 0;
+                          float * gated, float * gate_out, int T = 1) = 0;
+    // Dilated depthwise causal conv over a WINDOW, then silu.
+    //
+    // A ring with a moving head cannot serve a chunk: T tokens are produced
+    // at once and each needs its own history. The window is the ring
+    // straightened out -- PLE_CONV_HIST history slots followed by the
+    // chunk's T slots, so token t lives at slot PLE_CONV_HIST+t and its tap
+    // k reads slot t + k*PLE_CONV_DIL (the dilation is folded in: at k =
+    // PLE_CONV_K-1 that is the token itself). `conv_slide` then carries the
+    // tail into the next chunk. Out is [T][HC_DIM].
+    virtual void ple_conv_win(const float * win, const float * w, float * out, int T = 1) = 0;
+    // Copy the last `hist` occupied slots of a conv window down to slots
+    // [0, hist), so the next chunk sees its history. Source and destination
+    // overlap when T < hist, so each thread reads its whole channel column
+    // before writing any of it.
+    virtual void conv_slide(float * win, int hist, int channels, int T) = 0;
 
     // -- Gated DeltaNet (qwen4exp.cpp:793-918 + the fused op's formula) -----
-    // ggml_ssm_conv over GDN_CONV_K taps of the ring, then silu -- together
-    // with the gate chain, whose 48 elements ride along for free.
-    virtual void gdn_conv_gate(const float * ring, int head, const float * w,
+    // ggml_ssm_conv over GDN_CONV_K taps of the window (dilation 1), then
+    // silu -- together with the gate chain, whose 48 elements a token ride
+    // along for free.
+    //
+    // It writes the conv output TWICE: `conv_out` is [T][GDN_CONV_DIM], the
+    // reference's contiguous [q|k|v] row (the oracle tap, and where v is
+    // read from), and `conv_qk` is [T][2*GDN_KEY_DIM], q and k alone. The
+    // second copy costs 4 096 floats a token and buys l2_norm a buffer whose
+    // 32*T groups of 128 are contiguous -- in the [q|k|v] layout the k of
+    // token t and the q of token t+1 are 6 144 floats apart.
+    virtual void gdn_conv_gate(const float * win, const float * w,
                                const float * beta_raw, const float * alpha_raw,
                                const float * dt, const float * ssm_a,
-                               float * conv_out, float * beta_sig,
-                               float * a_softplus, float * gate, float * g_exp) = 0;
+                               float * conv_out, float * conv_qk, float * beta_sig,
+                               float * a_softplus, float * gate, float * g_exp,
+                               int T = 1) = 0;
     // qwen4exp.cpp:816-834's gate chain -- sigmoid(beta), softplus(alpha+dt),
     // *ssm_a, exp -- as ONE op over 48 elements instead of five. It still
     // writes a_softplus and gate, so the oracle taps are unchanged.
-    // One delta-rule step. `g_exp` is already exp(g) per v-head.
+    // The delta-rule recurrence over the chunk. `g_exp` is already exp(g)
+    // per v-head per token. `q`/`k` are strided by `qk_stride` a token and
+    // `v` by `v_stride`; `out` is [T][GDN_VAL_DIM]. The chunk is walked in
+    // order inside the kernel with the state row in registers, so T steps
+    // produce exactly what T calls at T = 1 produce.
     virtual void gdn_step(float * state, const float * q, const float * k, const float * v,
-                          const float * g_exp, const float * beta, float * out) = 0;
+                          const float * g_exp, const float * beta, float * out,
+                          int T = 1, int qk_stride = 0, int v_stride = 0) = 0;
     // rms_norm(x)*w * sigmoid(z), per head (build_norm_gated).
     virtual void gated_rms_norm(const float * x, const float * w, const float * z,
                                 float * y, int ne0, int n_groups, float eps) = 0;
@@ -232,11 +293,14 @@ public:
     // `ids_log` / `w_log` (nullable) receive a copy for the routing oracle,
     // written by this kernel so capture costs no extra launch.
     virtual void router(const float * logits, int * ids, float * weights,
-                        int * ids_log, float * w_log) = 0;
+                        int * ids_log, float * w_log, int T = 1) = 0;
+    // `ids` is [T][N_EXPERT_USED], `x` is [T][K] and the outputs are
+    // [T][N_EXPERT_USED][rows]: assignment (t,k) owns column t*K_TOP+k.
     virtual void moe_gate_up(const Mat & gate, const Mat & up, const int * ids,
-                             const float * x, float * y_gate, float * y_up) = 0;
+                             const float * x, float * y_gate, float * y_up, int T = 1) = 0;
     virtual void silu_mul(const float * gate, const float * up, float * h, size_t n) = 0;
-    virtual void moe_down(const Mat & down, const int * ids, const float * h, float * expert_out) = 0;
+    virtual void moe_down(const Mat & down, const int * ids, const float * h,
+                          float * expert_out, int T = 1) = 0;
     // build_moe_ffn's tail in one op: the weighted expert sum, the shared
     // expert's gate and the add. Writes ffn_moe_out and ffn_shexp_gated
     // because both are oracle taps.
@@ -246,7 +310,7 @@ public:
     virtual void moe_finish(const float * expert_out, const float * weights,
                             const float * sh_raw, const float * sh_gate,
                             float * sh_gate_sig, float * moe_out,
-                            float * sh_gated, float * out) = 0;
+                            float * sh_gated, float * out, int T = 1) = 0;
 
     // -- IMRoPE (ggml_rope_multi, mode GGML_ROPE_TYPE_IMROPE) ---------------
     virtual void rope_imrope(float * x, int n_heads, int head_dim, int n_rot, int pos) = 0;
@@ -260,9 +324,13 @@ public:
     // the planar form is what lets an attention lane pull 8 dims in one
     // aligned load. Scales are raw f16 bit patterns (uint16_t) so the CPU
     // backend needs no half type.
+    // `k`/`v` are [T][N_KV_HEADS*HEAD_DIM]; row t lands in cell `cell0 + t`.
+    // PREFILL.md section 3: EVERY row of the chunk is in the cache before
+    // anything is scored, which is what makes a chunk's selection identical
+    // to T single-token steps' (and is what the reference does too).
     virtual void kv_store_q8_0(const float * k, const float * v,
                                int8_t * kqs, uint16_t * ksc,
-                               int8_t * vqs, uint16_t * vsc, int cell) = 0;
+                               int8_t * vqs, uint16_t * vsc, int cell0, int T = 1) = 0;
     virtual bool verify_placement(FILE *) { return true; }
     // Mean-pool cells [blk*r, blk*r+r) (missing slots read cell 0, as
     // set_input_qsa's zero-filled blk_cells does), rms-norm with k_norm,
@@ -283,8 +351,15 @@ public:
     // `dbg_pooled` / `dbg_roped` receive this block's value before and after
     // the norm+rotation -- the reference's `indexer_k_pooled` and `indexer_k`
     // taps, both of which are incomparable across cache depths anyway.
-    virtual void idx_pool_block(const float * k_new, float * sum, float * raw0,
-                                int blk, int n_filled, const float * k_norm,
+    //
+    // `k_new` is [T][IDX_DIM], the chunk's raw indexer keys, and `pos0` is
+    // the position of its first row. The T cells are folded into the running
+    // sum IN ORDER inside one call, so every block the chunk touched is
+    // re-pooled and the arithmetic is the same sequence T single-token calls
+    // perform -- `sum` and `raw0` are what carry a partial block across a
+    // chunk boundary. `dbg_*` receive the LAST row's block.
+    virtual void idx_pool_chunk(const float * k_new, float * sum, float * raw0,
+                                int pos0, int T, const float * k_norm,
                                 float eps, uint16_t * pooled,
                                 float * dbg_pooled, float * dbg_roped) = 0;
     virtual void idx_scan(const uint16_t * pooled, const float * q, float * scores, int n_blocks) = 0;
@@ -314,10 +389,11 @@ public:
     // build_layer_attn's per-head post-processing in one op: the [q|gate]
     // split of attn_q's interleaved rows, the QK-norms, IMRoPE on q, k and
     // the indexer query, and the output gate's sigmoid.
+    // All buffers token-major; row t is rotated at position `pos0 + t`.
     virtual void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
                              const float * q_norm, const float * k_norm, const float * iq_norm,
                              float * qcur, float * gate, float * gsig,
-                             float * kcur, float * idxq, int pos, float eps) = 0;
+                             float * kcur, float * idxq, int pos0, float eps, int T = 1) = 0;
     // `out` is the reference's kqv_out / attn_pregate, `out_gated` is
     // attn_gated: the sigmoid gate is applied in the combine, so neither tap
     // costs a launch of its own.

@@ -45,12 +45,12 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#include <cstring>
 
 #define FK_QUAL __device__ __forceinline__
 #define FK_HALF_TO_F32(bits) __half2float(__ushort_as_half((unsigned short)(bits)))
@@ -229,10 +229,10 @@ __device__ __forceinline__ int desc_of(const GemvBatchD & b, int row) {
     return j;
 }
 
-// The prefill form of the same kernel (design 9.4): T activation columns per
-// launch, a wave loading each weight block ONCE and dotting it against
-// GEMM_TILE of them. That reuse is the whole point of batching a prompt --
-// the trunk is ~5 GB a token, so a tile of 8 reads it an eighth as often.
+// THE ONE GEMV/GEMM PATH (design 9.4): T activation columns per launch, a
+// wave loading each weight block ONCE and dotting it against GEMM_TILE of
+// them. That reuse is the whole point of batching a prompt -- the trunk is
+// ~5 GB a token, so a tile of 8 reads it an eighth as often.
 //
 // Activations are token-major (x[t*K + i]), so a row is contiguous and the
 // per-token loads inside the tile stay coalesced across the wave. Outputs are
@@ -241,7 +241,33 @@ __device__ __forceinline__ int desc_of(const GemvBatchD & b, int row) {
 // `t0` is the first token of this tile; grid.z selects the tile. A tile short
 // of GEMM_TILE at the end of a chunk is handled by the `nt` bound, not by
 // padding, so no garbage column is ever read.
+//
+// WHY THERE IS NO SEPARATE T=1 KERNEL, and what that costs. This kernel
+// replaced k_gemv_batch, whose one-column Q8_0 loop kept FOUR accumulators
+// (a0..a3, four blocks in flight per wave) and closed with (a0+a1)+(a2+a3).
+// Keeping a second kernel for T = 1 would mean the decode path and the
+// prefill path could disagree in the last bit and the `--chunk 6` vs
+// `--chunk 1` oracle would be testing two different things. So the tile form
+// carries the SAME per-column accumulator structure -- four for Q8_0, two for
+// Q6_K, one for BF16/F32, plain `+` where the old kernel had `+` and fmaf
+// where it had fmaf -- and every column of every tile therefore lands on the
+// bit pattern the old one-column kernel produced. The split-K count is chosen
+// from the MATRIX alone and never from T, for the same reason: nsplit changes
+// the summation order.
+//
+// `acc` is indexed only by fully unrolled constants, or it would be scratch
+// rather than registers.
 #define GEMM_TILE 8
+#define GEMM_ACC  4                       // the Q8_0 unroll, and the array's width
+
+// The activation of tile column j at global element index i. With `stage_x`
+// it comes from LDS (already silu-multiplied); without, the GX_SILU_MUL
+// activation is formed inline so both arms compute the same value.
+#define GEMM_X(j, i)                                                                     \
+    (stage_x ? sx[(size_t)(j) * slice + ((i) - e0)]                                      \
+             : (b.x_mode == GX_SILU_MUL                                                  \
+                ? d_silu(x[(size_t)(t0 + (j)) * b.K + (i)]) * x2[(size_t)(t0 + (j)) * b.K + (i)] \
+                : x[(size_t)(t0 + (j)) * b.K + (i)]))
 
 __global__ __launch_bounds__(GEMV_THREADS)
 void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
@@ -256,6 +282,9 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     const int nt   = min(GEMM_TILE, T - t0);
     if (nt <= 0) return;
 
+    // Element range of this split, in units of 32 so every lane stays in
+    // step. Q6_K super-blocks are 256 weights, so a batch containing one
+    // splits on 256-element boundaries; everything else splits on 32.
     const int gran = (b.has_q6k ? 256 : WAVE);
     int c0, c1;
     split_range((b.K + gran - 1) / gran, nsplit, blockIdx.y, &c0, &c1);
@@ -281,66 +310,105 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     const GemvDesc d = b.d[di];
     const int  row = grow - d.row_off;
 
-    float acc[GEMM_TILE];
+    float acc[GEMM_TILE][GEMM_ACC];
 #pragma unroll
-    for (int j = 0; j < GEMM_TILE; ++j) acc[j] = 0.0f;
+    for (int j = 0; j < GEMM_TILE; ++j)
+#pragma unroll
+        for (int u = 0; u < GEMM_ACC; ++u) acc[j][u] = 0.0f;
 
-    // one weight block, `nt` activation columns
     if (d.type == FK_Q_Q8_0) {
+        // the split is on 32-element boundaries, which is exactly a Q8_0
+        // block; one block's scale*quant is hoisted out of the column loop
         const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
-        for (int bl = e0 >> 5; bl < (e1 >> 5); ++bl) {
+        int bl = e0 >> 5;
+        const int bend = e1 >> 5;
+        for (; bl + GEMV_UNROLL - 1 < bend; bl += GEMV_UNROLL) {
+            float w[GEMV_UNROLL];
+#pragma unroll
+            for (int u = 0; u < GEMV_UNROLL; ++u) {
+                const unsigned char * bp = rp + (size_t)(bl + u) * FK_Q8_0_BLOCK_BYTES;
+                w[u] = fk_q8_0_block_d(bp) *
+                       (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[lane];
+            }
+#pragma unroll
+            for (int j = 0; j < GEMM_TILE; ++j) {
+                if (j >= nt) continue;
+#pragma unroll
+                for (int u = 0; u < GEMV_UNROLL; ++u)
+                    acc[j][u] += w[u] * GEMM_X(j, ((bl + u) << 5) + lane);
+            }
+        }
+        for (; bl < bend; ++bl) {
             const unsigned char * bp = rp + (size_t) bl * FK_Q8_0_BLOCK_BYTES;
             const float w = fk_q8_0_block_d(bp) *
                             (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[lane];
-            const int off = (bl << 5) + lane - e0;
-            for (int j = 0; j < nt; ++j)
-                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + off]
-                                         : x[(size_t)(t0 + j) * b.K + e0 + off], acc[j]);
+#pragma unroll
+            for (int j = 0; j < GEMM_TILE; ++j)
+                if (j < nt) acc[j][0] += w * GEMM_X(j, (bl << 5) + lane);
+        }
+    } else if (d.type == FK_Q_Q6_K) {
+        // Q6_K decodes a whole eight-weight lane run at once, so there is no
+        // single weight to hoist: the primitive is called per column, with
+        // the old kernel's two accumulators.
+        const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
+        const int xoff = lane << 3;
+        int bl = e0 >> 8;
+        const int bend = e1 >> 8;
+        for (; bl + 1 < bend; bl += 2) {
+#pragma unroll
+            for (int j = 0; j < GEMM_TILE; ++j) {
+                if (j >= nt) continue;
+                const float * xt = stage_x ? sx + (size_t) j * slice - e0
+                                           : x + (size_t)(t0 + j) * b.K;
+                acc[j][0] += fk_q6k_block_dot(rp + (size_t)(bl+0) * FK_Q6K_BLOCK_BYTES,
+                                              xt + ((bl+0) << 8) + xoff, lane);
+                acc[j][1] += fk_q6k_block_dot(rp + (size_t)(bl+1) * FK_Q6K_BLOCK_BYTES,
+                                              xt + ((bl+1) << 8) + xoff, lane);
+            }
+        }
+        for (; bl < bend; ++bl) {
+#pragma unroll
+            for (int j = 0; j < GEMM_TILE; ++j) {
+                if (j >= nt) continue;
+                const float * xt = stage_x ? sx + (size_t) j * slice - e0
+                                           : x + (size_t)(t0 + j) * b.K;
+                acc[j][0] += fk_q6k_block_dot(rp + (size_t) bl * FK_Q6K_BLOCK_BYTES,
+                                              xt + (bl << 8) + xoff, lane);
+            }
         }
     } else if (d.type == FK_Q_BF16) {
         const unsigned short * rp = (const unsigned short *) d.base + (size_t) row * d.row_stride;
         for (int i = e0 + lane; i < e1; i += WAVE) {
             const float w = fk_bf16_to_f32(rp[i]);
-            for (int j = 0; j < nt; ++j)
-                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + (i - e0)]
-                                         : x[(size_t)(t0 + j) * b.K + i], acc[j]);
+#pragma unroll
+            for (int j = 0; j < GEMM_TILE; ++j)
+                if (j < nt) acc[j][0] = fmaf(w, GEMM_X(j, i), acc[j][0]);
         }
-    } else if (d.type == FK_Q_F32) {
+    } else {
         const float * rp = (const float *) d.base + (size_t) row * d.row_stride;
         for (int i = e0 + lane; i < e1; i += WAVE) {
             const float w = rp[i];
-            for (int j = 0; j < nt; ++j)
-                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + (i - e0)]
-                                         : x[(size_t)(t0 + j) * b.K + i], acc[j]);
-        }
-    } else {
-        // IQ3_S / IQ4_XS / IQ4_NL / Q6_K decode a whole lane-run at once, so
-        // they reuse the single-column primitives per token rather than
-        // hoisting one weight; only the expert formats take this path and the
-        // experts get their own batched kernels (design 9.4 item 2).
-        for (int j = 0; j < nt; ++j) {
-            const float * xt = x + (size_t)(t0 + j) * b.K;
-            float a = 0.0f;
-            if (d.type == FK_Q_Q6_K) {
-                const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
-                for (int bl = e0 >> 8; bl < (e1 >> 8); ++bl)
-                    a += fk_q6k_block_dot(rp + (size_t) bl * FK_Q6K_BLOCK_BYTES,
-                                          xt + (bl << 8) + (lane << 3), lane);
-            }
-            acc[j] = a;
+#pragma unroll
+            for (int j = 0; j < GEMM_TILE; ++j)
+                if (j < nt) acc[j][0] = fmaf(w, GEMM_X(j, i), acc[j][0]);
         }
     }
 
+    // The closing reassociation is the old one-column kernel's, per format:
+    // (a0+a1)+(a2+a3) for Q8_0, a0+a1 for Q6_K, a0 alone otherwise -- the
+    // unused slots are zero, so one expression covers all three.
 #pragma unroll
     for (int j = 0; j < GEMM_TILE; ++j) {
         if (j >= nt) break;
-        const float sum = wave_sum(acc[j]);
+        const float sum = wave_sum((acc[j][0] + acc[j][1]) + (acc[j][2] + acc[j][3]));
         if (lane != 0) continue;
         if (nsplit > 1) part[((size_t) blockIdx.y * T + (t0 + j)) * b.total_rows + grow] = sum;
         else            d.out[(size_t)(t0 + j) * d.rows + row] = apply_epi(sum, d.epi, d.arg);
     }
 }
 
+// Fixed-order sum of the split partials, then each matrix's epilogue and its
+// own destination. Reproducible, unlike an atomicAdd -- the oracle needs it.
 __global__ void k_reduce_splits_gemm(GemvBatchD b, const float * __restrict__ part,
                                      int nsplit, int T) {
     const int grow = blockIdx.x * blockDim.x + threadIdx.x;
@@ -354,101 +422,14 @@ __global__ void k_reduce_splits_gemm(GemvBatchD b, const float * __restrict__ pa
         apply_epi(a, b.d[di].epi, b.d[di].arg);
 }
 
-__global__ __launch_bounds__(GEMV_THREADS)
-void k_gemv_batch(GemvBatchD b, const float * __restrict__ x,
-                  const float * __restrict__ x2, int nsplit,
-                  float * __restrict__ part, int stage_x) {
-    extern __shared__ float sx[];
-
-    const int wave = threadIdx.x / WAVE;
-    const int lane = threadIdx.x % WAVE;
-    const int grow = blockIdx.x * GEMV_WAVES + wave;   // concatenated row index
-
-    // Element range of this split, in units of 32 so every lane stays in step.
-    // Q6_K super-blocks are 256 weights, so a batch containing one splits on
-    // 256-element boundaries; everything else splits on 32.
-    const int gran = (b.has_q6k ? 256 : WAVE);
-    int c0, c1;
-    split_range((b.K + gran - 1) / gran, nsplit, blockIdx.y, &c0, &c1);
-    const int e0 = c0 * gran;
-    const int e1 = min(b.K, c1 * gran);
-
-    const float * xs = x + e0;
-    if (stage_x) {
-        for (int i = threadIdx.x; i < e1 - e0; i += GEMV_THREADS) {
-            const float v = x[e0 + i];
-            sx[i] = (b.x_mode == GX_SILU_MUL) ? d_silu(v) * x2[e0 + i] : v;
-        }
-        __syncthreads();
-        xs = sx;
-    }
-
-    if (grow >= b.total_rows) return;
-    const int  di  = desc_of(b, grow);
-    const GemvDesc d = b.d[di];
-    const int  row = grow - d.row_off;
-
-    float acc = 0.0f;
-    if (d.type == FK_Q_Q8_0) {
-        // the split is on 32-element boundaries, which is exactly a Q8_0 block
-        const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
-        int bl = e0 >> 5, bend = e1 >> 5;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        for (; bl + GEMV_UNROLL - 1 < bend; bl += GEMV_UNROLL) {
-            a0 += fk_q8_0_lane_dot(rp + (size_t)(bl+0) * FK_Q8_0_BLOCK_BYTES, xs + ((bl+0) << 5) - e0, lane);
-            a1 += fk_q8_0_lane_dot(rp + (size_t)(bl+1) * FK_Q8_0_BLOCK_BYTES, xs + ((bl+1) << 5) - e0, lane);
-            a2 += fk_q8_0_lane_dot(rp + (size_t)(bl+2) * FK_Q8_0_BLOCK_BYTES, xs + ((bl+2) << 5) - e0, lane);
-            a3 += fk_q8_0_lane_dot(rp + (size_t)(bl+3) * FK_Q8_0_BLOCK_BYTES, xs + ((bl+3) << 5) - e0, lane);
-        }
-        for (; bl < bend; ++bl)
-            a0 += fk_q8_0_lane_dot(rp + (size_t) bl * FK_Q8_0_BLOCK_BYTES, xs + (bl << 5) - e0, lane);
-        acc = (a0 + a1) + (a2 + a3);
-    } else if (d.type == FK_Q_Q6_K) {
-        const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
-        int bl = e0 >> 8, bend = e1 >> 8;          // 256 weights a super-block
-        const int xoff = lane << 3;
-        float a0 = 0.0f, a1 = 0.0f;
-        for (; bl + 1 < bend; bl += 2) {
-            a0 += fk_q6k_block_dot(rp + (size_t)(bl+0) * FK_Q6K_BLOCK_BYTES,
-                                   xs + ((bl+0) << 8) - e0 + xoff, lane);
-            a1 += fk_q6k_block_dot(rp + (size_t)(bl+1) * FK_Q6K_BLOCK_BYTES,
-                                   xs + ((bl+1) << 8) - e0 + xoff, lane);
-        }
-        for (; bl < bend; ++bl)
-            a0 += fk_q6k_block_dot(rp + (size_t) bl * FK_Q6K_BLOCK_BYTES,
-                                   xs + (bl << 8) - e0 + xoff, lane);
-        acc = a0 + a1;
-    } else if (d.type == FK_Q_BF16) {
-        const unsigned short * rp = (const unsigned short *) d.base + (size_t) row * d.row_stride;
-        for (int i = e0 + lane; i < e1; i += WAVE)
-            acc = fmaf(fk_bf16_to_f32(rp[i]), xs[i - e0], acc);
-    } else {
-        const float * rp = (const float *) d.base + (size_t) row * d.row_stride;
-        for (int i = e0 + lane; i < e1; i += WAVE)
-            acc = fmaf(rp[i], xs[i - e0], acc);
-    }
-
-    const float sum = wave_sum(acc);
-    if (lane != 0) return;
-    if (nsplit > 1) part[(size_t) blockIdx.y * b.total_rows + grow] = sum;
-    else            d.out[row] = apply_epi(sum, d.epi, d.arg);
-}
-
-// Fixed-order sum of the split partials, then each matrix's epilogue and its
-// own destination. Reproducible, unlike an atomicAdd -- the oracle needs it.
-__global__ void k_reduce_splits_batch(GemvBatchD b, const float * __restrict__ part,
-                                      int nsplit) {
-    const int grow = blockIdx.x * blockDim.x + threadIdx.x;
-    if (grow >= b.total_rows) return;
-    float a = 0.0f;
-    for (int s = 0; s < nsplit; ++s) a += part[(size_t) s * b.total_rows + grow];
-    const int di = desc_of(b, grow);
-    b.d[di].out[grow - b.d[di].row_off] = apply_epi(a, b.d[di].epi, b.d[di].arg);
-}
-
 // ======================================================= routed experts ===
 //
-// grid = (rows, K_TOP, 2): z == 0 is gate, z == 1 is up. One wave per row.
+// grid = (rows, K_TOP*T, 2): z == 0 is gate, z == 1 is up. One wave per row.
+// Assignment (token t, rank k) is column t*K_TOP + k of `ids` and of the
+// outputs, so the per-token work is the decode kernel with a longer grid.y.
+// Item 5 of design 9.4 then sorts those columns by expert so a weight row is
+// read once for all the tokens that chose it; until then each assignment
+// reads its own.
 
 __global__ __launch_bounds__(WAVE, 16)
 void k_moe_gate_up_iq3s(const unsigned char * __restrict__ gate_base,
@@ -456,17 +437,18 @@ void k_moe_gate_up_iq3s(const unsigned char * __restrict__ gate_base,
                         size_t expert_stride, size_t row_bytes,
                         const int * __restrict__ ids, const float * __restrict__ x,
                         float * __restrict__ y_gate, float * __restrict__ y_up,
-                        int rows, int K, int k_top) {
+                        int rows, int K, int k_top, int T) {
     const int row = blockIdx.x;
     if (row >= rows) return;
-    const int rank = blockIdx.y;
-    if (rank >= k_top) return;
+    const int col = blockIdx.y;
+    if (col >= k_top * T) return;
     if (K & (IQ3S_BLOCK_WEIGHTS - 1)) return;            // bounded-safe
     const int which = blockIdx.z;
     const int tid   = threadIdx.x;
+    x += (size_t)(col / k_top) * K;
 
     const unsigned char * A = (which ? up_base : gate_base)
-                            + (size_t) ids[rank] * expert_stride + (size_t) row * row_bytes;
+                            + (size_t) ids[col] * expert_stride + (size_t) row * row_bytes;
 
     const int ib32 = tid >> 2, l = tid & 3;
     const int sh1 = 8 - 2 * l, sh2 = 7 - 2 * l, xoff = tid << 3;
@@ -484,7 +466,7 @@ void k_moe_gate_up_iq3s(const unsigned char * __restrict__ gate_base,
         a0 += m1n_iq3s_block_dot(A + (size_t)b*IQ3S_BLOCK_BYTES, c_iq3s_grid, x + (b<<8) + xoff, tid, ib32, sh1, sh2);
 
     const float s = wave_sum((a0 + a1) + (a2 + a3));
-    if (tid == 0) (which ? y_up : y_gate)[(size_t) rank * rows + row] = s;
+    if (tid == 0) (which ? y_up : y_gate)[(size_t) col * rows + row] = s;
 }
 
 __global__ __launch_bounds__(WAVE, 16)
@@ -493,17 +475,18 @@ void k_moe_gate_up_iq4xs(const unsigned char * __restrict__ gate_base,
                          size_t expert_stride, size_t row_bytes,
                          const int * __restrict__ ids, const float * __restrict__ x,
                          float * __restrict__ y_gate, float * __restrict__ y_up,
-                         int rows, int K, int k_top) {
+                         int rows, int K, int k_top, int T) {
     const int row = blockIdx.x;
     if (row >= rows) return;
-    const int rank = blockIdx.y;
-    if (rank >= k_top) return;
+    const int col = blockIdx.y;
+    if (col >= k_top * T) return;
     if (K & (FK_IQ4XS_BLOCK_WEIGHTS - 1)) return;        // bounded-safe
     const int which = blockIdx.z;
     const int tid   = threadIdx.x;
+    x += (size_t)(col / k_top) * K;
 
     const unsigned char * A = (which ? up_base : gate_base)
-                            + (size_t) ids[rank] * expert_stride + (size_t) row * row_bytes;
+                            + (size_t) ids[col] * expert_stride + (size_t) row * row_bytes;
     const int nblk = K >> 8;
     const int xoff = tid << 3;
 
@@ -517,46 +500,46 @@ void k_moe_gate_up_iq4xs(const unsigned char * __restrict__ gate_base,
         a0 += fk_iq4xs_block_dot(A + (size_t)b*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl, x + (b<<8) + xoff, tid);
 
     const float s = wave_sum(a0 + a1);
-    if (tid == 0) (which ? y_up : y_gate)[(size_t) rank * rows + row] = s;
+    if (tid == 0) (which ? y_up : y_gate)[(size_t) col * rows + row] = s;
 }
 
 __global__ __launch_bounds__(WAVE, 16)
 void k_moe_down_iq4nl(const unsigned char * __restrict__ base, size_t expert_stride,
                       size_t row_bytes, const int * __restrict__ ids,
                       const float * __restrict__ h, float * __restrict__ eo,
-                      int rows, int K, int k_top) {
+                      int rows, int K, int k_top, int T) {
     const int row = blockIdx.x;
     if (row >= rows) return;
-    const int rank = blockIdx.y;
-    if (rank >= k_top) return;
+    const int col = blockIdx.y;
+    if (col >= k_top * T) return;
     if (K & (IQ4NL_BLOCK_WEIGHTS - 1)) return;           // bounded-safe
     const int tid = threadIdx.x;
 
-    const unsigned char * A = base + (size_t) ids[rank] * expert_stride + (size_t) row * row_bytes;
-    const float * hr = h + (size_t) rank * K;
+    const unsigned char * A = base + (size_t) ids[col] * expert_stride + (size_t) row * row_bytes;
+    const float * hr = h + (size_t) col * K;
     const int nchunk = (K >> 5) << 2;
 
     float lo = 0.0f, hi = 0.0f;
     for (int w = tid; w < nchunk; w += WAVE) m1n_iq4nl_chunk_dot(A, c_kvals_iq4nl, hr, w, &lo, &hi);
 
     const float s = wave_sum(lo + hi);
-    if (tid == 0) eo[(size_t) rank * rows + row] = s;
+    if (tid == 0) eo[(size_t) col * rows + row] = s;
 }
 
 __global__ __launch_bounds__(WAVE, 16)
 void k_moe_down_q8_0(const unsigned char * __restrict__ base, size_t expert_stride,
                      size_t row_bytes, const int * __restrict__ ids,
                      const float * __restrict__ h, float * __restrict__ eo,
-                     int rows, int K, int k_top) {
+                     int rows, int K, int k_top, int T) {
     const int row = blockIdx.x;
     if (row >= rows) return;
-    const int rank = blockIdx.y;
-    if (rank >= k_top) return;
+    const int col = blockIdx.y;
+    if (col >= k_top * T) return;
     if (K % FK_Q8_0_BLOCK_WEIGHTS) return;               // bounded-safe
     const int tid = threadIdx.x;
 
-    const unsigned char * A = base + (size_t) ids[rank] * expert_stride + (size_t) row * row_bytes;
-    const float * hr = h + (size_t) rank * K;
+    const unsigned char * A = base + (size_t) ids[col] * expert_stride + (size_t) row * row_bytes;
+    const float * hr = h + (size_t) col * K;
     const int nblk = K / FK_Q8_0_BLOCK_WEIGHTS;
 
     float acc = 0.0f;
@@ -565,7 +548,291 @@ void k_moe_down_q8_0(const unsigned char * __restrict__ base, size_t expert_stri
                                 hr + b * FK_Q8_0_BLOCK_WEIGHTS, tid);
 
     const float s = wave_sum(acc);
-    if (tid == 0) eo[(size_t) rank * rows + row] = s;
+    if (tid == 0) eo[(size_t) col * rows + row] = s;
+}
+
+// ------------------------------------------- the row-gather (9.4 item 5) --
+//
+// At T = 1 the ten assignments are ten DIFFERENT experts, so there is
+// nothing to share and the kernels above are the whole story. At T = 256
+// there are 2 560 assignments over at most 512 experts -- five a card on
+// average -- and the kernels above read each chosen expert's row once PER
+// ASSIGNMENT. This sorts the T x 10 assignments by expert on the device and
+// hands a wave a TILE of up to MOE_TILE_E assignments that share one, so the
+// row is walked once for all of them.
+//
+// What it deliberately does NOT do is decode the weights once and reuse the
+// decoded values: that would mean a second copy of the IQ3_S / IQ4_XS /
+// IQ4_NL decode next to decode_quant.h's, and a "faithful-looking retype" of
+// a kernel is exactly what that header exists to prevent (and what the two
+// paths would silently drift apart on). The tile calls the SAME primitive per
+// column, so the block's bytes are read from VRAM once and then served from
+// L1 for the rest of the tile, and every column accumulates in exactly the
+// order the one-assignment kernel used -- which is what keeps a chunk
+// bit-identical to T decode steps.
+#define MOE_TILE_E 8
+
+// Counting sort of the assignments by expert, plus the tile table, in one
+// workgroup of N_EXPERT threads. The scatter order inside an expert is
+// whatever the atomics give, which does not matter: every assignment writes
+// its own output column.
+__global__ __launch_bounds__(N_EXPERT)
+void k_moe_sort(const int * __restrict__ ids, int n,
+                int * __restrict__ order, int * __restrict__ tile_exp,
+                int * __restrict__ tile_off, int * __restrict__ tile_cnt,
+                int n_tiles_max) {
+    __shared__ int hist[N_EXPERT];
+    __shared__ int base[N_EXPERT];
+    __shared__ int tbase[N_EXPERT];
+    __shared__ int cur[N_EXPERT];
+    const int t = threadIdx.x;
+
+    hist[t] = 0;
+    for (int i = t; i < n_tiles_max; i += N_EXPERT) tile_cnt[i] = 0;
+    __syncthreads();
+    for (int i = t; i < n; i += N_EXPERT) atomicAdd(&hist[ids[i]], 1);
+    __syncthreads();
+
+    const int c  = hist[t];
+    const int tc = (c + MOE_TILE_E - 1) / MOE_TILE_E;
+    base[t]  = c;
+    tbase[t] = tc;
+    __syncthreads();
+    for (int off = 1; off < N_EXPERT; off <<= 1) {          // inclusive scans
+        const int a = (t >= off) ? base[t - off]  : 0;
+        const int b = (t >= off) ? tbase[t - off] : 0;
+        __syncthreads();
+        base[t]  += a;
+        tbase[t] += b;
+        __syncthreads();
+    }
+    const int start = base[t]  - c;                          // exclusive
+    const int t0    = tbase[t] - tc;
+    cur[t] = start;
+    __syncthreads();
+
+    for (int i = t; i < n; i += N_EXPERT) {
+        const int e = ids[i];
+        order[atomicAdd(&cur[e], 1)] = i;
+    }
+
+    for (int k = 0; k * MOE_TILE_E < c; ++k) {
+        const int idx = t0 + k;
+        if (idx >= n_tiles_max) break;
+        tile_exp[idx] = t;
+        tile_off[idx] = start + k * MOE_TILE_E;
+        tile_cnt[idx] = min(MOE_TILE_E, c - k * MOE_TILE_E);
+    }
+}
+
+// grid = (rows, n_tiles_max, 2). A tile past the end has tile_cnt 0.
+#define MOE_GATHER_PROLOGUE(nbits)                                                    \
+    const int row = blockIdx.x;                                                       \
+    if (row >= rows) return;                                                          \
+    const int cnt = tile_cnt[blockIdx.y];                                             \
+    if (cnt <= 0) return;                                                             \
+    const int tid = threadIdx.x;                                                      \
+    const int toff = tile_off[blockIdx.y];                                            \
+    int cols[MOE_TILE_E], xb[MOE_TILE_E];
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_gate_up_iq3s_gather(const unsigned char * __restrict__ gate_base,
+                               const unsigned char * __restrict__ up_base,
+                               size_t expert_stride, size_t row_bytes,
+                               const int * __restrict__ order,
+                               const int * __restrict__ tile_exp,
+                               const int * __restrict__ tile_off,
+                               const int * __restrict__ tile_cnt,
+                               const float * __restrict__ x,
+                               float * __restrict__ y_gate, float * __restrict__ y_up,
+                               int rows, int K, int k_top) {
+    MOE_GATHER_PROLOGUE(0)
+    if (K & (IQ3S_BLOCK_WEIGHTS - 1)) return;            // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = (cols[m] / k_top) * K;
+    }
+    const unsigned char * A = (blockIdx.z ? up_base : gate_base)
+                            + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int ib32 = tid >> 2, l = tid & 3;
+    const int sh1 = 8 - 2 * l, sh2 = 7 - 2 * l, xoff = tid << 3;
+    const int nblk = K >> 8;
+
+    float a[MOE_TILE_E][4];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m)
+#pragma unroll
+        for (int u = 0; u < 4; ++u) a[m][u] = 0.0f;
+
+    int b = 0;
+    for (; b + 3 < nblk; b += 4) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            const float * xm = x + xb[m] + xoff;
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+                a[m][u] += m1n_iq3s_block_dot(A + (size_t)(b+u)*IQ3S_BLOCK_BYTES, c_iq3s_grid,
+                                              xm + ((b+u) << 8), tid, ib32, sh1, sh2);
+        }
+    }
+    for (; b < nblk; ++b) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            a[m][0] += m1n_iq3s_block_dot(A + (size_t)b*IQ3S_BLOCK_BYTES, c_iq3s_grid,
+                                          x + xb[m] + xoff + (b << 8), tid, ib32, sh1, sh2);
+        }
+    }
+
+    float * out = blockIdx.z ? y_up : y_gate;
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum((a[m][0] + a[m][1]) + (a[m][2] + a[m][3]));
+        if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
+    }
+}
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_gate_up_iq4xs_gather(const unsigned char * __restrict__ gate_base,
+                                const unsigned char * __restrict__ up_base,
+                                size_t expert_stride, size_t row_bytes,
+                                const int * __restrict__ order,
+                                const int * __restrict__ tile_exp,
+                                const int * __restrict__ tile_off,
+                                const int * __restrict__ tile_cnt,
+                                const float * __restrict__ x,
+                                float * __restrict__ y_gate, float * __restrict__ y_up,
+                                int rows, int K, int k_top) {
+    MOE_GATHER_PROLOGUE(0)
+    if (K & (FK_IQ4XS_BLOCK_WEIGHTS - 1)) return;        // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = (cols[m] / k_top) * K;
+    }
+    const unsigned char * A = (blockIdx.z ? up_base : gate_base)
+                            + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int nblk = K >> 8;
+    const int xoff = tid << 3;
+
+    float a[MOE_TILE_E][2];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) { a[m][0] = 0.0f; a[m][1] = 0.0f; }
+
+    int b = 0;
+    for (; b + 1 < nblk; b += 2) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            const float * xm = x + xb[m] + xoff;
+            a[m][0] += fk_iq4xs_block_dot(A + (size_t)(b+0)*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
+                                          xm + ((b+0) << 8), tid);
+            a[m][1] += fk_iq4xs_block_dot(A + (size_t)(b+1)*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
+                                          xm + ((b+1) << 8), tid);
+        }
+    }
+    for (; b < nblk; ++b) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m) {
+            if (m >= cnt) continue;
+            a[m][0] += fk_iq4xs_block_dot(A + (size_t)b*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
+                                          x + xb[m] + xoff + (b << 8), tid);
+        }
+    }
+
+    float * out = blockIdx.z ? y_up : y_gate;
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum(a[m][0] + a[m][1]);
+        if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
+    }
+}
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_down_iq4nl_gather(const unsigned char * __restrict__ base, size_t expert_stride,
+                             size_t row_bytes, const int * __restrict__ order,
+                             const int * __restrict__ tile_exp,
+                             const int * __restrict__ tile_off,
+                             const int * __restrict__ tile_cnt,
+                             const float * __restrict__ h, float * __restrict__ eo,
+                             int rows, int K, int k_top) {
+    (void) k_top;
+    MOE_GATHER_PROLOGUE(0)
+    if (K & (IQ4NL_BLOCK_WEIGHTS - 1)) return;           // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = cols[m] * K;                           // h is [col][K]
+    }
+    const unsigned char * A = base + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int nchunk = (K >> 5) << 2;
+
+    float lo[MOE_TILE_E], hi[MOE_TILE_E];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) { lo[m] = 0.0f; hi[m] = 0.0f; }
+
+    for (int w = tid; w < nchunk; w += WAVE) {
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m)
+            if (m < cnt) m1n_iq4nl_chunk_dot(A, c_kvals_iq4nl, h + xb[m], w, &lo[m], &hi[m]);
+    }
+
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum(lo[m] + hi[m]);
+        if (tid == 0) eo[(size_t) cols[m] * rows + row] = s;
+    }
+}
+
+__global__ __launch_bounds__(WAVE)
+void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expert_stride,
+                            size_t row_bytes, const int * __restrict__ order,
+                            const int * __restrict__ tile_exp,
+                            const int * __restrict__ tile_off,
+                            const int * __restrict__ tile_cnt,
+                            const float * __restrict__ h, float * __restrict__ eo,
+                            int rows, int K, int k_top) {
+    (void) k_top;
+    MOE_GATHER_PROLOGUE(0)
+    if (K % FK_Q8_0_BLOCK_WEIGHTS) return;               // bounded-safe
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        cols[m] = (m < cnt) ? order[toff + m] : 0;
+        xb[m]   = cols[m] * K;
+    }
+    const unsigned char * A = base + (size_t) tile_exp[blockIdx.y] * expert_stride
+                            + (size_t) row * row_bytes;
+    const int nblk = K / FK_Q8_0_BLOCK_WEIGHTS;
+
+    float acc[MOE_TILE_E];
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) acc[m] = 0.0f;
+
+    for (int b = 0; b < nblk; ++b) {
+        const unsigned char * bp = A + (size_t) b * FK_Q8_0_BLOCK_BYTES;
+        // the one format whose lane value IS a single weight, so the decode
+        // really is hoisted here rather than served from L1
+        const float w = fk_q8_0_block_d(bp) *
+                        (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[tid];
+#pragma unroll
+        for (int m = 0; m < MOE_TILE_E; ++m)
+            if (m < cnt) acc[m] += w * h[xb[m] + b * FK_Q8_0_BLOCK_WEIGHTS + tid];
+    }
+
+#pragma unroll
+    for (int m = 0; m < MOE_TILE_E; ++m) {
+        if (m >= cnt) continue;
+        const float s = wave_sum(acc[m]);
+        if (tid == 0) eo[(size_t) cols[m] * rows + row] = s;
+    }
 }
 
 __global__ void k_silu_mul(const float * __restrict__ g, const float * __restrict__ u,
@@ -586,6 +853,12 @@ void k_router(const float * __restrict__ logits, int * __restrict__ ids,
     __shared__ float sp[N_EXPERT];
     __shared__ int   taken[N_EXPERT_USED];
     const int t = threadIdx.x;
+    // one workgroup per token of the chunk
+    logits += (size_t) blockIdx.x * N_EXPERT;
+    ids    += (size_t) blockIdx.x * N_EXPERT_USED;
+    w      += (size_t) blockIdx.x * N_EXPERT_USED;
+    if (ids_log) ids_log += (size_t) blockIdx.x * N_EXPERT_USED;
+    if (w_log)   w_log   += (size_t) blockIdx.x * N_EXPERT_USED;
 
     sv[t] = logits[t];
     __syncthreads();
@@ -692,15 +965,18 @@ __global__ void k_gather_strided(const float * __restrict__ src, float * __restr
     dst[i] = src[(size_t) r * src_stride + src_off + c];
 }
 
-// One workgroup per group; `w_tiled` picks between a [ne0] gamma reused by
-// every group (build_norm) and a [n_groups*ne0] one (build_hc_mix's grouped
-// RMSNorm over the hc streams).
-// The hc modules normalise only HC=4 groups, so the grid is four workgroups
-// whatever the block size: the only lever left is making each workgroup
-// wider, which shortens the strided walk over ne0=2560 from ten steps to
-// two or three. Block size is chosen by the host and the LDS is dynamic.
+// One workgroup per group. The gamma is PERIODIC in the group index with
+// period `w_period` groups: 1 for a [ne0] gamma reused by every group
+// (build_norm), HC for build_hc_mix's grouped RMSNorm over a token-major
+// [T][HC][ne0] buffer. That replaced a `w_tiled` flag, which could only say
+// "all groups" or "one group each" and therefore could not describe a chunk.
+// The hc modules normalise HC groups a token, so at T = 1 the grid is four
+// workgroups whatever the block size: the only lever left is making each
+// workgroup wider, which shortens the strided walk over ne0=2560 from ten
+// steps to two or three. Block size is chosen by the host and the LDS is
+// dynamic. At T = 256 the same launch has 1 024 workgroups.
 __global__ void k_rms_norm_mul(const float * __restrict__ x, const float * __restrict__ w,
-                    float * __restrict__ y, int ne0, float eps, int w_tiled, int has_w) {
+                    float * __restrict__ y, int ne0, float eps, int w_period, int has_w) {
     extern __shared__ float lds[];
     const float * xg = x + (size_t) blockIdx.x * ne0;
     float *       yg = y + (size_t) blockIdx.x * ne0;
@@ -709,7 +985,7 @@ __global__ void k_rms_norm_mul(const float * __restrict__ x, const float * __res
     for (int i = threadIdx.x; i < ne0; i += blockDim.x) s = fmaf(xg[i], xg[i], s);
     s = block_sum(s, lds);
     const float sc = rsqrtf(s / (float) ne0 + eps);
-    const float * wg = has_w ? (w_tiled ? w : w + (size_t) blockIdx.x * ne0) : nullptr;
+    const float * wg = has_w ? w + (size_t)(blockIdx.x % w_period) * ne0 : nullptr;
     for (int i = threadIdx.x; i < ne0; i += blockDim.x) yg[i] = xg[i] * sc * (has_w ? wg[i] : 1.0f);
 }
 
@@ -742,32 +1018,42 @@ __global__ void k_gated_rms_norm(const float * __restrict__ x, const float * __r
 
 // ================================================ hyper-connections ======
 
-__global__ void k_hc_broadcast(const float * __restrict__ x, float * __restrict__ res) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N_EMBD) return;
-    const float v = x[i];
+// The grid is n*T: a token is a row, and a row's arithmetic does not know
+// how many rows travel with it.
+__global__ void k_hc_broadcast(const float * __restrict__ x, float * __restrict__ res, int T) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= N_EMBD * T) return;
+    const int t = g / N_EMBD, i = g - t * N_EMBD;
+    const float v = x[g];
+    float * r = res + (size_t) t * HC_DIM;
 #pragma unroll
-    for (int c = 0; c < HC; ++c) res[c * N_EMBD + i] = v;
+    for (int c = 0; c < HC; ++c) r[c * N_EMBD + i] = v;
 }
 
 __global__ void k_hc_collapse(const float * __restrict__ xn, const float * __restrict__ gate,
-                              float * __restrict__ out) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N_EMBD) return;
-    float a = xn[i] * gate[i];
+                              float * __restrict__ out, int T) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= N_EMBD * T) return;
+    const int t = g / N_EMBD, i = g - t * N_EMBD;
+    const float * xt = xn   + (size_t) t * HC_DIM;
+    const float * gt = gate + (size_t) t * HC_DIM;
+    float a = xt[i] * gt[i];
 #pragma unroll
-    for (int c = 1; c < HC; ++c) a += xn[c * N_EMBD + i] * gate[c * N_EMBD + i];
-    out[i] = a * (1.0f / (float) HC);
+    for (int c = 1; c < HC; ++c) a += xt[c * N_EMBD + i] * gt[c * N_EMBD + i];
+    out[g] = a * (1.0f / (float) HC);
 }
 
 // ============================================================== PLE ======
 
+// One workgroup per (token, hc stream): blockIdx.x = t*HC + c.
 __global__ void k_ple_gate(const float * __restrict__ key, const float * __restrict__ query,
                 const float * __restrict__ value, float * __restrict__ gated,
                 float * __restrict__ gate_out) {
     extern __shared__ float lds[];
-    const int c = blockIdx.x;
-    const size_t o = (size_t) c * N_EMBD;
+    const int t = blockIdx.x / HC;
+    const int c = blockIdx.x - t * HC;
+    const size_t o = (size_t) t * HC_DIM + (size_t) c * N_EMBD;
+    const size_t vo = (size_t) t * N_EMBD;
     float s = 0.0f;
     for (int i = threadIdx.x; i < N_EMBD; i += blockDim.x) s = fmaf(key[o + i], query[o + i], s);
     s = block_sum(s, lds);
@@ -775,26 +1061,43 @@ __global__ void k_ple_gate(const float * __restrict__ key, const float * __restr
     const float mag = sqrtf(fmaxf(fabsf(sf), 1e-6f));      // ggml_sqrt(ggml_clamp(|s|,1e-6,inf))
     const float sgn = sf > 0.0f ? 1.0f : (sf < 0.0f ? -1.0f : 0.0f);
     const float g   = d_sigmoid(sgn * mag);
-    if (threadIdx.x == 0) gate_out[c] = g;
-    for (int i = threadIdx.x; i < N_EMBD; i += blockDim.x) gated[o + i] = value[i] * g;
+    if (threadIdx.x == 0) gate_out[blockIdx.x] = g;
+    for (int i = threadIdx.x; i < N_EMBD; i += blockDim.x) gated[o + i] = value[vo + i] * g;
 }
 
-// ggml_ssm_conv generalised by a dilation: tap k reads (kern-1-k)*dil
-// positions back, which is build_ple's shifted-copy sum and, at dil = 1, the
-// GDN conv1d. The ring slot is computed with a positive modulus.
-__global__ void k_conv_taps(const float * __restrict__ ring, int head, int ring_slots,
-                            int kern, int dil, int channels,
-                            const float * __restrict__ w, float * __restrict__ out) {
+// ggml_ssm_conv generalised by a dilation, over a WINDOW rather than a ring:
+// token t of the chunk sits at slot (kern-1)*dil + t and its tap k -- which
+// reads (kern-1-k)*dil positions back -- is at slot t + k*dil. No modulus,
+// and a chunk's first tokens read the previous chunk's tail with no special
+// case. The grid is channels*T.
+__global__ void k_conv_win(const float * __restrict__ win, int kern, int dil, int channels,
+                           const float * __restrict__ w, float * __restrict__ out, int T) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= channels * T) return;
+    const int t = g / channels, c = g - t * channels;
+    float a = 0.0f;
+    for (int k = 0; k < kern; ++k)
+        a = fmaf(win[(size_t)(t + k * dil) * channels + c], w[(size_t) c * kern + k], a);
+    out[g] = d_silu(a);
+}
+
+// Carry the window's tail into the next chunk. Source [T, T+hist) and
+// destination [0, hist) OVERLAP whenever T < hist (chunk 1 against the PLE
+// conv's nine history slots is the everyday case), so each thread reads its
+// whole channel column into registers before writing any of it -- a thread
+// touches only its own channel, so there is no cross-thread hazard.
+#define CONV_SLIDE_MAX_HIST 16
+__global__ void k_conv_slide(float * __restrict__ win, int hist, int channels, int T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
-    float a = 0.0f;
-    for (int k = 0; k < kern; ++k) {
-        const int back = (kern - 1 - k) * dil;
-        int slot = (head - back) % ring_slots;
-        if (slot < 0) slot += ring_slots;
-        a = fmaf(ring[(size_t) slot * channels + c], w[(size_t) c * kern + k], a);
-    }
-    out[c] = d_silu(a);
+    // unrolled over a compile-time bound, or `col` would be scratch
+    float col[CONV_SLIDE_MAX_HIST];
+#pragma unroll
+    for (int s = 0; s < CONV_SLIDE_MAX_HIST; ++s)
+        if (s < hist) col[s] = win[(size_t)(T + s) * channels + c];
+#pragma unroll
+    for (int s = 0; s < CONV_SLIDE_MAX_HIST; ++s)
+        if (s < hist) win[(size_t) s * channels + c] = col[s];
 }
 
 // ===================================================== Gated DeltaNet ====
@@ -803,11 +1106,18 @@ __global__ void k_conv_taps(const float * __restrict__ ring, int head, int ring_
 // state, contiguous in ggml's layout, so the whole step -- decay, the
 // prediction dot, the rank-1 update and the output dot -- happens in four
 // registers per lane with two wave reductions and no LDS.
+// The chunk is walked IN ORDER inside the kernel with the state row held in
+// registers: the state token t sees is the one token t-1 left, so T tokens
+// in one launch are the same sequence of updates as T launches of one token
+// and the recurrence is bit-identical at any chunk size. The state is read
+// once and written once for the whole chunk instead of once per token, which
+// is also the only reason a sequential kernel is not a disaster here -- it
+// is ~0.6 ms of a 22.7 ms token (PREFILL.md section 4).
 __global__ __launch_bounds__(WAVE)
 void k_gdn_step(float * __restrict__ S, const float * __restrict__ q,
                 const float * __restrict__ k, const float * __restrict__ v,
                 const float * __restrict__ g_exp, const float * __restrict__ beta,
-                float * __restrict__ out) {
+                float * __restrict__ out, int T, int qk_stride, int v_stride) {
     constexpr int PER = GDN_STATE / WAVE;                 // 4
     const int h    = blockIdx.x / GDN_STATE;
     const int j    = blockIdx.x - h * GDN_STATE;
@@ -815,32 +1125,44 @@ void k_gdn_step(float * __restrict__ S, const float * __restrict__ q,
     const int hk   = h % GDN_K_HEADS;                     // ggml_repeat / `iv1 % nek1`
 
     float * row = S + ((size_t) h * GDN_STATE + j) * GDN_STATE;
-    const float * kh = k + (size_t) hk * GDN_STATE;
-    const float * qh = q + (size_t) hk * GDN_STATE;
 
-    const float ge = g_exp[h];
-    float r[PER], kk[PER], qq[PER];
-    float sk = 0.0f;
+    float r[PER];
 #pragma unroll
-    for (int p = 0; p < PER; ++p) {
-        const int i = lane + p * WAVE;
-        r[p]  = row[i] * ge;                              // decay FIRST (ops.cpp:11012)
-        kk[p] = kh[i];
-        qq[p] = qh[i];
-        sk    = fmaf(r[p], kk[p], sk);
-    }
-    sk = wave_sum(sk);
+    for (int p = 0; p < PER; ++p) r[p] = row[lane + p * WAVE];
 
-    const float d = beta[h] * (v[(size_t) h * GDN_STATE + j] - sk);
-    float o = 0.0f;
+    for (int t = 0; t < T; ++t) {
+        const float * kh = k + (size_t) t * qk_stride + (size_t) hk * GDN_STATE;
+        const float * qh = q + (size_t) t * qk_stride + (size_t) hk * GDN_STATE;
+        const float ge = g_exp[(size_t) t * GDN_V_HEADS + h];
+
+        float kk[PER], qq[PER];
+        float sk = 0.0f;
 #pragma unroll
-    for (int p = 0; p < PER; ++p) {
-        r[p] = fmaf(kk[p], d, r[p]);
-        row[lane + p * WAVE] = r[p];
-        o = fmaf(r[p], qq[p], o);
+        for (int p = 0; p < PER; ++p) {
+            const int i = lane + p * WAVE;
+            r[p]  = r[p] * ge;                            // decay FIRST (ops.cpp:11012)
+            kk[p] = kh[i];
+            qq[p] = qh[i];
+            sk    = fmaf(r[p], kk[p], sk);
+        }
+        sk = wave_sum(sk);
+
+        const float d = beta[(size_t) t * GDN_V_HEADS + h] *
+                        (v[(size_t) t * v_stride + (size_t) h * GDN_STATE + j] - sk);
+        float o = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            r[p] = fmaf(kk[p], d, r[p]);
+            o = fmaf(r[p], qq[p], o);
+        }
+        o = wave_sum(o);
+        if (lane == 0)
+            out[(size_t) t * GDN_VAL_DIM + (size_t) h * GDN_STATE + j] =
+                o * rsqrtf((float) GDN_STATE);
     }
-    o = wave_sum(o);
-    if (lane == 0) out[(size_t) h * GDN_STATE + j] = o * rsqrtf((float) GDN_STATE);
+
+#pragma unroll
+    for (int p = 0; p < PER; ++p) row[lane + p * WAVE] = r[p];
 }
 
 // =================================================== fused small kernels ==
@@ -856,37 +1178,44 @@ void k_gdn_step(float * __restrict__ S, const float * __restrict__ q,
 // and the gate chain of qwen4exp.cpp:816-834 (sigmoid(beta),
 // softplus(alpha+dt), *ssm_a, exp) in one launch. The gate work is 48
 // elements; it rides along on threads past the channel count for free.
-__global__ void k_gdn_conv_gate(const float * __restrict__ ring, int head,
+// grid.x covers GDN_CONV_DIM + GDN_V_HEADS lanes of work, grid.y the chunk.
+// The conv output is written twice: conv_out in the reference's contiguous
+// [q|k|v] row (the oracle tap, and where the recurrence reads v) and
+// conv_qk with q and k alone, so l2_norm's 32 groups a token are contiguous
+// across the whole chunk.
+__global__ void k_gdn_conv_gate(const float * __restrict__ win,
                                 const float * __restrict__ w,
                                 const float * __restrict__ beta_raw,
                                 const float * __restrict__ alpha_raw,
                                 const float * __restrict__ dt,
                                 const float * __restrict__ ssm_a,
                                 float * __restrict__ conv_out,
+                                float * __restrict__ conv_qk,
                                 float * __restrict__ beta_sig,
                                 float * __restrict__ a_softplus,
                                 float * __restrict__ gate,
                                 float * __restrict__ g_exp) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
     if (i < GDN_CONV_DIM) {
         float a = 0.0f;
 #pragma unroll
-        for (int k = 0; k < GDN_CONV_K; ++k) {
-            int slot = (head - (GDN_CONV_K - 1 - k)) % GDN_CONV_K;
-            if (slot < 0) slot += GDN_CONV_K;
-            a = fmaf(ring[(size_t) slot * GDN_CONV_DIM + i], w[(size_t) i * GDN_CONV_K + k], a);
-        }
-        conv_out[i] = d_silu(a);
+        for (int k = 0; k < GDN_CONV_K; ++k)
+            a = fmaf(win[(size_t)(t + k) * GDN_CONV_DIM + i], w[(size_t) i * GDN_CONV_K + k], a);
+        const float v = d_silu(a);
+        conv_out[(size_t) t * GDN_CONV_DIM + i] = v;
+        if (i < 2 * GDN_KEY_DIM) conv_qk[(size_t) t * 2 * GDN_KEY_DIM + i] = v;
         return;
     }
     const int h = i - GDN_CONV_DIM;
     if (h >= GDN_V_HEADS) return;
-    beta_sig[h]   = d_sigmoid(beta_raw[h]);
-    const float sp = d_softplus(alpha_raw[h] + dt[h]);
-    a_softplus[h] = sp;
+    const size_t o = (size_t) t * GDN_V_HEADS + h;
+    beta_sig[o]   = d_sigmoid(beta_raw[o]);
+    const float sp = d_softplus(alpha_raw[o] + dt[h]);
+    a_softplus[o] = sp;
     const float g = sp * ssm_a[h];          // ssm_a already holds -exp(A_log)
-    gate[h]       = g;
-    g_exp[h]      = expf(g);
+    gate[o]       = g;
+    g_exp[o]      = expf(g);
 }
 
 // build_moe_ffn's tail: the weighted expert sum, the shared expert's sigmoid
@@ -900,17 +1229,20 @@ __global__ void k_moe_finish(const float * __restrict__ eo,
                              float * __restrict__ moe_out,
                              float * __restrict__ sh_gated,
                              float * __restrict__ out,
-                             int rows, int k_top) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const float g0 = d_sigmoid(sh_gate[0]);
-    if (i == 0) sh_gate_sig[0] = g0;
-    if (i >= rows) return;
+                             int rows, int k_top, int T) {
+    const int g_ = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g_ >= rows * T) return;
+    const int t = g_ / rows, i = g_ - t * rows;
+    const float g0 = d_sigmoid(sh_gate[t]);
+    if (i == 0) sh_gate_sig[t] = g0;
+    const float * eot = eo + (size_t) t * k_top * rows;
+    const float * wt  = w  + (size_t) t * k_top;
     float a = 0.0f;
-    for (int k = 0; k < k_top; ++k) a += w[k] * eo[(size_t) k * rows + i];
-    moe_out[i] = a;
-    const float g = sh_raw[i] * g0;
-    sh_gated[i] = g;
-    out[i] = a + g;
+    for (int k = 0; k < k_top; ++k) a += wt[k] * eot[(size_t) k * rows + i];
+    moe_out[g_] = a;
+    const float g = sh_raw[g_] * g0;
+    sh_gated[g_] = g;
+    out[g_] = a + g;
 }
 
 // hc_combine, optionally followed by the grouped RMSNorm the NEXT hc_mix
@@ -918,18 +1250,21 @@ __global__ void k_moe_finish(const float * __restrict__ eo,
 // elementwise over that stream's 2 560 elements and the norm reduces over
 // exactly the same range, so the two fuse with one __syncthreads and no
 // extra traffic. `w_norm == nullptr` does the combine alone.
+// blockIdx.x = t*HC + c: one workgroup per (token, hc stream).
 __global__ void k_hc_combine_norm(float * __restrict__ res, const float * __restrict__ blk,
                                   const float * __restrict__ inject,
                                   const float * __restrict__ w_norm,
                                   float * __restrict__ xn, float eps) {
     extern __shared__ float lds[];
-    const int c = blockIdx.x;
-    float * rc = res + (size_t) c * N_EMBD;
-    const float wgt = 2.0f * d_sigmoid(inject[c] * (1.0f / (float) HC));
+    const int t = blockIdx.x / HC;
+    const int c = blockIdx.x - t * HC;
+    float * rc = res + (size_t) t * HC_DIM + (size_t) c * N_EMBD;
+    const float * bt = blk + (size_t) t * N_EMBD;
+    const float wgt = 2.0f * d_sigmoid(inject[(size_t) t * HC + c] * (1.0f / (float) HC));
 
     float ss = 0.0f;
     for (int i = threadIdx.x; i < N_EMBD; i += blockDim.x) {
-        const float v = rc[i] + blk[i] * wgt;
+        const float v = rc[i] + bt[i] * wgt;
         rc[i] = v;
         ss = fmaf(v, v, ss);
     }
@@ -937,8 +1272,9 @@ __global__ void k_hc_combine_norm(float * __restrict__ res, const float * __rest
     ss = block_sum(ss, lds);
     const float sc = rsqrtf(ss / (float) N_EMBD + eps);
     const float * wg = w_norm + (size_t) c * N_EMBD;
+    float * xt = xn + (size_t) t * HC_DIM + (size_t) c * N_EMBD;
     for (int i = threadIdx.x; i < N_EMBD; i += blockDim.x)
-        xn[(size_t) c * N_EMBD + i] = rc[i] * sc * wg[i];
+        xt[i] = rc[i] * sc * wg[i];
 }
 
 // build_layer_attn's per-head post-processing, all of it, in one launch:
@@ -960,9 +1296,22 @@ void k_qsa_qk_post(const float * __restrict__ qfull,   // [N_Q_HEADS][2*HEAD_DIM
                    float * __restrict__ qcur, float * __restrict__ gate,
                    float * __restrict__ gsig, float * __restrict__ kcur,
                    float * __restrict__ idxq,
-                   int pos, float eps) {
+                   int pos0, float eps) {
     __shared__ float lds[QKPOST_THREADS];
     __shared__ float sv[HEAD_DIM];
+
+    // grid.y is the chunk: a row's post-processing is independent of every
+    // other row's, so this is the decode kernel with one more grid axis.
+    const int tk  = blockIdx.y;
+    const int pos = pos0 + tk;
+    qfull  += (size_t) tk * N_Q_HEADS   * HEAD_DIM * 2;
+    kraw   += (size_t) tk * N_KV_HEADS  * HEAD_DIM;
+    idxraw += (size_t) tk * IDX_N_HEADS * IDX_DIM;
+    qcur   += (size_t) tk * N_Q_HEADS   * HEAD_DIM;
+    gate   += (size_t) tk * N_Q_HEADS   * HEAD_DIM;
+    gsig   += (size_t) tk * N_Q_HEADS   * HEAD_DIM;
+    kcur   += (size_t) tk * N_KV_HEADS  * HEAD_DIM;
+    idxq   += (size_t) tk * IDX_N_HEADS * IDX_DIM;
 
     const int b = blockIdx.x;
     const bool is_q   = b < N_Q_HEADS;
@@ -1054,14 +1403,18 @@ __global__ void k_rope_imrope(float * __restrict__ x, int head_dim, int n_rot, i
 __global__ void k_kv_store_q8_0(const float * __restrict__ k, const float * __restrict__ v,
                                 int8_t * __restrict__ kqs, __half * __restrict__ ksc,
                                 int8_t * __restrict__ vqs, __half * __restrict__ vsc,
-                                int cell) {
-    // one workgroup per (tensor, head, 32-element block); 32 lanes
+                                int cell0, int T) {
+    // one workgroup per (tensor, head, token, 32-element block); 32 lanes
     const int which = blockIdx.z;                         // 0 = K, 1 = V
     const int h     = blockIdx.y;
-    const int b     = blockIdx.x;
+    const int t     = blockIdx.x / (HEAD_DIM / 32);
+    const int b     = blockIdx.x - t * (HEAD_DIM / 32);
     const int lane  = threadIdx.x;
+    if (t >= T) return;
+    const int cell  = cell0 + t;
 
-    const float * src = (which ? v : k) + (size_t) h * HEAD_DIM + b * 32;
+    const float * src = (which ? v : k) + (size_t) t * N_KV_HEADS * HEAD_DIM
+                      + (size_t) h * HEAD_DIM + b * 32;
     float a = fabsf(src[lane]);
 #pragma unroll
     for (int off = WAVE / 2; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor(a, off, WAVE));
@@ -1081,9 +1434,14 @@ __global__ void k_kv_store_q8_0(const float * __restrict__ k, const float * __re
 // unset slots read cell 0 (llama-memory-hybrid-idx.cpp:395) -- without keeping
 // every token's raw key. That f32 cache was 512 B a token a layer, eight times
 // what design 9.1 budgets for the pooled bf16 key and 134 MB a layer at 256k.
+// One workgroup, the whole chunk, IN ORDER: a block's members arrive in
+// order, so the running sum is a sequence and cannot be parallelised over
+// tokens -- and must not be, or a chunk would not reproduce T single-token
+// calls. It also means `sum` and `raw0` are read and written once for the
+// chunk rather than once a token.
 __global__ __launch_bounds__(IDX_DIM)
-void k_idx_pool_block(const float * __restrict__ k_new, float * __restrict__ sum,
-                      float * __restrict__ raw0, int blk, int n_filled,
+void k_idx_pool_chunk(const float * __restrict__ k_new, float * __restrict__ sum,
+                      float * __restrict__ raw0, int pos0, int T,
                       const float * __restrict__ k_norm, float eps,
                       unsigned short * __restrict__ pooled,
                       float * __restrict__ dbg_pooled, float * __restrict__ dbg_roped) {
@@ -1091,42 +1449,55 @@ void k_idx_pool_block(const float * __restrict__ k_new, float * __restrict__ sum
     __shared__ float s_r[IDX_DIM];
     const int i = threadIdx.x;
 
-    const float kv = k_new[i];
-    if (blk == 0 && n_filled == 1) raw0[i] = kv;      // cell 0 is the fill value
-    const float s = (n_filled == 1) ? kv : sum[i] + kv;
-    sum[i] = s;
-    float p = (s + (float)(QSA_RATIO - n_filled) * raw0[i]) * (1.0f / (float) QSA_RATIO);
-    if (dbg_pooled) dbg_pooled[i] = p;
+    float run  = sum[i];
+    float fill = raw0[i];
 
-    s_v[i] = p * p;
-    __syncthreads();
-    for (int s = IDX_DIM / 2; s > 0; s >>= 1) {
-        if (i < s) s_v[i] += s_v[i + s];
+    for (int t = 0; t < T; ++t) {
+        const int p        = pos0 + t;
+        const int blk      = p / QSA_RATIO;
+        const int n_filled = (p + 1) - blk * QSA_RATIO;
+        const bool last    = (t == T - 1);
+
+        const float kv = k_new[(size_t) t * IDX_DIM + i];
+        if (blk == 0 && n_filled == 1) fill = kv;     // cell 0 is the fill value
+        run = (n_filled == 1) ? kv : run + kv;
+        float p_v = (run + (float)(QSA_RATIO - n_filled) * fill) * (1.0f / (float) QSA_RATIO);
+        if (last && dbg_pooled) dbg_pooled[i] = p_v;
+
+        s_v[i] = p_v * p_v;
+        __syncthreads();
+        for (int s = IDX_DIM / 2; s > 0; s >>= 1) {
+            if (i < s) s_v[i] += s_v[i + s];
+            __syncthreads();
+        }
+        p_v = p_v * rsqrtf(s_v[0] / (float) IDX_DIM + eps) * k_norm[i];
+        s_r[i] = p_v;
+        __syncthreads();
+
+        // IMRoPE over the first N_ROT of IDX_DIM dims, position blk*QSA_RATIO
+        if (i < N_ROT / 2) {
+            const int sect_dims = ROPE_SECTIONS[0] + ROPE_SECTIONS[1] + ROPE_SECTIONS[2] + ROPE_SECTIONS[3];
+            const int sector = i % sect_dims;
+            const bool is_e = !((sector % 3 == 1 && sector < 3 * ROPE_SECTIONS[1]) ||
+                                (sector % 3 == 2 && sector < 3 * ROPE_SECTIONS[2]) ||
+                                (sector % 3 == 0 && sector < 3 * ROPE_SECTIONS[0]));
+            const float base = is_e ? 0.0f : (float)(blk * QSA_RATIO);
+            const float ts   = __powf(ROPE_FREQ_BASE, -2.0f / (float) N_ROT);
+            const float th   = base * __powf(ts, (float) i);
+            const float c = __cosf(th), s = __sinf(th);
+            const float x0 = s_r[i], x1 = s_r[i + N_ROT / 2];
+            s_r[i]              = x0 * c - x1 * s;
+            s_r[i + N_ROT / 2]  = x0 * s + x1 * c;
+        }
+        __syncthreads();
+
+        if (last && dbg_roped) dbg_roped[i] = s_r[i];
+        pooled[(size_t) blk * IDX_DIM + i] = fk_f32_to_bf16(s_r[i]);
         __syncthreads();
     }
-    p = p * rsqrtf(s_v[0] / (float) IDX_DIM + eps) * k_norm[i];
-    s_r[i] = p;
-    __syncthreads();
 
-    // IMRoPE over the first N_ROT of IDX_DIM dims, position blk*QSA_RATIO
-    if (i < N_ROT / 2) {
-        const int sect_dims = ROPE_SECTIONS[0] + ROPE_SECTIONS[1] + ROPE_SECTIONS[2] + ROPE_SECTIONS[3];
-        const int sector = i % sect_dims;
-        const bool is_e = !((sector % 3 == 1 && sector < 3 * ROPE_SECTIONS[1]) ||
-                            (sector % 3 == 2 && sector < 3 * ROPE_SECTIONS[2]) ||
-                            (sector % 3 == 0 && sector < 3 * ROPE_SECTIONS[0]));
-        const float base = is_e ? 0.0f : (float)(blk * QSA_RATIO);
-        const float ts   = __powf(ROPE_FREQ_BASE, -2.0f / (float) N_ROT);
-        const float th   = base * __powf(ts, (float) i);
-        const float c = __cosf(th), s = __sinf(th);
-        const float x0 = s_r[i], x1 = s_r[i + N_ROT / 2];
-        s_r[i]              = x0 * c - x1 * s;
-        s_r[i + N_ROT / 2]  = x0 * s + x1 * c;
-    }
-    __syncthreads();
-
-    if (dbg_roped) dbg_roped[i] = s_r[i];
-    pooled[(size_t) blk * IDX_DIM + i] = fk_f32_to_bf16(s_r[i]);
+    sum[i]  = run;
+    raw0[i] = fill;
 }
 
 // scores[b] = sum over the FOUR QUERY heads of relu(q_h . kpool[b]).
@@ -1605,6 +1976,7 @@ public:
         HIP_CHECK(hipMalloc(&mbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
         HIP_CHECK(hipMalloc(&lbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
         HIP_CHECK(hipMalloc(&gemv_part_, GEMV_PART_FLOATS * sizeof(float)));
+        part_floats_ = GEMV_PART_FLOATS;
         HIP_CHECK(hipMalloc(&amax_v_, ARGMAX_BLOCKS * sizeof(float)));
         HIP_CHECK(hipMalloc(&amax_i_, ARGMAX_BLOCKS * sizeof(int)));
         HIP_CHECK(hipEventCreateWithFlags(&bnd_, hipEventDisableTiming));
@@ -1616,6 +1988,8 @@ public:
         HIP_IGNORE(hipFree(partial_)); HIP_IGNORE(hipFree(mbuf_)); HIP_IGNORE(hipFree(lbuf_));
         HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
         HIP_IGNORE(hipFree(gemv_part_));
+        HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
+        HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
         for (int i = 0; i < STAGE_SLOTS; ++i) if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
         HIP_IGNORE(hipFree(amax_v_)); HIP_IGNORE(hipFree(amax_i_));
         HIP_IGNORE(hipEventDestroy(bnd_)); HIP_IGNORE(hipStreamDestroy(stream_));
@@ -1740,15 +2114,16 @@ public:
     }
     size_t placed_bytes() const override { return placed_; }
 
-    // There is exactly ONE GEMV path on the device now: everything goes
-    // through k_gemv_batch, so a single-matrix call is a batch of one.
+    // There is exactly ONE GEMV path on the device: everything goes through
+    // k_gemm_batch, so a single-matrix call is a batch of one and a decode
+    // token is a chunk of one.
     void gemv(const Mat & W, const float * x, float * y) override {
         GemvJob j; j.W = &W; j.out = y;
-        gemv_batch(&j, 1, x, -1, GX_PLAIN, nullptr);
+        gemv_batch(&j, 1, x, -1, GX_PLAIN, nullptr, 1);
     }
 
     void gemv_batch(const GemvJob * jobs, int n, const float * x, int group,
-                    int x_mode, const float * x2) override {
+                    int x_mode, const float * x2, int T) override {
         GemvBatchD b{};
         b.n = n < GEMV_BATCH_MAX ? n : GEMV_BATCH_MAX;
         b.K = (int) jobs[0].W->K;
@@ -1790,26 +2165,93 @@ public:
         // total waves == total rows, so the test is on ROWS: a matrix with
         // enough rows already fills the card and a split would only add a
         // reduce launch.
+        // nsplit is a function of the MATRIX ONLY. It must not see T: it
+        // decides the summation order, so a chunk whose split differed from
+        // a decode token's would not be bit-identical to it and the
+        // `--chunk 6` oracle would fail for a reason that is not a bug.
         int nsplit = (b.total_rows >= gemv_min_rows_) ? 1 : ceil_div(GEMV_TARGET_WGS, row_groups);
         if (nsplit > units) nsplit = units;
         if (nsplit < 1) nsplit = 1;
-        while (nsplit > 1 && (size_t) nsplit * b.total_rows > GEMV_PART_FLOATS) nsplit >>= 1;
+        if (T < 1) T = 1;
+        const int n_tiles = ceil_div(T, GEMM_TILE);
+        // The partial buffer is what grows with T instead; it is grown ONCE
+        // (chunk sizes do not change mid-run) rather than capped, because
+        // capping would make nsplit depend on T through the back door.
+        if (nsplit > 1) ensure_part((size_t) nsplit * (size_t) T * (size_t) b.total_rows);
 
         // `units` counts granules, so the slice is granules * gran -- not
         // * WAVE, which under-sized the LDS 8x for a Q6_K batch and let the
-        // staging loop write past the allocation.
-        const int slice = ceil_div(units, nsplit) * gran;
-        const int stage = (gemv_lds_ && slice <= GEMV_LDS_MAX_FLOATS) ? 1 : 0;
-        const size_t lds = stage ? (size_t) slice * sizeof(float) : 0;
+        // staging loop write past the allocation. A tile stages `nt` columns
+        // of it, so the LDS request is nt_max times bigger than at T = 1 --
+        // and staging is dropped rather than shrunk when it will not fit,
+        // because both arms compute the same value (GEMM_X).
+        const int slice  = ceil_div(units, nsplit) * gran;
+        const int nt_max = T < GEMM_TILE ? T : GEMM_TILE;
+        const int stage  = (gemv_lds_ && (size_t) nt_max * slice <= GEMV_LDS_MAX_FLOATS) ? 1 : 0;
+        const size_t lds = stage ? (size_t) nt_max * slice * sizeof(float) : 0;
 
-        mark(PC_TRUNK, group, bytes);
+        mark(PC_TRUNK, group, bytes * (size_t) T);
         last_op_ = "gemv_batch";
-        k_gemv_batch<<<dim3((unsigned) row_groups, (unsigned) nsplit), GEMV_THREADS, lds, stream_>>>(
-            b, x, x2, nsplit, gemv_part_, stage);
+        k_gemm_batch<<<dim3((unsigned) row_groups, (unsigned) nsplit, (unsigned) n_tiles),
+                       GEMV_THREADS, lds, stream_>>>(b, x, x2, nsplit, gemv_part_, stage, T);
         if (nsplit > 1) {
             ++launches_;
-            k_reduce_splits_batch<<<ceil_div(b.total_rows, BLK), BLK, 0, stream_>>>(b, gemv_part_, nsplit);
+            k_reduce_splits_gemm<<<dim3((unsigned) ceil_div(b.total_rows, BLK), (unsigned) T),
+                                   BLK, 0, stream_>>>(b, gemv_part_, nsplit, T);
         }
+    }
+
+    // Sort the chunk's T*10 expert assignments and build the tile table.
+    // Returns the tile-grid bound: at most one tile per expert that appears,
+    // plus one more for every MOE_TILE_E assignments. Tiles past the real
+    // count have tile_cnt 0 and their workgroups return immediately.
+    // moe_gate_up and moe_down of one layer are handed the SAME ids, so the
+    // second call reuses the first's sort rather than launching again.
+    int moe_sort(const int * ids, int T) {
+        const int n  = N_EXPERT_USED * T;
+        const int nt = (n < N_EXPERT ? n : N_EXPERT) + ceil_div(n, MOE_TILE_E);
+        if (moe_ids_ == ids && moe_n_ == n) return nt;
+        if (n > moe_cap_) {
+            dev_ensure(dev_);
+            HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
+            HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
+            moe_cap_ = n;
+            const int ntc = (moe_cap_ < N_EXPERT ? moe_cap_ : N_EXPERT) + ceil_div(moe_cap_, MOE_TILE_E);
+            HIP_CHECK(hipMalloc(&moe_order_,    (size_t) moe_cap_ * sizeof(int)));
+            HIP_CHECK(hipMalloc(&moe_tile_exp_, (size_t) ntc * sizeof(int)));
+            HIP_CHECK(hipMalloc(&moe_tile_off_, (size_t) ntc * sizeof(int)));
+            HIP_CHECK(hipMalloc(&moe_tile_cnt_, (size_t) ntc * sizeof(int)));
+        }
+        mark(PC_ROUTER);
+        last_op_ = "moe_sort";
+        k_moe_sort<<<1, N_EXPERT, 0, stream_>>>(ids, n, moe_order_, moe_tile_exp_,
+                                                moe_tile_off_, moe_tile_cnt_, nt);
+        moe_ids_ = ids;
+        moe_n_   = n;
+        return nt;
+    }
+
+    const int * moe_ids_ = nullptr;
+    int   moe_n_   = 0;
+    int   moe_cap_ = 0;
+    int * moe_order_    = nullptr;
+    int * moe_tile_exp_ = nullptr;
+    int * moe_tile_off_ = nullptr;
+    int * moe_tile_cnt_ = nullptr;
+
+    // The split-K partials, [nsplit][T][total_rows]. nsplit*total_rows stays
+    // near GEMV_TARGET_WGS*GEMV_WAVES by construction (nsplit rises only as
+    // rows falls), so this is ~32k floats a token; T multiplies it. Grown
+    // geometrically and only when a chunk first needs it -- hipFree
+    // SYNCHRONISES THE DEVICE, so this must never be a per-token event.
+    void ensure_part(size_t floats) {
+        if (floats <= part_floats_) return;
+        dev_ensure(dev_);
+        size_t want = part_floats_ ? part_floats_ : GEMV_PART_FLOATS;
+        while (want < floats) want <<= 1;
+        HIP_IGNORE(hipFree(gemv_part_));
+        HIP_CHECK(hipMalloc(&gemv_part_, want * sizeof(float)));
+        part_floats_ = want;
     }
     void set_gemv_lds(int on) override { gemv_lds_ = on; }
     void set_sync_debug(bool on) override { sync_debug_ = on; }
@@ -1866,8 +2308,9 @@ public:
         mark(PC_NORM);
         last_op_ = "rms_norm_mul";
         const int t = red_threads(ne0);
+        const int period = (int) std::max<size_t>(1, w_len / (size_t) ne0);
         k_rms_norm_mul<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, y, ne0, eps,
-                                          w_len == (size_t) ne0 ? 1 : 0, w ? 1 : 0);
+                                          period, w ? 1 : 0);
     }
     void l2_norm(const float * x, float * y, int ne0, int n_groups, float eps) override {
         mark(PC_NORM);
@@ -1875,54 +2318,63 @@ public:
         const int t = red_threads(ne0);
         k_l2_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, y, ne0, eps);
     }
-    void hc_broadcast(const float * x, float * r) override {
+    void hc_broadcast(const float * x, float * r, int T) override {
         mark(PC_ELEM);
         last_op_ = "hc_broadcast";
-        k_hc_broadcast<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(x, r);
+        k_hc_broadcast<<<ceil_div(N_EMBD * T, BLK), BLK, 0, stream_>>>(x, r, T);
     }
-    void hc_collapse(const float * xn, const float * g, float * o) override {
+    void hc_collapse(const float * xn, const float * g, float * o, int T) override {
         mark(PC_ELEM);
         last_op_ = "hc_collapse";
-        k_hc_collapse<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(xn, g, o);
+        k_hc_collapse<<<ceil_div(N_EMBD * T, BLK), BLK, 0, stream_>>>(xn, g, o, T);
     }
-    void hc_combine(float * r, const float * b, const float * inj) override {
-        hc_combine_norm(r, b, inj, nullptr, nullptr, 0.0f);
+    void hc_combine(float * r, const float * b, const float * inj, int T) override {
+        hc_combine_norm(r, b, inj, nullptr, nullptr, 0.0f, T);
     }
     void hc_combine_norm(float * r, const float * b, const float * inj,
-                         const float * w_norm, float * xn, float eps) override {
+                         const float * w_norm, float * xn, float eps, int T) override {
         mark(PC_ELEM);
         last_op_ = "hc_combine_norm";
         const int t = red_threads(N_EMBD);
-        k_hc_combine_norm<<<HC, t, t * sizeof(float), stream_>>>(r, b, inj, w_norm, xn, eps);
+        k_hc_combine_norm<<<HC * T, t, t * sizeof(float), stream_>>>(r, b, inj, w_norm, xn, eps);
     }
-    void ple_gate(const float * k, const float * q, const float * v, float * g, float * go) override {
+    void ple_gate(const float * k, const float * q, const float * v, float * g, float * go,
+                  int T) override {
         mark(PC_ELEM);
         last_op_ = "ple_gate";
         const int t = red_threads(N_EMBD);
-        k_ple_gate<<<HC, t, t * sizeof(float), stream_>>>(k, q, v, g, go);
+        k_ple_gate<<<HC * T, t, t * sizeof(float), stream_>>>(k, q, v, g, go);
     }
-    void ple_conv_silu(const float * ring, int head, const float * w, float * out) override {
+    void ple_conv_win(const float * win, const float * w, float * out, int T) override {
         mark(PC_ELEM);
-        last_op_ = "ple_conv_silu";
-        k_conv_taps<<<ceil_div(HC_DIM, BLK), BLK, 0, stream_>>>(ring, head, PLE_CONV_HIST + 1,
-                                                    PLE_CONV_K, PLE_CONV_DIL, HC_DIM, w, out);
+        last_op_ = "ple_conv_win";
+        k_conv_win<<<ceil_div(HC_DIM * T, BLK), BLK, 0, stream_>>>(
+            win, PLE_CONV_K, PLE_CONV_DIL, HC_DIM, w, out, T);
     }
-    void gdn_conv_gate(const float * ring, int head, const float * w,
+    void conv_slide(float * win, int hist, int channels, int T) override {
+        mark(PC_ELEM);
+        last_op_ = "conv_slide";
+        k_conv_slide<<<ceil_div(channels, BLK), BLK, 0, stream_>>>(win, hist, channels, T);
+    }
+    void gdn_conv_gate(const float * win, const float * w,
                        const float * beta_raw, const float * alpha_raw,
                        const float * dt, const float * ssm_a, float * conv_out,
-                       float * beta_sig, float * a_softplus, float * gate,
-                       float * g_exp) override {
+                       float * conv_qk, float * beta_sig, float * a_softplus,
+                       float * gate, float * g_exp, int T) override {
         mark(PC_ELEM);
         last_op_ = "gdn_conv_gate";
-        k_gdn_conv_gate<<<ceil_div(GDN_CONV_DIM + GDN_V_HEADS, BLK), BLK, 0, stream_>>>(
-            ring, head, w, beta_raw, alpha_raw, dt, ssm_a,
-            conv_out, beta_sig, a_softplus, gate, g_exp);
+        k_gdn_conv_gate<<<dim3(ceil_div(GDN_CONV_DIM + GDN_V_HEADS, BLK), (unsigned) T),
+                          BLK, 0, stream_>>>(
+            win, w, beta_raw, alpha_raw, dt, ssm_a,
+            conv_out, conv_qk, beta_sig, a_softplus, gate, g_exp);
     }
     void gdn_step(float * S, const float * q, const float * k, const float * v,
-                  const float * g, const float * b, float * o) override {
+                  const float * g, const float * b, float * o,
+                  int T, int qk_stride, int v_stride) override {
         mark(PC_GDN);
         last_op_ = "gdn_step";
-        k_gdn_step<<<GDN_V_HEADS * GDN_STATE, WAVE, 0, stream_>>>(S, q, k, v, g, b, o);
+        k_gdn_step<<<GDN_V_HEADS * GDN_STATE, WAVE, 0, stream_>>>(
+            S, q, k, v, g, b, o, T, qk_stride, v_stride);
     }
     void gated_rms_norm(const float * x, const float * w, const float * z, float * y,
                         int ne0, int n_groups, float eps) override {
@@ -1932,24 +2384,46 @@ public:
         k_gated_rms_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, z, y, ne0, eps);
     }
     void router(const float * logits, int * ids, float * w,
-                int * ids_log, float * w_log) override {
+                int * ids_log, float * w_log, int T) override {
         mark(PC_ROUTER);
         last_op_ = "router";
-        k_router<<<1, N_EXPERT, 0, stream_>>>(logits, ids, w, ids_log, w_log);
+        k_router<<<T, N_EXPERT, 0, stream_>>>(logits, ids, w, ids_log, w_log);
+        // Every layer routes into the SAME scratch buffer, so pointer
+        // identity alone would make moe_sort reuse the previous layer's sort.
+        // The router is the one thing that invalidates it.
+        moe_ids_ = nullptr;
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
-                     float * yg, float * yu) override {
-        const dim3 grid((unsigned) g.rows, N_EXPERT_USED, 2);
+                     float * yg, float * yu, int T) override {
+        if (T > 1) {
+            const int nt = moe_sort(ids, T);
+            const dim3 grid((unsigned) g.rows, (unsigned) nt, 2);
+            mark(PC_EXP_GATE_UP);
+            last_op_ = "moe_gate_up_gather";
+            if (g.type == FK_Q_IQ3_S) {
+                k_moe_gate_up_iq3s_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) g.base, (const unsigned char *) u.base,
+                    g.expert_stride, g.row_bytes, moe_order_, moe_tile_exp_, moe_tile_off_,
+                    moe_tile_cnt_, x, yg, yu, (int) g.rows, (int) g.K, N_EXPERT_USED);
+            } else {
+                k_moe_gate_up_iq4xs_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) g.base, (const unsigned char *) u.base,
+                    g.expert_stride, g.row_bytes, moe_order_, moe_tile_exp_, moe_tile_off_,
+                    moe_tile_cnt_, x, yg, yu, (int) g.rows, (int) g.K, N_EXPERT_USED);
+            }
+            return;
+        }
+        const dim3 grid((unsigned) g.rows, (unsigned)(N_EXPERT_USED * T), 2);
         mark(PC_EXP_GATE_UP);
         last_op_ = "moe_gate_up";
         if (g.type == FK_Q_IQ3_S) {
             k_moe_gate_up_iq3s<<<grid, WAVE, 0, stream_>>>((const unsigned char *) g.base,
                 (const unsigned char *) u.base, g.expert_stride, g.row_bytes, ids, x, yg, yu,
-                (int) g.rows, (int) g.K, N_EXPERT_USED);
+                (int) g.rows, (int) g.K, N_EXPERT_USED, T);
         } else {
             k_moe_gate_up_iq4xs<<<grid, WAVE, 0, stream_>>>((const unsigned char *) g.base,
                 (const unsigned char *) u.base, g.expert_stride, g.row_bytes, ids, x, yg, yu,
-                (int) g.rows, (int) g.K, N_EXPERT_USED);
+                (int) g.rows, (int) g.K, N_EXPERT_USED, T);
         }
     }
     void silu_mul(const float * g, const float * u, float * h, size_t n) override {
@@ -1957,26 +2431,46 @@ public:
         last_op_ = "silu_mul";
         k_silu_mul<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(g, u, h, (int) n);
     }
-    void moe_down(const Mat & d, const int * ids, const float * h, float * eo) override {
-        const dim3 grid((unsigned) d.rows, N_EXPERT_USED, 1);
+    void moe_down(const Mat & d, const int * ids, const float * h, float * eo, int T) override {
+        if (T > 1) {
+            // the layer's moe_gate_up has just sorted these very ids; the
+            // sort is reused unless something unexpected changed
+            const int nt = moe_sort(ids, T);
+            const dim3 grid((unsigned) d.rows, (unsigned) nt, 1);
+            mark(PC_EXP_DOWN);
+            last_op_ = "moe_down_gather";
+            if (d.type == FK_Q_IQ4_NL) {
+                k_moe_down_iq4nl_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) d.base, d.expert_stride, d.row_bytes,
+                    moe_order_, moe_tile_exp_, moe_tile_off_, moe_tile_cnt_,
+                    h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+            } else {
+                k_moe_down_q8_0_gather<<<grid, WAVE, 0, stream_>>>(
+                    (const unsigned char *) d.base, d.expert_stride, d.row_bytes,
+                    moe_order_, moe_tile_exp_, moe_tile_off_, moe_tile_cnt_,
+                    h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+            }
+            return;
+        }
+        const dim3 grid((unsigned) d.rows, (unsigned)(N_EXPERT_USED * T), 1);
         mark(PC_EXP_DOWN);
         last_op_ = "moe_down";
         if (d.type == FK_Q_IQ4_NL) {
             k_moe_down_iq4nl<<<grid, WAVE, 0, stream_>>>((const unsigned char *) d.base, d.expert_stride,
-                d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+                d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED, T);
         } else {
             k_moe_down_q8_0<<<grid, WAVE, 0, stream_>>>((const unsigned char *) d.base, d.expert_stride,
-                d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+                d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED, T);
         }
     }
     void moe_finish(const float * eo, const float * w, const float * sh_raw,
                     const float * sh_gate, float * sh_gate_sig, float * moe_out,
-                    float * sh_gated, float * out) override {
+                    float * sh_gated, float * out, int T) override {
         mark(PC_EXP_COMBINE);
         last_op_ = "moe_finish";
-        k_moe_finish<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(eo, w, sh_raw, sh_gate,
+        k_moe_finish<<<ceil_div(N_EMBD * T, BLK), BLK, 0, stream_>>>(eo, w, sh_raw, sh_gate,
                                                      sh_gate_sig, moe_out, sh_gated,
-                                                     out, N_EMBD, N_EXPERT_USED);
+                                                     out, N_EMBD, N_EXPERT_USED, T);
     }
     void rope_imrope(float * x, int n_heads, int head_dim, int n_rot, int pos) override {
         mark(PC_QSA);
@@ -1984,18 +2478,19 @@ public:
         k_rope_imrope<<<n_heads, n_rot / 2, 0, stream_>>>(x, head_dim, n_rot, pos);
     }
     void kv_store_q8_0(const float * k, const float * v, int8_t * kqs, uint16_t * ksc,
-                       int8_t * vqs, uint16_t * vsc, int cell) override {
-        const dim3 grid(HEAD_DIM / 32, N_KV_HEADS, 2);
+                       int8_t * vqs, uint16_t * vsc, int cell0, int T) override {
+        const dim3 grid((unsigned)(HEAD_DIM / 32 * T), N_KV_HEADS, 2);
         mark(PC_QSA);
         last_op_ = "kv_store_q8_0";
-        k_kv_store_q8_0<<<grid, WAVE, 0, stream_>>>(k, v, kqs, (__half *) ksc, vqs, (__half *) vsc, cell);
+        k_kv_store_q8_0<<<grid, WAVE, 0, stream_>>>(k, v, kqs, (__half *) ksc, vqs,
+                                                    (__half *) vsc, cell0, T);
     }
-    void idx_pool_block(const float * k_new, float * sum, float * raw0, int blk,
-                        int n_filled, const float * kn, float eps, uint16_t * pooled,
+    void idx_pool_chunk(const float * k_new, float * sum, float * raw0, int pos0,
+                        int T, const float * kn, float eps, uint16_t * pooled,
                         float * dbg_p, float * dbg_r) override {
         mark(PC_QSA);
-        last_op_ = "idx_pool_block";
-        k_idx_pool_block<<<1, IDX_DIM, 0, stream_>>>(k_new, sum, raw0, blk, n_filled,
+        last_op_ = "idx_pool_chunk";
+        k_idx_pool_chunk<<<1, IDX_DIM, 0, stream_>>>(k_new, sum, raw0, pos0, T,
                                          kn, eps, (unsigned short *) pooled, dbg_p, dbg_r);
     }
     void idx_scan(const uint16_t * pooled, const float * q, float * s, int n_blocks) override {
@@ -2010,12 +2505,13 @@ public:
     void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
                      const float * q_norm, const float * k_norm, const float * iq_norm,
                      float * qcur, float * gate, float * gsig, float * kcur,
-                     float * idxq, int pos, float eps) override {
+                     float * idxq, int pos0, float eps, int T) override {
         mark(PC_QSA);
         last_op_ = "qsa_qk_post";
-        k_qsa_qk_post<<<N_Q_HEADS + N_KV_HEADS + IDX_N_HEADS, QKPOST_THREADS, 0, stream_>>>(
+        k_qsa_qk_post<<<dim3(N_Q_HEADS + N_KV_HEADS + IDX_N_HEADS, (unsigned) T),
+                        QKPOST_THREADS, 0, stream_>>>(
             qfull, kraw, idxraw, q_norm, k_norm, iq_norm,
-            qcur, gate, gsig, kcur, idxq, pos, eps);
+            qcur, gate, gsig, kcur, idxq, pos0, eps);
     }
     void qsa_expand(const float * bs, float * c, int * sel, int n_kv, int q, int r,
                     int tail, int sel_identity) override {
@@ -2229,8 +2725,10 @@ private:
     float *     amax_v_ = nullptr;
     int *       amax_i_ = nullptr;
     // split-K partials: nsplit*rows stays near GEMV_TARGET_WGS*GEMV_WAVES by
-    // construction (nsplit rises only as rows falls), so this is small.
+    // construction (nsplit rises only as rows falls), so this is small at
+    // T = 1 and grows with the chunk (ensure_part).
     float *    gemv_part_ = nullptr;
+    size_t     part_floats_ = 0;
     static constexpr size_t GEMV_PART_FLOATS = 1u << 17;   // 128k floats = 512 KB
     static constexpr int    STAGE_SLOTS = 8;
     static constexpr size_t STAGE_BYTES = 1u << 16;        // 64 KB

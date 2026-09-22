@@ -338,13 +338,28 @@ int main(int argc, char ** argv) {
             // depends on the prefix), which is fine for timing: the work is
             // identical either way. Nothing else about the step differs.
             const float * ple = need_ple ? ple_all.data() + (tokens.size() - 1) * N_EMBD : nullptr;
+            // A timing loop measures the ENGINE: no taps, and no --verbose or
+            // --routing capture either (the log costs nothing now, but its
+            // read-back is a sync a token).
+            run.set_capture(false);
             run.step(filler, ple, off);         // one warm-up, not counted
             for (auto * b : devs) b->prof_reset();
+            std::vector<double> issue;
             for (int i = 0; i < time_n; ++i) {
                 run.step(filler, ple, off);
                 ms.push_back(run.last_body_ms());
+                issue.push_back(run.last_issue_ms());
             }
+            run.set_capture(true);
             std::printf("layers%d_%d_ms_median=%.4f n=%d\n", il0, il1, median(ms), time_n);
+            // The host cost of a token, and per launch over all devices. A
+            // card whose work is pre-queued runs at its own speed; a card
+            // being fed one op at a time runs at THIS rate.
+            long long lt = 0;
+            for (int d = 0; d < n_report; ++d) lt += devs[d]->launches_last_token();
+            const double iss = median(issue);
+            std::printf("issue_ms=%.4f prof_cpu_per_launch_us=%.2f launches_all_devices=%lld\n",
+                        iss, lt > 0 ? iss * 1000.0 / (double) lt : 0.0, lt);
             if (profile) {
                 for (int d = 0; d < n_report; ++d) {
                     std::printf("--- device %d ---\n", d);

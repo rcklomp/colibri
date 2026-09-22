@@ -183,7 +183,10 @@ __device__ __forceinline__ void split_range(int n_units, int nsplit, int split,
 // the 32 contiguous bytes one wave already pulls per block. What IS tunable
 // is how many of those are in flight, so the unroll depth is a compile-time
 // knob (GEMV_UNROLL, default 4) that the profile can move.
-#define GEMV_BATCH_MAX     8
+// The largest batch is the QSA projection's five (wq, wk, wv, indexer q/k).
+// The descriptor travels as a BY-VALUE kernel argument, so its size is host
+// work on every GEMV launch: eight slots cost ~404 bytes a launch, five ~260.
+#define GEMV_BATCH_MAX     5
 #define GEMV_LDS_MAX_FLOATS 4096
 #ifndef GEMV_UNROLL
 #define GEMV_UNROLL 4
@@ -224,6 +227,131 @@ __device__ __forceinline__ int desc_of(const GemvBatchD & b, int row) {
     for (int i = GEMV_BATCH_MAX - 1; i >= 0; --i)
         if (i < b.n && row < b.d[i].row_off + b.d[i].rows && row >= b.d[i].row_off) j = i;
     return j;
+}
+
+// The prefill form of the same kernel (design 9.4): T activation columns per
+// launch, a wave loading each weight block ONCE and dotting it against
+// GEMM_TILE of them. That reuse is the whole point of batching a prompt --
+// the trunk is ~5 GB a token, so a tile of 8 reads it an eighth as often.
+//
+// Activations are token-major (x[t*K + i]), so a row is contiguous and the
+// per-token loads inside the tile stay coalesced across the wave. Outputs are
+// token-major too: out[t*rows + row].
+//
+// `t0` is the first token of this tile; grid.z selects the tile. A tile short
+// of GEMM_TILE at the end of a chunk is handled by the `nt` bound, not by
+// padding, so no garbage column is ever read.
+#define GEMM_TILE 8
+
+__global__ __launch_bounds__(GEMV_THREADS)
+void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
+                  const float * __restrict__ x2, int nsplit,
+                  float * __restrict__ part, int stage_x, int T) {
+    extern __shared__ float sx[];
+
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int grow = blockIdx.x * GEMV_WAVES + wave;
+    const int t0   = blockIdx.z * GEMM_TILE;
+    const int nt   = min(GEMM_TILE, T - t0);
+    if (nt <= 0) return;
+
+    const int gran = (b.has_q6k ? 256 : WAVE);
+    int c0, c1;
+    split_range((b.K + gran - 1) / gran, nsplit, blockIdx.y, &c0, &c1);
+    const int e0 = c0 * gran;
+    const int e1 = min(b.K, c1 * gran);
+    const int slice = e1 - e0;
+
+    // Stage this tile's slice of every column: sx[j*slice + i]. Shared by all
+    // GEMV_WAVES rows of the workgroup, which is the second reuse.
+    if (stage_x) {
+        for (int j = 0; j < nt; ++j) {
+            const float * src  = x  + (size_t)(t0 + j) * b.K + e0;
+            const float * src2 = x2 ? x2 + (size_t)(t0 + j) * b.K + e0 : nullptr;
+            float * dst = sx + (size_t) j * slice;
+            for (int i = threadIdx.x; i < slice; i += GEMV_THREADS)
+                dst[i] = (b.x_mode == GX_SILU_MUL) ? d_silu(src[i]) * src2[i] : src[i];
+        }
+        __syncthreads();
+    }
+
+    if (grow >= b.total_rows) return;
+    const int  di  = desc_of(b, grow);
+    const GemvDesc d = b.d[di];
+    const int  row = grow - d.row_off;
+
+    float acc[GEMM_TILE];
+#pragma unroll
+    for (int j = 0; j < GEMM_TILE; ++j) acc[j] = 0.0f;
+
+    // one weight block, `nt` activation columns
+    if (d.type == FK_Q_Q8_0) {
+        const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
+        for (int bl = e0 >> 5; bl < (e1 >> 5); ++bl) {
+            const unsigned char * bp = rp + (size_t) bl * FK_Q8_0_BLOCK_BYTES;
+            const float w = fk_q8_0_block_d(bp) *
+                            (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[lane];
+            const int off = (bl << 5) + lane - e0;
+            for (int j = 0; j < nt; ++j)
+                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + off]
+                                         : x[(size_t)(t0 + j) * b.K + e0 + off], acc[j]);
+        }
+    } else if (d.type == FK_Q_BF16) {
+        const unsigned short * rp = (const unsigned short *) d.base + (size_t) row * d.row_stride;
+        for (int i = e0 + lane; i < e1; i += WAVE) {
+            const float w = fk_bf16_to_f32(rp[i]);
+            for (int j = 0; j < nt; ++j)
+                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + (i - e0)]
+                                         : x[(size_t)(t0 + j) * b.K + i], acc[j]);
+        }
+    } else if (d.type == FK_Q_F32) {
+        const float * rp = (const float *) d.base + (size_t) row * d.row_stride;
+        for (int i = e0 + lane; i < e1; i += WAVE) {
+            const float w = rp[i];
+            for (int j = 0; j < nt; ++j)
+                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + (i - e0)]
+                                         : x[(size_t)(t0 + j) * b.K + i], acc[j]);
+        }
+    } else {
+        // IQ3_S / IQ4_XS / IQ4_NL / Q6_K decode a whole lane-run at once, so
+        // they reuse the single-column primitives per token rather than
+        // hoisting one weight; only the expert formats take this path and the
+        // experts get their own batched kernels (design 9.4 item 2).
+        for (int j = 0; j < nt; ++j) {
+            const float * xt = x + (size_t)(t0 + j) * b.K;
+            float a = 0.0f;
+            if (d.type == FK_Q_Q6_K) {
+                const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
+                for (int bl = e0 >> 8; bl < (e1 >> 8); ++bl)
+                    a += fk_q6k_block_dot(rp + (size_t) bl * FK_Q6K_BLOCK_BYTES,
+                                          xt + (bl << 8) + (lane << 3), lane);
+            }
+            acc[j] = a;
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < GEMM_TILE; ++j) {
+        if (j >= nt) break;
+        const float sum = wave_sum(acc[j]);
+        if (lane != 0) continue;
+        if (nsplit > 1) part[((size_t) blockIdx.y * T + (t0 + j)) * b.total_rows + grow] = sum;
+        else            d.out[(size_t)(t0 + j) * d.rows + row] = apply_epi(sum, d.epi, d.arg);
+    }
+}
+
+__global__ void k_reduce_splits_gemm(GemvBatchD b, const float * __restrict__ part,
+                                     int nsplit, int T) {
+    const int grow = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t    = blockIdx.y;
+    if (grow >= b.total_rows || t >= T) return;
+    float a = 0.0f;
+    for (int s = 0; s < nsplit; ++s)
+        a += part[((size_t) s * T + t) * b.total_rows + grow];
+    const int di = desc_of(b, grow);
+    b.d[di].out[(size_t) t * b.d[di].rows + grow - b.d[di].row_off] =
+        apply_epi(a, b.d[di].epi, b.d[di].arg);
 }
 
 __global__ __launch_bounds__(GEMV_THREADS)
@@ -451,7 +579,8 @@ __global__ void k_silu_mul(const float * __restrict__ g, const float * __restric
 // gives the CPU path), then the clamped normalisation.
 __global__ __launch_bounds__(N_EXPERT)
 void k_router(const float * __restrict__ logits, int * __restrict__ ids,
-              float * __restrict__ w) {
+              float * __restrict__ w, int * __restrict__ ids_log,
+              float * __restrict__ w_log) {
     __shared__ float sv[N_EXPERT];
     __shared__ int   si[N_EXPERT];
     __shared__ float sp[N_EXPERT];
@@ -497,13 +626,18 @@ void k_router(const float * __restrict__ logits, int * __restrict__ ids,
 
     if (t < N_EXPERT_USED) {
         ids[t] = taken[t];
-    }
-    __syncthreads();
+        if (ids_log) ids_log[t] = taken[t];      // the routing oracle's copy,
+    }                                            // written here so capture
+    __syncthreads();                             // costs no extra launch
     if (t == 0) {
         float s = 0.0f;
         for (int k = 0; k < N_EXPERT_USED; ++k) s += sp[taken[k]];
         s = fmaxf(s, 6.103515625e-5f);           // build_moe_ffn's f16 clamp
-        for (int k = 0; k < N_EXPERT_USED; ++k) w[k] = sp[taken[k]] / s;
+        for (int k = 0; k < N_EXPERT_USED; ++k) {
+            const float v = sp[taken[k]] / s;
+            w[k] = v;
+            if (w_log) w_log[k] = v;
+        }
     }
 }
 
@@ -1453,8 +1587,6 @@ class GpuBackend : public Backend {
 public:
     explicit GpuBackend(int dev) : dev_(dev) {
         HIP_CHECK(hipSetDevice(dev));
-        cur_device_slot() = dev;   // keep dev_ensure's tracker true: a raw hipSetDevice left it stale,
-                                   // so dev_ensure(0) did nothing and set_profile made device-0 events on device 2
         HIP_CHECK(hipStreamCreate(&stream_));
         std::snprintf(name_, sizeof(name_), "gpu(device %d)", dev_);
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_iq3s_grid),  iq3s_grid,      sizeof(uint32_t) * 512));
@@ -1799,10 +1931,11 @@ public:
         const int t = red_threads(ne0);
         k_gated_rms_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, z, y, ne0, eps);
     }
-    void router(const float * logits, int * ids, float * w) override {
+    void router(const float * logits, int * ids, float * w,
+                int * ids_log, float * w_log) override {
         mark(PC_ROUTER);
         last_op_ = "router";
-        k_router<<<1, N_EXPERT, 0, stream_>>>(logits, ids, w);
+        k_router<<<1, N_EXPERT, 0, stream_>>>(logits, ids, w, ids_log, w_log);
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu) override {
@@ -1921,7 +2054,6 @@ public:
 
     void set_profile(bool on) override {
         prof_ = on;
-        dev_ensure(dev_);   // the events must be created on THIS backend's device (lost once in a rebase; invalid resource handle at mark())
         if (on && ev_.empty()) {
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);
@@ -1940,7 +2072,8 @@ public:
         dev_ensure(dev_);
         debug_check("end of token");
         blocking_in_body_ += blocking_ - blocking_at_token_start_;
-        launches_in_body_ += launches_ - launches_at_token_start_;
+        launches_last_ = launches_ - launches_at_token_start_;
+        launches_in_body_ += launches_last_;
         ++tokens_profiled_;
         if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
         // one closing event, then ONE synchronisation for the whole token
@@ -1974,9 +2107,13 @@ public:
         }
         std::fprintf(out, "prof_host_syncs_per_token=%.2f\n", (double) blocking_in_body_ / n);
         std::fprintf(out, "prof_launches_per_token=%.2f\n", (double) launches_in_body_ / n);
+        std::fprintf(out, "prof_events_merged_per_token=%.2f  (class runs sharing one event)\n",
+                     (double) ev_merged_ / n);
         if (n_ev_ >= PROF_MAX_EVENTS)
             std::fprintf(out, "prof_WARNING=event pool exhausted, times are a lower bound\n");
     }
+
+    long long launches_last_token() const override { return launches_last_; }
 
     void   timer_start() override {
         dev_ensure(dev_);
@@ -2024,6 +2161,17 @@ private:
         ++launches_;                       // one op == one launch, except where noted
         if (gemv_group >= 0 && gemv_group < GG_N) gemv_bytes_[gemv_group] += (double) bytes;
         if (!prof_ || n_ev_ >= PROF_MAX_EVENTS) return;
+        // Record only when the CLASS CHANGES. The interval from event i to
+        // event i+1 is charged to ev_cls_[i], so a run of ops in one class
+        // needs one event, not one each -- and hipEventRecord is host work in
+        // the issue path, which is exactly what --profile was perturbing. A
+        // GEMV always takes its own event, because the per-projection
+        // bandwidths are per launch group.
+        if (n_ev_ > 0 && cls == ev_cls_[n_ev_ - 1] && gemv_group < 0 &&
+            ev_grp_[n_ev_ - 1] < 0) {
+            ++ev_merged_;
+            return;
+        }
         HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         ev_cls_[n_ev_] = cls;
         ev_grp_[n_ev_] = gemv_group;
@@ -2037,6 +2185,7 @@ private:
     int        last_cls_ = 0;
     int        dbg_layer_ = -1;
     int        n_ev_ = 0;
+    long long  ev_merged_ = 0;
     long long  launches_ = 0;
     long long  blocking_ = 0;              // host-blocking calls, counted always
     long long  blocking_at_token_start_ = 0;
@@ -2044,6 +2193,7 @@ private:
     int        tokens_profiled_ = 0;
     long long  blocking_in_body_ = 0;
     long long  launches_in_body_ = 0;
+    long long  launches_last_ = 0;
     double     prof_us_[PC_N] = {0};
     double     gemv_us_[GG_N]  = {0};
     double     gemv_bytes_[GG_N] = {0};

@@ -229,7 +229,10 @@ public:
 
     // -- MoE (build_moe_ffn) -------------------------------------------------
     // softmax over N_EXPERT, top-N_EXPERT_USED, gather, normalise (clamped).
-    virtual void router(const float * logits, int * ids, float * weights) = 0;
+    // `ids_log` / `w_log` (nullable) receive a copy for the routing oracle,
+    // written by this kernel so capture costs no extra launch.
+    virtual void router(const float * logits, int * ids, float * weights,
+                        int * ids_log, float * w_log) = 0;
     virtual void moe_gate_up(const Mat & gate, const Mat & up, const int * ids,
                              const float * x, float * y_gate, float * y_up) = 0;
     virtual void silu_mul(const float * gate, const float * up, float * h, size_t n) = 0;
@@ -357,6 +360,11 @@ public:
     virtual void prof_reset() {}
     virtual void prof_end_token() {}
     virtual void prof_report(FILE * out, int n_tokens) { (void) out; (void) n_tokens; }
+    // Launches this device enqueued inside the last token's body. The runner
+    // divides its own host wall time by this to get the per-launch issue cost,
+    // which is the number that says whether a card is compute-bound or waiting
+    // for the host to feed it.
+    virtual long long launches_last_token() const { return 0; }
 };
 
 Backend * make_cpu_backend(int n_threads);

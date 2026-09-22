@@ -114,6 +114,16 @@ public:
     // Wall/GPU time of the last step's layer body, milliseconds.
     double last_body_ms() const { return last_body_ms_; }
 
+    // HOST wall time to ENQUEUE one token's whole body -- no waits, no syncs,
+    // nothing read back. A card with its work pre-queued runs at its own
+    // speed; a card that is being fed one op at a time runs at this rate, so
+    // `issue_ms` against `last_body_ms` says which of the two is happening.
+    double last_issue_ms() const { return last_issue_ms_; }
+
+    // Turns the --verbose / --routing capture off, so a timing loop measures
+    // the engine rather than the instrumentation.
+    void set_capture(bool on) { capture_ = on; }
+
     // Bytes of QSA cache this device holds, and the per-token rate, so the
     // sizing is a printed number rather than a belief (`kv_bytes_dev<i>=`).
     void report_cache_bytes(FILE * out) const;
@@ -181,6 +191,10 @@ private:
     float         eps_;
     int           pos_ = 0;
     double        last_body_ms_ = 0.0;
+    double        last_issue_ms_ = 0.0;
+    bool          capture_ = true;
+    std::vector<float> emb_;          // hoisted: a per-token heap allocation
+                                      // in the issue path is host time too
 
     std::mt19937            jrng_{0xC0FFEE42u};
     std::vector<LayerState> lstate_;

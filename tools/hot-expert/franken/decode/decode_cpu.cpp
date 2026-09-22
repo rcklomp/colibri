@@ -248,8 +248,11 @@ public:
     void    download(void * d, const void * s, size_t b) override { std::memcpy(d, s, b); }
     void    sync() override {}
     int     device() const override { return -1; }
-    void    boundary_recv(void * dst, Backend &, const void * src, size_t b) override {
-        std::memcpy(dst, src, b);          // one host backend serves every range
+    void    boundary_recv(void * dst, Backend &, const void * src, size_t b, int) override {
+        // One host backend serves every range, and it is synchronous, so the
+        // residual bank the runner picked is only ever a different address --
+        // which is exactly what makes the CPU arm a gate on the bank logic.
+        std::memcpy(dst, src, b);
     }
     void    argmax(const float * logits, int n, int * out_id) override {
         int best = 0;

@@ -81,7 +81,9 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
         Scratch & S = pool_[d];
 
         S.x        = A(T * N_EMBD);
-        S.res_hc   = A(T * HC_DIM);
+        // Two banks: see N_RES_BANKS. 40 KB a token a bank, so 10 MB a device
+        // extra at T = 256 -- the price of the whole pipeline.
+        for (int b = 0; b < N_RES_BANKS; ++b) S.res_hc[b] = A(T * HC_DIM);
         S.xn       = A(T * HC_DIM);
         S.lo       = A(T * HC_LR);
         S.hgate    = A(T * HC_DIM);
@@ -211,7 +213,7 @@ void DecodeRunner::bind(int d) {
     cur_dev_ = d;
     bep_ = &model_.dev(d);
     Scratch & S = pool_[d];
-    x_ = S.x; res_hc_ = S.res_hc; xn_ = S.xn; lo_ = S.lo; hgate_ = S.hgate;
+    x_ = S.x; res_hc_ = S.res_hc[bank_]; xn_ = S.xn; lo_ = S.lo; hgate_ = S.hgate;
     mixed_ = S.mixed; inject_ = S.inject; blk_ = S.blk;
     z_ = S.z; conv_ = S.conv; convqk_ = S.convqk;
     qkn_ = S.qkn; qn_ = S.qkn; kn_ = S.qkn + GDN_KEY_DIM;
@@ -597,14 +599,32 @@ void DecodeRunner::layer_ffn(const LayerWeights & L, int il, Recorder & rec) {
 // hyper-connection residual across each boundary, then the final mixer,
 // lm_head and a device-side argmax on the last card. The only host work is
 // the two per-token row gathers (design 9.1) and the one int that comes back.
-int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Recorder & rec) {
+int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Recorder & rec,
+                       bool flush) {
     if (T < 1 || T > max_T_)
         throw std::runtime_error("chunk larger than the configured --chunk");
     if (pos_ + T > cfg_.ctx) throw std::runtime_error("sequence longer than --ctx");
     T_ = T;
     const size_t tl = (size_t)(T_ - 1);
 
+    // A tap is a download and the routing log is a download, so a captured
+    // chunk cannot run ahead of the device. Deciding it here rather than at
+    // the call site means no caller can accidentally lose a tap by asking for
+    // the pipeline.
+    const bool capture_now = rec.enabled() ||
+                             (capture_ && (cfg_.verbose || cfg_.log_routing));
+    if (capture_now || cfg_.jitter > 0.0f || cfg_.sync_debug) flush = true;
+    last_flushed_ = flush;
+
+    bank_ = (int) (chunks_ & (N_RES_BANKS - 1));
+    ++chunks_;
+
+    cur_dev_ = -1;                       // the bank moved: rebind unconditionally
     bind(model_.dev_of(model_.il0()));
+
+    // Nothing may overwrite this bank until the card downstream has copied
+    // the PREVIOUS chunk that used it out. A stream wait, not a host one.
+    bep_->boundary_wait_free(bank_);
 
     // One gather and ONE upload for the chunk: a per-token host copy in the
     // issue path is host time, and at T = 256 it would be 256 of them.
@@ -644,10 +664,13 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
                             cur_dev_, il - 1, L.dev);
             std::fflush(stdout);
             const int src_dev = cur_dev_;
-            float * src = pool_[src_dev].res_hc;
+            float * src = pool_[src_dev].res_hc[bank_];
             bind(L.dev);
+            // This card is about to have bank_ written under it by the peer
+            // copy; wait for ITS consumer to be done with the bank first.
+            bep_->boundary_wait_free(bank_);
             bep_->boundary_recv(res_hc_, model_.dev(src_dev), src,
-                                (size_t) T_ * HC_DIM * sizeof(float));
+                                (size_t) T_ * HC_DIM * sizeof(float), bank_);
             xn_ready_ = false;             // xn was computed on the other card
         }
 
@@ -720,6 +743,14 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
 
     if (cfg_.progress && pos_ == 0) { std::printf("  head done on dev%d\n", cur_dev_); std::fflush(stdout); }
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).prof_end_token();
+
+    // EVERYTHING BELOW WAITS, and a pipelined chunk does none of it: the
+    // timer read is an event synchronise and the greedy id is a download, and
+    // either one would drain the queue that the next chunk is supposed to be
+    // filling. `last_body_ms_` is left at 0 to say so rather than repeating
+    // the previous chunk's number.
+    if (!flush) { last_body_ms_ = 0.0; pos_ += T_; return -1; }
+
     last_body_ms_ = bep_->timer_stop_ms();
 
     if (model_.have_head()) {

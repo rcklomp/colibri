@@ -1949,6 +1949,12 @@ enum ProfClass {
     PC_COPY,        // device-to-device copies
     PC_BOUNDARY,    // the hyper-connection residual crossing to the next card
     PC_ARGMAX,      // greedy sampling on the device
+    // Only with a deferred profile (--prefill-pipeline): the interval from
+    // the end of one chunk's enqueued work on this card to the first op of
+    // the next. It IS this card's idle time, so `total - gap` is its busy
+    // time and three cards whose busy times add up to more than the wall
+    // clock are overlapping.
+    PC_GAP,
     PC_N
 };
 const char * prof_name(int c) {
@@ -1965,6 +1971,7 @@ const char * prof_name(int c) {
         case PC_COPY:         return "copy";
         case PC_BOUNDARY:     return "boundary_p2p";
         case PC_ARGMAX:       return "argmax";
+        case PC_GAP:          return "gap_idle";
         default:              return "copy";
     }
 }
@@ -1984,7 +1991,7 @@ public:
         // engine's own stream rather than a blocking hipMemcpy: a pageable
         // hipMemcpyAsync degrades to a synchronous one.
         for (int i = 0; i < STAGE_SLOTS; ++i)
-            HIP_CHECK(hipHostMalloc(&stage_[i], STAGE_BYTES, hipHostMallocDefault));
+            HIP_CHECK(hipHostMalloc(&stage_[i], stage_bytes_, hipHostMallocDefault));
         // the attention/top-k scratch is sized for the worst case the runner
         // can present; both are small and allocated once
         const int max_chunks = ceil_div(MAX_SEL, ATTN_CHUNK);
@@ -1996,6 +2003,10 @@ public:
         HIP_CHECK(hipMalloc(&amax_v_, ARGMAX_BLOCKS * sizeof(float)));
         HIP_CHECK(hipMalloc(&amax_i_, ARGMAX_BLOCKS * sizeof(int)));
         HIP_CHECK(hipEventCreateWithFlags(&bnd_, hipEventDisableTiming));
+        for (int i = 0; i < N_BANKS; ++i)
+            HIP_CHECK(hipEventCreateWithFlags(&drained_[i], hipEventDisableTiming));
+        for (int i = 0; i < STAGE_SLOTS; ++i)
+            HIP_CHECK(hipEventCreateWithFlags(&stage_ev_[i], hipEventDisableTiming));
         // the candidate lists are sized by the CACHE depth, not the budget,
         // and grown on demand by topk_select()
     }
@@ -2006,8 +2017,12 @@ public:
         HIP_IGNORE(hipFree(gemv_part_));
         HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
         HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
-        for (int i = 0; i < STAGE_SLOTS; ++i) if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+        for (int i = 0; i < STAGE_SLOTS; ++i) {
+            if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+            HIP_IGNORE(hipEventDestroy(stage_ev_[i]));
+        }
         HIP_IGNORE(hipFree(amax_v_)); HIP_IGNORE(hipFree(amax_i_));
+        for (int i = 0; i < N_BANKS; ++i) HIP_IGNORE(hipEventDestroy(drained_[i]));
         HIP_IGNORE(hipEventDestroy(bnd_)); HIP_IGNORE(hipStreamDestroy(stream_));
         for (auto & e : ev_) HIP_IGNORE(hipEventDestroy(e));
         HIP_IGNORE(hipEventDestroy(ev0_)); HIP_IGNORE(hipEventDestroy(ev1_));
@@ -2019,8 +2034,18 @@ public:
     // The destination records nothing of its own: it waits on an event the
     // SOURCE stream recorded, then pulls the bytes on its own stream. No host
     // call, so a boundary costs the P2P time M5 measured and nothing else.
-    void boundary_recv(void * dst, Backend & src, const void * src_ptr, size_t bytes) override {
+    //
+    // The pipeline adds the OTHER half of the handshake. After the copy this
+    // device records `drained_[bank]` on its own stream and registers itself
+    // as the source's consumer of that bank; the source then waits on that
+    // event (boundary_wait_free) before it overwrites the bank for a later
+    // chunk. Both halves are stream events -- the host never waits, which is
+    // the whole point -- and together they bound the pipeline at two chunks
+    // of run-ahead per boundary without any explicit depth counter.
+    void boundary_recv(void * dst, Backend & src, const void * src_ptr, size_t bytes,
+                       int bank) override {
         GpuBackend & s = static_cast<GpuBackend &>(src);
+        if (bank < 0 || bank >= N_BANKS) bank = 0;
         // The event belongs to the SOURCE's device, so record it with that
         // device current; the wait and the copy belong to the destination.
         dev_ensure(s.dev_);
@@ -2029,12 +2054,28 @@ public:
         mark(PC_BOUNDARY);                 // ensures THIS device
         last_op_ = "boundary_recv";
         if (sync_debug_) {
-            std::fprintf(stderr, "sync-debug boundary: dev%d[%p .. %p) <- dev%d[%p .. %p) %zu B\n",
+            std::fprintf(stderr, "sync-debug boundary: dev%d[%p .. %p) <- dev%d[%p .. %p) %zu B bank %d\n",
                          dev_, dst, (const void *)((const char *) dst + bytes),
-                         s.dev_, src_ptr, (const void *)((const char *) src_ptr + bytes), bytes);
+                         s.dev_, src_ptr, (const void *)((const char *) src_ptr + bytes),
+                         bytes, bank);
         }
         HIP_CHECK(hipStreamWaitEvent(stream_, s.bnd_, 0));
         HIP_CHECK(hipMemcpyPeerAsync(dst, dev_, src_ptr, s.dev_, bytes, stream_));
+        // "this bank has been read out of you": recorded on the DESTINATION's
+        // stream, after the copy, and handed to the source.
+        HIP_CHECK(hipEventRecord(drained_[bank], stream_));
+        s.sink_[bank] = this;
+    }
+
+    void boundary_wait_free(int bank) override {
+        if (bank < 0 || bank >= N_BANKS) return;
+        GpuBackend * c = sink_[bank];
+        if (!c) return;                    // nobody has ever consumed it
+        dev_ensure(dev_);
+        // hipStreamWaitEvent binds to the event's MOST RECENT record at the
+        // time of this host call, and the host issues chunks in order, so
+        // this is the drain of the last chunk that used this bank.
+        HIP_CHECK(hipStreamWaitEvent(stream_, c->drained_[bank], 0));
     }
 
     void argmax(const float * logits, int n, int * out_id) override {
@@ -2085,17 +2126,39 @@ public:
         return p;
     }
     void free_buf(void * p) override { dev_ensure(dev_); HIP_IGNORE(hipFree(p)); }
+    // THE STAGING RING GROWS, and that is what lets a chunk be pipelined.
+    //
+    // A chunk uploads the embedding gather and the PLE gather: T x 2 560 f32,
+    // which is 2.6 MB at T = 256 and 5.2 MB at 512. Against a FIXED 64 KB
+    // ring both fell through to the blocking `hipMemcpy` below -- and a
+    // blocking copy on the default stream drains a blocking stream, so every
+    // chunk started by emptying card 0's queue. Nothing would have overlapped.
+    // So the ring is sized to the largest upload it is ever handed, once, and
+    // a slot is only reused after the event that says its previous copy has
+    // left it (with STAGE_SLOTS slots and two uploads a chunk that is four
+    // chunks of slack, so the wait is normally already satisfied).
+    void ensure_stage(size_t bytes) {
+        if (bytes <= stage_bytes_) return;
+        HIP_CHECK(hipStreamSynchronize(stream_));   // once, before the swap
+        size_t want = stage_bytes_;
+        while (want < bytes) want <<= 1;
+        for (int i = 0; i < STAGE_SLOTS; ++i) {
+            if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+            HIP_CHECK(hipHostMalloc(&stage_[i], want, hipHostMallocDefault));
+            stage_used_[i] = false;
+        }
+        stage_bytes_ = want;
+    }
     void upload(void * d, const void * s, size_t b) override {
         dev_ensure(dev_);
-        if (b <= STAGE_BYTES) {
-            void * st = stage_[stage_next_];
-            stage_next_ = (stage_next_ + 1) % STAGE_SLOTS;
-            std::memcpy(st, s, b);
-            HIP_CHECK(hipMemcpyAsync(d, st, b, hipMemcpyHostToDevice, stream_));
-            return;                        // stream-ordered, does NOT block the host
-        }
-        ++blocking_;
-        HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyHostToDevice));
+        ensure_stage(b);
+        const int sl = stage_next_;
+        stage_next_ = (stage_next_ + 1) % STAGE_SLOTS;
+        if (stage_used_[sl]) HIP_CHECK(hipEventSynchronize(stage_ev_[sl]));
+        std::memcpy(stage_[sl], s, b);
+        HIP_CHECK(hipMemcpyAsync(d, stage_[sl], b, hipMemcpyHostToDevice, stream_));
+        HIP_CHECK(hipEventRecord(stage_ev_[sl], stream_));
+        stage_used_[sl] = true;            // stream-ordered, does NOT block the host
     }
     void download(void * d, const void * s, size_t b) override {
         dev_ensure(dev_);
@@ -2606,21 +2669,20 @@ public:
         }
     }
     void prof_reset() override {
+        // Anything still pending belongs to the chunks being discarded.
+        if (prof_defer_ && n_ev_ > 0) prof_flush();
         for (int i = 0; i < PC_N; ++i) prof_us_[i] = 0.0;
         for (int i = 0; i < GG_N; ++i) { gemv_us_[i] = 0.0; gemv_bytes_[i] = 0.0; }
         tokens_profiled_ = 0;
         blocking_in_body_ = 0;
         launches_in_body_ = 0;
     }
-    void prof_end_token() override {
-        dev_ensure(dev_);
-        debug_check("end of token");
-        blocking_in_body_ += blocking_ - blocking_at_token_start_;
-        launches_last_ = launches_ - launches_at_token_start_;
-        launches_in_body_ += launches_last_;
-        ++tokens_profiled_;
+    void prof_defer(bool on) override { prof_defer_ = on; }
+    // Records the closing event, waits for it ONCE, and reduces every interval
+    // still in the pool. The only synchronisation the deferred profile does.
+    void prof_flush() override {
         if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
-        // one closing event, then ONE synchronisation for the whole token
+        dev_ensure(dev_);
         HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         HIP_CHECK(hipEventSynchronize(ev_[n_ev_]));
         for (int i = 0; i < n_ev_; ++i) {
@@ -2631,13 +2693,43 @@ public:
         }
         n_ev_ = 0;
     }
+    void prof_end_token() override {
+        dev_ensure(dev_);
+        debug_check("end of token");
+        blocking_in_body_ += blocking_ - blocking_at_token_start_;
+        launches_last_ = launches_ - launches_at_token_start_;
+        launches_in_body_ += launches_last_;
+        ++tokens_profiled_;
+        if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
+        if (!prof_defer_) { prof_flush(); return; }
+        // DEFERRED: close the chunk with an event of class PC_GAP and keep
+        // going. The interval from it to the next chunk's first mark() is
+        // this card's idle time, and nothing here waits -- a synchronise
+        // would serialise the pipeline the profile exists to show.
+        HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
+        ev_cls_[n_ev_] = PC_GAP;
+        ev_grp_[n_ev_] = -1;
+        ++n_ev_;
+        // Reducing costs one sync; at ~400 events a chunk this is roughly
+        // once every twenty chunks, which is why it is cheaper than the
+        // per-chunk sync it replaced and still cannot exhaust the pool.
+        if (n_ev_ >= PROF_MAX_EVENTS - 1024) prof_flush();
+    }
     void prof_report(FILE * out, int n_tokens) override {
+        prof_flush();                      // anything a pipelined run left pending
         const double n = n_tokens > 0 ? (double) n_tokens : 1.0;
         double total = 0.0;
         for (int c = 0; c < PC_N; ++c) total += prof_us_[c];
         for (int c = 0; c < PC_N; ++c)
             std::fprintf(out, "prof_%s_us=%.2f\n", prof_name(c), prof_us_[c] / n);
         std::fprintf(out, "prof_total_us=%.2f\n", total / n);
+        // THE OVERLAP NUMBER. `busy` is this card's own work; `total` is the
+        // span it covered. Three cards each busy ~2.5 ms a token inside a
+        // 7.6 ms token is the sequential picture; the same three busy ~2.5 ms
+        // inside a 2.6 ms token is the pipelined one.
+        std::fprintf(out, "prof_busy_us=%.2f prof_gap_us_explicit=%.2f prof_busy_frac=%.3f\n",
+                     (total - prof_us_[PC_GAP]) / n, prof_us_[PC_GAP] / n,
+                     total > 0.0 ? (total - prof_us_[PC_GAP]) / total : 0.0);
         // Achieved bandwidth per projection class: the bytes are the weight
         // bytes those launches actually read, so this is the number to hold
         // against the 800 GB/s of M5, not the lumped trunk total.
@@ -2723,6 +2815,7 @@ private:
     }
 
     bool       prof_ = false;
+    bool       prof_defer_ = false;
     bool       sync_debug_ = false;
     const char * last_op_   = nullptr;
     const char * dbg_phase_ = nullptr;
@@ -2770,9 +2863,18 @@ private:
     size_t     part_floats_ = 0;
     static constexpr size_t GEMV_PART_FLOATS = 1u << 17;   // 128k floats = 512 KB
     static constexpr int    STAGE_SLOTS = 8;
-    static constexpr size_t STAGE_BYTES = 1u << 16;        // 64 KB
     void *     stage_[STAGE_SLOTS] = {nullptr};
+    hipEvent_t stage_ev_[STAGE_SLOTS] = {};
+    bool       stage_used_[STAGE_SLOTS] = {false};
+    size_t     stage_bytes_ = 1u << 16;                    // 64 KB, grown on demand
     int        stage_next_ = 0;
+    // The residual banks of the pipeline (decode_graph.h N_RES_BANKS).
+    // `drained_[b]` is recorded on THIS device's stream once it has copied
+    // bank b out of some other card; `sink_[b]` is the card that did that to
+    // US, so boundary_wait_free knows whose event to wait on.
+    static constexpr int N_BANKS = 2;
+    hipEvent_t   drained_[N_BANKS] = {};
+    GpuBackend * sink_[N_BANKS] = {nullptr, nullptr};
     size_t placed_ = 0;
 };
 

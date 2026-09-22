@@ -237,7 +237,7 @@ RESERVE_PER_CARD_GIB=3
 # needlessly CPU-heavy placement. The ladder itself still stops at ~18k.
 F11_CTX=${F11_CTX:-262144}   # env-overridable (2026-09-22): a smaller window leaves more experts on the cards
 MAX_TRIES=1          # placement is llama.cpp's fit (see start_f11): one load, no N search
-FIT_MARGIN_MIB=1024  # llama.cpp's default free margin per card
+FIT_MARGIN_MIB=${FIT_MARGIN_MIB:-1024}  # llama.cpp's default free margin per card; env-overridable (M0c, 2026-09-22)
 VRAM_TOTAL_BYTES=$(( VRAM_PER_CARD_GIB * CARDS * GIB ))
 RESERVE_BYTES=$(( RESERVE_PER_CARD_GIB * CARDS * GIB ))
 VRAM_USABLE_BYTES=$(( VRAM_TOTAL_BYTES - RESERVE_BYTES ))

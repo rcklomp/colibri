@@ -14,6 +14,21 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 46 (2026-09-22 02:40 CEST, 00:40 UTC) -- THE DESIGN EXISTS:
+> `FRANKEN-ENGINE-DESIGN-2026-09-22.md` rev 1.** The owner's addendum: this
+> is an architect's analysis and design, and inventing what the other
+> engines cannot do is in scope. The design: a placement-and-streaming
+> engine, layer-range pipeline over three cards (no RCCL, no per-op host
+> round trips, KV on the cards), hipFire's HIP kernels for the resident
+> trunk and experts (to be measured head to head against llama.cpp's and
+> Colibri's, M1), llama.cpp's per-architecture graphs as the reference for
+> what each model computes, Colibri's ring/streaming, histogram placement,
+> batched prefill and the whole gateway (checkpoints, ledger). Invented:
+> router-lookahead prefetch, hottest-expert replication per card,
+> PCIe-link-aware layer-range assignment, 256k checkpoints. Measurement
+> program M0-M5, each closing a design choice; M0 in flight. Projected
+> targets, labelled: >= 40 tok/s and a ~5 min cold prompt at 256k.
+>
 > **Rev 45 (2026-09-22 01:30 CEST, 23:30 UTC 09-21) -- THE OWNER'S DEFINITION
 > OF THE FRANKEN-ENGINE, VERBATIM IN SUBSTANCE, BINDING ON EVERY REV BELOW
 > AND ABOVE:** the engine is a NEW engine, created from the parts of the

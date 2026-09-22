@@ -2023,13 +2023,25 @@ public:
         last_op_ = "qsa_expand";
         k_qsa_expand<<<ceil_div(n_kv, BLK), BLK, 0, stream_>>>(bs, c, sel, n_kv, q, r, tail, sel_identity);
     }
+    void reserve_topk(int n) override {
+        if (n <= cand_cap_) return;
+        dev_ensure(dev_);
+        HIP_IGNORE(hipFree(cand_key_));
+        HIP_IGNORE(hipFree(cand_idx_));
+        cand_cap_ = n;
+        HIP_CHECK(hipMalloc(&cand_key_, (size_t) cand_cap_ * sizeof(uint32_t)));
+        HIP_CHECK(hipMalloc(&cand_idx_, (size_t) cand_cap_ * sizeof(int)));
+    }
+
     int topk_select(const float * scores, int n, int width, int * out) override {
         dev_ensure(dev_);
+        // Must never fire: the runner reserves --ctx at construction. Kept as
+        // a safety net, and GEOMETRIC so that even if it did it could not
+        // happen again on the next token.
         if (n > cand_cap_) {
-            HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
-            cand_cap_ = n;
-            HIP_CHECK(hipMalloc(&cand_key_, (size_t) cand_cap_ * sizeof(uint32_t)));
-            HIP_CHECK(hipMalloc(&cand_idx_, (size_t) cand_cap_ * sizeof(int)));
+            std::fprintf(stderr, "topk_select: growing the candidate list to %d mid-run "
+                                 "(reserve_topk was not called with a large enough --ctx)\n", n);
+            reserve_topk(n > 2 * cand_cap_ ? n : 2 * cand_cap_);
         }
         const int k = width < n ? width : n;
         mark(PC_QSA);

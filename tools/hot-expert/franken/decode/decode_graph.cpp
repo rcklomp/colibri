@@ -145,6 +145,9 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
         S.wts_log  = A((size_t) n_layers * N_EXPERT_USED);
     }
 
+    // Once, here -- never per token. See Backend::reserve_topk.
+    for (int d = 0; d < n_dev; ++d) model_.dev(d).reserve_topk(cfg_.ctx);
+
     need_ple_ = (PLE_LAYER >= model_.il0() && PLE_LAYER <= model_.il1());
     routed_ids_.assign((size_t) n_layers * N_EXPERT_USED, -1);
 

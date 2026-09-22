@@ -31,8 +31,10 @@
 > cards. The "miss-cost calibration" first written into this rev is
 > withdrawn; llama.cpp's 34-40 ms a token is the FULLY RESIDENT case, 4-5x
 > off the ~7.5 ms bandwidth bound for ~6.2 GB of VRAM reads a token. M0b
-> done: a step (24 tok/s at 32k-128k, 15 at 256k); M0c in flight (fit
-> margin 1024 vs 3072 MiB, GTT sampled): over-commit eviction or not. For
+> done: a step (24 tok/s at 32k-128k, 15 at 256k); M0c/M0d: not eviction
+> -- llama.cpp's fit moves five layers of expert gate/up (3.2 GB) to the
+> CPU at 256k, ~0.5 ms per CPU expert evaluation; a lean engine keeps the
+> model resident at 256k. For
 > Qwen3.8 the engine is a resident engine (L0 on three cards, no stream);
 > streaming stays for DeepSeek/GLM (L0b, L5). GLM back in service, `accept_live` PASS 01:27 UTC after the
 > chain exited. Quality run 2 (`f11_quality2_chain.sh`) is not resumed; its

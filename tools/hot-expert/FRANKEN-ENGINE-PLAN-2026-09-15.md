@@ -24,10 +24,17 @@
 > separate depth slope of §F11-DEPTH (15 -> 6 tok/s). The design's reference
 > is therefore ~25 tok/s at 32k / 15 at 256k on this engine, and the new
 > engine's attention must cost only the used cells (design §2 row 2, §3.4).
-> Miss-cost term calibrated: at 30 % host residency ~24 of 34-40 ms a token
-> is the host-read (arithmetic, labelled). M0b in flight (64k and 128k
-> windows, `~/bench/f11_fit3.sh`): slope in the window or a step near the
-> full card. GLM back in service, `accept_live` PASS 01:27 UTC after the
+> **Corrected within the hour (design rev 4, record §F11-M0 point 2):** the
+> GGUF header shows the 30 % on the host is `per_layer_token_embd` (28.8 GB,
+> a CPU gather table), NOT experts -- every routed expert (IQ3_S gate/up,
+> IQ4_NL down; the file's "IQ4_XS" names one layer) is resident on the
+> cards. The "miss-cost calibration" first written into this rev is
+> withdrawn; llama.cpp's 34-40 ms a token is the FULLY RESIDENT case, 4-5x
+> off the ~7.5 ms bandwidth bound for ~6.2 GB of VRAM reads a token. M0b
+> done: a step (24 tok/s at 32k-128k, 15 at 256k); M0c in flight (fit
+> margin 1024 vs 3072 MiB, GTT sampled): over-commit eviction or not. For
+> Qwen3.8 the engine is a resident engine (L0 on three cards, no stream);
+> streaming stays for DeepSeek/GLM (L0b, L5). GLM back in service, `accept_live` PASS 01:27 UTC after the
 > chain exited. Quality run 2 (`f11_quality2_chain.sh`) is not resumed; its
 > partial results stay under `~/bench/f11_quality/`. Next: M1 and M3 (read
 > the hot loops first), per design §4.

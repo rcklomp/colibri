@@ -79,6 +79,10 @@ struct DecodeConfig {
     // read the routed ids back after the body even without --verbose (the
     // routing oracle needs them; it is one download a device a token)
     bool  log_routing = false;
+    bool  sync_debug   = false;
+    // print a line per layer range on the first token, so an abort says how
+    // far it got (stdout is line-buffered by main for the same reason)
+    bool  progress     = true;
 };
 
 // Step 3: one runner over all the devices the model was placed on. Every

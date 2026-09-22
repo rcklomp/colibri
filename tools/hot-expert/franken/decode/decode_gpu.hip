@@ -1497,14 +1497,25 @@ public:
     // call, so a boundary costs the P2P time M5 measured and nothing else.
     void boundary_recv(void * dst, Backend & src, const void * src_ptr, size_t bytes) override {
         GpuBackend & s = static_cast<GpuBackend &>(src);
-        mark(PC_BOUNDARY);
+        // The event belongs to the SOURCE's device, so record it with that
+        // device current; the wait and the copy belong to the destination.
+        dev_ensure(s.dev_);
+        s.debug_check("boundary source drain");
         HIP_CHECK(hipEventRecord(s.bnd_, s.stream_));
+        mark(PC_BOUNDARY);                 // ensures THIS device
+        last_op_ = "boundary_recv";
+        if (sync_debug_) {
+            std::fprintf(stderr, "sync-debug boundary: dev%d[%p .. %p) <- dev%d[%p .. %p) %zu B\n",
+                         dev_, dst, (const void *)((const char *) dst + bytes),
+                         s.dev_, src_ptr, (const void *)((const char *) src_ptr + bytes), bytes);
+        }
         HIP_CHECK(hipStreamWaitEvent(stream_, s.bnd_, 0));
         HIP_CHECK(hipMemcpyPeerAsync(dst, dev_, src_ptr, s.dev_, bytes, stream_));
     }
 
     void argmax(const float * logits, int n, int * out_id) override {
         mark(PC_ARGMAX);
+        last_op_ = "argmax";
         k_argmax_partial<<<ARGMAX_BLOCKS, ARGMAX_THREADS, 0, stream_>>>(logits, n, amax_v_, amax_i_);
         ++launches_;
         k_argmax_final<<<1, ARGMAX_BLOCKS, 0, stream_>>>(amax_v_, amax_i_, out_id);
@@ -1564,11 +1575,17 @@ public:
     }
     void download(void * d, const void * s, size_t b) override {
         dev_ensure(dev_);
+        debug_check("download()");
         ++blocking_;                       // the host reads it: this always blocks
         HIP_CHECK(hipStreamSynchronize(stream_));
         HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyDeviceToHost));
     }
-    void sync() override { dev_ensure(dev_); ++blocking_; HIP_CHECK(hipStreamSynchronize(stream_)); }
+    void sync() override {
+        dev_ensure(dev_);
+        debug_check("sync()");
+        ++blocking_;
+        HIP_CHECK(hipStreamSynchronize(stream_));
+    }
 
     const void * place(const void * host, size_t bytes, const char * what) override {
         dev_ensure(dev_);                  // or the bytes land on another card
@@ -1610,7 +1627,16 @@ public:
             if ((int) W.K != b.K) { std::fprintf(stderr, "gemv_batch: %s has a different K\n", W.name); std::abort(); }
             b.d[i].base       = W.base;
             b.d[i].out        = jobs[i].out;
-            b.d[i].row_stride = (W.type == FK_Q_Q8_0) ? W.row_bytes : (size_t) W.K;
+            // A QUANTISED row is addressed in BYTES, an f32/bf16 row in
+            // ELEMENTS -- see the two pointer casts in k_gemv_batch. This
+            // used to test only for Q8_0, which was accidentally right while
+            // Q8_0, BF16 and F32 were the only formats a batch ever saw.
+            // Q6_K (lm_head) broke it: its rows are 2 100 B but W.K is 2 560,
+            // so every row past 203 700 of 248 320 addressed beyond the
+            // 521 MB allocation, up to 114 MB past its end -- the "page not
+            // present" fault on the card that holds lm_head.
+            b.d[i].row_stride = (W.type == FK_Q_F32 || W.type == FK_Q_BF16)
+                              ? (size_t) W.K : W.row_bytes;
             b.d[i].type       = W.type;
             if (W.type == FK_Q_Q6_K) b.has_q6k = 1;
             b.d[i].rows       = (int) W.rows;
@@ -1635,11 +1661,15 @@ public:
         if (nsplit < 1) nsplit = 1;
         while (nsplit > 1 && (size_t) nsplit * b.total_rows > GEMV_PART_FLOATS) nsplit >>= 1;
 
-        const int slice = ceil_div(units, nsplit) * WAVE;
+        // `units` counts granules, so the slice is granules * gran -- not
+        // * WAVE, which under-sized the LDS 8x for a Q6_K batch and let the
+        // staging loop write past the allocation.
+        const int slice = ceil_div(units, nsplit) * gran;
         const int stage = (gemv_lds_ && slice <= GEMV_LDS_MAX_FLOATS) ? 1 : 0;
         const size_t lds = stage ? (size_t) slice * sizeof(float) : 0;
 
         mark(PC_TRUNK, group, bytes);
+        last_op_ = "gemv_batch";
         k_gemv_batch<<<dim3((unsigned) row_groups, (unsigned) nsplit), GEMV_THREADS, lds, stream_>>>(
             b, x, x2, nsplit, gemv_part_, stage);
         if (nsplit > 1) {
@@ -1648,6 +1678,10 @@ public:
         }
     }
     void set_gemv_lds(int on) override { gemv_lds_ = on; }
+    void set_sync_debug(bool on) override { sync_debug_ = on; }
+    void set_debug_context(const char * phase, int layer) override {
+        dbg_phase_ = phase; dbg_layer_ = layer;
+    }
     void set_gemv_min_rows(int r) override { gemv_min_rows_ = r > 0 ? r : 1; }
     void gemv_expert(const Mat & W, int e, const float * x, float * y) override {
         Mat slice = W;
@@ -1658,52 +1692,63 @@ public:
 
     void copy(float * d, const float * s, size_t n) override {
         mark(PC_COPY);
+        last_op_ = "copy";
         HIP_CHECK(hipMemcpyAsync(d, s, n * sizeof(float), hipMemcpyDeviceToDevice, 0));
     }
     void unary(int op, const float * x, float * y, size_t n) override {
         mark(PC_ELEM);
+        last_op_ = "unary";
         k_unary<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(op, x, y, (int) n);
     }
     void binary(int op, const float * a, const float * b, float * y, size_t n) override {
         mark(PC_ELEM);
+        last_op_ = "binary";
         k_binary<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(op, a, b, y, (int) n);
     }
     void scale(const float * x, float s, float * y, size_t n) override {
         mark(PC_ELEM);
+        last_op_ = "scale";
         k_scale<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(x, s, y, (int) n);
     }
     void binary3_add(const float * a, const float * b, const float * c,
                      float * y, size_t n) override {
         mark(PC_ELEM);
+        last_op_ = "binary3_add";
         k_binary3_add<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(a, b, c, y, (int) n);
     }
     void mul_tiled(const float * x, const float * w, float * y, size_t n, size_t ne0_w) override {
         mark(PC_ELEM);
+        last_op_ = "mul_tiled";
         k_mul_tiled<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(x, w, y, (int) n, (int) ne0_w);
     }
     void gather_strided(const float * src, float * dst, int n_rows, int row_len,
                         int src_stride, int src_off) override {
         mark(PC_ELEM);
+        last_op_ = "gather_strided";
         k_gather_strided<<<ceil_div(n_rows * row_len, BLK), BLK, 0, stream_>>>(src, dst, n_rows, row_len, src_stride, src_off);
     }
     void rms_norm_mul(const float * x, const float * w, float * y,
                       int ne0, int n_groups, size_t w_len, float eps) override {
         mark(PC_NORM);
+        last_op_ = "rms_norm_mul";
         const int t = red_threads(ne0);
         k_rms_norm_mul<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, y, ne0, eps,
                                           w_len == (size_t) ne0 ? 1 : 0, w ? 1 : 0);
     }
     void l2_norm(const float * x, float * y, int ne0, int n_groups, float eps) override {
         mark(PC_NORM);
+        last_op_ = "l2_norm";
         const int t = red_threads(ne0);
         k_l2_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, y, ne0, eps);
     }
     void hc_broadcast(const float * x, float * r) override {
         mark(PC_ELEM);
+        last_op_ = "hc_broadcast";
         k_hc_broadcast<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(x, r);
     }
     void hc_collapse(const float * xn, const float * g, float * o) override {
         mark(PC_ELEM);
+        last_op_ = "hc_collapse";
         k_hc_collapse<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(xn, g, o);
     }
     void hc_combine(float * r, const float * b, const float * inj) override {
@@ -1712,16 +1757,19 @@ public:
     void hc_combine_norm(float * r, const float * b, const float * inj,
                          const float * w_norm, float * xn, float eps) override {
         mark(PC_ELEM);
+        last_op_ = "hc_combine_norm";
         const int t = red_threads(N_EMBD);
         k_hc_combine_norm<<<HC, t, t * sizeof(float), stream_>>>(r, b, inj, w_norm, xn, eps);
     }
     void ple_gate(const float * k, const float * q, const float * v, float * g, float * go) override {
         mark(PC_ELEM);
+        last_op_ = "ple_gate";
         const int t = red_threads(N_EMBD);
         k_ple_gate<<<HC, t, t * sizeof(float), stream_>>>(k, q, v, g, go);
     }
     void ple_conv_silu(const float * ring, int head, const float * w, float * out) override {
         mark(PC_ELEM);
+        last_op_ = "ple_conv_silu";
         k_conv_taps<<<ceil_div(HC_DIM, BLK), BLK, 0, stream_>>>(ring, head, PLE_CONV_HIST + 1,
                                                     PLE_CONV_K, PLE_CONV_DIL, HC_DIM, w, out);
     }
@@ -1731,6 +1779,7 @@ public:
                        float * beta_sig, float * a_softplus, float * gate,
                        float * g_exp) override {
         mark(PC_ELEM);
+        last_op_ = "gdn_conv_gate";
         k_gdn_conv_gate<<<ceil_div(GDN_CONV_DIM + GDN_V_HEADS, BLK), BLK, 0, stream_>>>(
             ring, head, w, beta_raw, alpha_raw, dt, ssm_a,
             conv_out, beta_sig, a_softplus, gate, g_exp);
@@ -1738,22 +1787,26 @@ public:
     void gdn_step(float * S, const float * q, const float * k, const float * v,
                   const float * g, const float * b, float * o) override {
         mark(PC_GDN);
+        last_op_ = "gdn_step";
         k_gdn_step<<<GDN_V_HEADS * GDN_STATE, WAVE, 0, stream_>>>(S, q, k, v, g, b, o);
     }
     void gated_rms_norm(const float * x, const float * w, const float * z, float * y,
                         int ne0, int n_groups, float eps) override {
         mark(PC_NORM);
+        last_op_ = "gated_rms_norm";
         const int t = red_threads(ne0);
         k_gated_rms_norm<<<n_groups, t, t * sizeof(float), stream_>>>(x, w, z, y, ne0, eps);
     }
     void router(const float * logits, int * ids, float * w) override {
         mark(PC_ROUTER);
+        last_op_ = "router";
         k_router<<<1, N_EXPERT, 0, stream_>>>(logits, ids, w);
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu) override {
         const dim3 grid((unsigned) g.rows, N_EXPERT_USED, 2);
         mark(PC_EXP_GATE_UP);
+        last_op_ = "moe_gate_up";
         if (g.type == FK_Q_IQ3_S) {
             k_moe_gate_up_iq3s<<<grid, WAVE, 0, stream_>>>((const unsigned char *) g.base,
                 (const unsigned char *) u.base, g.expert_stride, g.row_bytes, ids, x, yg, yu,
@@ -1766,11 +1819,13 @@ public:
     }
     void silu_mul(const float * g, const float * u, float * h, size_t n) override {
         mark(PC_ELEM);
+        last_op_ = "silu_mul";
         k_silu_mul<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(g, u, h, (int) n);
     }
     void moe_down(const Mat & d, const int * ids, const float * h, float * eo) override {
         const dim3 grid((unsigned) d.rows, N_EXPERT_USED, 1);
         mark(PC_EXP_DOWN);
+        last_op_ = "moe_down";
         if (d.type == FK_Q_IQ4_NL) {
             k_moe_down_iq4nl<<<grid, WAVE, 0, stream_>>>((const unsigned char *) d.base, d.expert_stride,
                 d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
@@ -1783,24 +1838,28 @@ public:
                     const float * sh_gate, float * sh_gate_sig, float * moe_out,
                     float * sh_gated, float * out) override {
         mark(PC_EXP_COMBINE);
+        last_op_ = "moe_finish";
         k_moe_finish<<<ceil_div(N_EMBD, BLK), BLK, 0, stream_>>>(eo, w, sh_raw, sh_gate,
                                                      sh_gate_sig, moe_out, sh_gated,
                                                      out, N_EMBD, N_EXPERT_USED);
     }
     void rope_imrope(float * x, int n_heads, int head_dim, int n_rot, int pos) override {
         mark(PC_QSA);
+        last_op_ = "rope_imrope";
         k_rope_imrope<<<n_heads, n_rot / 2, 0, stream_>>>(x, head_dim, n_rot, pos);
     }
     void kv_store_q8_0(const float * k, const float * v, int8_t * kqs, uint16_t * ksc,
                        int8_t * vqs, uint16_t * vsc, int cell) override {
         const dim3 grid(HEAD_DIM / 32, N_KV_HEADS, 2);
         mark(PC_QSA);
+        last_op_ = "kv_store_q8_0";
         k_kv_store_q8_0<<<grid, WAVE, 0, stream_>>>(k, v, kqs, (__half *) ksc, vqs, (__half *) vsc, cell);
     }
     void idx_pool_block(const float * k_new, float * sum, float * raw0, int blk,
                         int n_filled, const float * kn, float eps, uint16_t * pooled,
                         float * dbg_p, float * dbg_r) override {
         mark(PC_QSA);
+        last_op_ = "idx_pool_block";
         k_idx_pool_block<<<1, IDX_DIM, 0, stream_>>>(k_new, sum, raw0, blk, n_filled,
                                          kn, eps, (unsigned short *) pooled, dbg_p, dbg_r);
     }
@@ -1810,6 +1869,7 @@ public:
         if (wgs > 4096) wgs = 4096;
         if (wgs < 1) wgs = 1;
         mark(PC_QSA);
+        last_op_ = "idx_scan";
         k_idx_scan<<<wgs, IDXS_THREADS, 0, stream_>>>((const unsigned short *) pooled, q, s, n_blocks);
     }
     void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
@@ -1817,6 +1877,7 @@ public:
                      float * qcur, float * gate, float * gsig, float * kcur,
                      float * idxq, int pos, float eps) override {
         mark(PC_QSA);
+        last_op_ = "qsa_qk_post";
         k_qsa_qk_post<<<N_Q_HEADS + N_KV_HEADS + IDX_N_HEADS, QKPOST_THREADS, 0, stream_>>>(
             qfull, kraw, idxraw, q_norm, k_norm, iq_norm,
             qcur, gate, gsig, kcur, idxq, pos, eps);
@@ -1824,6 +1885,7 @@ public:
     void qsa_expand(const float * bs, float * c, int * sel, int n_kv, int q, int r,
                     int tail, int sel_identity) override {
         mark(PC_QSA);
+        last_op_ = "qsa_expand";
         k_qsa_expand<<<ceil_div(n_kv, BLK), BLK, 0, stream_>>>(bs, c, sel, n_kv, q, r, tail, sel_identity);
     }
     int topk_select(const float * scores, int n, int width, int * out) override {
@@ -1836,6 +1898,7 @@ public:
         }
         const int k = width < n ? width : n;
         mark(PC_QSA);
+        last_op_ = "topk_select";
         k_topk_radix_select<<<1, TOPK_THREADS, 0, stream_>>>(scores, n, k, cand_key_, cand_idx_, out);
         return k;
     }
@@ -1844,17 +1907,18 @@ public:
                   const float * gsig, float * out, float * out_gated) override {
         const int n_chunks = ceil_div(n_sel, ATTN_CHUNK);
         mark(PC_QSA);
+        last_op_ = "attn_qsa";
         k_attn_flash_split<<<dim3(n_chunks, N_KV_HEADS), ATTN_THREADS, 0, stream_>>>(
             kqs, (const __half *) ksc, vqs, (const __half *) vsc, q, sel,
             partial_, mbuf_, lbuf_, n_sel);
         mark(PC_QSA);
+        last_op_ = "attn_qsa";
         k_attn_combine<<<N_Q_HEADS, HEAD_DIM, 0, stream_>>>(partial_, mbuf_, lbuf_, gsig,
                                                 out, out_gated, n_chunks);
     }
 
     void set_profile(bool on) override {
         prof_ = on;
-        dev_ensure(dev_);   // events belong to the device current at creation (M5 bug class)
         if (on && ev_.empty()) {
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);
@@ -1871,6 +1935,7 @@ public:
     }
     void prof_end_token() override {
         dev_ensure(dev_);
+        debug_check("end of token");
         blocking_in_body_ += blocking_ - blocking_at_token_start_;
         launches_in_body_ += launches_ - launches_at_token_start_;
         ++tokens_profiled_;
@@ -1927,8 +1992,32 @@ public:
 
 private:
     // ---- profiling state ----
+    // --sync-debug: validate everything enqueued since the PREVIOUS mark, so
+    // the op named in the message is the one that actually faulted rather
+    // than whichever launch happened to be in flight when the queue drained.
+    void debug_check(const char * where) {
+        if (!sync_debug_) return;
+        const hipError_t es = hipStreamSynchronize(stream_);
+        const hipError_t el = hipGetLastError();
+        if (es == hipSuccess && el == hipSuccess) return;
+        std::fprintf(stderr,
+            "\nSYNC-DEBUG FAULT on device %d\n"
+            "  failing op   : %s (class %s)\n"
+            "  reached at   : %s\n"
+            "  context      : %s layer %d\n"
+            "  sync says    : %s\n"
+            "  lasterr says : %s\n",
+            dev_, last_op_ ? last_op_ : "(none)", prof_name(last_cls_), where,
+            dbg_phase_ ? dbg_phase_ : "(none)", dbg_layer_,
+            hipGetErrorString(es), hipGetErrorString(el));
+        std::fflush(stderr);
+        std::abort();
+    }
+
     void mark(int cls, int gemv_group = -1, size_t bytes = 0) {
         dev_ensure(dev_);                  // every op runs on its OWN card
+        debug_check("the next op's mark()");
+        last_cls_ = cls;
         ++launches_;                       // one op == one launch, except where noted
         if (gemv_group >= 0 && gemv_group < GG_N) gemv_bytes_[gemv_group] += (double) bytes;
         if (!prof_ || n_ev_ >= PROF_MAX_EVENTS) return;
@@ -1939,6 +2028,11 @@ private:
     }
 
     bool       prof_ = false;
+    bool       sync_debug_ = false;
+    const char * last_op_   = nullptr;
+    const char * dbg_phase_ = nullptr;
+    int        last_cls_ = 0;
+    int        dbg_layer_ = -1;
     int        n_ev_ = 0;
     long long  launches_ = 0;
     long long  blocking_ = 0;              // host-blocking calls, counted always

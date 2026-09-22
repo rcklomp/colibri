@@ -568,6 +568,10 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
         // source's stream and pulls the bytes on its own -- no host call, so
         // this is M5's ~30 us of P2P and nothing else.
         if (L.dev != cur_dev_) {
+            if (cfg_.progress && pos_ == 0)
+                std::printf("  range done: dev%d up to layer %d, crossing to dev%d\n",
+                            cur_dev_, il - 1, L.dev);
+            std::fflush(stdout);
             const int src_dev = cur_dev_;
             float * src = pool_[src_dev].res_hc;
             bind(L.dev);
@@ -575,6 +579,7 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
             xn_ready_ = false;             // xn was computed on the other card
         }
 
+        bep_->set_debug_context(L.recurrent ? "GDN layer" : "QSA layer", il);
         if (L.is_ple) { layer_ple(L, rec); xn_ready_ = false; }
 
         hc_mix(L, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject,
@@ -610,7 +615,12 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
 
     // ---- head: the final mixer IS the output norm (qwen4exp.cpp:380) ----
     int greedy = -1;
+    if (cfg_.progress && pos_ == 0) {
+        std::printf("  range done: dev%d up to layer %d (last)\n", cur_dev_, model_.il1());
+        std::fflush(stdout);
+    }
     if (model_.have_head()) {
+        bep_->set_debug_context("head", -1);
         bep_->rms_norm_mul(res_hc_, model_.head_norm(), head_xn_, N_EMBD, HC, HC_DIM, eps_);
         GemvJob dn; dn.W = &model_.head_down(); dn.out = head_lo_;
         dn.epi = GE_SCALE_SILU; dn.arg = 1.0f / (float) HC;
@@ -627,6 +637,7 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
         bep_->argmax(logits_all_, (int) model_.lm_head().rows, greedy_id_);
     }
 
+    if (cfg_.progress && pos_ == 0) { std::printf("  head done on dev%d\n", cur_dev_); std::fflush(stdout); }
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).prof_end_token();
     last_body_ms_ = bep_->timer_stop_ms();
 

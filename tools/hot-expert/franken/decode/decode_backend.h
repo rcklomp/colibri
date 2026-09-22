@@ -349,6 +349,11 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
+    // --sync-debug: drain and check after every launch and copy, so the op
+    // named in a fault message is the one that faulted rather than whichever
+    // launch was in flight when the queue drained.
+    virtual void set_sync_debug(bool) {}
+    virtual void set_debug_context(const char * phase, int layer) { (void) phase; (void) layer; }
     virtual void prof_reset() {}
     virtual void prof_end_token() {}
     virtual void prof_report(FILE * out, int n_tokens) { (void) out; (void) n_tokens; }

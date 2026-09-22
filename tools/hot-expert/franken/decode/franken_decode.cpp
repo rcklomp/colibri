@@ -61,6 +61,8 @@ void usage(const char * p) {
         "                           both arms exist so the profile can decide\n"
         "          [--gemv-min-rows N] split K below this many output rows (default\n"
         "                           1024); sweep it against prof_gemv_*_gbs\n"
+        "          [--sync-debug]   drain and check after every launch and copy;\n"
+        "                           names the failing op, its class, layer and device\n"
         "          [--dump DIR]     write this run's taps in the oracle's own format,\n"
         "                           so one run can be the oracle of another\n"
         "          [--jitter X]     perturb every block input by +-X (oracle only):\n"
@@ -85,6 +87,11 @@ double median(std::vector<double> v) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    // Line-buffered, so the progress lines survive an abort: a GPU memory
+    // fault kills the process and a full stdout buffer goes with it, which
+    // is how the first three-card run produced no output at all.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     std::string model_path, oracle_dir, dump_dir;
     float jitter = 0.0f;
     std::vector<int32_t> tokens;
@@ -106,6 +113,7 @@ int main(int argc, char ** argv) {
     bool profile = false;
     int  gemv_lds = 1;
     int  gemv_min_rows = 1024;
+    bool sync_debug = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -122,6 +130,7 @@ int main(int argc, char ** argv) {
         else if (a == "--routing" && i + 1 < argc) routing_dir = argv[++i];
         else if (a == "--gemv-lds" && i + 1 < argc) gemv_lds = std::atoi(argv[++i]);
         else if (a == "--gemv-min-rows" && i + 1 < argc) gemv_min_rows = std::atoi(argv[++i]);
+        else if (a == "--sync-debug")             sync_debug = true;
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--jitter" && i + 1 < argc) jitter = (float) std::atof(argv[++i]);
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
@@ -161,6 +170,7 @@ int main(int argc, char ** argv) {
             if (profile)   b->set_profile(true);
             b->set_gemv_lds(gemv_lds);
             b->set_gemv_min_rows(gemv_min_rows);
+            b->set_sync_debug(sync_debug);
         }
         Backend * be = devs.front();
         std::printf("backend=%s devices=%d layers=%d-%d ctx=%d tokens=%zu head=%d quant_act=%d\n",
@@ -199,11 +209,14 @@ int main(int argc, char ** argv) {
         cfg.verbose = verbose;
         cfg.jitter  = jitter;
         cfg.log_routing = !routing_dir.empty();
+        cfg.sync_debug  = sync_debug;
         // weights first, then the caches and scratch, each on its owning card
         DecodeRunner run(model, cfg);
         run.report_cache_bytes(stdout);
+        std::printf("caches+scratch allocated\n");
         for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after caches+scratch");
 
+        std::printf("starting token 0\n");
         Recorder rec;
         RoutingOracle routing;
         if (!routing_dir.empty()) {

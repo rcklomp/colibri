@@ -492,3 +492,54 @@ device against its ~1.2 GB. With ~21.5 GB of weights the fullest card sits at
 
 The CPU graph is **bit-identical** after the rework: 538 of 538 taps
 `cos=1.000000` against the step-2 dump.
+
+### Step 3 fix 2 (2026-09-22): the device-2 page fault
+
+`Memory access fault by GPU node-3 ... Page not present` was **`lm_head`
+reading past its own allocation**, and it was one line:
+
+```c
+b.d[i].row_stride = (W.type == FK_Q_Q8_0) ? W.row_bytes : (size_t) W.K;
+```
+
+`k_gemv_batch` addresses a **quantised** row in BYTES and an f32/bf16 row in
+ELEMENTS — the two pointer casts in the kernel. The test above was
+accidentally right while Q8_0, BF16 and F32 were the only formats a batch
+ever saw. Q6_K is the first quantised format other than Q8_0 to go through
+it: its rows are **2 100 B** but `W.K` is **2 560**, so
+
+```
+row 203 700 of 248 320 first addresses past the 521.5 MB tensor
+the last row addresses 635.7 MB — 114 MB past the end
+```
+
+on exactly the card that holds `lm_head`. `place_mat` had already validated
+`row_bytes × rows == nbytes` at load; the wrong field was passed at launch.
+
+A second bug in the same launcher, found looking for the first: the LDS slice
+was `ceil_div(units, nsplit) * WAVE`, but `units` counts *granules*, which are
+256 for a Q6_K batch and 32 otherwise. That under-sized the staging buffer 8×
+and let the staging loop write past it. It is `* gran` now.
+
+**`--sync-debug`** drains the stream and checks `hipGetLastError` after every
+launch and copy. The check runs at the *next* op's `mark()`, so the op named
+in the message is the one that faulted rather than whichever launch was in
+flight when the queue drained; it prints the op, its class, the phase and
+layer, and for a boundary the pointer ranges and both device ids.
+
+**stdout is line-buffered** (`setvbuf` at the top of `main`) because a GPU
+memory fault kills the process and takes a full stdout buffer with it — which
+is why the first three-card run produced no output at all. Progress lines now
+mark placement, cache allocation, the first token, each layer range as it
+finishes on its device, and the head.
+
+**Audited for buffers used off their owner**, all clean: the boundary
+destination is the destination device's `res_hc` and the event is now recorded
+with the *source* device current; the cross-layer norm fusion is off whenever
+`layer(il+1).dev != layer(il).dev`, so layers 16 and 32 normalise the local
+copy they just received; all 61 `Scratch` members are rebound by `bind()`;
+the embedding and PLE uploads target device 0's buffers through device 0's
+backend; the argmax scratch, logits and head scratch are the last device's;
+the `__constant__` decode tables are filled per device in each constructor
+after its `hipSetDevice`; and every `Mat` and `LayerState` buffer is placed
+through `dev_for(il)`.

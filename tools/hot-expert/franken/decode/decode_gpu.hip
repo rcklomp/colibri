@@ -257,6 +257,18 @@ __device__ __forceinline__ int desc_of(const GemvBatchD & b, int row) {
 //
 // `acc` is indexed only by fully unrolled constants, or it would be scratch
 // rather than registers.
+//
+// TILE IS A TEMPLATE PARAMETER, and T == 1 instantiates TILE = 1. It has to
+// be: measured 2026-09-22, the TILE = 8 kernel run at T = 1 costs the decode
+// token 26.98 ms against the 22.70 ms of the one-column kernel it replaced.
+// The cause is not the arithmetic -- at nt = 1 seven of the eight columns are
+// predicated off -- it is that `float acc[8][4]` is live whatever nt is, so
+// the kernel asks for 135 VGPRs and gets 10 waves/SIMD where the one-column
+// kernel got 16. TILE = 1 gives back `acc[1][4]`, and it is the SAME SOURCE:
+// same accumulator structure, same operation order, same `+` and `fmaf` in
+// the same places, so T = 1 through TILE = 1 and T = 6 through TILE = 8 still
+// land on the same bits per column. The LDS staging rule follows TILE too,
+// so a decode token stages exactly what it staged before.
 #define GEMM_TILE 8
 #define GEMM_ACC  4                       // the Q8_0 unroll, and the array's width
 
@@ -269,6 +281,7 @@ __device__ __forceinline__ int desc_of(const GemvBatchD & b, int row) {
                 ? d_silu(x[(size_t)(t0 + (j)) * b.K + (i)]) * x2[(size_t)(t0 + (j)) * b.K + (i)] \
                 : x[(size_t)(t0 + (j)) * b.K + (i)]))
 
+template <int TILE>
 __global__ __launch_bounds__(GEMV_THREADS)
 void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
                   const float * __restrict__ x2, int nsplit,
@@ -278,8 +291,8 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     const int wave = threadIdx.x / WAVE;
     const int lane = threadIdx.x % WAVE;
     const int grow = blockIdx.x * GEMV_WAVES + wave;
-    const int t0   = blockIdx.z * GEMM_TILE;
-    const int nt   = min(GEMM_TILE, T - t0);
+    const int t0   = blockIdx.z * TILE;
+    const int nt   = min(TILE, T - t0);
     if (nt <= 0) return;
 
     // Element range of this split, in units of 32 so every lane stays in
@@ -310,9 +323,9 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     const GemvDesc d = b.d[di];
     const int  row = grow - d.row_off;
 
-    float acc[GEMM_TILE][GEMM_ACC];
+    float acc[TILE][GEMM_ACC];
 #pragma unroll
-    for (int j = 0; j < GEMM_TILE; ++j)
+    for (int j = 0; j < TILE; ++j)
 #pragma unroll
         for (int u = 0; u < GEMM_ACC; ++u) acc[j][u] = 0.0f;
 
@@ -331,7 +344,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
                        (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[lane];
             }
 #pragma unroll
-            for (int j = 0; j < GEMM_TILE; ++j) {
+            for (int j = 0; j < TILE; ++j) {
                 if (j >= nt) continue;
 #pragma unroll
                 for (int u = 0; u < GEMV_UNROLL; ++u)
@@ -343,7 +356,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
             const float w = fk_q8_0_block_d(bp) *
                             (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[lane];
 #pragma unroll
-            for (int j = 0; j < GEMM_TILE; ++j)
+            for (int j = 0; j < TILE; ++j)
                 if (j < nt) acc[j][0] += w * GEMM_X(j, (bl << 5) + lane);
         }
     } else if (d.type == FK_Q_Q6_K) {
@@ -356,7 +369,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
         const int bend = e1 >> 8;
         for (; bl + 1 < bend; bl += 2) {
 #pragma unroll
-            for (int j = 0; j < GEMM_TILE; ++j) {
+            for (int j = 0; j < TILE; ++j) {
                 if (j >= nt) continue;
                 const float * xt = stage_x ? sx + (size_t) j * slice - e0
                                            : x + (size_t)(t0 + j) * b.K;
@@ -368,7 +381,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
         }
         for (; bl < bend; ++bl) {
 #pragma unroll
-            for (int j = 0; j < GEMM_TILE; ++j) {
+            for (int j = 0; j < TILE; ++j) {
                 if (j >= nt) continue;
                 const float * xt = stage_x ? sx + (size_t) j * slice - e0
                                            : x + (size_t)(t0 + j) * b.K;
@@ -381,7 +394,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
         for (int i = e0 + lane; i < e1; i += WAVE) {
             const float w = fk_bf16_to_f32(rp[i]);
 #pragma unroll
-            for (int j = 0; j < GEMM_TILE; ++j)
+            for (int j = 0; j < TILE; ++j)
                 if (j < nt) acc[j][0] = fmaf(w, GEMM_X(j, i), acc[j][0]);
         }
     } else {
@@ -389,7 +402,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
         for (int i = e0 + lane; i < e1; i += WAVE) {
             const float w = rp[i];
 #pragma unroll
-            for (int j = 0; j < GEMM_TILE; ++j)
+            for (int j = 0; j < TILE; ++j)
                 if (j < nt) acc[j][0] = fmaf(w, GEMM_X(j, i), acc[j][0]);
         }
     }
@@ -398,7 +411,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     // (a0+a1)+(a2+a3) for Q8_0, a0+a1 for Q6_K, a0 alone otherwise -- the
     // unused slots are zero, so one expression covers all three.
 #pragma unroll
-    for (int j = 0; j < GEMM_TILE; ++j) {
+    for (int j = 0; j < TILE; ++j) {
         if (j >= nt) break;
         const float sum = wave_sum((acc[j][0] + acc[j][1]) + (acc[j][2] + acc[j][3]));
         if (lane != 0) continue;
@@ -2173,7 +2186,11 @@ public:
         if (nsplit > units) nsplit = units;
         if (nsplit < 1) nsplit = 1;
         if (T < 1) T = 1;
-        const int n_tiles = ceil_div(T, GEMM_TILE);
+        // TILE = 1 for a decode token: see k_gemm_batch's header. The tile
+        // width is the ONLY thing that changes, and it changes nothing a
+        // column sees.
+        const int tile    = (T == 1) ? 1 : GEMM_TILE;
+        const int n_tiles = ceil_div(T, tile);
         // The partial buffer is what grows with T instead; it is grown ONCE
         // (chunk sizes do not change mid-run) rather than capped, because
         // capping would make nsplit depend on T through the back door.
@@ -2186,14 +2203,17 @@ public:
         // and staging is dropped rather than shrunk when it will not fit,
         // because both arms compute the same value (GEMM_X).
         const int slice  = ceil_div(units, nsplit) * gran;
-        const int nt_max = T < GEMM_TILE ? T : GEMM_TILE;
+        const int nt_max = T < tile ? T : tile;
         const int stage  = (gemv_lds_ && (size_t) nt_max * slice <= GEMV_LDS_MAX_FLOATS) ? 1 : 0;
         const size_t lds = stage ? (size_t) nt_max * slice * sizeof(float) : 0;
 
         mark(PC_TRUNK, group, bytes * (size_t) T);
         last_op_ = "gemv_batch";
-        k_gemm_batch<<<dim3((unsigned) row_groups, (unsigned) nsplit, (unsigned) n_tiles),
-                       GEMV_THREADS, lds, stream_>>>(b, x, x2, nsplit, gemv_part_, stage, T);
+        const dim3 grid((unsigned) row_groups, (unsigned) nsplit, (unsigned) n_tiles);
+        if (tile == 1) k_gemm_batch<1><<<grid, GEMV_THREADS, lds, stream_>>>(
+                           b, x, x2, nsplit, gemv_part_, stage, T);
+        else           k_gemm_batch<GEMM_TILE><<<grid, GEMV_THREADS, lds, stream_>>>(
+                           b, x, x2, nsplit, gemv_part_, stage, T);
         if (nsplit > 1) {
             ++launches_;
             k_reduce_splits_gemm<<<dim3((unsigned) ceil_div(b.total_rows, BLK), (unsigned) T),
@@ -2259,6 +2279,7 @@ public:
         dbg_phase_ = phase; dbg_layer_ = layer;
     }
     void set_gemv_min_rows(int r) override { gemv_min_rows_ = r > 0 ? r : 1; }
+    void set_expert_gather(bool on) override { expert_gather_ = on; }
     void gemv_expert(const Mat & W, int e, const float * x, float * y) override {
         Mat slice = W;
         slice.base = (const unsigned char *) W.base + (size_t) e * W.expert_stride;
@@ -2395,7 +2416,7 @@ public:
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu, int T) override {
-        if (T > 1) {
+        if (T > 1 && expert_gather_) {
             const int nt = moe_sort(ids, T);
             const dim3 grid((unsigned) g.rows, (unsigned) nt, 2);
             mark(PC_EXP_GATE_UP);
@@ -2432,7 +2453,7 @@ public:
         k_silu_mul<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(g, u, h, (int) n);
     }
     void moe_down(const Mat & d, const int * ids, const float * h, float * eo, int T) override {
-        if (T > 1) {
+        if (T > 1 && expert_gather_) {
             // the layer's moe_gate_up has just sorted these very ids; the
             // sort is reused unless something unexpected changed
             const int nt = moe_sort(ids, T);
@@ -2562,6 +2583,7 @@ public:
 
     void set_profile(bool on) override {
         prof_ = on;
+        dev_ensure(dev_);   // the events must be created on THIS backend's device (lost once in a rebase; invalid resource handle at mark())
         if (on && ev_.empty()) {
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);
@@ -2718,6 +2740,7 @@ private:
     int        cand_cap_ = 0;
     int        gemv_lds_ = 1;
     int        gemv_min_rows_ = 1024;
+    bool       expert_gather_ = true;
     int        dev_ = 0;
     char       name_[24] = {0};
     hipStream_t stream_{};

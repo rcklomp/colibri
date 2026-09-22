@@ -14,6 +14,30 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 45 (2026-09-22 01:30 CEST, 23:30 UTC 09-21) -- THE OWNER'S DEFINITION
+> OF THE FRANKEN-ENGINE, VERBATIM IN SUBSTANCE, BINDING ON EVERY REV BELOW
+> AND ABOVE:** the engine is a NEW engine, created from the parts of the
+> other engines (Colibri, llama.cpp, hipFire, hipEngine, ...) that make it
+> run optimally on THIS AMD hardware -- three RX 7900 XTX, 247 GiB RAM, one
+> 8-core EPYC -- for the models on his list (Qwen3.8, DeepSeek V4.x, GLM-5.3
+> and successors) at a 256k window. Serving an existing engine, or one
+> engine per model, is NOT the goal; llama.cpp is not built for this rig
+> (his words), which is why hipFire and hipEngine were investigated. Revs
+> 38-44's framing ("which engine serves which model") was the orchestrator's
+> error, twice, and is withdrawn. What stands from them is data: llama.cpp's
+> HIP path on Qwen3.8-Flash-Next IQ4_XS gives 15 tok/s at 19k and 6 at 257k
+> with ~a quarter of the experts in host RAM; hipFire's HIP kernels give
+> 80-130 tok/s on one card for a resident 35B; Colibri's Vulkan tier gives
+> 4-5 tok/s on the same class with 60-70 % of the model in RAM but owns the
+> placement, checkpoint and ledger logic Open WebUI needs. **Method from
+> here: per component of a decode/prefill token -- expert kernel + quant
+> format, attention + KV at 256k, expert placement and host->device
+> streaming, multi-card dispatch, prefill batching -- measure which existing
+> implementation is fastest on gfx1100, then assemble.** The queued fit runs
+> (32k vs 256k window) are the first such component number: the cost of
+> RAM-resident experts under llama.cpp's HIP MoE path. The quality run of
+> rev 43/44 is stopped; quant choice is a workload parameter, not the work.
+>
 > **Rev 44 (2026-09-22 00:40 CEST, 22:40 UTC 09-21) -- THE FIRST QUALITY
 > RUN IS NOT A MODEL COMPARISON; THE OWNER SAID SO AND HE IS RIGHT.** It
 > compared GLM on Colibri with reasoning effectively off (median 80 answer

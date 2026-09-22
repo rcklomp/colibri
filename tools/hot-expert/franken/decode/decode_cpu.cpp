@@ -57,6 +57,10 @@ static_assert(sizeof(block_q8_0)   == FK_Q8_0_BLOCK_BYTES,   "block_q8_0 size mo
 static_assert(sizeof(block_iq4_xs) == FK_IQ4XS_BLOCK_BYTES,  "block_iq4_xs size moved");
 static_assert(sizeof(block_iq3_s)  == IQ3S_BLOCK_BYTES,      "block_iq3_s size moved");
 static_assert(sizeof(block_iq4_nl) == IQ4NL_BLOCK_BYTES,     "block_iq4_nl size moved");
+static_assert(sizeof(block_q6_K)   == FK_Q6K_BLOCK_BYTES,    "block_q6_K size moved");
+static_assert(offsetof(block_q6_K, qh)     == FK_Q6K_OFF_QH,     "q6_K qh moved");
+static_assert(offsetof(block_q6_K, scales) == FK_Q6K_OFF_SCALES, "q6_K scales moved");
+static_assert(offsetof(block_q6_K, d)      == FK_Q6K_OFF_D,      "q6_K d moved");
 static_assert(offsetof(block_q8_0,   qs)       == FK_Q8_0_OFF_QS,        "q8_0 qs moved");
 static_assert(offsetof(block_iq4_xs, scales_h) == FK_IQ4XS_OFF_SCALES_H, "iq4_xs scales_h moved");
 static_assert(offsetof(block_iq4_xs, scales_l) == FK_IQ4XS_OFF_SCALES_L, "iq4_xs scales_l moved");
@@ -74,6 +78,7 @@ const char * gemv_group_name(int g) {
         case GG_SH_DOWN:        return "shexp_down";
         case GG_QSA_PROJ:       return "qsa_q_k_v_indexer";
         case GG_ATTN_OUT:       return "attn_output";
+        case GG_LM_HEAD:        return "lm_head";
         default:                return "ple";
     }
 }
@@ -168,6 +173,16 @@ float row_dot(int type, const unsigned char * row, const float * x, int64_t K) {
             }
             return (float) a;
         }
+        case FK_Q_Q6_K: {
+            const int64_t nblk = K / FK_Q6K_BLOCK_WEIGHTS;
+            double a = 0.0;
+            for (int64_t b = 0; b < nblk; ++b) {
+                const unsigned char * bp = row + b * FK_Q6K_BLOCK_BYTES;
+                for (int tid = 0; tid < 32; ++tid)
+                    a += fk_q6k_block_dot(bp, x + b * FK_Q6K_BLOCK_WEIGHTS + 8 * tid, tid);
+            }
+            return (float) a;
+        }
         case FK_Q_IQ3_S: {
             const int64_t nblk = K / IQ3S_BLOCK_WEIGHTS;
             double a = 0.0;
@@ -232,6 +247,15 @@ public:
     void    upload(void * d, const void * s, size_t b) override { std::memcpy(d, s, b); }
     void    download(void * d, const void * s, size_t b) override { std::memcpy(d, s, b); }
     void    sync() override {}
+    int     device() const override { return -1; }
+    void    boundary_recv(void * dst, Backend &, const void * src, size_t b) override {
+        std::memcpy(dst, src, b);          // one host backend serves every range
+    }
+    void    argmax(const float * logits, int n, int * out_id) override {
+        int best = 0;
+        for (int i = 1; i < n; ++i) if (logits[i] > logits[best]) best = i;
+        *out_id = best;
+    }
     void    set_quant_act(bool on) override { quant_act_ = on; }
 
     const void * place(const void * host, size_t bytes, const char *) override {

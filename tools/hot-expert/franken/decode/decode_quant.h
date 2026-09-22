@@ -152,6 +152,73 @@ FK_QUAL float fk_iq4xs_block_dot(
     return a0 + a1;
 }
 
+// ---------------------------------------------------------------- Q6_K ----
+//
+// ggml's block_q6_K { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16];
+// ggml_half d; } == 210 bytes for 256 weights. Only `output.weight`
+// (lm_head, [2560, 248320]) uses it, and only step 3 needs it.
+//
+// dequantize_row_q6_K (ggml-quants.c:1939) walks the super-block in two
+// GROUPS of 128 weights, and inside a group the four quarters are strided,
+// not contiguous:
+//
+//   for n in {0,128}:
+//     for l in 0..31:  is = l/16
+//       y[l+ 0] = d*sc[is+0]*(((ql[l   ] & 0xF) | ((qh[l]>>0 & 3)<<4)) - 32)
+//       y[l+32] = d*sc[is+2]*(((ql[l+32] & 0xF) | ((qh[l]>>2 & 3)<<4)) - 32)
+//       y[l+64] = d*sc[is+4]*(((ql[l   ] >>  4) | ((qh[l]>>4 & 3)<<4)) - 32)
+//       y[l+96] = d*sc[is+6]*(((ql[l+32] >>  4) | ((qh[l]>>6 & 3)<<4)) - 32)
+//     ql += 64; qh += 32; sc += 8
+//
+// Lane mapping: lane `tid` owns weights [8*tid, 8*tid+8). Because 8 divides
+// 32, those eight always land in ONE quarter of ONE group, so the strided
+// layout costs no branching inside the loop:
+//   group   n = tid>>4          (0 or 1)
+//   offset  o = (tid&15)*8      (0..120, a multiple of 8)
+//   quarter q = o>>5, base l0 = o&31 in {0,8,16,24}
+#define FK_Q6K_BLOCK_WEIGHTS 256
+#define FK_Q6K_BLOCK_BYTES   210
+#define FK_Q6K_OFF_QL          0
+#define FK_Q6K_OFF_QH        128
+#define FK_Q6K_OFF_SCALES    192
+#define FK_Q6K_OFF_D         208
+
+FK_QUAL float fk_q6k_block_dot(const unsigned char * bp, const float * xb, int tid) {
+    const unsigned int dbits = (unsigned int)bp[FK_Q6K_OFF_D] |
+                               ((unsigned int)bp[FK_Q6K_OFF_D + 1] << 8);
+    const float d = FK_HALF_TO_F32(dbits);
+
+    const int n  = tid >> 4;
+    const int o  = (tid & 15) << 3;
+    const int qt = o >> 5;              // 0..3
+    const int l0 = o & 31;              // 0, 8, 16, 24
+
+    const unsigned char * ql = bp + FK_Q6K_OFF_QL     + n * 64;
+    const unsigned char * qh = bp + FK_Q6K_OFF_QH     + n * 32;
+    const signed char   * sc = (const signed char *)(bp + FK_Q6K_OFF_SCALES) + n * 8;
+
+    // within a quarter the low/high nibble and the qh shift are fixed
+    const int lo_off  = (qt & 1) ? 32 : 0;     // quarters 1 and 3 read ql[l+32]
+    const int hi_nib  = (qt >= 2);             // quarters 2 and 3 take the high nibble
+    const int qh_shift = qt << 1;              // 0, 2, 4, 6
+    const int sc_base  = qt << 1;              // sc[is + 0/2/4/6]
+
+    float a0 = 0.0f, a1 = 0.0f;
+#ifdef __HIP_DEVICE_COMPILE__
+    #pragma unroll
+#endif
+    for (int j = 0; j < 8; j += 2) {
+        const int lA = l0 + j, lB = l0 + j + 1;
+        const int vA = (int)(hi_nib ? (ql[lA + lo_off] >> 4) : (ql[lA + lo_off] & 0xF))
+                     | (int)(((qh[lA] >> qh_shift) & 3) << 4);
+        const int vB = (int)(hi_nib ? (ql[lB + lo_off] >> 4) : (ql[lB + lo_off] & 0xF))
+                     | (int)(((qh[lB] >> qh_shift) & 3) << 4);
+        a0 += (d * (float) sc[(lA >> 4) + sc_base]) * (float)(vA - 32) * xb[j];
+        a1 += (d * (float) sc[(lB >> 4) + sc_base]) * (float)(vB - 32) * xb[j + 1];
+    }
+    return a0 + a1;
+}
+
 // ----------------------------------------------------------------- BF16 ---
 //
 // A bf16 value is the top 16 bits of an IEEE-754 f32, so widening is a
@@ -182,6 +249,7 @@ FK_QUAL size_t fk_row_bytes(int type, long long K) {
         case FK_Q_IQ4_NL: return (size_t)(K / IQ4NL_BLOCK_WEIGHTS)     * IQ4NL_BLOCK_BYTES;
         case FK_Q_IQ4_XS: return (size_t)(K / FK_IQ4XS_BLOCK_WEIGHTS)  * FK_IQ4XS_BLOCK_BYTES;
         case FK_Q_IQ3_S:  return (size_t)(K / IQ3S_BLOCK_WEIGHTS)      * IQ3S_BLOCK_BYTES;
+        case FK_Q_Q6_K:   return (size_t)(K / FK_Q6K_BLOCK_WEIGHTS)   * FK_Q6K_BLOCK_BYTES;
         default:          return 0;
     }
 }

@@ -56,6 +56,8 @@ struct LayerWeights {
     Mat sh_gate, sh_up, sh_down;
     Mat sh_gate_inp;                       // [2560 -> 1]
 
+    int dev = 0;   // which backend holds this layer's tensors
+
     // PLE (layer 1 only)
     Mat ple_key, ple_value;
     const float * ple_norm_key   = nullptr;
@@ -64,11 +66,18 @@ struct LayerWeights {
     const float * ple_conv1d     = nullptr;   // [HC_DIM][4] (ne = [4, 10240])
 };
 
+// Step 3, design 9.1: the model on three cards by layer range, 0-15 / 16-31
+// / 32-47, with the final hyper-connection mixer and lm_head on the last one.
+// Each range's tensors are placed on that range's backend, so nothing a layer
+// reads ever crosses a device -- only the hyper-connection residual does, at
+// the two boundaries (decode_graph.cpp).
 class DecodeModel {
 public:
-    // Opens the split, checks its hparams against decode_shapes.h, and places
-    // layers [il0, il1] plus token_embd's metadata on `be`.
-    DecodeModel(const std::string & any_shard_path, Backend & be, int il0, int il1);
+    // `devs` holds one backend per layer range, in order. A single-element
+    // vector is step 2's one-card case unchanged. `il0`/`il1` bound the whole
+    // span; the span is split evenly across `devs`.
+    DecodeModel(const std::string & any_shard_path, std::vector<Backend *> devs,
+                int il0, int il1, bool with_head);
 
     const GgufModel & gguf() const { return *model_; }
     const HParams &   hp()   const { return model_->hparams(); }
@@ -77,6 +86,19 @@ public:
     int il0() const { return il0_; }
     int il1() const { return il1_; }
     const LayerWeights & layer(int il) const { return layers_.at(il - il0_); }
+    int  n_devices() const { return (int) devs_.size(); }
+    Backend & dev(int d) const { return *devs_.at(d); }
+    int  dev_of(int il) const { return layer(il).dev; }
+    Backend & dev_for(int il) const { return *devs_.at(dev_of(il)); }
+
+    // The head: the final hyper-connection mixer (there is no separate output
+    // norm -- "the final mixer IS the output norm", qwen4exp.cpp:380) and
+    // lm_head, both on the LAST device. Absent unless `with_head`.
+    bool have_head() const { return have_head_; }
+    const Mat & head_down() const { return head_down_; }
+    const Mat & head_up()   const { return head_up_; }
+    const Mat & lm_head()   const { return lm_head_; }
+    const float * head_norm() const { return head_norm_; }
 
     // token_embd stays on the HOST: it is a per-token row gather, and design
     // 9.1's rule ("any tensor read by a per-token row gather lives in host
@@ -92,8 +114,12 @@ private:
     const float * place_f32(Backend & be, const std::string & name, int64_t n_expect);
 
     std::unique_ptr<GgufModel> model_;
+    std::vector<Backend *>     devs_;
     std::vector<LayerWeights>  layers_;
     const TensorInfo *         tok_embd_ = nullptr;
+    bool  have_head_ = false;
+    Mat   head_down_, head_up_, lm_head_;
+    const float * head_norm_ = nullptr;
     int    il0_ = 0, il1_ = 0;
     float  rms_eps_ = RMS_EPS_DEFAULT;
     size_t placed_ = 0;

@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include <fstream>
+
 #include "../ple.h"
 #include "decode_graph.h"
 #include "decode_model.h"
@@ -36,7 +38,12 @@ namespace {
 void usage(const char * p) {
     std::fprintf(stderr,
         "usage: %s --model <path-to-any-shard.gguf> --tokens <id> [<id> ...]\n"
-        "          [--layers A-B]   layer range on device 0 (default 0-15)\n"
+        "          [--layers A-B]   layer span (default 0-47, the whole model)\n"
+        "          [--devices N]    split the span over N cards (default 3)\n"
+        "          [--no-head]      skip the final mixer and lm_head\n"
+        "          [--greedy N]     append the argmax and decode N more tokens\n"
+        "          [--expect-ids F] compare the greedy ids with F, one id a line\n"
+        "          [--routing DIR]  compare the routed experts with DIR/moe_ids.txt\n"
         "          [--oracle DIR]   compare every tap against llama.cpp's dump\n"
         "          [--cpu]          run the same graph on the host (no GPU at all)\n"
         "          [--time N]       decode N further tokens and time the layer body\n"
@@ -81,7 +88,10 @@ int main(int argc, char ** argv) {
     std::string model_path, oracle_dir, dump_dir;
     float jitter = 0.0f;
     std::vector<int32_t> tokens;
-    int il0 = 0, il1 = 15;
+    int il0 = 0, il1 = N_LAYER - 1;
+    int n_devices = 3, greedy_n = 0;
+    bool with_head = true;
+    std::string expect_ids_path, routing_dir;
     int time_n = 0, ctx = 512, threads = 4;
     // franken_decode_cpu is built with -DFRANKEN_NO_HIP and has no GPU
     // backend to fall back to, so --cpu is its only mode and its default.
@@ -105,6 +115,11 @@ int main(int argc, char ** argv) {
         else if (a == "--quant-act")              quant_act = true;
         else if (a == "--verbose")                verbose = true;
         else if (a == "--profile")                profile = true;
+        else if (a == "--devices" && i + 1 < argc) n_devices = std::atoi(argv[++i]);
+        else if (a == "--no-head")                with_head = false;
+        else if (a == "--greedy"  && i + 1 < argc) greedy_n = std::atoi(argv[++i]);
+        else if (a == "--expect-ids" && i + 1 < argc) expect_ids_path = argv[++i];
+        else if (a == "--routing" && i + 1 < argc) routing_dir = argv[++i];
         else if (a == "--gemv-lds" && i + 1 < argc) gemv_lds = std::atoi(argv[++i]);
         else if (a == "--gemv-min-rows" && i + 1 < argc) gemv_min_rows = std::atoi(argv[++i]);
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
@@ -126,16 +141,35 @@ int main(int argc, char ** argv) {
     }
 
     try {
-        std::unique_ptr<Backend> be(use_cpu ? make_cpu_backend(threads) : make_gpu_backend(0));
-        if (quant_act) be->set_quant_act(true);
-        if (profile)   be->set_profile(true);
-        be->set_gemv_lds(gemv_lds);
-        be->set_gemv_min_rows(gemv_min_rows);
-        std::printf("backend=%s layers=%d-%d ctx=%d tokens=%zu quant_act=%d\n",
-                    be->name(), il0, il1, ctx, tokens.size(), (int) quant_act);
+        if (n_devices < 1) n_devices = 1;
+        // One CpuBackend serves every range: it is all the same host memory,
+        // so the "devices" only decide which layers a range holds.
+        std::vector<std::unique_ptr<Backend>> owned;
+        std::vector<Backend *> devs;
+        if (use_cpu) {
+            owned.emplace_back(make_cpu_backend(threads));
+            for (int d = 0; d < n_devices; ++d) devs.push_back(owned[0].get());
+        } else {
+            enable_peer_access(n_devices);          // before anything is placed
+            for (int d = 0; d < n_devices; ++d) {
+                owned.emplace_back(make_gpu_backend(d));
+                devs.push_back(owned.back().get());
+            }
+        }
+        for (auto * b : devs) {
+            if (quant_act) b->set_quant_act(true);
+            if (profile)   b->set_profile(true);
+            b->set_gemv_lds(gemv_lds);
+            b->set_gemv_min_rows(gemv_min_rows);
+        }
+        Backend * be = devs.front();
+        std::printf("backend=%s devices=%d layers=%d-%d ctx=%d tokens=%zu head=%d quant_act=%d\n",
+                    be->name(), n_devices, il0, il1, ctx, tokens.size(),
+                    (int) with_head, (int) quant_act);
 
-        DecodeModel model(model_path, *be, il0, il1);
+        DecodeModel model(model_path, devs, il0, il1, with_head);
         std::printf("placed=%.2f GB rms_eps=%g\n", model.placed_bytes() / 1e9, model.rms_eps());
+        for (int d = 0; d < (use_cpu ? 1 : n_devices); ++d) devs[d]->vram_report(stdout, "after placement");
 
         // The PLE gather is host work by design (9.1) and depends on the whole
         // token prefix, so it is computed once for the sequence. ../ple.cpp's
@@ -153,17 +187,58 @@ int main(int argc, char ** argv) {
         cfg.ctx = ctx;
         cfg.verbose = verbose;
         cfg.jitter  = jitter;
-        DecodeRunner run(*be, model, cfg);
+        cfg.log_routing = !routing_dir.empty();
+        DecodeRunner run(model, cfg);
+        for (int d = 0; d < (use_cpu ? 1 : n_devices); ++d) devs[d]->vram_report(stdout, "after scratch");
 
         Recorder rec;
+        RoutingOracle routing;
+        if (!routing_dir.empty()) {
+            std::string why;
+            if (!routing.load(routing_dir, why)) std::printf("routing PENDING: %s\n", why.c_str());
+        }
+
+        std::vector<int> greedy_ids;
+        int last_greedy = -1;
+        int greedy_first_mismatch = -1;
         for (size_t t = 0; t < tokens.size(); ++t) {
-            // only the LAST token is recorded: that is the column the oracle
-            // dump writes.
+            // only the LAST prompt token is recorded: that is the column the
+            // oracle dump writes.
             rec.enable(t + 1 == tokens.size());
             const float * ple = need_ple ? ple_all.data() + t * N_EMBD : nullptr;
-            run.step(tokens[t], ple, rec);
+            last_greedy = run.step(tokens[t], ple, rec);
+            if (routing.loaded()) routing.observe(run.pos() - 1, il0, run.routed_ids());
             std::printf("token %zu id=%d pos=%d done\n", t, tokens[t], run.pos() - 1);
             std::fflush(stdout);
+        }
+
+        // ---- greedy continuation -------------------------------------------
+        // Each new token's PLE row depends on the whole prefix, so the gather
+        // is redone for the appended id (host work, design 9.1).
+        if (greedy_n > 0) {
+            if (!model.have_head()) {
+                std::fprintf(stderr, "--greedy needs the head; drop --no-head\n");
+                return 2;
+            }
+            std::vector<int32_t> seq = tokens;
+            for (int g = 0; g < greedy_n; ++g) {
+                if (last_greedy < 0) break;
+                seq.push_back(last_greedy);
+                greedy_ids.push_back(last_greedy);
+                std::vector<float> ple_row;
+                const float * ple = nullptr;
+                if (need_ple) {
+                    const auto r = franken::ple_gather(model.gguf(), seq);
+                    ple_row.assign(r.emb.end() - N_EMBD, r.emb.end());
+                    ple = ple_row.data();
+                }
+                Recorder off;
+                last_greedy = run.step(seq.back(), ple, off);
+                if (routing.loaded()) routing.observe(run.pos() - 1, il0, run.routed_ids());
+            }
+            std::printf("greedy_ids:");
+            for (int id : greedy_ids) std::printf(" %d", id);
+            std::printf("\n");
         }
 
         // A cheap, always-printed sanity number: a zero or non-finite residual
@@ -186,6 +261,31 @@ int main(int argc, char ** argv) {
         }
 
         int rc = 0;
+        if (!expect_ids_path.empty()) {
+            std::vector<int> want;
+            std::string why;
+            if (!load_expected_ids(expect_ids_path, want, why)) {
+                std::printf("expect-ids PENDING: %s\n", why.c_str());
+                rc = 4;
+            } else {
+                const int first = first_mismatch(greedy_ids, want);
+                greedy_first_mismatch = first;
+                const size_t n = std::min(greedy_ids.size(), want.size());
+                if (first < 0) std::printf("GREEDY MATCH %zu of %zu ids\n", n, want.size());
+                else std::printf("GREEDY MISMATCH at position %d: mine=%d ref=%d (of %zu compared)\n",
+                                 first, greedy_ids[first], want[first], n);
+                if (first >= 0) rc = 1;
+            }
+        }
+        if (routing.loaded()) {
+            // Positions at and after the first greedy mismatch are fed a
+            // DIFFERENT token than the reference was, so only the positions
+            // below it compare like with like.
+            const int valid_end = greedy_first_mismatch < 0
+                                ? (int) tokens.size() + (int) greedy_ids.size()
+                                : (int) tokens.size() + greedy_first_mismatch;
+            routing.report(stdout, il0, il1, valid_end);
+        }
         if (!oracle_dir.empty()) {
             Oracle oracle;
             std::string why;
@@ -213,13 +313,18 @@ int main(int argc, char ** argv) {
             // identical either way. Nothing else about the step differs.
             const float * ple = need_ple ? ple_all.data() + (tokens.size() - 1) * N_EMBD : nullptr;
             run.step(filler, ple, off);         // one warm-up, not counted
-            be->prof_reset();
+            for (auto * b : devs) b->prof_reset();
             for (int i = 0; i < time_n; ++i) {
                 run.step(filler, ple, off);
                 ms.push_back(run.last_body_ms());
             }
             std::printf("layers%d_%d_ms_median=%.4f n=%d\n", il0, il1, median(ms), time_n);
-            if (profile) be->prof_report(stdout, time_n);
+            if (profile) {
+                for (int d = 0; d < (use_cpu ? 1 : n_devices); ++d) {
+                    std::printf("--- device %d ---\n", d);
+                    devs[d]->prof_report(stdout, time_n);
+                }
+            }
         }
         return rc;
     } catch (const std::exception & e) {

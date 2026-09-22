@@ -31,6 +31,7 @@ enum FkQuantType : int {
     FK_Q_IQ4_NL = 3,
     FK_Q_IQ4_XS = 4,
     FK_Q_IQ3_S  = 5,
+    FK_Q_Q6_K   = 6,   // lm_head only
 };
 
 namespace fk {

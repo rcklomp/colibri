@@ -80,6 +80,41 @@ private:
     std::map<std::string, OracleEntry> entries_;
 };
 
+// ------------------------------------------------- the step-3 oracles ----
+//
+// Taps prove the arithmetic; these two prove the MODEL. Step 2 established
+// that the per-point cosines stop being a test once the MoE router's
+// top-10-of-512 selection diverges, so step 3 adds the two checks that
+// survive that: what the model actually SAYS, and which experts it picked.
+
+// (b) greedy ids, one per line, against llama.cpp at temperature 0. `#` and
+// blank lines are ignored so the dump tool may annotate the file.
+bool load_expected_ids(const std::string & path, std::vector<int> & out, std::string & why);
+// -1 when the common prefix agrees; otherwise the first differing position.
+int  first_mismatch(const std::vector<int> & mine, const std::vector<int> & ref);
+
+// (c) the routing oracle the record now names. `<dir>/moe_ids.txt` holds
+// lines `il pos: id id ...`; the score is the mean over positions of
+// |A n B| / n_expert_used, per layer. It is a SET overlap, not an ordered
+// comparison: the reference's own order at the cut is unspecified.
+class RoutingOracle {
+public:
+    bool load(const std::string & dir, std::string & why);
+    bool loaded() const { return loaded_; }
+    // `ids` is [n_layers][N_EXPERT_USED] for the layer span starting at il0.
+    void observe(int pos, int il0, const std::vector<int> & ids);
+    // `valid_pos_end` is the first position whose INPUT TOKEN differs from the
+    // reference's. Beyond it the two engines are decoding different text, so a
+    // routing difference says nothing about the router -- the headline number
+    // is the one over positions below it.
+    void report(FILE * out, int il0, int il1, int valid_pos_end) const;
+
+private:
+    bool loaded_ = false;
+    std::map<std::pair<int,int>, std::vector<int>> ref_;      // (il, pos) -> ids
+    std::map<std::pair<int,int>, double>           overlap_;  // (il, pos) -> |A n B| / k
+};
+
 // Writes this engine's taps in exactly the format above, so one run can be
 // the oracle of another: `--dump A` then `--oracle A` on a second run gives a
 // GPU-versus-CPU check that needs no llama.cpp, and a jitter arm that answers

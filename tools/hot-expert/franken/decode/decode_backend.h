@@ -101,6 +101,7 @@ enum GemvGroup {
     GG_QSA_PROJ,        // wq + wk + wv + indexer q/k
     GG_ATTN_OUT,
     GG_PLE,
+    GG_LM_HEAD,         // output.weight, Q6_K, 248 320 rows
     GG_N
 };
 const char * gemv_group_name(int g);
@@ -127,6 +128,24 @@ public:
     virtual void    upload(void * dst, const void * src, size_t bytes) = 0;
     virtual void    download(void * dst, const void * src, size_t bytes) = 0;
     virtual void    sync() = 0;
+
+    // -- device boundaries (step 3, design 9.1/9.2) -------------------------
+    //
+    // Everything the next layer range needs is the wide residual: the
+    // hyper-connection streams, hc_count * n_embd f32 = 40 KB. Nothing else
+    // survives a layer, so that is the whole boundary payload.
+    //
+    // `boundary_recv` is a method of the DESTINATION: it records an event on
+    // the source's stream, makes its own stream wait on it, and issues the
+    // peer copy on its own stream. No host call is involved, so a boundary
+    // costs the ~30 us of P2P that M5 measured and nothing else.
+    virtual int  device() const { return -1; }
+    virtual void boundary_recv(void * dst, Backend & src, const void * src_ptr,
+                               size_t bytes) = 0;
+    // Greedy sampling on the device: a reduction over the 248 320 logits, so
+    // the only thing that crosses to the host per token is one int.
+    virtual void argmax(const float * logits, int n, int * out_id) = 0;
+    virtual void vram_report(FILE * out, const char * tag) { (void) out; (void) tag; }
 
     // Make a host (mmap) tensor readable by this backend's kernels. CpuBackend
     // returns the pointer unchanged (nothing is copied, nothing is paged in
@@ -323,5 +342,7 @@ public:
 
 Backend * make_cpu_backend(int n_threads);
 Backend * make_gpu_backend(int device);
+// Must run before anything is placed; a no-op in the CPU-only build.
+void enable_peer_access(int n_devices);
 
 } // namespace fk

@@ -338,3 +338,102 @@ before it — 538 of 538 taps `cos=1.000000` against the pre-rewrite dump,
 0.999993, `l_last-3` 0.999407 under `--quant-act`). 35 kernels, still zero
 scratch and zero spills, occupancy 16 except `attn_flash_split` at 15;
 `k_gemv_batch` is 46 VGPR. Not run: no GPU was touched.
+
+## Step 3 (2026-09-22): the whole model on three cards, and a real oracle
+
+Step 2b measured `layers0_15_ms_median=7.6204` (from 11.73) at 389 launches
+and 0 host syncs, with the GPU kernels matching the CPU graph 534/534.
+Step 3 is design §9.5 step 3: all 48 layers, three cards, `lm_head`, and an
+oracle that tests the MODEL rather than the arithmetic.
+
+### What crosses a card boundary
+
+Exactly one thing: the wide residual, `hc_count × n_embd` f32 = **40 KB**.
+Nothing else survives a layer. `Backend::boundary_recv` is a method of the
+*destination*: it records an event on the source's stream, makes its own
+stream wait on it, and issues `hipMemcpyPeerAsync` on its own stream. No host
+call, so a boundary is M5's ~30 µs of P2P and nothing else.
+`enable_peer_access()` runs before anything is placed.
+
+Each device has its own stream, its own scratch set (`bind()` swaps the
+active pointers at a layer, so the body code never knows which card it is
+on), and owns the QSA caches and GDN/conv state of its own layers.
+
+The token time is taken on the **last** device, whose stream is idle when the
+start event is recorded, so its start timestamp is the token's start. Each
+token fully drains before the next begins — which costs nothing, because a
+decode token depends on the previous one's argmax.
+
+### The head
+
+`output_hc_*` is the final hyper-connection mixer and there is no separate
+output norm — "the final mixer IS the output norm" (qwen4exp.cpp:380). It
+takes no inject, so only down/up are placed. `lm_head` is Q6_K, the one
+tensor in that format; `fk_q6k_block_dot` ports ggml's
+`dequantize_row_q6_K`. Its super-blocks are 256 weights, so a batch
+containing it splits K on 256-element boundaries rather than 32.
+
+Greedy sampling is a **device-side** two-stage argmax over the 248 320
+logits, so the only thing crossing to the host per token is one int. The
+full logits stay downloadable for the last token.
+
+### The three oracles
+
+- `--oracle` still compares every tap, now on any device.
+- `--expect-ids F` compares the greedy ids with llama.cpp at temperature 0
+  and prints the first mismatch.
+- `--routing DIR` compares the routed expert set per layer per position
+  against `DIR/moe_ids.txt` and reports the mean `|A ∩ B| / 10`.
+
+Two things the comparator learned doing this, both of which would otherwise
+have read as engine failures:
+
+- **The dump writes the last ne1 column when ne2 == 1.** After llama.cpp
+  applies `inp_out_ids` the final layer's `l_last-47` is `[2560, 4, 1]` and
+  its file holds hyper-connection stream **3** alone. Comparing it against
+  stream 0 read `cos=0.579`; comparing like with like reads **0.9787**.
+- **`result_norm` and `result_output` are 4 bytes each** in this dump — one
+  float for a 2 560- and a 248 320-long tensor. A one-element cosine is ±1
+  whatever the values, so those are now REFUSED rather than reported as a
+  spectacular failure. Worth fixing in the dump tool; until then the head is
+  checked by the greedy ids, not by a tap.
+
+And one the routing oracle needed: beyond the first greedy mismatch the two
+engines are decoding **different text**, so a routing difference there is a
+consequence of the sequence having diverged, not evidence about the router.
+The report gives both numbers and the same-input one is the headline.
+
+### What `--cpu` shows over all 48 layers
+
+Six prompt ids then 16 greedy, `--devices 3`, against
+`~/bench/franken/oracle`:
+
+- **greedy: 7 of 16 ids identical to llama.cpp** — `271 2064 10054 1040 488
+  2493 381` — then position 7 diverges (mine 8008, ref 3322).
+- **routing: mean set overlap 0.909** across all 48 layers over the 13
+  positions whose input token is the reference's own. Layer 0 is **0.992**,
+  falling to ~0.85 by layer 47. (Over all 22 positions it reads 0.713, but
+  that number mixes in positions where the sequences had already parted.)
+- taps: `l_last-0` 0.99996, `l_last-15` 0.98955, `l_last-16` 0.98579,
+  `l_last-31` 0.94168, `l_last-32` 0.93344, `l_last-47` 0.97872. 1 184
+  compared, 410 with no dump entry, 60 incomparable, 10 refused.
+
+So the compounding of step 2's routing divergence is now quantified at both
+ends: ~9 of 10 experts agree per layer per position, and the model says the
+same thing for seven tokens.
+
+### What the GPU run needs
+
+```
+franken_decode --model <shard> --tokens 248044 785 10945 315 1495 374 \
+               --devices 3 --layers 0-47 --ctx <N> \
+               --greedy 16 --expect-ids ~/bench/franken/oracle/greedy.txt \
+               --routing ~/bench/franken/oracle --oracle ~/bench/franken/oracle \
+               --dump <dir> --time 32 --profile
+```
+under the rig lock with the gateway stopped. `--ctx` sizes the QSA caches
+**per device**; each card holds 4 QSA layers, so 256k costs
+4 × 256k × (2 heads × 256 dims × 2 tensors q8_0 + indexer) ≈ 1.5 GB — design
+§9.1's figure. `vram_report` prints used/free/total per card after placement
+and again after the scratch, so the fullest card's headroom is a measurement
+rather than an estimate. Nothing here has been run on a GPU.

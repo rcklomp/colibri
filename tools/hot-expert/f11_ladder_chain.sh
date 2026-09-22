@@ -431,7 +431,7 @@ start_f11() {   # start_f11 <model> <ncmoe> <name> <alias>
     # What fit will decide, printed by llama.cpp's own estimator (llama-fit-params; the
     # --fit-print flag belongs to that tool only, NOT to llama-server -- 2026-09-22, two runs
     # lost to it). Same image, devices free at this point, seconds, no server.
-    echo "--- llama-fit-params estimate for $label at ctx=$F11_CTX"
+    echo "--- llama-fit-params estimate for $name at ctx=$F11_CTX"
     docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
       --security-opt seccomp=unconfined --ipc=host \
       -e "LD_LIBRARY_PATH=/opt/rocm/lib:${F11_BIN_DIR}" -v /home/ronald:/home/ronald \

@@ -14,6 +14,18 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 55 (2026-09-22 20:30 CEST, 18:30 UTC) -- BATCHED PREFILL EXISTS (record
+> §L0-PREFILL).** T-wide graph, GDN over T, causal QSA over T (proof in
+> decode/PREFILL.md), expert row-gather batching. CPU arm: chunked ==
+> token-by-token bit for bit (1 592 taps, uneven splits too). GPU: identical
+> except QSA layers 23-39's attention outputs (cos 0.999995+) -- being made
+> bit-exact. First rate: 8 192 tokens in 61.3 s = 7.48 ms/token (llama.cpp
+> 0.8-2.0; target <= 1) -- unprofiled first cut. The unified GEMM kernel
+> regressed decode 22.7 -> 27.0 ms; a T=1 specialisation restores it. Also
+> fixed today: hipFree per token in the top-k (8k depth 23.2 ms/token, +0.5
+> over depth 6). Next: the two fixes, prefill profile, then the depth ladder
+> to 256k and step 4 (gateway).**
+>
 > **Rev 54 (2026-09-22 19:10 CEST, 17:10 UTC) -- L0 STEP 3: THE WHOLE MODEL ON
 > THREE CARDS (record §L0-STEP3, design rev 10).** Qwen3.8-Flash-Next, 256k
 > allocated (23.1/22.5/23.4 GB used, 2.4-3.3 GB free per card), P2P

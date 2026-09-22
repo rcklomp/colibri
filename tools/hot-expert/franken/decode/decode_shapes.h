@@ -72,6 +72,9 @@ constexpr int GDN_KEY_DIM = GDN_STATE * GDN_K_HEADS;   // 2048
 constexpr int GDN_VAL_DIM = GDN_STATE * GDN_V_HEADS;   // 6144
 // load_arch_tensors: conv_dim = key_dim*2 + value_dim, and that is attn_qkv's ne1
 constexpr int GDN_CONV_DIM = GDN_KEY_DIM * 2 + GDN_VAL_DIM;  // 10240
+// The GDN conv is undilated, so its window needs GDN_CONV_K-1 history slots
+// in front of the chunk (decode_backend.h, ple_conv_win).
+constexpr int GDN_CONV_HIST = GDN_CONV_K - 1;                // 3
 
 // ---- MoE ----------------------------------------------------------------
 constexpr int N_EXPERT      = 512;  // qwen4exp.expert_count

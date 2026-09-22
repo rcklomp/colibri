@@ -274,27 +274,37 @@ public:
     // GPU launches, and reproducing it here would only make this path slower
     // and less obviously correct. The epilogues and the GX_SILU_MUL
     // activation ARE reproduced, because those change the arithmetic.
+    //
+    // A chunk is the same thing T times, one column at a time, so the host
+    // path is bit-identical at any T by construction -- which is what makes
+    // `franken_decode_cpu --chunk 6` a usable oracle for `--chunk 1`.
     void gemv_batch(const GemvJob * jobs, int n, const float * x, int group,
-                    int x_mode, const float * x2) override {
+                    int x_mode, const float * x2, int T) override {
         (void) group;
+        const int64_t K = jobs[0].W->K;
         std::vector<float> xbuf;
-        const float * xin = x;
-        if (x_mode == GX_SILU_MUL) {
-            xbuf.resize((size_t) jobs[0].W->K);
-            for (size_t i = 0; i < xbuf.size(); ++i) xbuf[i] = siluf(x[i]) * x2[i];
-            xin = xbuf.data();
-        }
-        for (int i = 0; i < n; ++i) {
-            const Mat & W = *jobs[i].W;
-            gemv(W, xin, jobs[i].out);
-            switch (jobs[i].epi) {
-                case GE_SIGMOID:
-                    for (int64_t r = 0; r < W.rows; ++r) jobs[i].out[r] = sigmoidf(jobs[i].out[r]);
-                    break;
-                case GE_SCALE_SILU:
-                    for (int64_t r = 0; r < W.rows; ++r) jobs[i].out[r] = siluf(jobs[i].out[r] * jobs[i].arg);
-                    break;
-                default: break;
+        if (x_mode == GX_SILU_MUL) xbuf.resize((size_t) K);
+        for (int t = 0; t < (T > 0 ? T : 1); ++t) {
+            const float * xt  = x + (size_t) t * K;
+            const float * xin = xt;
+            if (x_mode == GX_SILU_MUL) {
+                const float * x2t = x2 + (size_t) t * K;
+                for (int64_t i = 0; i < K; ++i) xbuf[i] = siluf(xt[i]) * x2t[i];
+                xin = xbuf.data();
+            }
+            for (int i = 0; i < n; ++i) {
+                const Mat & W = *jobs[i].W;
+                float * out = jobs[i].out + (size_t) t * W.rows;
+                gemv(W, xin, out);
+                switch (jobs[i].epi) {
+                    case GE_SIGMOID:
+                        for (int64_t r = 0; r < W.rows; ++r) out[r] = sigmoidf(out[r]);
+                        break;
+                    case GE_SCALE_SILU:
+                        for (int64_t r = 0; r < W.rows; ++r) out[r] = siluf(out[r] * jobs[i].arg);
+                        break;
+                    default: break;
+                }
             }
         }
     }
@@ -345,16 +355,18 @@ public:
 
     void rms_norm_mul(const float * x, const float * w, float * y,
                       int ne0, int n_groups, size_t w_len, float eps) override {
+        // period in GROUPS: 1 for a [ne0] gamma, HC for a [HC*ne0] one. See
+        // decode_backend.h -- this is the batched generalisation of the old
+        // `w_tiled` flag and reduces to it at T == 1.
+        const int period = (int) std::max<size_t>(1, w_len / (size_t) ne0);
         for (int g = 0; g < n_groups; ++g) {
             const float * xg = x + (size_t) g * ne0;
             float * yg = y + (size_t) g * ne0;
             double sum = 0.0;
             for (int i = 0; i < ne0; ++i) sum += (double) xg[i] * xg[i];
             const float sc = 1.0f / std::sqrt((float)(sum / ne0) + eps);
-            for (int i = 0; i < ne0; ++i) {
-                const float wv = w ? w[w_len == (size_t) ne0 ? i : (size_t) g * ne0 + i] : 1.0f;
-                yg[i] = xg[i] * sc * wv;
-            }
+            const float * wg = w ? w + (size_t)(g % period) * ne0 : nullptr;
+            for (int i = 0; i < ne0; ++i) yg[i] = xg[i] * sc * (wg ? wg[i] : 1.0f);
         }
     }
     void l2_norm(const float * x, float * y, int ne0, int n_groups, float eps) override {
@@ -369,65 +381,101 @@ public:
     }
 
     // -- hyper-connections ---------------------------------------------------
-    void hc_broadcast(const float * x, float * res) override {
-        for (int c = 0; c < HC; ++c) std::memcpy(res + (size_t) c * N_EMBD, x, N_EMBD * sizeof(float));
+    void hc_broadcast(const float * x, float * res, int T) override {
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < HC; ++c)
+                std::memcpy(res + (size_t) t * HC_DIM + (size_t) c * N_EMBD,
+                            x + (size_t) t * N_EMBD, N_EMBD * sizeof(float));
     }
-    void hc_collapse(const float * xn, const float * gate, float * out) override {
-        for (int i = 0; i < N_EMBD; ++i) {
-            float a = xn[i] * gate[i];                       // stream 0 first, as ggml_cont does
-            for (int c = 1; c < HC; ++c) a += xn[(size_t) c * N_EMBD + i] * gate[(size_t) c * N_EMBD + i];
-            out[i] = a * (1.0f / (float) HC);
+    void hc_collapse(const float * xn, const float * gate, float * out, int T) override {
+        for (int t = 0; t < T; ++t) {
+            const float * xt = xn   + (size_t) t * HC_DIM;
+            const float * gt = gate + (size_t) t * HC_DIM;
+            float * ot = out + (size_t) t * N_EMBD;
+            for (int i = 0; i < N_EMBD; ++i) {
+                float a = xt[i] * gt[i];                     // stream 0 first, as ggml_cont does
+                for (int c = 1; c < HC; ++c)
+                    a += xt[(size_t) c * N_EMBD + i] * gt[(size_t) c * N_EMBD + i];
+                ot[i] = a * (1.0f / (float) HC);
+            }
         }
     }
-    void hc_combine(float * res, const float * blk, const float * inject) override {
-        hc_combine_norm(res, blk, inject, nullptr, nullptr, 0.0f);
+    void hc_combine(float * res, const float * blk, const float * inject, int T) override {
+        hc_combine_norm(res, blk, inject, nullptr, nullptr, 0.0f, T);
     }
     void hc_combine_norm(float * res, const float * blk, const float * inject,
-                         const float * w_norm, float * xn, float eps) override {
-        for (int c = 0; c < HC; ++c) {
-            const float w = 2.0f * sigmoidf(inject[c] * (1.0f / (float) HC));
-            float * rc = res + (size_t) c * N_EMBD;
-            double ss = 0.0;
-            for (int i = 0; i < N_EMBD; ++i) { rc[i] += blk[i] * w; ss += (double) rc[i] * rc[i]; }
-            if (!w_norm) continue;
-            const float sc = 1.0f / std::sqrt((float)(ss / N_EMBD) + eps);
-            const float * wg = w_norm + (size_t) c * N_EMBD;
-            for (int i = 0; i < N_EMBD; ++i) xn[(size_t) c * N_EMBD + i] = rc[i] * sc * wg[i];
+                         const float * w_norm, float * xn, float eps, int T) override {
+        for (int t = 0; t < T; ++t) {
+            const float * bt = blk + (size_t) t * N_EMBD;
+            for (int c = 0; c < HC; ++c) {
+                const float w = 2.0f * sigmoidf(inject[(size_t) t * HC + c] * (1.0f / (float) HC));
+                float * rc = res + (size_t) t * HC_DIM + (size_t) c * N_EMBD;
+                double ss = 0.0;
+                for (int i = 0; i < N_EMBD; ++i) { rc[i] += bt[i] * w; ss += (double) rc[i] * rc[i]; }
+                if (!w_norm) continue;
+                const float sc = 1.0f / std::sqrt((float)(ss / N_EMBD) + eps);
+                const float * wg = w_norm + (size_t) c * N_EMBD;
+                float * xt = xn + (size_t) t * HC_DIM + (size_t) c * N_EMBD;
+                for (int i = 0; i < N_EMBD; ++i) xt[i] = rc[i] * sc * wg[i];
+            }
         }
     }
 
     // -- PLE -----------------------------------------------------------------
     void ple_gate(const float * key, const float * query, const float * value,
-                  float * gated, float * gate_out) override {
-        for (int c = 0; c < HC; ++c) {
-            double s = 0.0;
-            for (int i = 0; i < N_EMBD; ++i)
-                s += (double) key[(size_t) c * N_EMBD + i] * query[(size_t) c * N_EMBD + i];
-            const float sf  = (float)(s) * (1.0f / std::sqrt((float) N_EMBD));
-            const float mag = std::sqrt(std::max(std::fabs(sf), 1e-6f));
-            const float g   = sigmoidf(sgnf(sf) * mag);
-            gate_out[c] = g;
-            for (int i = 0; i < N_EMBD; ++i) gated[(size_t) c * N_EMBD + i] = value[i] * g;
+                  float * gated, float * gate_out, int T) override {
+        for (int t = 0; t < T; ++t) {
+            const float * kt = key   + (size_t) t * HC_DIM;
+            const float * qt = query + (size_t) t * HC_DIM;
+            const float * vt = value + (size_t) t * N_EMBD;
+            for (int c = 0; c < HC; ++c) {
+                double s = 0.0;
+                for (int i = 0; i < N_EMBD; ++i)
+                    s += (double) kt[(size_t) c * N_EMBD + i] * qt[(size_t) c * N_EMBD + i];
+                const float sf  = (float)(s) * (1.0f / std::sqrt((float) N_EMBD));
+                const float mag = std::sqrt(std::max(std::fabs(sf), 1e-6f));
+                const float g   = sigmoidf(sgnf(sf) * mag);
+                gate_out[(size_t) t * HC + c] = g;
+                float * gt = gated + (size_t) t * HC_DIM + (size_t) c * N_EMBD;
+                for (int i = 0; i < N_EMBD; ++i) gt[i] = vt[i] * g;
+            }
         }
     }
-    void ple_conv_silu(const float * ring, int head, const float * w, float * out) override {
-        conv_taps(ring, head, PLE_CONV_HIST + 1, PLE_CONV_K, PLE_CONV_DIL, HC_DIM, w, out);
+    void ple_conv_win(const float * win, const float * w, float * out, int T) override {
+        for (int t = 0; t < T; ++t)
+            conv_win_taps(win, t, PLE_CONV_K, PLE_CONV_DIL, HC_DIM, w,
+                          out + (size_t) t * HC_DIM);
+    }
+    void conv_slide(float * win, int hist, int channels, int T) override {
+        // every channel column is read whole before it is written, so the
+        // overlapping T < hist case is safe
+        std::vector<float> col(hist);
+        for (int c = 0; c < channels; ++c) {
+            for (int s = 0; s < hist; ++s) col[s] = win[(size_t)(T + s) * channels + c];
+            for (int s = 0; s < hist; ++s) win[(size_t) s * channels + c] = col[s];
+        }
     }
 
     // -- Gated DeltaNet ------------------------------------------------------
-    void gdn_conv_gate(const float * ring, int head, const float * w,
+    void gdn_conv_gate(const float * win, const float * w,
                        const float * beta_raw, const float * alpha_raw,
                        const float * dt, const float * ssm_a, float * conv_out,
-                       float * beta_sig, float * a_softplus, float * gate,
-                       float * g_exp) override {
-        conv_taps(ring, head, GDN_CONV_K, GDN_CONV_K, 1, GDN_CONV_DIM, w, conv_out);
-        for (int h = 0; h < GDN_V_HEADS; ++h) {
-            beta_sig[h]   = sigmoidf(beta_raw[h]);
-            const float sp = softplusf(alpha_raw[h] + dt[h]);
-            a_softplus[h] = sp;
-            const float g = sp * ssm_a[h];      // ssm_a already holds -exp(A_log)
-            gate[h]       = g;
-            g_exp[h]      = std::exp(g);
+                       float * conv_qk, float * beta_sig, float * a_softplus,
+                       float * gate, float * g_exp, int T) override {
+        for (int t = 0; t < T; ++t) {
+            float * co = conv_out + (size_t) t * GDN_CONV_DIM;
+            conv_win_taps(win, t, GDN_CONV_K, 1, GDN_CONV_DIM, w, co);
+            std::memcpy(conv_qk + (size_t) t * 2 * GDN_KEY_DIM, co,
+                        (size_t) 2 * GDN_KEY_DIM * sizeof(float));
+            for (int h = 0; h < GDN_V_HEADS; ++h) {
+                const size_t o = (size_t) t * GDN_V_HEADS + h;
+                beta_sig[o]   = sigmoidf(beta_raw[o]);
+                const float sp = softplusf(alpha_raw[o] + dt[h]);
+                a_softplus[o] = sp;
+                const float g = sp * ssm_a[h];  // ssm_a already holds -exp(A_log)
+                gate[o]       = g;
+                g_exp[o]      = std::exp(g);
+            }
         }
     }
 
@@ -440,24 +488,32 @@ public:
     // ORDER matters too: m3 computed the prediction from the UNDECAYED state,
     // this decays first, as the op does.
     void gdn_step(float * state, const float * q, const float * k, const float * v,
-                  const float * g_exp, const float * beta, float * out) override {
+                  const float * g_exp, const float * beta, float * out,
+                  int T, int qk_stride, int v_stride) override {
         const float scale = 1.0f / std::sqrt((float) GDN_STATE);
         pool_.parallel_for(GDN_V_HEADS, [&](int64_t h0, int64_t h1) {
             for (int64_t h = h0; h < h1; ++h) {
                 const int hk = (int)(h % GDN_K_HEADS);     // ggml_repeat / `iv1 % nek1`
-                const float * kh = k + (size_t) hk * GDN_STATE;
-                const float * qh = q + (size_t) hk * GDN_STATE;
-                const float * vh = v + (size_t) h  * GDN_STATE;
                 float * S = state + (size_t) h * GDN_STATE * GDN_STATE;
-                const float ge = g_exp[h], bh = beta[h];
-                for (int j = 0; j < GDN_STATE; ++j) {
-                    float * row = S + (size_t) j * GDN_STATE;
-                    double sk = 0.0;
-                    for (int i = 0; i < GDN_STATE; ++i) { row[i] *= ge; sk += (double) row[i] * kh[i]; }
-                    const float d = bh * (vh[j] - (float) sk);
-                    double o = 0.0;
-                    for (int i = 0; i < GDN_STATE; ++i) { row[i] += kh[i] * d; o += (double) row[i] * qh[i]; }
-                    out[(size_t) h * GDN_STATE + j] = (float) o * scale;
+                // the chunk in order: the state a token sees is the one the
+                // token before it left, which is what makes T steps of one
+                // token and one step of T tokens the same arithmetic
+                for (int t = 0; t < T; ++t) {
+                    const float * kh = k + (size_t) t * qk_stride + (size_t) hk * GDN_STATE;
+                    const float * qh = q + (size_t) t * qk_stride + (size_t) hk * GDN_STATE;
+                    const float * vh = v + (size_t) t * v_stride  + (size_t) h  * GDN_STATE;
+                    const float ge = g_exp[(size_t) t * GDN_V_HEADS + h];
+                    const float bh = beta [(size_t) t * GDN_V_HEADS + h];
+                    float * ot = out + (size_t) t * GDN_VAL_DIM + (size_t) h * GDN_STATE;
+                    for (int j = 0; j < GDN_STATE; ++j) {
+                        float * row = S + (size_t) j * GDN_STATE;
+                        double sk = 0.0;
+                        for (int i = 0; i < GDN_STATE; ++i) { row[i] *= ge; sk += (double) row[i] * kh[i]; }
+                        const float d = bh * (vh[j] - (float) sk);
+                        double o = 0.0;
+                        for (int i = 0; i < GDN_STATE; ++i) { row[i] += kh[i] * d; o += (double) row[i] * qh[i]; }
+                        ot[j] = (float) o * scale;
+                    }
                 }
             }
         });
@@ -478,7 +534,16 @@ public:
 
     // -- MoE ------------------------------------------------------------------
     void router(const float * logits, int * ids, float * weights,
-                int * ids_log, float * w_log) override {
+                int * ids_log, float * w_log, int T) override {
+        for (int t = 0; t < T; ++t)
+            router_one(logits + (size_t) t * N_EXPERT,
+                       ids + (size_t) t * N_EXPERT_USED,
+                       weights + (size_t) t * N_EXPERT_USED,
+                       ids_log ? ids_log + (size_t) t * N_EXPERT_USED : nullptr,
+                       w_log   ? w_log   + (size_t) t * N_EXPERT_USED : nullptr);
+    }
+    void router_one(const float * logits, int * ids, float * weights,
+                    int * ids_log, float * w_log) {
         // ggml_soft_max over all N_EXPERT, then ggml_top_k on the same probs
         float mx = logits[0];
         for (int i = 1; i < N_EXPERT; ++i) mx = std::max(mx, logits[i]);
@@ -502,30 +567,42 @@ public:
     }
 
     void moe_gate_up(const Mat & gate, const Mat & up, const int * ids,
-                     const float * x, float * y_gate, float * y_up) override {
-        for (int k = 0; k < N_EXPERT_USED; ++k) {
-            gemv_expert(gate, ids[k], x, y_gate + (size_t) k * N_FF_EXP);
-            gemv_expert(up,   ids[k], x, y_up   + (size_t) k * N_FF_EXP);
-        }
+                     const float * x, float * y_gate, float * y_up, int T) override {
+        for (int t = 0; t < T; ++t)
+            for (int k = 0; k < N_EXPERT_USED; ++k) {
+                const int e = ids[(size_t) t * N_EXPERT_USED + k];
+                const size_t col = (size_t) t * N_EXPERT_USED + k;
+                const float * xt = x + (size_t) t * gate.K;
+                gemv_expert(gate, e, xt, y_gate + col * N_FF_EXP);
+                gemv_expert(up,   e, xt, y_up   + col * N_FF_EXP);
+            }
     }
     void silu_mul(const float * g, const float * u, float * h, size_t n) override {
         for (size_t i = 0; i < n; ++i) h[i] = siluf(g[i]) * u[i];
     }
-    void moe_down(const Mat & down, const int * ids, const float * h, float * eo) override {
-        for (int k = 0; k < N_EXPERT_USED; ++k)
-            gemv_expert(down, ids[k], h + (size_t) k * N_FF_EXP, eo + (size_t) k * N_EMBD);
+    void moe_down(const Mat & down, const int * ids, const float * h, float * eo, int T) override {
+        for (int t = 0; t < T; ++t)
+            for (int k = 0; k < N_EXPERT_USED; ++k) {
+                const size_t col = (size_t) t * N_EXPERT_USED + k;
+                gemv_expert(down, ids[col], h + col * N_FF_EXP, eo + col * N_EMBD);
+            }
     }
     void moe_finish(const float * eo, const float * w, const float * sh_raw,
                     const float * sh_gate, float * sh_gate_sig, float * moe_out,
-                    float * sh_gated, float * out) override {
-        const float g0 = sigmoidf(sh_gate[0]);
-        sh_gate_sig[0] = g0;
-        for (int i = 0; i < N_EMBD; ++i) {
-            float a = 0.0f;
-            for (int k = 0; k < N_EXPERT_USED; ++k) a += w[k] * eo[(size_t) k * N_EMBD + i];
-            moe_out[i]  = a;
-            sh_gated[i] = sh_raw[i] * g0;
-            out[i]      = a + sh_gated[i];
+                    float * sh_gated, float * out, int T) override {
+        for (int t = 0; t < T; ++t) {
+            const float g0 = sigmoidf(sh_gate[t]);
+            sh_gate_sig[t] = g0;
+            const float * eot = eo + (size_t) t * N_EXPERT_USED * N_EMBD;
+            const float * wt  = w  + (size_t) t * N_EXPERT_USED;
+            const size_t o = (size_t) t * N_EMBD;
+            for (int i = 0; i < N_EMBD; ++i) {
+                float a = 0.0f;
+                for (int k = 0; k < N_EXPERT_USED; ++k) a += wt[k] * eot[(size_t) k * N_EMBD + i];
+                moe_out[o + i]  = a;
+                sh_gated[o + i] = sh_raw[o + i] * g0;
+                out[o + i]      = a + sh_gated[o + i];
+            }
         }
     }
 
@@ -551,17 +628,32 @@ public:
     // -- QSA -------------------------------------------------------------------
     void kv_store_q8_0(const float * k, const float * v,
                        int8_t * kqs, uint16_t * ksc, int8_t * vqs, uint16_t * vsc,
-                       int cell) override {
-        for (int h = 0; h < N_KV_HEADS; ++h) {
-            const size_t e = ((size_t) cell * N_KV_HEADS + h) * HEAD_DIM;
-            const size_t sb = ((size_t) cell * N_KV_HEADS + h) * (HEAD_DIM / 32);
-            quant_row(k + (size_t) h * HEAD_DIM, kqs + e, ksc + sb);
-            quant_row(v + (size_t) h * HEAD_DIM, vqs + e, vsc + sb);
+                       int cell0, int T) override {
+        for (int t = 0; t < T; ++t)
+            for (int h = 0; h < N_KV_HEADS; ++h) {
+                const size_t e  = ((size_t)(cell0 + t) * N_KV_HEADS + h) * HEAD_DIM;
+                const size_t sb = ((size_t)(cell0 + t) * N_KV_HEADS + h) * (HEAD_DIM / 32);
+                const size_t s  = (size_t) t * N_KV_HEADS * HEAD_DIM + (size_t) h * HEAD_DIM;
+                quant_row(k + s, kqs + e, ksc + sb);
+                quant_row(v + s, vqs + e, vsc + sb);
+            }
+    }
+    void idx_pool_chunk(const float * k_new, float * sum, float * raw0, int pos0,
+                        int T, const float * k_norm, float eps, uint16_t * pooled,
+                        float * dbg_pooled, float * dbg_roped) override {
+        for (int t = 0; t < T; ++t) {
+            const int p        = pos0 + t;
+            const int blk      = p / QSA_RATIO;
+            const int n_filled = (p + 1) - blk * QSA_RATIO;
+            idx_pool_block(k_new + (size_t) t * IDX_DIM, sum, raw0, blk, n_filled,
+                           k_norm, eps, pooled,
+                           t + 1 == T ? dbg_pooled : nullptr,
+                           t + 1 == T ? dbg_roped  : nullptr);
         }
     }
     void idx_pool_block(const float * k_new, float * sum, float * raw0, int blk,
                         int n_filled, const float * k_norm, float eps,
-                        uint16_t * pooled, float * dbg_pooled, float * dbg_roped) override {
+                        uint16_t * pooled, float * dbg_pooled, float * dbg_roped) {
         float p[IDX_DIM];
         for (int i = 0; i < IDX_DIM; ++i) {
             const float kv = k_new[i];
@@ -593,26 +685,37 @@ public:
     void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
                      const float * q_norm, const float * k_norm, const float * iq_norm,
                      float * qcur, float * gate, float * gsig, float * kcur,
-                     float * idxq, int pos, float eps) override {
+                     float * idxq, int pos0, float eps, int T) override {
+      for (int t = 0; t < T; ++t) {
+        const float * qf = qfull  + (size_t) t * N_Q_HEADS   * HEAD_DIM * 2;
+        const float * kr = kraw   + (size_t) t * N_KV_HEADS  * HEAD_DIM;
+        const float * ir = idxraw + (size_t) t * IDX_N_HEADS * IDX_DIM;
+        float * qc = qcur + (size_t) t * N_Q_HEADS   * HEAD_DIM;
+        float * ga = gate + (size_t) t * N_Q_HEADS   * HEAD_DIM;
+        float * gs = gsig + (size_t) t * N_Q_HEADS   * HEAD_DIM;
+        float * kc = kcur + (size_t) t * N_KV_HEADS  * HEAD_DIM;
+        float * iq = idxq + (size_t) t * IDX_N_HEADS * IDX_DIM;
+
         // the [q|gate] split of attn_q's interleaved rows (qwen4exp.cpp:726)
         for (int h = 0; h < N_Q_HEADS; ++h) {
-            const float * row = qfull + (size_t) h * HEAD_DIM * 2;
-            std::memcpy(qcur + (size_t) h * HEAD_DIM, row, HEAD_DIM * sizeof(float));
+            const float * row = qf + (size_t) h * HEAD_DIM * 2;
+            std::memcpy(qc + (size_t) h * HEAD_DIM, row, HEAD_DIM * sizeof(float));
             for (int i = 0; i < HEAD_DIM; ++i) {
                 const float v = row[HEAD_DIM + i];
-                gate[(size_t) h * HEAD_DIM + i] = v;
-                gsig[(size_t) h * HEAD_DIM + i] = sigmoidf(v);
+                ga[(size_t) h * HEAD_DIM + i] = v;
+                gs[(size_t) h * HEAD_DIM + i] = sigmoidf(v);
             }
         }
-        std::memcpy(kcur, kraw,   (size_t) N_KV_HEADS  * HEAD_DIM * sizeof(float));
-        std::memcpy(idxq, idxraw, (size_t) IDX_N_HEADS * IDX_DIM  * sizeof(float));
+        std::memcpy(kc, kr, (size_t) N_KV_HEADS  * HEAD_DIM * sizeof(float));
+        std::memcpy(iq, ir, (size_t) IDX_N_HEADS * IDX_DIM  * sizeof(float));
 
-        rms_norm_mul(qcur, q_norm,  qcur, HEAD_DIM, N_Q_HEADS,   HEAD_DIM, eps);
-        rms_norm_mul(kcur, k_norm,  kcur, HEAD_DIM, N_KV_HEADS,  HEAD_DIM, eps);
-        rms_norm_mul(idxq, iq_norm, idxq, IDX_DIM,  IDX_N_HEADS, IDX_DIM,  eps);
-        rope_imrope(qcur, N_Q_HEADS,   HEAD_DIM, N_ROT, pos);
-        rope_imrope(kcur, N_KV_HEADS,  HEAD_DIM, N_ROT, pos);
-        rope_imrope(idxq, IDX_N_HEADS, IDX_DIM,  N_ROT, pos);
+        rms_norm_mul(qc, q_norm,  qc, HEAD_DIM, N_Q_HEADS,   HEAD_DIM, eps);
+        rms_norm_mul(kc, k_norm,  kc, HEAD_DIM, N_KV_HEADS,  HEAD_DIM, eps);
+        rms_norm_mul(iq, iq_norm, iq, IDX_DIM,  IDX_N_HEADS, IDX_DIM,  eps);
+        rope_imrope(qc, N_Q_HEADS,   HEAD_DIM, N_ROT, pos0 + t);
+        rope_imrope(kc, N_KV_HEADS,  HEAD_DIM, N_ROT, pos0 + t);
+        rope_imrope(iq, IDX_N_HEADS, IDX_DIM,  N_ROT, pos0 + t);
+      }
     }
     void qsa_expand(const float * blk_scores, float * cell, int * sel, int n_kv,
                     int q_pos, int ratio, int tail_start, int sel_identity) override {
@@ -714,13 +817,16 @@ private:
 
     // ggml_ssm_conv (ops.cpp:9741-9750) generalised by a dilation, which is
     // how build_ple's tap k reads (kern-1-k)*dilation positions back.
-    void conv_taps(const float * ring, int head, int ring_slots, int kern, int dil,
-                   int channels, const float * w, float * out) {
+    //
+    // Window form: token `t` of the chunk lives at slot (kern-1)*dil + t, so
+    // its tap k -- which reads (kern-1-k)*dil positions back -- is at slot
+    // t + k*dil. No modulus, and the first tokens of a chunk read the
+    // previous chunk's tail without any special case.
+    void conv_win_taps(const float * win, int t, int kern, int dil,
+                       int channels, const float * w, float * out) {
         for (int c = 0; c < channels; ++c) out[c] = 0.0f;
         for (int k = 0; k < kern; ++k) {
-            const int back = (kern - 1 - k) * dil;
-            const int slot = ((head - back) % ring_slots + ring_slots) % ring_slots;
-            const float * s = ring + (size_t) slot * channels;
+            const float * s = win + (size_t)(t + k * dil) * channels;
             for (int c = 0; c < channels; ++c) out[c] += s[c] * w[(size_t) c * kern + k];
         }
         for (int c = 0; c < channels; ++c) out[c] = siluf(out[c]);

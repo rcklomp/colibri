@@ -125,6 +125,13 @@ D_MODEL=/home/ronald/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M/DeepSeek-V4
 D_SNAP_DIR=/home/ronald/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M
 D_LABEL="DeepSeek-V4-Flash-0731 UD-IQ2_M"
 
+# GLM-5.3-Flash on the SAME llama.cpp: 149 GB, ~half of it stays in host RAM under fit (2.8 tok/s
+# on the 09-16 ladder). Not for daily use; it exists so the three models can be compared on one
+# engine (2026-09-22).
+G_MODEL=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
+G_SNAP_DIR=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS
+G_LABEL="GLM-5.3-Flash UD-IQ4_XS (llama.cpp)"
+
 # --- backend: HIP docker, same bin dir/image the F11 chain used --------------------------------
 ALT_BIN_DIR=/home/ronald/src/llama-glm53/build-hip/bin
 ALT_IMAGE=rocm/dev-ubuntu-24.04:7.14.0-full
@@ -445,6 +452,7 @@ cmd_alt() {
   case "$model_key" in
     Q) model=$Q_MODEL; snap=$Q_SNAP_DIR; label=$Q_LABEL; logname=qwen38 ;;
     D) model=$D_MODEL; snap=$D_SNAP_DIR; label=$D_LABEL; logname=deepseek ;;
+    G) model=$G_MODEL; snap=$G_SNAP_DIR; label=$G_LABEL; logname=glm-llama ;;
   esac
   echo "=== serve_alt: switching to $label $(date -Is)"
   refuse_if_busy "$logname" || exit 1
@@ -519,6 +527,7 @@ cmd_status() {
 case "${1:-}" in
   qwen38)   cmd_alt Q ;;
   deepseek) cmd_alt D ;;
+  glm-llama) cmd_alt G ;;
   glm)      cmd_glm ;;
   status)   cmd_status ;;
   *)

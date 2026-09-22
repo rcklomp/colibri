@@ -50,6 +50,13 @@
 # would refuse a larger number anyway.
 set -u
 
+# FRANKEN_BIN may be the engine itself or a wrapper that execs it (the docker
+# wrapper the first served run used, ~/bench/franken_decode_docker.sh, is one:
+# the gateway only ever runs `<BIN> <cap>` with SERVE=1 in the environment, so
+# anything that forwards stdin/stdout/stderr and the environment will do).
+# Whatever it is, the PROCESS the engine runs as must still be called
+# franken_decode: serve_alt.sh's `ps -C franken_decode` is how the rig lock's
+# keeper and `serve_alt.sh status` find it.
 BIN=${FRANKEN_BIN:-$HOME/src/colibri/tools/hot-expert/franken/decode/franken_decode}
 GGUF=${FRANKEN_GGUF:-$HOME/models/Qwen3.8-Flash-Next/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf}
 GGUF_DIR=$(dirname "$GGUF")
@@ -73,15 +80,63 @@ export FRANKEN_CTX=${FRANKEN_CTX:-262144}
 export FRANKEN_CHUNK=${FRANKEN_CHUNK:-256}
 export FRANKEN_DEVICES=${FRANKEN_DEVICES:-3}
 export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-0}
-# Prefix reuse: one snapshot of the recurrent state per prefill chunk, eight
-# kept per slot. A snapshot is ~118 MB of HOST memory and one download a card;
-# they are what lets a second conversation reuse a shared system/tool block
-# (accept_live.sh check 2 wants reused >= prompt_tokens - 256, which is the
-# chunk). FRANKEN_SNAP_EVERY in TOKENS, 0 keeps the default.
+# Prefix reuse. A checkpoint is taken at every prefill chunk boundary and once
+# at the end of every request (the point a follow-up turn resumes from), eight
+# kept per slot inside a host-memory budget. Each costs ~118 MB of recurrent
+# state, plus ~13.8 kB a token of CELLS if and when something is about to
+# overwrite them -- see franken_serve.cpp's `struct Snapshot`. They are what
+# lets a second conversation reuse a shared system/tool block after another
+# request has used the same slot; accept_live.sh check 2 wants
+# reused >= prompt_tokens - 256, which is why the interval is the chunk.
+# Halving FRANKEN_SNAP_EVERY is the lever if a real prompt's shared prefix ends
+# just above a boundary; it costs one more 118 MB download per interval.
 export FRANKEN_SNAP_EVERY=${FRANKEN_SNAP_EVERY:-256}
 export FRANKEN_SNAP_KEEP=${FRANKEN_SNAP_KEEP:-8}
-# The [req] accounting line, same as the GLM gateway.
+export FRANKEN_SNAP_BUDGET_MB=${FRANKEN_SNAP_BUDGET_MB:-6144}
+# --- THE ENV DIFF AGAINST ~/start_glm53.sh ----------------------------------
+# Everything that file exports falls into three groups. The engine-specific
+# ones (COLI_VULKAN, COLI_VK_DEV*/EXPERTS*/SHADERS, COLI_USAGE_PATH,
+# COLI_KDA_GPU, GLM53_VK_SWIGLU_CLAMP, GLM53_PREFILL_CHUNK, GLM53_MLA_ATTN_GPU,
+# GLM53_MOE_ONE_TEAM, GLM53_I4_FAST, GLM53_PREFIX_CKPT, GLM53_MAXT,
+# GLM53_VERBOSE) are read by glm53.c and by nothing else; this engine's
+# equivalents are the FRANKEN_* block above. That leaves the GATEWAY-side ones,
+# which are family-neutral and are the ones that had to be copied:
+#
+#   COLI_REQ_LOG=1     the one [req] line a request, which ~/bench/owui_report.sh
+#                      and accept_live.sh's idle check both read.
+#   COLI_PREFIX_PIN=1  P7. Open WebUI rebuilds its `memory_context` system block
+#                      every turn; pin_context_blocks (openai_server.py:2371)
+#                      replaces it with the conversation's FIRST one, so the
+#                      shared prefix stays byte-identical across turns. Without
+#                      it the prompt changes near its head and prefix reuse --
+#                      the thing this engine's checkpoints exist for -- is lost
+#                      on every turn. It is a no-op while the ledger is on, and
+#                      the ledger is off here (see COLI_LEDGER).
+#   COLI_THINK=0       Qwen3.8's gateway default is xhigh thinking
+#                      (openai_server.py:5041), which is why the first served
+#                      run answered every UI turn with a reasoning_content
+#                      block in front of it. The GLM path the owner is used to
+#                      serves with thinking off; this is the same switch, and
+#                      the renderer closes the block in the prompt
+#                      (`<think>\n\n</think>`) rather than hoping the model
+#                      stops on its own. An explicit client reasoning_effort
+#                      still wins.
+#   COLI_LEDGER=1      set for parity and NOT sufficient: ledger_enabled()
+#                      (openai_server.py:2703-2706) is `ARCH == "glm53" and
+#                      COLI_LEDGER != "0"`, so the conversation ledger -- and
+#                      with it accept_live.sh check 2b -- is off BY CODE for
+#                      every other family, whatever this variable says. 2b
+#                      reporting SKIP against this engine is that, not a
+#                      configuration mistake. Widening the gate is a gateway
+#                      change with a real risk attached: _ledger_record reads
+#                      `plan.parts`, which only render_chat_glm53 produces
+#                      (openai_server.py:1998), so a ledger on qwen38 would
+#                      record part-less entries and can log `ledger=broken` --
+#                      which check 2b fails on, turning a SKIP into a FAIL.
 export COLI_REQ_LOG=1
+export COLI_PREFIX_PIN=1
+export COLI_THINK=0
+export COLI_LEDGER=1
 
 # The gateway refuses to bind 0.0.0.0 without a key -- same key file, same
 # permissions rule as start_glm53.sh.

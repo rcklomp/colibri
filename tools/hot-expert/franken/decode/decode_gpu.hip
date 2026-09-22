@@ -229,6 +229,131 @@ __device__ __forceinline__ int desc_of(const GemvBatchD & b, int row) {
     return j;
 }
 
+// The prefill form of the same kernel (design 9.4): T activation columns per
+// launch, a wave loading each weight block ONCE and dotting it against
+// GEMM_TILE of them. That reuse is the whole point of batching a prompt --
+// the trunk is ~5 GB a token, so a tile of 8 reads it an eighth as often.
+//
+// Activations are token-major (x[t*K + i]), so a row is contiguous and the
+// per-token loads inside the tile stay coalesced across the wave. Outputs are
+// token-major too: out[t*rows + row].
+//
+// `t0` is the first token of this tile; grid.z selects the tile. A tile short
+// of GEMM_TILE at the end of a chunk is handled by the `nt` bound, not by
+// padding, so no garbage column is ever read.
+#define GEMM_TILE 8
+
+__global__ __launch_bounds__(GEMV_THREADS)
+void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
+                  const float * __restrict__ x2, int nsplit,
+                  float * __restrict__ part, int stage_x, int T) {
+    extern __shared__ float sx[];
+
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int grow = blockIdx.x * GEMV_WAVES + wave;
+    const int t0   = blockIdx.z * GEMM_TILE;
+    const int nt   = min(GEMM_TILE, T - t0);
+    if (nt <= 0) return;
+
+    const int gran = (b.has_q6k ? 256 : WAVE);
+    int c0, c1;
+    split_range((b.K + gran - 1) / gran, nsplit, blockIdx.y, &c0, &c1);
+    const int e0 = c0 * gran;
+    const int e1 = min(b.K, c1 * gran);
+    const int slice = e1 - e0;
+
+    // Stage this tile's slice of every column: sx[j*slice + i]. Shared by all
+    // GEMV_WAVES rows of the workgroup, which is the second reuse.
+    if (stage_x) {
+        for (int j = 0; j < nt; ++j) {
+            const float * src  = x  + (size_t)(t0 + j) * b.K + e0;
+            const float * src2 = x2 ? x2 + (size_t)(t0 + j) * b.K + e0 : nullptr;
+            float * dst = sx + (size_t) j * slice;
+            for (int i = threadIdx.x; i < slice; i += GEMV_THREADS)
+                dst[i] = (b.x_mode == GX_SILU_MUL) ? d_silu(src[i]) * src2[i] : src[i];
+        }
+        __syncthreads();
+    }
+
+    if (grow >= b.total_rows) return;
+    const int  di  = desc_of(b, grow);
+    const GemvDesc d = b.d[di];
+    const int  row = grow - d.row_off;
+
+    float acc[GEMM_TILE];
+#pragma unroll
+    for (int j = 0; j < GEMM_TILE; ++j) acc[j] = 0.0f;
+
+    // one weight block, `nt` activation columns
+    if (d.type == FK_Q_Q8_0) {
+        const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
+        for (int bl = e0 >> 5; bl < (e1 >> 5); ++bl) {
+            const unsigned char * bp = rp + (size_t) bl * FK_Q8_0_BLOCK_BYTES;
+            const float w = fk_q8_0_block_d(bp) *
+                            (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[lane];
+            const int off = (bl << 5) + lane - e0;
+            for (int j = 0; j < nt; ++j)
+                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + off]
+                                         : x[(size_t)(t0 + j) * b.K + e0 + off], acc[j]);
+        }
+    } else if (d.type == FK_Q_BF16) {
+        const unsigned short * rp = (const unsigned short *) d.base + (size_t) row * d.row_stride;
+        for (int i = e0 + lane; i < e1; i += WAVE) {
+            const float w = fk_bf16_to_f32(rp[i]);
+            for (int j = 0; j < nt; ++j)
+                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + (i - e0)]
+                                         : x[(size_t)(t0 + j) * b.K + i], acc[j]);
+        }
+    } else if (d.type == FK_Q_F32) {
+        const float * rp = (const float *) d.base + (size_t) row * d.row_stride;
+        for (int i = e0 + lane; i < e1; i += WAVE) {
+            const float w = rp[i];
+            for (int j = 0; j < nt; ++j)
+                acc[j] = fmaf(w, stage_x ? sx[(size_t) j * slice + (i - e0)]
+                                         : x[(size_t)(t0 + j) * b.K + i], acc[j]);
+        }
+    } else {
+        // IQ3_S / IQ4_XS / IQ4_NL / Q6_K decode a whole lane-run at once, so
+        // they reuse the single-column primitives per token rather than
+        // hoisting one weight; only the expert formats take this path and the
+        // experts get their own batched kernels (design 9.4 item 2).
+        for (int j = 0; j < nt; ++j) {
+            const float * xt = x + (size_t)(t0 + j) * b.K;
+            float a = 0.0f;
+            if (d.type == FK_Q_Q6_K) {
+                const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
+                for (int bl = e0 >> 8; bl < (e1 >> 8); ++bl)
+                    a += fk_q6k_block_dot(rp + (size_t) bl * FK_Q6K_BLOCK_BYTES,
+                                          xt + (bl << 8) + (lane << 3), lane);
+            }
+            acc[j] = a;
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < GEMM_TILE; ++j) {
+        if (j >= nt) break;
+        const float sum = wave_sum(acc[j]);
+        if (lane != 0) continue;
+        if (nsplit > 1) part[((size_t) blockIdx.y * T + (t0 + j)) * b.total_rows + grow] = sum;
+        else            d.out[(size_t)(t0 + j) * d.rows + row] = apply_epi(sum, d.epi, d.arg);
+    }
+}
+
+__global__ void k_reduce_splits_gemm(GemvBatchD b, const float * __restrict__ part,
+                                     int nsplit, int T) {
+    const int grow = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t    = blockIdx.y;
+    if (grow >= b.total_rows || t >= T) return;
+    float a = 0.0f;
+    for (int s = 0; s < nsplit; ++s)
+        a += part[((size_t) s * T + t) * b.total_rows + grow];
+    const int di = desc_of(b, grow);
+    b.d[di].out[(size_t) t * b.d[di].rows + grow - b.d[di].row_off] =
+        apply_epi(a, b.d[di].epi, b.d[di].arg);
+}
+
 __global__ __launch_bounds__(GEMV_THREADS)
 void k_gemv_batch(GemvBatchD b, const float * __restrict__ x,
                   const float * __restrict__ x2, int nsplit,

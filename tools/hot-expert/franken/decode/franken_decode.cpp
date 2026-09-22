@@ -70,6 +70,10 @@ void usage(const char * p) {
         "                           both arms exist so the profile can decide\n"
         "          [--gemv-min-rows N] split K below this many output rows (default\n"
         "                           1024); sweep it against prof_gemv_*_gbs\n"
+        "          [--no-expert-gather] run a chunk's expert assignments one at a time\n"
+        "                           instead of through the device-side sort + row-gather;\n"
+        "                           the A/B that says whether design 9.4 item 5 is\n"
+        "                           bit-identical to the per-assignment path\n"
         "          [--sync-debug]   drain and check after every launch and copy;\n"
         "                           names the failing op, its class, layer and device\n"
         "          [--dump DIR]     write this run's taps in the oracle's own format,\n"
@@ -124,6 +128,7 @@ int main(int argc, char ** argv) {
     int  gemv_lds = 1;
     int  gemv_min_rows = 1024;
     bool sync_debug = false;
+    bool expert_gather = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -141,6 +146,7 @@ int main(int argc, char ** argv) {
         else if (a == "--gemv-lds" && i + 1 < argc) gemv_lds = std::atoi(argv[++i]);
         else if (a == "--gemv-min-rows" && i + 1 < argc) gemv_min_rows = std::atoi(argv[++i]);
         else if (a == "--sync-debug")             sync_debug = true;
+        else if (a == "--no-expert-gather")       expert_gather = false;
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--jitter" && i + 1 < argc) jitter = (float) std::atof(argv[++i]);
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
@@ -197,6 +203,7 @@ int main(int argc, char ** argv) {
             b->set_gemv_lds(gemv_lds);
             b->set_gemv_min_rows(gemv_min_rows);
             b->set_sync_debug(sync_debug);
+            b->set_expert_gather(expert_gather);
         }
         Backend * be = devs.front();
         std::printf("backend=%s devices=%d layers=%d-%d ctx=%d tokens=%zu chunk=%d head=%d quant_act=%d\n",
@@ -258,27 +265,74 @@ int main(int argc, char ** argv) {
         // the LAST ROW of the LAST chunk -- the column the oracle dump
         // writes -- whatever the chunking, which is what makes two runs at
         // different --chunk comparable tap for tap.
+        // A timing run measures the ENGINE: a tap is a download and the
+        // recorder would put 1 600 of them on the last chunk.
+        if (time_prefill > 0) run.set_capture(false);
+        std::vector<double> chunk_ms, chunk_issue;
+        long long pf_launches = 0;
+        int n_chunks = 0;
         const auto t_pf0 = std::chrono::steady_clock::now();
         for (size_t t = 0; t < tokens.size(); t += (size_t) chunk) {
             const int T = (int) std::min((size_t) chunk, tokens.size() - t);
-            rec.enable(t + (size_t) T == tokens.size());
+            rec.enable(time_prefill == 0 && t + (size_t) T == tokens.size());
             const float * ple = need_ple ? ple_all.data() + t * N_EMBD : nullptr;
             last_greedy = run.step(tokens.data() + t, T, ple, rec);
             if (routing.loaded()) routing.observe(run.pos() - 1, il0, run.routed_ids());
+            ++n_chunks;
+            chunk_ms.push_back(run.last_body_ms());
+            chunk_issue.push_back(run.last_issue_ms());
+            // The FIRST chunk pays every one-time allocation this run makes
+            // (the split-K partials and the expert sort tables grow with T),
+            // so the profile is reset after it rather than before: otherwise
+            // a hipMalloc and a hipFree land in the first chunk's numbers and
+            // hipFree synchronises the device.
+            if (time_prefill > 0 && n_chunks == 1 &&
+                t + (size_t) T < tokens.size())            // only if more follow
+                for (auto * b : devs) b->prof_reset();
             if (time_prefill == 0 || t == 0 || t + (size_t) T == tokens.size()) {
                 std::printf("chunk at %zu T=%d id=%d pos=%d done\n", t, T, tokens[t], run.pos() - 1);
                 std::fflush(stdout);
             }
         }
         if (time_prefill > 0) {
+            run.set_capture(true);
             // One sync already happened inside step() (the greedy id), so the
             // wall time below is the whole prefill and not a queue depth.
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t_pf0).count();
-            std::printf("prefill_tokens=%d chunk=%d prefill_ms=%.1f "
+            std::printf("prefill_tokens=%d chunk=%d chunks=%d prefill_ms=%.1f "
                         "prefill_ms_per_token=%.4f prefill_tokens_per_s=%.2f\n",
-                        time_prefill, chunk, ms, ms / (double) time_prefill,
+                        time_prefill, chunk, n_chunks, ms, ms / (double) time_prefill,
                         1000.0 * (double) time_prefill / ms);
+            // Where the wall clock goes at the chunk level, before the
+            // per-class breakdown: body is the last device's GPU time for a
+            // chunk, issue is the host's cost to enqueue one.
+            for (int d = 0; d < n_report; ++d) pf_launches += devs[d]->launches_last_token();
+            const double bms = median(chunk_ms), ims = median(chunk_issue);
+            std::printf("prefill_chunk_body_ms_median=%.3f prefill_chunk_issue_ms_median=%.3f "
+                        "prefill_launches_last_chunk_all_devices=%lld "
+                        "prefill_cpu_per_launch_us=%.2f\n",
+                        bms, ims, pf_launches,
+                        pf_launches > 0 ? ims * 1000.0 / (double) pf_launches : 0.0);
+            // The hyper-connection residual is the ONLY thing that crosses a
+            // card, and a chunk makes it T times bigger: 40 KB a token, so
+            // 10.5 MB at T = 256 against M5's 16-24 GB/s and ~30 us of
+            // latency. Printed because it is a term that did not exist at
+            // T = 1 and prof_boundary_p2p_us should be held against it.
+            const double bnd = (double) (n_devices - 1) * (double) chunk * HC_DIM * sizeof(float);
+            std::printf("prefill_boundary_bytes_per_chunk=%.0f (%.2f MB, %d crossings of T x 40 KB)\n",
+                        bnd, bnd / 1e6, n_devices - 1);
+            if (profile) {
+                // per token, so every number can be held against
+                // prefill_ms_per_token directly
+                const int skipped = (n_chunks > 1) ? std::min(time_prefill, chunk) : 0;
+                const int counted = time_prefill - skipped;
+                for (int d = 0; d < n_report; ++d) {
+                    std::printf("--- device %d (per prompt token, %d tokens over chunks %d..%d) ---\n",
+                                d, counted, n_chunks > 1 ? 2 : 1, n_chunks);
+                    devs[d]->prof_report(stdout, counted);
+                }
+            }
         }
 
         // ---- greedy continuation -------------------------------------------

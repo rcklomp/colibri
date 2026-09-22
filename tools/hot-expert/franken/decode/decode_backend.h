@@ -437,6 +437,13 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
+    // --no-expert-gather: run the chunk's expert assignments one at a time,
+    // the way a decode token does, instead of through the device-side sort
+    // and the row-gather kernels (design 9.4 item 5). The two must agree bit
+    // for bit -- every column accumulates in the same order either way -- so
+    // this is the arm that says whether they do, on a path that only exists
+    // at T > 1 and that no CPU gate can reach.
+    virtual void set_expert_gather(bool) {}
     // --sync-debug: drain and check after every launch and copy, so the op
     // named in a fault message is the one that faulted rather than whichever
     // launch was in flight when the queue drained.

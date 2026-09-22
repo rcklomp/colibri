@@ -47,7 +47,7 @@ run_one() {
         echo "error: binary not found or not executable: $DIR/$bin" >&2
         return 127
     fi
-    docker run --rm --user "$(id -u)":"$(id -g)" \
+    docker run --rm \
         "${DOCKER_GPU_FLAGS[@]}" \
         -v /home/ronald:/home/ronald -w "$DIR" \
         -e LD_LIBRARY_PATH="$ld_path" \

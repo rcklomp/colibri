@@ -14,6 +14,16 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 58 (2026-09-22 22:05 CEST, 20:05 UTC) -- THE 256K NUMBER (record
+> §L0-256K, design rev 11).** Franken engine, Qwen3.8-Flash-Next, three cards,
+> 262 144 window: cold 262 000-token prompt 467 s (7.8 min, 1.78 ms/token);
+> **decode at 256k depth 26.1 ms/token = 38.4 tok/s** (llama.cpp on this
+> rig: 17 min and 6 tok/s; design target >= 40 and ~5 min). Depth 6 -> 262k
+> costs 2.8 ms/token, as §M3 predicted. Remaining for L0: the gateway
+> (step 4), accept_live/accept_ui, the quality number at the served
+> settings; then the named decode/prefill optimisations; then DeepSeek/GLM
+> (streamed, L0b/L5).**
+>
 > **Rev 57 (2026-09-22 21:50 CEST, 19:50 UTC) -- PREFILL 7.7 -> 3.0 -> 1.63 ms
 > A TOKEN (record §L0-PREFILL-2).** Chunk pipelining across the cards (94-100 %
 > busy, bit-identical, default on) and an LDS-tiled trunk GEMM behind

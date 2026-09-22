@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 10)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 11)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -149,6 +149,14 @@ at the bound at batch 32 (§M1). The projection stands and is sharpened in §6.*
 
 ## 6. Targets (projected, to be refuted by the program)
 
+**Rev 11 (2026-09-22 evening, record §L0-256K) -- MEASURED on the built
+engine, three cards, Qwen3.8-Flash-Next at a 262 144 window:** decode at
+256k depth **26.1 ms a token = 38.4 tok/s** (llama.cpp 6.1-6.5; target >= 40:
+4 % short, owners named), cold 262 000-token prompt **467 s = 7.8 min**
+(llama.cpp 17 min; target ~5 min), decode at short depth 42.9 tok/s. The
+paragraphs below are the projections as they stood; they are kept as the
+record of what was claimed before it was built.
+
 Decode at 256k for Qwen3.8-Flash-Next with ALL experts resident (rev 4;
 §F11-M0 point 2): the bandwidth bound is ~7.8 ms/token for ~6.2 GB of VRAM
 reads over three cards in sequence (§M5 measured 794 of 800 GB/s on a
@@ -290,3 +298,6 @@ llama.cpp is not the reference to beat, the 5-minute target of §6 is.
    ladder at 19k and 256k (the number), the quality harness at the L0
    format (the quality number). Gate: tok/s ≥ 40 at 256k, quality within the
    measured spread of llama.cpp's IQ3_S/IQ4_NL serving (record §F11-QUALITY).
+   **The depth number is measured (§L0-256K: 38.4 tok/s at 256k, 7.8 min
+   cold prompt); the gateway, accept_live and the quality number are what
+   remain of L0.**

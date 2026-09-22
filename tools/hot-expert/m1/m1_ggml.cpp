@@ -51,10 +51,35 @@
 // Building this program does NOT touch the GPUs: it links a HIP backend
 // but the offline hipcc compile only needs --offload-arch=gfx1100 codegen.
 // It is not run here; the orchestrator runs it under the rig lock.
+//
+// BUG FOUND AND FIXED 2026-09-22 (all-zero oracle on the GPU run: rc 0,
+// ggml_check_maxabs=0, ggml_check_cos=nan -- both gpu_out and ref_out were
+// zero). Root cause: this harness allocates ONE graph per T and calls
+// ggml_backend_graph_compute on it 1100 times (100 warmup + 1000 timed) to
+// keep allocation cost out of the timing -- unlike llama.cpp's own usage,
+// which builds a fresh ggml_context/cgraph every token. ggml_set_input() on
+// a leaf does NOT stop ggml_gallocr from reusing that leaf's buffer for a
+// later node's output once nothing else in the graph reads it again; across
+// repeated ggml_backend_graph_compute calls on the SAME allocated graph,
+// down's/moe_out's output ended up written into x/ids/weights' memory, so
+// by warmup iteration 2 `ids` no longer held the uploaded expert indices.
+// A `--cpu` diagnostic mode (ggml_backend_cpu_init(), touches no GPU) plus
+// a one-shot pre-warmup read isolated it: the FIRST compute produced a
+// healthy `up` (diag_oneshot_up_l1 nonzero), but reading `up` again after
+// the 100-iteration warmup loop gave 0, and diag_ids_unchanged_after_warmup
+// caught `ids` itself corrupted. Standalone ggml_mul_mat (plain, no _id)
+// and standalone ggml_mul_mat_id calls (n_used=1 and n_used=10, sequential
+// and random ids) on the same weight tensors all worked individually,
+// ruling out the quantiser, the fork-local IQ-panel CPU GEMM path
+// (ggml-cpu/iqp.cpp, ruled out with ggml_backend_cpu_set_use_ref(true)),
+// and ggml_mul_mat_id's row-selection logic itself. Fix: ggml_set_output()
+// on x/ids/weights (below) marks them persistent, so gallocr never reuses
+// their memory -- confirmed on --cpu (ggml_check_cos=0.999965, exit 0).
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"  // ggml_backend_cpu_init -- --cpu diagnostic mode
 #include "ggml-cuda.h" // ggml_backend_cuda_init -- HIP backend, CUDA-named API
 
 #include "m1_common.h"
@@ -68,7 +93,14 @@
 
 namespace {
 
-constexpr int64_t N_EXPERT      = 512;
+// N_EXPERT is mutable (not the brief's fixed 512) ONLY so `--cpu` can shrink
+// it to 16: the diagnostic CPU-backend mode this file gained after the GPU
+// run of 2026-09-22 reported an all-zero oracle (ggml_check_maxabs=0,
+// ggml_check_cos=nan on BOTH gpu_out and ref_out) exists to isolate that bug
+// without touching the GPUs, and quantising 512 experts x 3 tensors on a CPU
+// backend is slow enough to want a smaller N_EXPERT for that path. The GPU
+// path (no --cpu) always uses the real N_EXPERT=512.
+int64_t N_EXPERT           = 512;
 constexpr int64_t N_EXPERT_USED = 10;
 constexpr int64_t D_MODEL       = 2560; // K for gate/up, n_embd for down's output
 constexpr int64_t N_FF          = 640;  // rows for gate/up, K for down
@@ -87,7 +119,15 @@ struct WeightSet {
 // them into `dst`'s expert slice `e`. Generates and quantises ONE expert at
 // a time (a few MB of host fp32) rather than materialising all 512 experts
 // of a tensor in host RAM at once (that would be ~3.3 GB per tensor).
-void quantize_upload_expert(ggml_tensor *dst, int64_t e, int64_t nrows, int64_t n_per_row) {
+//
+// `diag_label`, when non-null, prints a diagnostic for THIS call's row 0
+// only: the L1 norm of the pre-quant source row and of the same row
+// immediately dequantised back (ggml_get_type_traits(type)->to_float) --
+// BEFORE any upload/readback round-trip -- so a zero here means the
+// quantiser itself is degenerate for this type/shape, independent of any
+// backend or ggml_mul_mat_id bug.
+void quantize_upload_expert(ggml_tensor *dst, int64_t e, int64_t nrows, int64_t n_per_row,
+                             const char *diag_label = nullptr) {
     std::vector<float> src = m1::randf_vec(static_cast<size_t>(nrows) * n_per_row, -1.0f, 1.0f);
     size_t row_size = ggml_row_size(dst->type, n_per_row);
     std::vector<uint8_t> qbuf(row_size * nrows);
@@ -96,6 +136,17 @@ void quantize_upload_expert(ggml_tensor *dst, int64_t e, int64_t nrows, int64_t 
     if (written != qbuf.size()) {
         std::fprintf(stderr, "quantize_chunk wrote %zu, expected %zu\n", written, qbuf.size());
         std::abort();
+    }
+    if (diag_label) {
+        std::vector<float> dequant_row0(n_per_row);
+        ggml_get_type_traits(dst->type)->to_float(qbuf.data(), dequant_row0.data(), n_per_row);
+        char lbl[128];
+        std::snprintf(lbl, sizeof(lbl), "diag_%s_src_row0_l1", diag_label);
+        std::printf("%s=%.6g\n", lbl, m1::l1_norm(src.data(), n_per_row));
+        m1::print_first_n(lbl, src.data(), n_per_row);
+        std::snprintf(lbl, sizeof(lbl), "diag_%s_dequant_row0_l1", diag_label);
+        std::printf("%s=%.6g\n", lbl, m1::l1_norm(dequant_row0.data(), n_per_row));
+        m1::print_first_n(lbl, dequant_row0.data(), n_per_row);
     }
     size_t offset = dst->nb[2] * static_cast<size_t>(e);
     if (qbuf.size() != dst->nb[2]) {
@@ -128,7 +179,7 @@ WeightSet build_weights(ggml_backend_t backend) {
     }
 
     for (int64_t e = 0; e < N_EXPERT; e++) {
-        quantize_upload_expert(w.gate_exps, e, N_FF, D_MODEL);
+        quantize_upload_expert(w.gate_exps, e, N_FF, D_MODEL, e == 0 ? "gate_e0" : nullptr);
         quantize_upload_expert(w.up_exps,   e, N_FF, D_MODEL);
         quantize_upload_expert(w.down_exps, e, D_MODEL, N_FF);
     }
@@ -145,17 +196,134 @@ WeightSet build_weights(ggml_backend_t backend) {
 } // namespace
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+    bool cpu_mode = false;
+    bool use_ref  = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--cpu") == 0) cpu_mode = true;
+        // --use-ref: ggml-cpu's own escape hatch (ggml_backend_cpu_set_use_ref)
+        // that disables its fork-local "IQ panel" GEMM path (ggml-cpu/iqp.cpp)
+        // for MUL_MAT/MUL_MAT_ID and falls back to the plain vec_dot path.
+        // Added here as a diagnostic toggle to test suspect (d): a bug in
+        // that fork-local kernel, not in build_moe_ffn's graph shape (which
+        // is upstream, heavily used code) or in IQ3_S/IQ4_NL quantisation
+        // (already ruled out: diag_gate_e0_dequant_row0_l1 is nonzero).
+        if (std::strcmp(argv[i], "--use-ref") == 0) use_ref = true;
+    }
 
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) {
-        std::fprintf(stderr, "ggml_backend_cuda_init(0) failed -- no HIP device backend\n");
-        return 2;
+    ggml_backend_t backend = nullptr;
+    if (cpu_mode) {
+        // Diagnostic mode (2026-09-22): runs the identical weight build +
+        // graph + oracle on the ggml CPU backend, touching no GPU, to
+        // isolate whether the GPU run's all-zero oracle is a quantiser bug
+        // (would reproduce here too) or a HIP-backend/upload-readback bug
+        // (would NOT reproduce here). N_EXPERT shrinks to 16 -- 512 experts
+        // x 3 tensors of CPU-side quantisation is slow and the oracle only
+        // ever reads N_EXPERT_USED=10 of them per token anyway.
+        N_EXPERT = 16;
+        backend = ggml_backend_cpu_init();
+        if (!backend) {
+            std::fprintf(stderr, "ggml_backend_cpu_init() failed\n");
+            return 2;
+        }
+        if (use_ref) {
+            ggml_backend_cpu_set_use_ref(backend, true);
+        }
+        std::fprintf(stderr, "--cpu: N_EXPERT=%lld, backend=CPU, use_ref=%d\n",
+                     (long long)N_EXPERT, (int)use_ref);
+    } else {
+        backend = ggml_backend_cuda_init(0);
+        if (!backend) {
+            std::fprintf(stderr, "ggml_backend_cuda_init(0) failed -- no HIP device backend\n");
+            return 2;
+        }
     }
 
     WeightSet w = build_weights(backend);
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+
+    // Minimal isolation test (--cpu only): plain ggml_mul_mat on a single
+    // expert's plane of w.up_exps, entirely bypassing ggml_mul_mat_id's
+    // row-selection machinery. diag_gate_e0_dequant_row0_l1 already showed
+    // IQ3_S's to_float() dequantiser is fine -- to_float is NOT what the
+    // matmul op itself uses (that's vec_dot_iq3_s / a Q8_K-converted src1);
+    // this isolates whether THAT is where the zero comes from, independent
+    // of _id row selection.
+    if (cpu_mode) {
+        size_t mm_mem = 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false) + 4096;
+        ggml_init_params mm_params = {mm_mem, nullptr, true};
+        ggml_context *mm_ctx = ggml_init(mm_params);
+        ggml_cgraph *mm_gf = ggml_new_graph_custom(mm_ctx, 8, false);
+
+        ggml_tensor *expert0_up = ggml_view_2d(mm_ctx, w.up_exps, D_MODEL, N_FF,
+                                                w.up_exps->nb[1], /*offset=*/0);
+        ggml_tensor *xs = ggml_new_tensor_1d(mm_ctx, GGML_TYPE_F32, D_MODEL);
+        ggml_set_input(xs);
+        ggml_tensor *mm_out = ggml_mul_mat(mm_ctx, expert0_up, xs);
+        ggml_set_output(mm_out);
+        ggml_build_forward_expand(mm_gf, mm_out);
+
+        ggml_gallocr_t mm_galloc = ggml_gallocr_new(buft);
+        if (!ggml_gallocr_alloc_graph(mm_galloc, mm_gf)) {
+            std::fprintf(stderr, "diag mul_mat gallocr_alloc_graph failed\n");
+        } else {
+            std::vector<float> xs_host = m1::randf_vec(D_MODEL, -1.0f, 1.0f);
+            ggml_backend_tensor_set(xs, xs_host.data(), 0, xs_host.size() * sizeof(float));
+            ggml_status st = ggml_backend_graph_compute(backend, mm_gf);
+            std::printf("diag_plain_mulmat_status=%s\n", ggml_status_to_string(st));
+            std::vector<float> mm_out_host(N_FF);
+            ggml_backend_tensor_get(mm_out, mm_out_host.data(), 0, N_FF * sizeof(float));
+            std::printf("diag_plain_mulmat_l1=%.6g\n", m1::l1_norm(mm_out_host.data(), N_FF));
+            m1::print_first_n("diag_plain_mulmat", mm_out_host.data(), N_FF);
+        }
+        ggml_gallocr_free(mm_galloc);
+        ggml_free(mm_ctx);
+
+        // Second isolation test: ggml_mul_mat_id itself, trimmed to the
+        // simplest possible case -- ONE token, ONE selected expert (id 0),
+        // b's ne[1]=1 broadcast still exercised (same as the real graph).
+        // Plain mul_mat on the same plane already proved nonzero above, so
+        // this isolates the "_id" row-selection/dispatch machinery itself.
+        auto minimal_mulmatid_test = [&](const char *label, const std::vector<int32_t> &ids_vec) {
+            int64_t n_used = (int64_t)ids_vec.size();
+            size_t mid_mem = 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false) + 4096;
+            ggml_init_params mid_params = {mid_mem, nullptr, true};
+            ggml_context *mid_ctx = ggml_init(mid_params);
+            ggml_cgraph *mid_gf = ggml_new_graph_custom(mid_ctx, 8, false);
+
+            ggml_tensor *xs2 = ggml_new_tensor_3d(mid_ctx, GGML_TYPE_F32, D_MODEL, 1, 1);
+            ggml_set_input(xs2);
+            ggml_tensor *ids1 = ggml_new_tensor_2d(mid_ctx, GGML_TYPE_I32, n_used, 1); // T=1
+            ggml_set_input(ids1);
+            ggml_tensor *mid_out = ggml_mul_mat_id(mid_ctx, w.up_exps, xs2, ids1);
+            ggml_set_output(mid_out);
+            ggml_build_forward_expand(mid_gf, mid_out);
+
+            ggml_gallocr_t mid_galloc = ggml_gallocr_new(buft);
+            if (!ggml_gallocr_alloc_graph(mid_galloc, mid_gf)) {
+                std::fprintf(stderr, "diag mul_mat_id(%s) gallocr_alloc_graph failed\n", label);
+            } else {
+                std::vector<float> xs2_host = m1::randf_vec(D_MODEL, -1.0f, 1.0f);
+                ggml_backend_tensor_set(xs2, xs2_host.data(), 0, xs2_host.size() * sizeof(float));
+                ggml_backend_tensor_set(ids1, ids_vec.data(), 0, ids_vec.size() * sizeof(int32_t));
+                ggml_status st = ggml_backend_graph_compute(backend, mid_gf);
+                std::printf("diag_mulmatid_%s_status=%s\n", label, ggml_status_to_string(st));
+                // Read back ALL n_used columns (not just column 0).
+                std::vector<float> mid_out_host((size_t)N_FF * n_used);
+                ggml_backend_tensor_get(mid_out, mid_out_host.data(), 0, mid_out_host.size() * sizeof(float));
+                std::printf("diag_mulmatid_%s_l1=%.6g\n", label, m1::l1_norm(mid_out_host.data(), mid_out_host.size()));
+                for (int64_t c = 0; c < n_used; c++) {
+                    double col_l1 = m1::l1_norm(mid_out_host.data() + c * N_FF, N_FF);
+                    std::printf("diag_mulmatid_%s_col%lld_l1=%.6g (id=%d)\n", label, (long long)c, col_l1, ids_vec[c]);
+                }
+            }
+            ggml_gallocr_free(mid_galloc);
+            ggml_free(mid_ctx);
+        };
+        minimal_mulmatid_test("used1", std::vector<int32_t>{0});
+        minimal_mulmatid_test("used10_seq", std::vector<int32_t>{0,1,2,3,4,5,6,7,8,9});
+        minimal_mulmatid_test("used10_distinct_hi", m1::random_distinct_ids(N_EXPERT, 10, 1));
+    }
 
     bool any_check_fail = false;
 
@@ -174,13 +342,45 @@ int main(int argc, char **argv) {
         ggml_tensor *weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, N_EXPERT_USED, T);
         ggml_set_name(weights, "weights");
         ggml_set_input(weights);
+        // FIX (2026-09-22, all-zero oracle): ggml_set_input() alone does not
+        // stop ggml_gallocr from reusing an input leaf's memory for another
+        // tensor's output once the allocator's liveness analysis decides
+        // nothing in THIS graph reads it again -- true here, since nothing
+        // downstream re-reads x/ids/weights after the last mul_mat_id/mul
+        // that consumes them. That's fine for the llama.cpp pattern (a new
+        // ggml_context + a fresh ggml_gallocr_alloc_graph every token), but
+        // this harness intentionally allocates ONE graph and calls
+        // ggml_backend_graph_compute on it 1100 times (100 warmup + 1000
+        // timed) to amortise allocation cost out of the timing -- across
+        // those repeats, the SAME buffer got reused for down's/moe_out's
+        // output, so by the second call ids/x no longer held what was
+        // uploaded (confirmed below: diag_ids_unchanged_after_warmup).
+        // ggml_set_output() marks a leaf as persistent -- gallocr never
+        // reuses its memory for anything else -- so it also fixes the case
+        // where CALLER-owned inputs must survive repeated computes of one
+        // allocated graph.
+        ggml_set_output(x);
+        ggml_set_output(ids);
+        ggml_set_output(weights);
 
-        ggml_tensor *up   = ggml_mul_mat_id(ctx, w.up_exps, x, ids);
-        ggml_tensor *gate = ggml_mul_mat_id(ctx, w.gate_exps, x, ids);
-        ggml_tensor *h    = ggml_swiglu_split(ctx, gate, up);
-        ggml_tensor *down = ggml_mul_mat_id(ctx, w.down_exps, h, ids);
-        down = ggml_mul(ctx, down, weights);
+        ggml_tensor *up      = ggml_mul_mat_id(ctx, w.up_exps, x, ids);
+        ggml_tensor *gate    = ggml_mul_mat_id(ctx, w.gate_exps, x, ids);
+        ggml_tensor *h       = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor *down_raw = ggml_mul_mat_id(ctx, w.down_exps, h, ids);
+        ggml_tensor *down    = ggml_mul(ctx, down_raw, weights);
         ggml_build_forward_expand(gf, down);
+
+        // T=1 diagnostic: keep every stage's own memory alive (no gallocr
+        // buffer reuse across stages) so each can be read back after one
+        // compute, to find which stage first turns zero.
+        bool extra_diag = (T == 1);
+        if (extra_diag) {
+            ggml_set_output(up);
+            ggml_set_output(gate);
+            ggml_set_output(h);
+            ggml_set_output(down_raw);
+            ggml_set_output(down);
+        }
 
         std::vector<ggml_tensor *> cur_experts(N_EXPERT_USED);
         for (int64_t i = 0; i < N_EXPERT_USED; i++) {
@@ -192,6 +392,12 @@ int main(int argc, char **argv) {
             moe_out = ggml_add(ctx, moe_out, cur_experts[i]);
             ggml_build_forward_expand(gf, moe_out);
         }
+        // Suspect (b): without this, gallocr is free to consider moe_out's
+        // memory reclaimable the moment nothing else in the SAME graph
+        // reads it -- true here since it's the last node, so in a single
+        // ggml_backend_graph_compute this shouldn't matter, but it costs
+        // nothing and rules the allocator out as a cause outright.
+        ggml_set_output(moe_out);
 
         ggml_gallocr_t galloc = ggml_gallocr_new(buft);
         if (!ggml_gallocr_alloc_graph(galloc, gf)) {
@@ -204,14 +410,67 @@ int main(int argc, char **argv) {
         std::vector<float> weights_host = m1::random_norm_weights((int)N_EXPERT_USED, (int)T);
         std::vector<float> x_host = m1::randf_vec((size_t)D_MODEL * T, -1.0f, 1.0f);
 
+        {
+            const char *tag0 = (T == 1) ? "T1" : "T32";
+            std::printf("diag_x_host_%s_l1=%.6g\n", tag0, m1::l1_norm(x_host.data(), x_host.size()));
+        }
+
         ggml_backend_tensor_set(x, x_host.data(), 0, x_host.size() * sizeof(float));
         ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
         ggml_backend_tensor_set(weights, weights_host.data(), 0, weights_host.size() * sizeof(float));
 
+        if (extra_diag) {
+            // ONE-SHOT compute + read, before the 100+1000-iteration loop:
+            // isolates whether the zero appears from the very first call
+            // (a construction/compute bug) or only after repeated reruns of
+            // the same allocated graph (an in-place/aliasing corruption
+            // that accumulates across iterations).
+            ggml_status st1 = ggml_backend_graph_compute(backend, gf);
+            std::printf("diag_oneshot_status=%s\n", ggml_status_to_string(st1));
+            std::vector<float> up_oneshot(ggml_nelements(up));
+            ggml_backend_tensor_get(up, up_oneshot.data(), 0, up_oneshot.size() * sizeof(float));
+            std::printf("diag_oneshot_up_l1=%.6g\n", m1::l1_norm(up_oneshot.data(), up_oneshot.size()));
+            m1::print_first_n("diag_oneshot_up", up_oneshot.data(), up_oneshot.size());
+        }
+
+        ggml_status warmup_status = GGML_STATUS_SUCCESS;
         for (int i = 0; i < WARMUP_ITERS; i++) {
-            ggml_backend_graph_compute(backend, gf);
+            warmup_status = ggml_backend_graph_compute(backend, gf);
         }
         ggml_backend_synchronize(backend);
+        std::printf("diag_graph_compute_status_%s=%s\n", (T == 1) ? "T1" : "T32",
+                    ggml_status_to_string(warmup_status));
+
+        if (extra_diag) {
+            // Confirm/deny the buffer-reuse hypothesis directly: are the
+            // INPUT tensors (ids especially) still what we uploaded, after
+            // the graph has been recomputed 100 more times on the same
+            // allocation? diag_oneshot_up_l1 above was healthy; if ids has
+            // changed here, gallocr let something overwrite an input.
+            std::vector<int32_t> ids_readback(ids_host.size());
+            ggml_backend_tensor_get(ids, ids_readback.data(), 0, ids_readback.size() * sizeof(int32_t));
+            bool ids_match = (ids_readback == ids_host);
+            std::printf("diag_ids_unchanged_after_warmup=%d\n", (int)ids_match);
+            if (!ids_match) {
+                std::printf("diag_ids_readback:");
+                for (size_t k = 0; k < ids_readback.size() && k < 10; k++) std::printf(" %d", ids_readback[k]);
+                std::printf("\n");
+            }
+            auto dump_stage = [&](const char *label, ggml_tensor *t) {
+                std::vector<float> buf(ggml_nelements(t));
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+                char lbl[64];
+                std::snprintf(lbl, sizeof(lbl), "diag_stage_%s_l1", label);
+                std::printf("%s=%.6g\n", lbl, m1::l1_norm(buf.data(), buf.size()));
+                std::snprintf(lbl, sizeof(lbl), "diag_stage_%s", label);
+                m1::print_first_n(lbl, buf.data(), buf.size());
+            };
+            dump_stage("up", up);
+            dump_stage("gate", gate);
+            dump_stage("h", h);
+            dump_stage("down_raw", down_raw);
+            dump_stage("down_weighted", down);
+        }
 
         std::vector<double> samples_us;
         samples_us.reserve(TIMED_ITERS);
@@ -297,11 +556,29 @@ int main(int argc, char **argv) {
                 }
             }
 
-            double cos = m1::cosine_similarity(gpu_out.data(), ref_out.data(), D_MODEL);
-            double maxabs = m1::max_abs_diff(gpu_out.data(), ref_out.data(), D_MODEL);
-            std::printf("ggml_check_maxabs=%.6g\n", maxabs);
-            std::printf("ggml_check_cos=%.6g\n", cos);
-            if (cos < 0.999) any_check_fail = true;
+            double gpu_l1 = m1::l1_norm(gpu_out.data(), D_MODEL);
+            double ref_l1 = m1::l1_norm(ref_out.data(), D_MODEL);
+            std::printf("diag_gpu_out_l1=%.6g\n", gpu_l1);
+            m1::print_first_n("diag_gpu_out", gpu_out.data(), D_MODEL);
+            std::printf("diag_ref_out_l1=%.6g\n", ref_l1);
+            m1::print_first_n("diag_ref_out", ref_out.data(), D_MODEL);
+
+            // Refuse a trivial pass: two all-zero vectors have an undefined
+            // (NaN, from 0/0) cosine, which is NOT >= 0.999 and so used to
+            // fail correctly by accident -- but a near-zero L1 on just one
+            // side (a partially-broken path) could still cosine-pass by
+            // chance. Check both norms explicitly and say so.
+            if (gpu_l1 == 0.0 || ref_l1 == 0.0) {
+                std::fprintf(stderr, "CHECK_FAIL zero output (gpu_out_l1=%.6g ref_out_l1=%.6g)\n",
+                             gpu_l1, ref_l1);
+                any_check_fail = true;
+            } else {
+                double cos = m1::cosine_similarity(gpu_out.data(), ref_out.data(), D_MODEL);
+                double maxabs = m1::max_abs_diff(gpu_out.data(), ref_out.data(), D_MODEL);
+                std::printf("ggml_check_maxabs=%.6g\n", maxabs);
+                std::printf("ggml_check_cos=%.6g\n", cos);
+                if (cos < 0.999) any_check_fail = true;
+            }
         }
 
         ggml_gallocr_free(galloc);

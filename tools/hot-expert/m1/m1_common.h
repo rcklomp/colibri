@@ -114,6 +114,21 @@ inline double max_abs_diff(const float *a, const float *b, size_t n) {
     return m;
 }
 
+inline double l1_norm(const float *a, size_t n) {
+    double s = 0.0;
+    for (size_t i = 0; i < n; i++) s += std::fabs((double)a[i]);
+    return s;
+}
+
+// "label: v0 v1 v2 v3 ..." for up to the first `n` values (or fewer if the
+// vector is shorter) -- a quick eyeball diagnostic, not a full dump.
+inline void print_first_n(const char *label, const float *a, size_t total_n, size_t show_n = 4) {
+    std::printf("%s:", label);
+    size_t show = std::min(total_n, show_n);
+    for (size_t i = 0; i < show; i++) std::printf(" %.6g", (double)a[i]);
+    std::printf("\n");
+}
+
 inline void kv(const char *key, double value) {
     std::printf("%s=%g\n", key, value);
 }

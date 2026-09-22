@@ -829,15 +829,18 @@ void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expe
 #pragma unroll
     for (int m = 0; m < MOE_TILE_E; ++m) acc[m] = 0.0f;
 
+    // The inner statement is TEXTUALLY the per-assignment kernel's, down to
+    // the primitive call. It used to hoist `d * qs[tid]` out of the column
+    // loop -- algebraically the same thing, and the host test agrees to the
+    // bit -- but the device did not, so the hoist is gone: when two paths
+    // must produce the same bits, the cheapest guarantee is that they are
+    // the same source. The decode is then recomputed per column, which for
+    // Q8_0 is one f16 widen and one multiply off L1.
     for (int b = 0; b < nblk; ++b) {
-        const unsigned char * bp = A + (size_t) b * FK_Q8_0_BLOCK_BYTES;
-        // the one format whose lane value IS a single weight, so the decode
-        // really is hoisted here rather than served from L1
-        const float w = fk_q8_0_block_d(bp) *
-                        (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[tid];
 #pragma unroll
         for (int m = 0; m < MOE_TILE_E; ++m)
-            if (m < cnt) acc[m] += w * h[xb[m] + b * FK_Q8_0_BLOCK_WEIGHTS + tid];
+            if (m < cnt) acc[m] += fk_q8_0_lane_dot(A + (size_t) b * FK_Q8_0_BLOCK_BYTES,
+                                                    h + xb[m] + b * FK_Q8_0_BLOCK_WEIGHTS, tid);
     }
 
 #pragma unroll
@@ -2279,7 +2282,7 @@ public:
         dbg_phase_ = phase; dbg_layer_ = layer;
     }
     void set_gemv_min_rows(int r) override { gemv_min_rows_ = r > 0 ? r : 1; }
-    void set_expert_gather(bool on) override { expert_gather_ = on; }
+    void set_expert_gather(int mask) override { expert_gather_ = mask; }
     void gemv_expert(const Mat & W, int e, const float * x, float * y) override {
         Mat slice = W;
         slice.base = (const unsigned char *) W.base + (size_t) e * W.expert_stride;
@@ -2416,7 +2419,7 @@ public:
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu, int T) override {
-        if (T > 1 && expert_gather_) {
+        if (T > 1 && (expert_gather_ & 1)) {
             const int nt = moe_sort(ids, T);
             const dim3 grid((unsigned) g.rows, (unsigned) nt, 2);
             mark(PC_EXP_GATE_UP);
@@ -2453,8 +2456,8 @@ public:
         k_silu_mul<<<ceil_div((int) n, BLK), BLK, 0, stream_>>>(g, u, h, (int) n);
     }
     void moe_down(const Mat & d, const int * ids, const float * h, float * eo, int T) override {
-        if (T > 1 && expert_gather_) {
-            // the layer's moe_gate_up has just sorted these very ids; the
+        if (T > 1 && (expert_gather_ & 2)) {
+            // the layer's moe_gate_up may already have sorted these very ids; the
             // sort is reused unless something unexpected changed
             const int nt = moe_sort(ids, T);
             const dim3 grid((unsigned) d.rows, (unsigned) nt, 1);
@@ -2583,7 +2586,18 @@ public:
 
     void set_profile(bool on) override {
         prof_ = on;
-        dev_ensure(dev_);   // the events must be created on THIS backend's device (lost once in a rebase; invalid resource handle at mark())
+        // ------------------------------------------------------------------
+        // DO NOT DELETE THIS LINE. It has been lost three times now (c265941,
+        // then a rebase, then ab8c9cd) and the symptom is always the same:
+        // "invalid resource handle" from mark(), because hipEventCreate acts
+        // on the CURRENT device -- process-wide state, not something a stream
+        // or a backend object carries -- and make_gpu_backend(0..2) leaves it
+        // at 2, so devices 0 and 1 got device-2 events and recording them on
+        // their own streams is an error. It is a rule in CLAUDE.md.
+        // Anything in this class that allocates, copies, creates an event or
+        // launches must call dev_ensure(dev_) first.
+        // ------------------------------------------------------------------
+        dev_ensure(dev_);
         if (on && ev_.empty()) {
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);
@@ -2740,7 +2754,9 @@ private:
     int        cand_cap_ = 0;
     int        gemv_lds_ = 1;
     int        gemv_min_rows_ = 1024;
-    bool       expert_gather_ = true;
+    // Bit 0 (gate/up) is MEASURED bit-exact on three cards; bit 1 (down) is
+    // measured NOT to be and is off until it is. See decode_backend.h.
+    int        expert_gather_ = 1;
     int        dev_ = 0;
     char       name_[24] = {0};
     hipStream_t stream_{};

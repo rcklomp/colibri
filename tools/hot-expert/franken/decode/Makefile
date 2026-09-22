@@ -54,7 +54,7 @@ INCS     := -I$(GGML_INC) -I$(GGML_SRC_INC) -I..
 # dependency through the back door.
 LDLIBS   := -L$(GGML_LIB_DIR) -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(GGML_LIB_DIR)
 
-.PHONY: all clean resources cpu gpu ldd-check
+.PHONY: all clean resources cpu gpu ldd-check moe-gather-test
 all: $(CPU_BIN) $(GPU_BIN)
 
 cpu: $(CPU_BIN)
@@ -80,5 +80,14 @@ ldd-check: $(CPU_BIN)
 		&& { echo "FAIL: $(CPU_BIN) links a HIP runtime"; exit 1; } \
 		|| echo "OK: $(CPU_BIN) links no HIP runtime"
 
+# Does the expert row-gather compute the same BITS as the per-assignment
+# kernels? Host only, no HIP, seconds. See moe_gather_test.cpp.
+moe-gather-test: franken_moe_gather_test
+	./franken_moe_gather_test
+
+franken_moe_gather_test: moe_gather_test.cpp $(HDRS)
+	$(DOCKER_RUN) c++ -O2 -std=c++17 -Wall $(INCS) moe_gather_test.cpp \
+		-o franken_moe_gather_test $(LDLIBS)
+
 clean:
-	rm -f $(CPU_BIN) $(GPU_BIN)
+	rm -f $(CPU_BIN) $(GPU_BIN) franken_moe_gather_test

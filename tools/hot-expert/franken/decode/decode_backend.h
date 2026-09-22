@@ -437,13 +437,41 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
-    // --no-expert-gather: run the chunk's expert assignments one at a time,
-    // the way a decode token does, instead of through the device-side sort
-    // and the row-gather kernels (design 9.4 item 5). The two must agree bit
-    // for bit -- every column accumulates in the same order either way -- so
-    // this is the arm that says whether they do, on a path that only exists
-    // at T > 1 and that no CPU gate can reach.
-    virtual void set_expert_gather(bool) {}
+    // --expert-gather MASK: which expert stages take design 9.4 item 5's
+    // device-side sort and row-gather at T > 1. Bit 0 is gate/up, bit 1 is
+    // down. A stage that is off runs every assignment on its own, exactly as
+    // a decode token does.
+    //
+    // THE DEFAULT IS 1, AND EVERY BIT OF THAT IS A MEASUREMENT, not a
+    // judgement. On three cards, 2026-09-22, --chunk 6 against --chunk 1:
+    //
+    //   mask 0  bit-identical, greedy 12/16 as decode
+    //   mask 1  bit-identical            <- gate/up is exact, so it is on
+    //   mask 2  diverges from layer 1 on (Kcur-11 1.7e-6 ... Kcur-27 1.0e-3)
+    //   mask 3  diverges the same way
+    //
+    // so the DOWN gather alone is at fault and stays off until it is not.
+    // Everything else was cleared by the same bisection: --chunk 1 against
+    // its own dump is identical (the engine is deterministic) and
+    // --gemv-lds 0 on both arms changes nothing (the LDS staging flip is not
+    // it).
+    //
+    // WHY THE DOWN GATHER IS WRONG IS STILL NOT KNOWN, and the interesting
+    // part is what that now rules out. moe_gather_test.cpp transcribes both
+    // down paths on the host over the SAME shared primitives, emulating a
+    // 32-lane wave, and they agree BIT FOR BIT -- as do the counting sort's
+    // invariants. The sort is independently proved on the device by the mask
+    // 1 arm, which shares it. So the fault is not the algorithm, not the
+    // indexing, not the accumulator structure and not the reduction: it is
+    // something the device's code generation does to one of the two kernels
+    // and not the other. The Q8_0 gather's one textual difference (a hoisted
+    // `d * qs[tid]`) has since been removed, which leaves IQ4_NL's
+    // array-of-accumulators against the per-assignment kernel's two scalars
+    // as the last one standing.
+    //
+    // The mask is per STAGE because that is what turned "the gather is
+    // wrong" into "the down gather is wrong" in two runs.
+    virtual void set_expert_gather(int) {}
     // --sync-debug: drain and check after every launch and copy, so the op
     // named in a fault message is the one that faulted rather than whichever
     // launch was in flight when the queue drained.

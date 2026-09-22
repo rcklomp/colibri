@@ -222,6 +222,20 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   Gemma-style models) follows the same rule; VRAM is for tensors read
   wholesale per token. Do not spend a session re-deriving this: it is why
   Qwen3.8 (93.7 GB on disk) is resident on three cards.
+- **HIP multi-GPU rule (cost four crashes on 2026-09-22, record §L0-STEP3):
+  the current device is PROCESS-WIDE state.** `hipMalloc`, `hipMemcpy`,
+  `hipEventCreate`, `hipStreamCreate` and every launch bind to whatever
+  `hipSetDevice` last selected -- in any thread, from any object. A backend
+  object per card must set its device at the top of EVERY entry that
+  allocates, creates an event/stream or launches (not once in its
+  constructor), events must be created with the stream's device current,
+  and any tracker of "the current device" must be updated by every raw
+  `hipSetDevice`. Symptoms seen: "invalid resource handle" on
+  `hipEventRecord`, all three cards' weights landing on one card (OOM at
+  the 18th layer), a page fault on the card that holds the head. Also:
+  `hipFree` synchronises the device -- never in a per-token path. First run
+  of any new multi-device code: `--sync-debug` (or its equivalent), then
+  the timed run.
 - **Port 8081 may not be GLM (since 2026-09-21).** `tools/hot-expert/serve_alt.sh
   qwen38|deepseek|glm|status` swaps the model behind Open WebUI: llama-server
   (HIP build `~/src/llama-glm53/build-hip`, docker, `--fit on`, 262144 window)

@@ -1453,6 +1453,8 @@ class GpuBackend : public Backend {
 public:
     explicit GpuBackend(int dev) : dev_(dev) {
         HIP_CHECK(hipSetDevice(dev));
+        cur_device_slot() = dev;   // keep dev_ensure's tracker true: a raw hipSetDevice left it stale,
+                                   // so dev_ensure(0) did nothing and set_profile made device-0 events on device 2
         HIP_CHECK(hipStreamCreate(&stream_));
         std::snprintf(name_, sizeof(name_), "gpu(device %d)", dev_);
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_iq3s_grid),  iq3s_grid,      sizeof(uint32_t) * 512));

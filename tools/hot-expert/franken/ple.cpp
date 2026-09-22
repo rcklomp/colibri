@@ -6,7 +6,14 @@
 #include <cstring>
 #include <stdexcept>
 
+// load_ple_table_pinned() is the only thing in this file that needs the HIP
+// runtime, and nothing calls it (ple.h says so). FRANKEN_NO_HIP omits both,
+// so a binary that must provably link no HIP -- decode/franken_decode_cpu,
+// which is how L0 step 2 proves its math without touching a card -- can still
+// reuse this gather unchanged.
+#ifndef FRANKEN_NO_HIP
 #include <hip/hip_runtime.h>
+#endif
 
 namespace franken {
 
@@ -113,6 +120,7 @@ void print_ple_check(const HParams & hp, const std::vector<int32_t> & tokens,
     }
 }
 
+#ifndef FRANKEN_NO_HIP
 void * load_ple_table_pinned(const GgufModel & model, size_t & out_bytes) {
     // NEVER CALLED (see ple.h) -- kept behind its own function so nothing
     // else in this file has to link or touch the HIP runtime to build.
@@ -127,5 +135,7 @@ void * load_ple_table_pinned(const GgufModel & model, size_t & out_bytes) {
     out_bytes = table->nbytes;
     return pinned;
 }
+
+#endif // FRANKEN_NO_HIP
 
 } // namespace franken

@@ -63,6 +63,13 @@ void usage(const char * p) {
         "                           host stops waiting, no kernel moves. Forced off for\n"
         "                           a chunk the recorder is capturing (a tap is a\n"
         "                           download) and for --jitter / --sync-debug.\n"
+        "          [--gemm-lds M]   trunk GEMM kernel at T > 1: 0 the wave-per-row\n"
+        "                           k_gemm_batch (DEFAULT, bit-identical to decode),\n"
+        "                           1 the LDS-tiled GEMM (weight block decoded once per\n"
+        "                           64 token columns, not per 8), 2 the same with the\n"
+        "                           activation tile quantised to int8 and RDNA3's\n"
+        "                           v_dot4_i32_iu8. 1 and 2 reassociate K, so they are\n"
+        "                           a knob and their divergence is measured.\n"
         "          [--ctx N]        cells the QSA caches are sized for (default 512)\n"
         "          [--threads N]    CPU backend threads (default 4)\n"
         "          [--min-cos X]    oracle bar (default 0.999)\n"
@@ -138,6 +145,7 @@ int main(int argc, char ** argv) {
     bool sync_debug = false;
     int expert_gather = 1;
     int prefill_pipeline = 1;
+    int gemm_lds = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -163,6 +171,7 @@ int main(int argc, char ** argv) {
         else if (a == "--chunk"  && i + 1 < argc) chunk = std::atoi(argv[++i]);
         else if (a == "--time-prefill" && i + 1 < argc) time_prefill = std::atoi(argv[++i]);
         else if (a == "--prefill-pipeline" && i + 1 < argc) prefill_pipeline = std::atoi(argv[++i]);
+        else if (a == "--gemm-lds" && i + 1 < argc) gemm_lds = std::atoi(argv[++i]);
         else if (a == "--ctx"    && i + 1 < argc) ctx = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--min-cos"&& i + 1 < argc) min_cos = std::atof(argv[++i]);
@@ -215,13 +224,18 @@ int main(int argc, char ** argv) {
             b->set_gemv_min_rows(gemv_min_rows);
             b->set_sync_debug(sync_debug);
             b->set_expert_gather(expert_gather);
+            b->set_gemm_lds(gemm_lds);
             if (profile) b->prof_defer(prefill_pipeline != 0);
         }
         Backend * be = devs.front();
         std::printf("backend=%s devices=%d layers=%d-%d ctx=%d tokens=%zu chunk=%d head=%d quant_act=%d\n",
                     be->name(), n_devices, il0, il1, ctx, tokens.size(), chunk,
                     (int) with_head, (int) quant_act);
-        std::printf("prefill_pipeline=%d\n", prefill_pipeline);
+        // Two lines a gate greps for. `gemm_kernel` names the kernel a T > 1
+        // trunk GEMM will take, so an oracle log says which arm produced it.
+        std::printf("prefill_pipeline=%d gemm_lds=%d gemm_kernel=%s\n",
+                    prefill_pipeline, gemm_lds,
+                    gemm_lds == 2 ? "lds_i8_dot4" : (gemm_lds == 1 ? "lds_f32" : "batch_tile"));
 
         const int n_report = use_cpu ? 1 : n_devices;
         // BEFORE the weights, so "the card was empty" is a measurement

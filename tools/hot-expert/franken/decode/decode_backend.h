@@ -451,6 +451,23 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
+    // --gemm-lds MODE: which kernel serves a T > 1 trunk GEMM.
+    //   0  k_gemm_batch<GEMM_TILE> -- the wave-per-row kernel, bit-identical
+    //      to the decode token's TILE = 1 instantiation per column. DEFAULT.
+    //   1  k_gemm_lds -- an LDS-tiled GEMM: a 64x64 (row x token) tile per
+    //      workgroup, the weight block decoded ONCE per 64 activation
+    //      columns instead of once per 8, f32 accumulation per thread over K.
+    //   2  k_gemm_lds_i8 -- the same tiling with the activation tile
+    //      quantised to int8 per 32-block and RDNA3's v_dot4_i32_iu8
+    //      (__builtin_amdgcn_sudot4, which DOES compile for gfx1100 where
+    //      __builtin_amdgcn_sdot4 does not). Falls back to mode 1 for a batch
+    //      that is not all-Q8_0.
+    // Modes 1 and 2 accumulate K linearly per thread instead of across a
+    // wave's lanes, so they are a DIFFERENT SUMMATION ORDER and cannot be
+    // bit-identical to decode. That is why they are a knob and the default is
+    // 0: the chunk-vs-decode oracle keeps its meaning unless the knob is on,
+    // and with it on the orchestrator measures how far the last bits moved.
+    virtual void set_gemm_lds(int) {}
     // --expert-gather MASK: which expert stages take design 9.4 item 5's
     // device-side sort and row-gather at T > 1. Bit 0 is gate/up, bit 1 is
     // down. A stage that is off runs every assignment on its own, exactly as

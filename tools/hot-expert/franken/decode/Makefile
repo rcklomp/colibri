@@ -5,9 +5,16 @@
 # Builds inside the rocm/dev-ubuntu-24.04:7.14.0-full docker image, the same
 # recipe as ../Makefile and ../../m1/Makefile. NO --device flags are passed to
 # docker, so the container cannot see the GPUs; hipcc compiling for
-# --offload-arch=gfx1100 does not need them (offline codegen), and
-# `__builtin_amdgcn_sdot4` is not used anywhere here -- it does not compile for
-# gfx1100 on this toolchain (see ../../m1/Makefile's note).
+# --offload-arch=gfx1100 does not need them (offline codegen).
+#
+# ON THE INT8 DOT PRODUCT, since ../../m1/Makefile's note has been read as
+# "gfx1100 has none": `__builtin_amdgcn_sdot4` indeed does not compile here
+# (it wants the `dot1-insts` feature), but `__builtin_amdgcn_sudot4` DOES,
+# and emits `v_dot4_i32_iu8 ... neg_lo:[1,1,0]` -- the real packed int8 dot.
+# `__builtin_amdgcn_udot4`, `__builtin_amdgcn_fdot2` and inline
+# `v_dot4_i32_iu8` / `v_dot4_i32_i8` also compile. decode_gpu.hip's
+# k_gemm_lds_i8 (--gemm-lds 2) uses sudot4; `make resources` shows 128 of
+# them in that kernel.
 #
 # `make` builds and runs nothing. Two binaries:
 #

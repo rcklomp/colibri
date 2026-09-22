@@ -14,6 +14,16 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 59 (2026-09-23 01:45 CEST, 23:45 UTC 09-22) -- STEP 4 FIRST SERVE (record
+> §L0-STEP4).** The Franken engine served real chats behind the owner's
+> gateway and Open WebUI: first token on screen 6.8 s on the 4.9k tool
+> block, 22-27 tok/s; 4 of 5 accept_live checks pass. Prefix reuse is the
+> open item (reused=0 across chats, empty on short follow-ups, and a reported
+> reuse still re-prefilled everything) plus launcher env (ledger) and
+> thinking-off for the UI -- all with the build. The engine runs inside the
+> ROCm 7.14 image (host ROCm 6.2 lacks libllama's libhipblas). GLM restored.
+> Next session: the reuse fixes, then accept_live/accept_ui PASS, quality.**
+>
 > **Rev 58 (2026-09-22 22:05 CEST, 20:05 UTC) -- THE 256K NUMBER (record
 > §L0-256K, design rev 11).** Franken engine, Qwen3.8-Flash-Next, three cards,
 > 262 144 window: cold 262 000-token prompt 467 s (7.8 min, 1.78 ms/token);

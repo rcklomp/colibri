@@ -14,6 +14,23 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 49 (2026-09-22 12:00 CEST, 10:00 UTC) -- M1 MEASURED, M3 FIRST CUT
+> (record §M1, §M3; design rev 6).** M1 on Qwen3.8's real expert shapes:
+> hipFire's MoE GEMV kernels 452 GB/s at batch 1 and 826 (= the VRAM bound)
+> at batch 32; llama.cpp's served mul_mat_id path 174 / 271. Design §2 row 3
+> decided for hipFire's kernel shape, with two ports (runtime K_TOP=10, a
+> group-128/64 format for the expert down's K=640). The first ggml run's
+> oracle was broken (allocator reused the inputs of a reused graph); fixed,
+> the oracle now refuses zero outputs, the clobbered timing is discarded.
+> M3: the GGUF DOES carry compress_ratios=4 (a build agent said not; verified
+> from the header), so llama.cpp's depth numbers are QSA numbers. With plain
+> first-cut kernels a QSA layer is 2.6-3.2 ms (top-k 2.05 ms, sparse
+> attention 0.48 ms, indexer scan 0.03-0.28 ms -- the only depth-dependent
+> part), GDN 0.67 ms a token for 36 layers. The bytes say ~0.15 ms a layer.
+> M3 is NOT closed and the go/no-go is not decided: two kernels (radix
+> top-k, coalesced sparse attention) are commissioned at the Opus tier and
+> M3 re-runs on them.**
+>
 > **Rev 48 (2026-09-22 10:45 CEST, 08:45 UTC) -- M5 MEASURED (record §M5, design
 > rev 5): the launch/sync floor on gfx1100 under HIP is 3 µs async, 24 µs
 > blocking, 31 µs cross-stream, ~30 µs per P2P boundary; a synthetic 48-layer

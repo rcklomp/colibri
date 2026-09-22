@@ -29,6 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #include "decode_shapes.h"
@@ -92,6 +93,10 @@ public:
     virtual void unary(int op, const float * x, float * y, size_t n) = 0;
     virtual void binary(int op, const float * a, const float * b, float * y, size_t n) = 0;
     virtual void scale(const float * x, float s, float * y, size_t n) = 0;
+    // build_hc_mix's silu(scale(lo, 1/hc)) as one op. Every elementwise op
+    // costs a dependent kernel latency whatever its size, and the hc modules
+    // run 32 times a token.
+    virtual void scale_silu(const float * x, float s, float * y, size_t n) = 0;
     // y[i] = x[i] * w[i % ne0_w]; ne0_w == n means a plain elementwise mul.
     virtual void mul_tiled(const float * x, const float * w, float * y, size_t n, size_t ne0_w) = 0;
     // dst[r*row_len + i] = src[r*src_stride + src_off + i] -- the strided view
@@ -126,6 +131,13 @@ public:
     // -- Gated DeltaNet (qwen4exp.cpp:793-918 + the fused op's formula) -----
     // ggml_ssm_conv over GDN_CONV_K taps of the ring, then silu.
     virtual void gdn_conv_silu(const float * ring, int head, const float * w, float * out) = 0;
+    // qwen4exp.cpp:816-834's gate chain -- sigmoid(beta), softplus(alpha+dt),
+    // *ssm_a, exp -- as ONE op over 48 elements instead of five. It still
+    // writes a_softplus and gate, so the oracle taps are unchanged.
+    virtual void gdn_gate(const float * beta_raw, const float * alpha_raw,
+                          const float * dt, const float * ssm_a,
+                          float * beta_sig, float * a_softplus,
+                          float * gate, float * g_exp, int n) = 0;
     // One delta-rule step. `g_exp` is already exp(g) per v-head.
     virtual void gdn_step(float * state, const float * q, const float * k, const float * v,
                           const float * g_exp, const float * beta, float * out) = 0;
@@ -168,9 +180,14 @@ public:
                                 const float * k_norm, float eps, uint16_t * pooled,
                                 float * dbg_pooled, float * dbg_roped) = 0;
     virtual void idx_scan(const uint16_t * pooled, const float * q, float * scores, int n_blocks) = 0;
-    // cell_scores[j] = (j <= q_pos) ? blk_scores[j/r] + blk_bias[j/r] : -inf
-    virtual void qsa_expand(const float * blk_scores, const float * blk_bias,
-                            float * cell_scores, int n_kv, int q_pos, int ratio) = 0;
+    // cell_scores[j] = (j <= q_pos) ? blk_scores[j/r] + bias(j/r) : -inf, with
+    // set_input_qsa's per-block bias computed IN the kernel from tail_start:
+    // +1e9 for a block at or past the incomplete tail, -inf for a block that
+    // could not be pooled, 0 otherwise (llama-memory-hybrid-idx.cpp:438-447).
+    // It used to be a host-side array uploaded per QSA layer, which put a
+    // BLOCKING hipMemcpy inside the 16-layer body -- see decode_graph.cpp.
+    virtual void qsa_expand(const float * blk_scores, float * cell_scores,
+                            int n_kv, int q_pos, int ratio, int tail_start) = 0;
     // Returns how many were selected (min(width, visible)); fills `out`.
     virtual int  topk_select(const float * scores, int n, int width, int * out) = 0;
     virtual void attn_qsa(const int8_t * kqs, const uint16_t * ksc,
@@ -190,6 +207,21 @@ public:
 
     virtual void   timer_start() {}
     virtual double timer_stop_ms() { return 0.0; }
+
+    // -- profiling (--profile; GPU backend only) ----------------------------
+    //
+    // Per-kernel-class DEVICE time for one token, plus the two counts that say
+    // whether the GPU is starved rather than slow: how many host-blocking
+    // calls happen inside the layer body (it must be zero) and how many
+    // kernels a token launches. One hipEvent is recorded BEFORE each op and
+    // one after the body, so the interval between consecutive events is that
+    // op's wall time on the device timeline INCLUDING any bubble in front of
+    // it -- which is the number that distinguishes "this kernel is slow" from
+    // "the GPU was idle waiting for the host".
+    virtual void set_profile(bool) {}
+    virtual void prof_reset() {}
+    virtual void prof_end_token() {}
+    virtual void prof_report(FILE * out, int n_tokens) { (void) out; (void) n_tokens; }
 };
 
 Backend * make_cpu_backend(int n_threads);

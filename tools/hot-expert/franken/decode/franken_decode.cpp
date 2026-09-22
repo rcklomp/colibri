@@ -47,6 +47,9 @@ void usage(const char * p) {
         "                           ggml vec_dot_type before the dot, as llama.cpp's\n"
         "                           CPU mul_mat does. A DIAGNOSTIC ARM, never the engine.\n"
         "          [--verbose]      print the routed experts each layer picks\n"
+        "                           (device-side; read back AFTER the body)\n"
+        "          [--profile]      per-kernel-class device time for one token, plus\n"
+        "                           prof_host_syncs_per_token and prof_launches_per_token\n"
         "          [--dump DIR]     write this run's taps in the oracle's own format,\n"
         "                           so one run can be the oracle of another\n"
         "          [--jitter X]     perturb every block input by +-X (oracle only):\n"
@@ -86,6 +89,7 @@ int main(int argc, char ** argv) {
     double min_cos = 0.999;
     bool quant_act = false;
     bool verbose = false;
+    bool profile = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -94,6 +98,7 @@ int main(int argc, char ** argv) {
         else if (a == "--cpu")                    use_cpu = true;
         else if (a == "--quant-act")              quant_act = true;
         else if (a == "--verbose")                verbose = true;
+        else if (a == "--profile")                profile = true;
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--jitter" && i + 1 < argc) jitter = (float) std::atof(argv[++i]);
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
@@ -115,6 +120,7 @@ int main(int argc, char ** argv) {
     try {
         std::unique_ptr<Backend> be(use_cpu ? make_cpu_backend(threads) : make_gpu_backend(0));
         if (quant_act) be->set_quant_act(true);
+        if (profile)   be->set_profile(true);
         std::printf("backend=%s layers=%d-%d ctx=%d tokens=%zu quant_act=%d\n",
                     be->name(), il0, il1, ctx, tokens.size(), (int) quant_act);
 
@@ -189,14 +195,21 @@ int main(int argc, char ** argv) {
         }
 
         if (time_n > 0) {
-            Recorder off;
+            Recorder off;                       // no taps: a tap is a download
             std::vector<double> ms;
             const int32_t filler = tokens.back();
+            // The PLE row of a filler token is not its own (the n-gram hash
+            // depends on the prefix), which is fine for timing: the work is
+            // identical either way. Nothing else about the step differs.
+            const float * ple = need_ple ? ple_all.data() + (tokens.size() - 1) * N_EMBD : nullptr;
+            run.step(filler, ple, off);         // one warm-up, not counted
+            be->prof_reset();
             for (int i = 0; i < time_n; ++i) {
-                run.step(filler, need_ple ? ple_all.data() + (tokens.size() - 1) * N_EMBD : nullptr, off);
+                run.step(filler, ple, off);
                 ms.push_back(run.last_body_ms());
             }
             std::printf("layers%d_%d_ms_median=%.4f n=%d\n", il0, il1, median(ms), time_n);
+            if (profile) be->prof_report(stdout, time_n);
         }
         return rc;
     } catch (const std::exception & e) {

@@ -77,6 +77,8 @@ DecodeRunner::DecodeRunner(Backend & be, DecodeModel & model, const DecodeConfig
     beta_     = A(GDN_V_HEADS);
     gexp_     = A(GDN_V_HEADS);
     abuf_     = A(GDN_V_HEADS);
+    bsig_     = A(GDN_V_HEADS);
+    gate_raw_ = A(GDN_V_HEADS);
     gdn_      = A(GDN_VAL_DIM);
     gnorm_    = A(GDN_VAL_DIM);
 
@@ -92,7 +94,6 @@ DecodeRunner::DecodeRunner(Backend & be, DecodeModel & model, const DecodeConfig
     idxq_      = A((size_t) IDX_N_HEADS * IDX_DIM);
     idxk_      = A(IDX_DIM);
     blkscore_  = A(max_blocks);
-    blkbias_   = A(max_blocks);
     cellscore_ = A(cfg_.ctx);
     pool_raw_  = A((size_t) max_blocks * IDX_DIM);   // f32 shadow of the pooled cache,
     pool_rope_ = A((size_t) max_blocks * IDX_DIM);   // pre- and post-norm/rope (oracle taps)
@@ -121,6 +122,11 @@ DecodeRunner::DecodeRunner(Backend & be, DecodeModel & model, const DecodeConfig
     pleconv_  = A(HC_DIM);
     pleemb_   = A(N_EMBD);
     ple_ring_ = A((size_t)(PLE_CONV_HIST + 1) * HC_DIM);
+
+    const int n_layers = model_.il1() - model_.il0() + 1;
+    ids_log_ = AI((size_t) n_layers * N_EXPERT_USED);
+    wts_log_ = A((size_t) n_layers * N_EXPERT_USED);
+    need_ple_ = (PLE_LAYER >= model_.il0() && PLE_LAYER <= model_.il1());
 
     // Per-layer persistent state. alloc_f32 zeroes, which is exactly a fresh
     // sequence: llama.cpp clears the recurrent cells the same way.
@@ -163,8 +169,7 @@ void DecodeRunner::hc_mix(const LayerWeights & L, const float * w_norm, const Ma
     rec.tap(be_, "hc_norm", il, xn_, HC_DIM, suffix);
 
     be_.gemv(down, xn_, lo_);
-    be_.scale(lo_, 1.0f / (float) HC, lo_, HC_LR);
-    be_.unary(FK_SILU, lo_, lo_, HC_LR);
+    be_.scale_silu(lo_, 1.0f / (float) HC, lo_, HC_LR);
     be_.gemv(up, lo_, hgate_);
     be_.unary(FK_SIGMOID, hgate_, hgate_, HC_DIM);
     rec.tap(be_, "hc_gate", il, hgate_, HC_DIM, suffix);
@@ -192,9 +197,9 @@ void DecodeRunner::jitter(float * buf, size_t n) {
 }
 
 // ------------------------------------------------------- build_ple (1137) --
-void DecodeRunner::layer_ple(const LayerWeights & L, const float * ple_emb, Recorder & rec) {
-    if (!ple_emb) throw std::runtime_error("the layer range includes the PLE layer but no PLE gather was given");
-    be_.upload(pleemb_, ple_emb, N_EMBD * sizeof(float));
+void DecodeRunner::layer_ple(const LayerWeights & L, Recorder & rec) {
+    // pleemb_ was uploaded by step() BEFORE the layer body: a per-token host
+    // gather must not become a host->device copy in the middle of the loop.
     rec.tap(be_, "ple_embd", -1, pleemb_, N_EMBD);
 
     be_.gemv(L.ple_key,   pleemb_, plek_);   // [hc_dim]
@@ -227,23 +232,20 @@ void DecodeRunner::layer_gdn(const LayerWeights & L, LayerState & st, int il, Re
     be_.gemv(L.ssm_gate, mixed_, z_);
     rec.tap(be_, "z", il, z_, GDN_VAL_DIM);
 
-    be_.gemv(L.ssm_beta, mixed_, beta_);
+    be_.gemv(L.ssm_beta,  mixed_, beta_);
     rec.tap(be_, "beta", il, beta_, GDN_V_HEADS);
-    be_.unary(FK_SIGMOID, beta_, beta_, GDN_V_HEADS);
-    rec.tap(be_, "beta_sigmoid", il, beta_, GDN_V_HEADS);
-
     be_.gemv(L.ssm_alpha, mixed_, alpha_);
     rec.tap(be_, "alpha", il, alpha_, GDN_V_HEADS);
-    be_.binary(FK_ADD, alpha_, L.ssm_dt, abuf_, GDN_V_HEADS);
-    be_.unary(FK_SOFTPLUS, abuf_, abuf_, GDN_V_HEADS);
-    rec.tap(be_, "a_softplus", il, abuf_, GDN_V_HEADS);
 
-    // gate = softplus(alpha + dt) * ssm_a, where ssm_a already holds
-    // -exp(A_log) (qwen4exp.cpp:831's comment). The delta rule decays by
-    // exp(gate) -- ops.cpp:11012's ggml_vec_scale_f32(.., expf(g_d[0])).
-    be_.binary(FK_MUL, abuf_, L.ssm_a, gexp_, GDN_V_HEADS);
-    rec.tap(be_, "gate", il, gexp_, GDN_V_HEADS);
-    be_.unary(FK_EXP, gexp_, gexp_, GDN_V_HEADS);
+    // sigmoid(beta); softplus(alpha + dt) * ssm_a (which already holds
+    // -exp(A_log), qwen4exp.cpp:831); exp of that, because the delta rule
+    // decays by exp(gate) -- ops.cpp:11012's ggml_vec_scale_f32(.., expf(g)).
+    // One launch over 48 elements instead of five: see decode_gpu.hip.
+    be_.gdn_gate(beta_, alpha_, L.ssm_dt, L.ssm_a, bsig_, abuf_, gate_raw_, gexp_,
+                 GDN_V_HEADS);
+    rec.tap(be_, "beta_sigmoid", il, bsig_,     GDN_V_HEADS);
+    rec.tap(be_, "a_softplus",   il, abuf_,     GDN_V_HEADS);
+    rec.tap(be_, "gate",         il, gate_raw_, GDN_V_HEADS);
 
     // cb(state, "state_predelta") is the state as read from the cache, i.e.
     // BEFORE this token's decay and update. Its ne2 is the HEAD axis, so the
@@ -273,7 +275,7 @@ void DecodeRunner::layer_gdn(const LayerWeights & L, LayerState & st, int il, Re
     // The 16 k-heads serve the 48 v-heads as h_k = h_v % 16 -- ggml_repeat's
     // tiling (qwen4exp.cpp:893) and, on the fused path, ops.cpp's
     // `ik1 = iv1 % nek1`. NOT h_v / 3.
-    be_.gdn_step(st.gdn_state, qn_, kn_, v_conv, gexp_, beta_, gdn_);
+    be_.gdn_step(st.gdn_state, qn_, kn_, v_conv, gexp_, bsig_, gdn_);
     rec.tap(be_, "attn_output", il, gdn_, GDN_VAL_DIM);
 
     be_.gated_rms_norm(gdn_, L.ssm_norm, z_, gnorm_, GDN_STATE, GDN_V_HEADS, eps_);
@@ -325,22 +327,13 @@ void DecodeRunner::layer_qsa(const LayerWeights & L, LayerState & st, int il, Re
     be_.idx_scan(st.idx_pooled, idxq_, blkscore_, n_blocks);
     rec.tap(be_, "indexer_score", il, blkscore_, n_blocks);
 
-    // set_input_qsa's per-block bias (llama-memory-hybrid-idx.cpp:438-447):
-    // the incomplete tail is always visible (+1e9); a block that could not be
-    // pooled is -inf. In a contiguous cache only the last block can be
-    // partial, and it IS the tail, so the second case never fires -- the
-    // general formula is kept so a paged cache does not silently change it.
-    {
-        const int tail_start = ((pos_ + 1) / r) * r;
-        std::vector<float> bias(n_blocks);
-        for (int b = 0; b < n_blocks; ++b) {
-            const int filled = std::min(r, n_kv - b * r);
-            bias[b] = (b * r >= tail_start) ? 1e9f
-                    : (filled < r ? -INFINITY : 0.0f);
-        }
-        be_.upload(blkbias_, bias.data(), bias.size() * sizeof(float));
-    }
-    be_.qsa_expand(blkscore_, blkbias_, cellscore_, n_kv, pos_, r);
+    // set_input_qsa's per-block bias (llama-memory-hybrid-idx.cpp:438-447) is
+    // a closed form of the position, so the kernel computes it: the incomplete
+    // tail is always visible (+1e9), a block that could not be pooled is -inf,
+    // everything else 0. It used to be built on the host and uploaded here,
+    // which put a BLOCKING hipMemcpy inside the layer body once per QSA layer.
+    const int tail_start = ((pos_ + 1) / r) * r;
+    be_.qsa_expand(blkscore_, cellscore_, n_kv, pos_, r, tail_start);
     rec.tap(be_, "indexer_score_tokens", il, cellscore_, n_kv);
 
     // "the reference returns indexer_top_k + compress_ratio - 1: whole blocks
@@ -401,14 +394,12 @@ void DecodeRunner::layer_ffn(const LayerWeights & L, int il, Recorder & rec) {
     // tests the routing, not the arithmetic. Printing the chosen ids makes
     // that visible instead of leaving it as an unexplained divergence.
     if (cfg_.verbose) {
-        int ids[N_EXPERT_USED];
-        float w[N_EXPERT_USED];
-        be_.sync();
-        be_.download(ids, ids_, sizeof(ids));
-        be_.download(w,   wts_, sizeof(w));
-        std::printf("moe_ids il=%d pos=%d:", il, pos_);
-        for (int k = 0; k < N_EXPERT_USED; ++k) std::printf(" %d(%.4f)", ids[k], w[k]);
-        std::printf("\n");
+        // device->device only: reading these back here would put a sync per
+        // layer inside the body, which is exactly what --profile must be able
+        // to report as zero. step() prints them AFTER the body.
+        const int slot = il - model_.il0();
+        be_.copy((float *) (ids_log_ + (size_t) slot * N_EXPERT_USED), (const float *) ids_, N_EXPERT_USED);
+        be_.copy(wts_log_ + (size_t) slot * N_EXPERT_USED, wts_, N_EXPERT_USED);
     }
 
     be_.moe_gate_up(L.exp_gate, L.exp_up, ids_, mixed_, ygate_, yup_);
@@ -445,6 +436,8 @@ void DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
     std::vector<float> emb(N_EMBD);
     model_.embed_row(token, emb.data());
     be_.upload(x_, emb.data(), N_EMBD * sizeof(float));
+    if (ple_emb) be_.upload(pleemb_, ple_emb, N_EMBD * sizeof(float));
+    else if (need_ple_) throw std::runtime_error("the layer range includes the PLE layer but no PLE gather was given");
     rec.tap(be_, "model.input_embed", -1, x_, N_EMBD);
 
     // "the wide residual starts as hc identical copies of the embedding" (324)
@@ -456,7 +449,7 @@ void DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
         const LayerWeights & L = model_.layer(il);
         LayerState & st = lstate_[il - model_.il0()];
 
-        if (L.is_ple) layer_ple(L, ple_emb, rec);
+        if (L.is_ple) layer_ple(L, rec);
 
         hc_mix(L, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject,
                res_hc_, mixed_, inject_, il, rec, "");
@@ -478,6 +471,23 @@ void DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
         rec.tap(be_, "l_last", il, res_hc_, HC_DIM);
     }
     last_body_ms_ = be_.timer_stop_ms();
+    be_.prof_end_token();
+
+    if (cfg_.verbose) {
+        const int nl = model_.il1() - model_.il0() + 1;
+        std::vector<int>   ids((size_t) nl * N_EXPERT_USED);
+        std::vector<float> w((size_t) nl * N_EXPERT_USED);
+        be_.sync();
+        be_.download(ids.data(), ids_log_, ids.size() * sizeof(int));
+        be_.download(w.data(),   wts_log_, w.size() * sizeof(float));
+        for (int l = 0; l < nl; ++l) {
+            std::printf("moe_ids il=%d pos=%d:", model_.il0() + l, pos_);
+            for (int k = 0; k < N_EXPERT_USED; ++k)
+                std::printf(" %d(%.4f)", ids[(size_t) l * N_EXPERT_USED + k],
+                                          w[(size_t) l * N_EXPERT_USED + k]);
+            std::printf("\n");
+        }
+    }
 
     ++pos_;
 }

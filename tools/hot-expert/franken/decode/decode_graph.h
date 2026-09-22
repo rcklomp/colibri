@@ -113,7 +113,7 @@ private:
                 const Mat & up, const Mat & inj, const float * x,
                 float * out_mixed, float * out_inject, int il, Recorder & rec,
                 const char * suffix);
-    void layer_ple(const LayerWeights & L, const float * ple_emb, Recorder & rec);
+    void layer_ple(const LayerWeights & L, Recorder & rec);
     void layer_gdn(const LayerWeights & L, LayerState & st, int il, Recorder & rec);
     void layer_qsa(const LayerWeights & L, LayerState & st, int il, Recorder & rec);
     void layer_ffn(const LayerWeights & L, int il, Recorder & rec);
@@ -136,14 +136,17 @@ private:
 
     // scratch (all backend buffers)
     float *x_, *res_hc_, *xn_, *lo_, *hgate_, *mixed_, *inject_, *blk_;
-    float *qkv_, *z_, *conv_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *gdn_, *gnorm_;
+    float *qkv_, *z_, *conv_, *qn_, *kn_, *alpha_, *beta_, *gexp_, *abuf_, *bsig_, *gate_raw_, *gdn_, *gnorm_;
     float *qfull_, *qcur_, *gate_, *gsig_, *kcur_, *vcur_, *kqv_;
-    float *idxq_, *idxk_, *blkscore_, *blkbias_, *cellscore_, *pool_raw_, *pool_rope_;
+    float *idxq_, *idxk_, *blkscore_, *cellscore_, *pool_raw_, *pool_rope_;
     int   *sel_;
     float *logits_, *wts_, *ygate_, *yup_, *hmoe_, *eo_, *moeout_;
     float *shg_, *shu_, *shh_, *shout_, *shgate_;
     float *plek_, *plev_, *pleq_, *plegated_, *plegate_, *plenorm_, *pleconv_, *pleemb_;
     int   *ids_;
+    int   *ids_log_ = nullptr;   // per-layer routed ids, read back AFTER the body
+    float *wts_log_ = nullptr;
+    bool   need_ple_ = false;
 };
 
 } // namespace fk

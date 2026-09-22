@@ -50,6 +50,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <cstring>
 
 #define FK_QUAL __device__ __forceinline__
 #define FK_HALF_TO_F32(bits) __half2float(__ushort_as_half((unsigned short)(bits)))
@@ -108,60 +109,137 @@ __device__ __forceinline__ float d_softplus(float x){ return x > 20.0f ? x : log
 
 // ============================================================== GEMV ======
 //
-// One 32-lane wave per output row, the wave walking the row's blocks. For
-// Q8_0 the whole wave consumes ONE block at a time -- qs[0..31] is 32
-// contiguous bytes, a single coalesced request, and `d` is a two-byte
-// broadcast (the 34-byte AoS stride leaves it only 2-aligned, so it is read
-// as bytes; see decode_quant.h).
+// GEOMETRY, and why it is not one wave per row any more.
+//
+// The first cut launched `grid = rows, block = 32`: one wave per output row.
+// That is fine for the two wide projections and starves the card on every
+// other one, because this model's trunk is mostly SHORT and FAT or SHORT and
+// THIN. Counted on a 7900 XTX (96 CUs, 192 SIMD32), per GDN layer:
+//
+//   tensor            rows    K     bytes   workgroups (old)   waves/SIMD
+//   attn_qkv         10240   2560   27.9M      10240              53
+//   ssm_out           2560   6144   16.7M       2560              13
+//   hc_*_down          320  10240    3.5M        320             1.7   <-- x4
+//   ffn_gate_inp       512   2560    5.2M        512             2.7   <-- x1
+//   ssm_alpha/beta      48   2560    0.5M         48             0.25  <-- x2
+//   hc_*_inject          4  10240    0.16M         4             0.02  <-- x4
+//   ffn_gate_inp_shexp   1   2560    0.01M         1             0.005 <-- x1
+//
+// A memory-bound kernel needs many waves in flight to cover latency; four
+// workgroups cannot, however few bytes they move. `hc_attn_inject` and
+// `hc_ffn_inject` run 32 times a token between them and each was four waves
+// walking 40 KB apiece.
+//
+// So: a workgroup is now 256 threads = GEMV_WAVES waves, each wave on its own
+// ROW, and K is SPLIT across `nsplit` workgroups chosen by the host so that
+// `row_groups * nsplit` reaches GEMV_TARGET_WGS. hc_inject goes from 4
+// workgroups to 256, ssm_alpha from 48 to 384, ffn_gate_inp from 512 to 2048.
+// With nsplit > 1 the partials land in a scratch [nsplit][rows] and
+// k_reduce_splits sums them in a FIXED order, so the result stays
+// reproducible run to run (an atomicAdd would not, and the oracle depends on
+// it).
+//
+// The Q8_0 inner loop keeps decode_quant.h's lane mapping -- the wave reads
+// one block's 32 contiguous qs bytes per step, which is the widest request
+// ggml's 34-byte AoS stride allows without an unaligned dword load -- but
+// unrolls FOUR blocks instead of two, so four independent requests are in
+// flight per wave rather than two.
 
-__global__ __launch_bounds__(WAVE)
+#define GEMV_WAVES      8                     // waves per workgroup, one row each
+#define GEMV_THREADS    (GEMV_WAVES * WAVE)   // 256
+#define GEMV_TARGET_WGS 2048
+// A GEMV that already fills the card is left alone: splitting attn_qkv
+// (1 280 row-groups) would only add a reduce launch.
+#define GEMV_MIN_WGS    512
+
+// Block range [b0, b1) this split owns, for a K split on block boundaries.
+__device__ __forceinline__ void split_range(int n_units, int nsplit, int split,
+                                            int * u0, int * u1) {
+    const int per = (n_units + nsplit - 1) / nsplit;
+    *u0 = split * per;
+    *u1 = min(n_units, *u0 + per);
+}
+
+__global__ __launch_bounds__(GEMV_THREADS)
 void k_gemv_q8_0(const unsigned char * __restrict__ W, size_t row_bytes,
-                 const float * __restrict__ x, float * __restrict__ y, int rows, int K) {
-    const int row = blockIdx.x;
+                 const float * __restrict__ x, float * __restrict__ y,
+                 int rows, int K, int nsplit) {
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int row  = blockIdx.x * GEMV_WAVES + wave;
     if (row >= rows) return;
     if (K % FK_Q8_0_BLOCK_WEIGHTS) return;               // bounded-safe
+
+    int b, bend;
+    split_range(K / FK_Q8_0_BLOCK_WEIGHTS, nsplit, blockIdx.y, &b, &bend);
+
     const unsigned char * rp = W + (size_t) row * row_bytes;
-    const int nblk = K / FK_Q8_0_BLOCK_WEIGHTS;
-    const int lane = threadIdx.x;
-
-    float a0 = 0.0f, a1 = 0.0f;
-    int b = 0;
-    for (; b + 1 < nblk; b += 2) {
-        a0 += fk_q8_0_lane_dot(rp + (size_t)(b + 0) * FK_Q8_0_BLOCK_BYTES,
-                               x + (b + 0) * FK_Q8_0_BLOCK_WEIGHTS, lane);
-        a1 += fk_q8_0_lane_dot(rp + (size_t)(b + 1) * FK_Q8_0_BLOCK_BYTES,
-                               x + (b + 1) * FK_Q8_0_BLOCK_WEIGHTS, lane);
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (; b + 3 < bend; b += 4) {
+        a0 += fk_q8_0_lane_dot(rp + (size_t)(b+0) * FK_Q8_0_BLOCK_BYTES, x + (b+0) * 32, lane);
+        a1 += fk_q8_0_lane_dot(rp + (size_t)(b+1) * FK_Q8_0_BLOCK_BYTES, x + (b+1) * 32, lane);
+        a2 += fk_q8_0_lane_dot(rp + (size_t)(b+2) * FK_Q8_0_BLOCK_BYTES, x + (b+2) * 32, lane);
+        a3 += fk_q8_0_lane_dot(rp + (size_t)(b+3) * FK_Q8_0_BLOCK_BYTES, x + (b+3) * 32, lane);
     }
-    for (; b < nblk; ++b)
-        a0 += fk_q8_0_lane_dot(rp + (size_t) b * FK_Q8_0_BLOCK_BYTES,
-                               x + b * FK_Q8_0_BLOCK_WEIGHTS, lane);
+    for (; b < bend; ++b)
+        a0 += fk_q8_0_lane_dot(rp + (size_t) b * FK_Q8_0_BLOCK_BYTES, x + b * 32, lane);
 
-    const float s = wave_sum(a0 + a1);
-    if (lane == 0) y[row] = s;
+    const float s = wave_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0) y[(size_t) blockIdx.y * rows + row] = s;
 }
 
-__global__ __launch_bounds__(WAVE)
+__global__ __launch_bounds__(GEMV_THREADS)
 void k_gemv_bf16(const unsigned short * __restrict__ W, size_t row_elems,
-                 const float * __restrict__ x, float * __restrict__ y, int rows, int K) {
-    const int row = blockIdx.x;
+                 const float * __restrict__ x, float * __restrict__ y,
+                 int rows, int K, int nsplit) {
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int row  = blockIdx.x * GEMV_WAVES + wave;
     if (row >= rows) return;
+
+    int c0, c1;                                  // chunks of 32 elements
+    split_range((K + WAVE - 1) / WAVE, nsplit, blockIdx.y, &c0, &c1);
+
     const unsigned short * rp = W + (size_t) row * row_elems;
     float acc = 0.0f;
-    for (int i = threadIdx.x; i < K; i += WAVE) acc = fmaf(fk_bf16_to_f32(rp[i]), x[i], acc);
+    for (int c = c0; c < c1; ++c) {
+        const int i = c * WAVE + lane;
+        if (i < K) acc = fmaf(fk_bf16_to_f32(rp[i]), x[i], acc);
+    }
     const float s = wave_sum(acc);
-    if (threadIdx.x == 0) y[row] = s;
+    if (lane == 0) y[(size_t) blockIdx.y * rows + row] = s;
 }
 
-__global__ __launch_bounds__(WAVE)
+__global__ __launch_bounds__(GEMV_THREADS)
 void k_gemv_f32(const float * __restrict__ W, size_t row_elems,
-                const float * __restrict__ x, float * __restrict__ y, int rows, int K) {
-    const int row = blockIdx.x;
+                const float * __restrict__ x, float * __restrict__ y,
+                int rows, int K, int nsplit) {
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int row  = blockIdx.x * GEMV_WAVES + wave;
     if (row >= rows) return;
+
+    int c0, c1;
+    split_range((K + WAVE - 1) / WAVE, nsplit, blockIdx.y, &c0, &c1);
+
     const float * rp = W + (size_t) row * row_elems;
     float acc = 0.0f;
-    for (int i = threadIdx.x; i < K; i += WAVE) acc = fmaf(rp[i], x[i], acc);
+    for (int c = c0; c < c1; ++c) {
+        const int i = c * WAVE + lane;
+        if (i < K) acc = fmaf(rp[i], x[i], acc);
+    }
     const float s = wave_sum(acc);
-    if (threadIdx.x == 0) y[row] = s;
+    if (lane == 0) y[(size_t) blockIdx.y * rows + row] = s;
+}
+
+// Fixed-order sum of the split partials: reproducible, unlike an atomicAdd.
+__global__ void k_reduce_splits(const float * __restrict__ p, float * __restrict__ y,
+                                int rows, int nsplit) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float a = 0.0f;
+    for (int s = 0; s < nsplit; ++s) a += p[(size_t) s * rows + r];
+    y[r] = a;
 }
 
 // ======================================================= routed experts ===
@@ -388,6 +466,37 @@ __global__ void k_binary(int op, const float * __restrict__ a, const float * __r
     }
 }
 
+// build_hc_mix's `silu(scale(lo, 1/hc))`: two launches on a 320-element
+// vector became one. Every elementwise op in this engine costs a dependent
+// kernel latency whatever its size, and the hc modules run 32 times a token.
+__global__ void k_scale_silu(const float * __restrict__ x, float s,
+                             float * __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = d_silu(x[i] * s);
+}
+
+// The Gated DeltaNet gate chain of qwen4exp.cpp:816-834 -- sigmoid(beta),
+// softplus(alpha + dt), *ssm_a, exp -- as ONE launch over 48 elements
+// instead of five. It still WRITES a_softplus and gate, so the oracle taps
+// are unchanged.
+__global__ void k_gdn_gate(const float * __restrict__ beta_raw,
+                           const float * __restrict__ alpha_raw,
+                           const float * __restrict__ dt,
+                           const float * __restrict__ ssm_a,
+                           float * __restrict__ beta_sig,
+                           float * __restrict__ a_softplus,
+                           float * __restrict__ gate,
+                           float * __restrict__ g_exp, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    beta_sig[i]   = d_sigmoid(beta_raw[i]);
+    const float sp = d_softplus(alpha_raw[i] + dt[i]);
+    a_softplus[i] = sp;
+    const float g = sp * ssm_a[i];      // ssm_a already holds -exp(A_log)
+    gate[i]       = g;
+    g_exp[i]      = expf(g);
+}
+
 __global__ void k_scale(const float * __restrict__ x, float s, float * __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = x[i] * s;
@@ -410,45 +519,46 @@ __global__ void k_gather_strided(const float * __restrict__ src, float * __restr
 // One workgroup per group; `w_tiled` picks between a [ne0] gamma reused by
 // every group (build_norm) and a [n_groups*ne0] one (build_hc_mix's grouped
 // RMSNorm over the hc streams).
-__global__ __launch_bounds__(BLK)
-void k_rms_norm_mul(const float * __restrict__ x, const float * __restrict__ w,
+// The hc modules normalise only HC=4 groups, so the grid is four workgroups
+// whatever the block size: the only lever left is making each workgroup
+// wider, which shortens the strided walk over ne0=2560 from ten steps to
+// two or three. Block size is chosen by the host and the LDS is dynamic.
+__global__ void k_rms_norm_mul(const float * __restrict__ x, const float * __restrict__ w,
                     float * __restrict__ y, int ne0, float eps, int w_tiled, int has_w) {
-    __shared__ float lds[BLK];
+    extern __shared__ float lds[];
     const float * xg = x + (size_t) blockIdx.x * ne0;
     float *       yg = y + (size_t) blockIdx.x * ne0;
 
     float s = 0.0f;
-    for (int i = threadIdx.x; i < ne0; i += BLK) s = fmaf(xg[i], xg[i], s);
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) s = fmaf(xg[i], xg[i], s);
     s = block_sum(s, lds);
     const float sc = rsqrtf(s / (float) ne0 + eps);
     const float * wg = has_w ? (w_tiled ? w : w + (size_t) blockIdx.x * ne0) : nullptr;
-    for (int i = threadIdx.x; i < ne0; i += BLK) yg[i] = xg[i] * sc * (has_w ? wg[i] : 1.0f);
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) yg[i] = xg[i] * sc * (has_w ? wg[i] : 1.0f);
 }
 
 // ggml_l2_norm: 1/max(sqrt(sum), eps). NOT the rms form.
-__global__ __launch_bounds__(BLK)
-void k_l2_norm(const float * __restrict__ x, float * __restrict__ y, int ne0, float eps) {
-    __shared__ float lds[BLK];
+__global__ void k_l2_norm(const float * __restrict__ x, float * __restrict__ y, int ne0, float eps) {
+    extern __shared__ float lds[];
     const float * xg = x + (size_t) blockIdx.x * ne0;
     float *       yg = y + (size_t) blockIdx.x * ne0;
     float s = 0.0f;
-    for (int i = threadIdx.x; i < ne0; i += BLK) s = fmaf(xg[i], xg[i], s);
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) s = fmaf(xg[i], xg[i], s);
     s = block_sum(s, lds);
     const float sc = 1.0f / fmaxf(sqrtf(s), eps);
-    for (int i = threadIdx.x; i < ne0; i += BLK) yg[i] = xg[i] * sc;
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) yg[i] = xg[i] * sc;
 }
 
-__global__ __launch_bounds__(BLK)
-void k_gated_rms_norm(const float * __restrict__ x, const float * __restrict__ w,
+__global__ void k_gated_rms_norm(const float * __restrict__ x, const float * __restrict__ w,
                       const float * __restrict__ z, float * __restrict__ y,
                       int ne0, float eps) {
-    __shared__ float lds[BLK];
+    extern __shared__ float lds[];
     const size_t o = (size_t) blockIdx.x * ne0;
     float s = 0.0f;
-    for (int i = threadIdx.x; i < ne0; i += BLK) s = fmaf(x[o + i], x[o + i], s);
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) s = fmaf(x[o + i], x[o + i], s);
     s = block_sum(s, lds);
     const float sc = rsqrtf(s / (float) ne0 + eps);
-    for (int i = threadIdx.x; i < ne0; i += BLK)
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x)
         y[o + i] = x[o + i] * sc * w[i] * d_sigmoid(z[o + i]);
 }
 
@@ -488,22 +598,21 @@ __global__ void k_hc_combine(float * __restrict__ res, const float * __restrict_
 
 // ============================================================== PLE ======
 
-__global__ __launch_bounds__(BLK)
-void k_ple_gate(const float * __restrict__ key, const float * __restrict__ query,
+__global__ void k_ple_gate(const float * __restrict__ key, const float * __restrict__ query,
                 const float * __restrict__ value, float * __restrict__ gated,
                 float * __restrict__ gate_out) {
-    __shared__ float lds[BLK];
+    extern __shared__ float lds[];
     const int c = blockIdx.x;
     const size_t o = (size_t) c * N_EMBD;
     float s = 0.0f;
-    for (int i = threadIdx.x; i < N_EMBD; i += BLK) s = fmaf(key[o + i], query[o + i], s);
+    for (int i = threadIdx.x; i < N_EMBD; i += blockDim.x) s = fmaf(key[o + i], query[o + i], s);
     s = block_sum(s, lds);
     const float sf  = s * rsqrtf((float) N_EMBD);
     const float mag = sqrtf(fmaxf(fabsf(sf), 1e-6f));      // ggml_sqrt(ggml_clamp(|s|,1e-6,inf))
     const float sgn = sf > 0.0f ? 1.0f : (sf < 0.0f ? -1.0f : 0.0f);
     const float g   = d_sigmoid(sgn * mag);
     if (threadIdx.x == 0) gate_out[c] = g;
-    for (int i = threadIdx.x; i < N_EMBD; i += BLK) gated[o + i] = value[i] * g;
+    for (int i = threadIdx.x; i < N_EMBD; i += blockDim.x) gated[o + i] = value[i] * g;
 }
 
 // ggml_ssm_conv generalised by a dilation: tap k reads (kern-1-k)*dil
@@ -729,13 +838,20 @@ void k_idx_scan(const unsigned short * __restrict__ pooled, const float * __rest
     }
 }
 
+// set_input_qsa's per-block bias, inline: the incomplete tail is always
+// visible (+1e9), a block that could not be pooled is -inf, everything else
+// 0. Computing it here removed the host->device copy the layer body used to
+// do once per QSA layer.
 __global__ void k_qsa_expand(const float * __restrict__ blk_scores,
-                             const float * __restrict__ blk_bias,
-                             float * __restrict__ cell, int n_kv, int q_pos, int ratio) {
+                             float * __restrict__ cell,
+                             int n_kv, int q_pos, int ratio, int tail_start) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_kv) return;
-    const int b = j / ratio;
-    cell[j] = (j <= q_pos) ? blk_scores[b] + blk_bias[b] : -INFINITY;
+    const int b      = j / ratio;
+    const int filled = min(ratio, n_kv - b * ratio);
+    const float bias = (b * ratio >= tail_start) ? 1e9f
+                     : (filled < ratio ? -INFINITY : 0.0f);
+    cell[j] = (j <= q_pos) ? blk_scores[b] + bias : -INFINITY;
 }
 
 // m3_attn.hip's radix_select_11_7_7_7_1wg, ratio fixed at 1 (the reference
@@ -1003,6 +1119,50 @@ void k_attn_combine(const float * __restrict__ partial, const float * __restrict
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
+// A reduction workgroup wide enough to walk ne0 in a few steps, capped at the
+// hardware maximum; the LDS is sized to match.
+inline int red_threads(int ne0) {
+    int t = WAVE;
+    while (t < ne0 && t < 1024) t <<= 1;
+    return t;
+}
+
+// ------------------------------------------------------------ profiling --
+//
+// One hipEvent recorded BEFORE each op plus one after the body: on a single
+// stream the interval between consecutive events is that op's wall time on
+// the device timeline INCLUDING the bubble in front of it, which is what
+// separates "this kernel is slow" from "the GPU was waiting for the host".
+// Nothing here synchronises until the token is over.
+enum ProfClass {
+    PC_TRUNK = 0,   // trunk GEMVs (+ their split reduce)
+    PC_NORM,        // rms / l2 / gated rms
+    PC_ELEM,        // elementwise, hc mix/combine, conv, PLE gate
+    PC_GDN,         // the delta-rule step
+    PC_QSA,         // indexer scan / top-k / cache writes / attention
+    PC_ROUTER,
+    PC_EXP_GATE_UP,
+    PC_EXP_DOWN,
+    PC_EXP_COMBINE,
+    PC_COPY,        // device-to-device copies
+    PC_N
+};
+const char * prof_name(int c) {
+    switch (c) {
+        case PC_TRUNK:        return "trunk_gemv";
+        case PC_NORM:         return "norm";
+        case PC_ELEM:         return "elem_hc";
+        case PC_GDN:          return "gdn_step";
+        case PC_QSA:          return "qsa";
+        case PC_ROUTER:       return "router";
+        case PC_EXP_GATE_UP:  return "expert_gate_up";
+        case PC_EXP_DOWN:     return "expert_down";
+        case PC_EXP_COMBINE:  return "expert_combine";
+        default:              return "copy";
+    }
+}
+constexpr int PROF_MAX_EVENTS = 4096;
+
 class GpuBackend : public Backend {
 public:
     explicit GpuBackend(int dev) {
@@ -1011,18 +1171,27 @@ public:
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_kvals_iq4nl), kvalues_iq4nl, sizeof(int8_t) * 16));
         HIP_CHECK(hipEventCreate(&ev0_));
         HIP_CHECK(hipEventCreate(&ev1_));
+        // A pinned staging ring so a per-token upload is an ASYNC copy on the
+        // engine's own stream rather than a blocking hipMemcpy: a pageable
+        // hipMemcpyAsync degrades to a synchronous one.
+        for (int i = 0; i < STAGE_SLOTS; ++i)
+            HIP_CHECK(hipHostMalloc(&stage_[i], STAGE_BYTES, hipHostMallocDefault));
         // the attention/top-k scratch is sized for the worst case the runner
         // can present; both are small and allocated once
         const int max_chunks = ceil_div(MAX_SEL, ATTN_CHUNK);
         HIP_CHECK(hipMalloc(&partial_, (size_t) max_chunks * N_Q_HEADS * HEAD_DIM * sizeof(float)));
         HIP_CHECK(hipMalloc(&mbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
         HIP_CHECK(hipMalloc(&lbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
+        HIP_CHECK(hipMalloc(&gemv_part_, GEMV_PART_FLOATS * sizeof(float)));
         // the candidate lists are sized by the CACHE depth, not the budget,
         // and grown on demand by topk_select()
     }
     ~GpuBackend() override {
         HIP_IGNORE(hipFree(partial_)); HIP_IGNORE(hipFree(mbuf_)); HIP_IGNORE(hipFree(lbuf_));
         HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
+        HIP_IGNORE(hipFree(gemv_part_));
+        for (int i = 0; i < STAGE_SLOTS; ++i) if (stage_[i]) HIP_IGNORE(hipHostFree(stage_[i]));
+        for (auto & e : ev_) HIP_IGNORE(hipEventDestroy(e));
         HIP_IGNORE(hipEventDestroy(ev0_)); HIP_IGNORE(hipEventDestroy(ev1_));
     }
 
@@ -1039,9 +1208,22 @@ public:
         return p;
     }
     void free_buf(void * p) override { HIP_IGNORE(hipFree(p)); }
-    void upload(void * d, const void * s, size_t b) override { HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyHostToDevice)); }
-    void download(void * d, const void * s, size_t b) override { HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyDeviceToHost)); }
-    void sync() override { HIP_CHECK(hipDeviceSynchronize()); }
+    void upload(void * d, const void * s, size_t b) override {
+        if (b <= STAGE_BYTES) {
+            void * st = stage_[stage_next_];
+            stage_next_ = (stage_next_ + 1) % STAGE_SLOTS;
+            std::memcpy(st, s, b);
+            HIP_CHECK(hipMemcpyAsync(d, st, b, hipMemcpyHostToDevice, 0));
+            return;                        // stream-ordered, does NOT block the host
+        }
+        ++blocking_;
+        HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyHostToDevice));
+    }
+    void download(void * d, const void * s, size_t b) override {
+        ++blocking_;                       // the host reads it: this always blocks
+        HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyDeviceToHost));
+    }
+    void sync() override { ++blocking_; HIP_CHECK(hipDeviceSynchronize()); }
 
     const void * place(const void * host, size_t bytes, const char * what) override {
         void * p = nullptr;
@@ -1063,66 +1245,99 @@ public:
     }
 
     void copy(float * d, const float * s, size_t n) override {
+        mark(PC_COPY);
         HIP_CHECK(hipMemcpyAsync(d, s, n * sizeof(float), hipMemcpyDeviceToDevice, 0));
     }
     void unary(int op, const float * x, float * y, size_t n) override {
+        mark(PC_ELEM);
         k_unary<<<ceil_div((int) n, BLK), BLK>>>(op, x, y, (int) n);
     }
     void binary(int op, const float * a, const float * b, float * y, size_t n) override {
+        mark(PC_ELEM);
         k_binary<<<ceil_div((int) n, BLK), BLK>>>(op, a, b, y, (int) n);
     }
     void scale(const float * x, float s, float * y, size_t n) override {
+        mark(PC_ELEM);
         k_scale<<<ceil_div((int) n, BLK), BLK>>>(x, s, y, (int) n);
     }
+    void scale_silu(const float * x, float s, float * y, size_t n) override {
+        mark(PC_ELEM);
+        k_scale_silu<<<ceil_div((int) n, BLK), BLK>>>(x, s, y, (int) n);
+    }
+    void gdn_gate(const float * beta_raw, const float * alpha_raw, const float * dt,
+                  const float * ssm_a, float * beta_sig, float * a_softplus,
+                  float * gate, float * g_exp, int n) override {
+        mark(PC_ELEM);
+        k_gdn_gate<<<ceil_div(n, BLK), BLK>>>(beta_raw, alpha_raw, dt, ssm_a,
+                                              beta_sig, a_softplus, gate, g_exp, n);
+    }
     void mul_tiled(const float * x, const float * w, float * y, size_t n, size_t ne0_w) override {
+        mark(PC_ELEM);
         k_mul_tiled<<<ceil_div((int) n, BLK), BLK>>>(x, w, y, (int) n, (int) ne0_w);
     }
     void gather_strided(const float * src, float * dst, int n_rows, int row_len,
                         int src_stride, int src_off) override {
+        mark(PC_ELEM);
         k_gather_strided<<<ceil_div(n_rows * row_len, BLK), BLK>>>(src, dst, n_rows, row_len, src_stride, src_off);
     }
     void rms_norm_mul(const float * x, const float * w, float * y,
                       int ne0, int n_groups, size_t w_len, float eps) override {
-        k_rms_norm_mul<<<n_groups, BLK>>>(x, w, y, ne0, eps,
+        mark(PC_NORM);
+        const int t = red_threads(ne0);
+        k_rms_norm_mul<<<n_groups, t, t * sizeof(float)>>>(x, w, y, ne0, eps,
                                           w_len == (size_t) ne0 ? 1 : 0, w ? 1 : 0);
     }
     void l2_norm(const float * x, float * y, int ne0, int n_groups, float eps) override {
-        k_l2_norm<<<n_groups, BLK>>>(x, y, ne0, eps);
+        mark(PC_NORM);
+        const int t = red_threads(ne0);
+        k_l2_norm<<<n_groups, t, t * sizeof(float)>>>(x, y, ne0, eps);
     }
     void hc_broadcast(const float * x, float * r) override {
+        mark(PC_ELEM);
         k_hc_broadcast<<<ceil_div(N_EMBD, BLK), BLK>>>(x, r);
     }
     void hc_collapse(const float * xn, const float * g, float * o) override {
+        mark(PC_ELEM);
         k_hc_collapse<<<ceil_div(N_EMBD, BLK), BLK>>>(xn, g, o);
     }
     void hc_combine(float * r, const float * b, const float * inj) override {
+        mark(PC_ELEM);
         k_hc_combine<<<ceil_div(N_EMBD, BLK), BLK>>>(r, b, inj);
     }
     void ple_gate(const float * k, const float * q, const float * v, float * g, float * go) override {
-        k_ple_gate<<<HC, BLK>>>(k, q, v, g, go);
+        mark(PC_ELEM);
+        const int t = red_threads(N_EMBD);
+        k_ple_gate<<<HC, t, t * sizeof(float)>>>(k, q, v, g, go);
     }
     void ple_conv_silu(const float * ring, int head, const float * w, float * out) override {
+        mark(PC_ELEM);
         k_conv_taps<<<ceil_div(HC_DIM, BLK), BLK>>>(ring, head, PLE_CONV_HIST + 1,
                                                     PLE_CONV_K, PLE_CONV_DIL, HC_DIM, w, out);
     }
     void gdn_conv_silu(const float * ring, int head, const float * w, float * out) override {
+        mark(PC_ELEM);
         k_conv_taps<<<ceil_div(GDN_CONV_DIM, BLK), BLK>>>(ring, head, GDN_CONV_K,
                                                           GDN_CONV_K, 1, GDN_CONV_DIM, w, out);
     }
     void gdn_step(float * S, const float * q, const float * k, const float * v,
                   const float * g, const float * b, float * o) override {
+        mark(PC_GDN);
         k_gdn_step<<<GDN_V_HEADS * GDN_STATE, WAVE>>>(S, q, k, v, g, b, o);
     }
     void gated_rms_norm(const float * x, const float * w, const float * z, float * y,
                         int ne0, int n_groups, float eps) override {
-        k_gated_rms_norm<<<n_groups, BLK>>>(x, w, z, y, ne0, eps);
+        mark(PC_NORM);
+        const int t = red_threads(ne0);
+        k_gated_rms_norm<<<n_groups, t, t * sizeof(float)>>>(x, w, z, y, ne0, eps);
     }
     void router(const float * logits, int * ids, float * w) override {
+        mark(PC_ROUTER);
         k_router<<<1, N_EXPERT>>>(logits, ids, w);
     }
     void moe_gate_up(const Mat & g, const Mat & u, const int * ids, const float * x,
                      float * yg, float * yu) override {
         const dim3 grid((unsigned) g.rows, N_EXPERT_USED, 2);
+        mark(PC_EXP_GATE_UP);
         if (g.type == FK_Q_IQ3_S) {
             k_moe_gate_up_iq3s<<<grid, WAVE>>>((const unsigned char *) g.base,
                 (const unsigned char *) u.base, g.expert_stride, g.row_bytes, ids, x, yg, yu,
@@ -1134,10 +1349,12 @@ public:
         }
     }
     void silu_mul(const float * g, const float * u, float * h, size_t n) override {
+        mark(PC_ELEM);
         k_silu_mul<<<ceil_div((int) n, BLK), BLK>>>(g, u, h, (int) n);
     }
     void moe_down(const Mat & d, const int * ids, const float * h, float * eo) override {
         const dim3 grid((unsigned) d.rows, N_EXPERT_USED, 1);
+        mark(PC_EXP_DOWN);
         if (d.type == FK_Q_IQ4_NL) {
             k_moe_down_iq4nl<<<grid, WAVE>>>((const unsigned char *) d.base, d.expert_stride,
                 d.row_bytes, ids, h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
@@ -1147,21 +1364,26 @@ public:
         }
     }
     void moe_combine(const float * eo, const float * w, float * o) override {
+        mark(PC_EXP_COMBINE);
         k_moe_combine<<<ceil_div(N_EMBD, BLK), BLK>>>(eo, w, o, N_EMBD, N_EXPERT_USED);
     }
     void rope_imrope(float * x, int n_heads, int head_dim, int n_rot, int pos) override {
+        mark(PC_QSA);
         k_rope_imrope<<<n_heads, n_rot / 2>>>(x, head_dim, n_rot, pos);
     }
     void kv_store_q8_0(const float * k, const float * v, int8_t * kqs, uint16_t * ksc,
                        int8_t * vqs, uint16_t * vsc, int cell) override {
         const dim3 grid(HEAD_DIM / 32, N_KV_HEADS, 2);
+        mark(PC_QSA);
         k_kv_store_q8_0<<<grid, WAVE>>>(k, v, kqs, (__half *) ksc, vqs, (__half *) vsc, cell);
     }
     void idx_raw_store(const float * kr, float * raw, int cell) override {
+        mark(PC_QSA);
         k_idx_raw_store<<<ceil_div(IDX_DIM, BLK), BLK>>>(kr, raw, cell);
     }
     void idx_pool_block(const float * raw, int blk, int n_filled, const float * kn,
                         float eps, uint16_t * pooled, float * dbg_p, float * dbg_r) override {
+        mark(PC_QSA);
         k_idx_pool_block<<<1, IDX_DIM>>>(raw, blk, n_filled, kn, eps,
                                          (unsigned short *) pooled, dbg_p, dbg_r);
     }
@@ -1170,10 +1392,12 @@ public:
         int wgs = ceil_div(n_blocks, nsub);
         if (wgs > 4096) wgs = 4096;
         if (wgs < 1) wgs = 1;
+        mark(PC_QSA);
         k_idx_scan<<<wgs, IDXS_THREADS>>>((const unsigned short *) pooled, q, s, n_blocks);
     }
-    void qsa_expand(const float * bs, const float * bb, float * c, int n_kv, int q, int r) override {
-        k_qsa_expand<<<ceil_div(n_kv, BLK), BLK>>>(bs, bb, c, n_kv, q, r);
+    void qsa_expand(const float * bs, float * c, int n_kv, int q, int r, int tail) override {
+        mark(PC_QSA);
+        k_qsa_expand<<<ceil_div(n_kv, BLK), BLK>>>(bs, c, n_kv, q, r, tail);
     }
     int topk_select(const float * scores, int n, int width, int * out) override {
         if (n > cand_cap_) {
@@ -1183,6 +1407,7 @@ public:
             HIP_CHECK(hipMalloc(&cand_idx_, (size_t) cand_cap_ * sizeof(int)));
         }
         const int k = width < n ? width : n;
+        mark(PC_QSA);
         k_topk_radix_select<<<1, TOPK_THREADS>>>(scores, n, k, cand_key_, cand_idx_, out);
         return k;
     }
@@ -1190,13 +1415,61 @@ public:
                   const uint16_t * vsc, const float * q, const int * sel, int n_sel,
                   float * out) override {
         const int n_chunks = ceil_div(n_sel, ATTN_CHUNK);
+        mark(PC_QSA);
         k_attn_flash_split<<<dim3(n_chunks, N_KV_HEADS), ATTN_THREADS>>>(
             kqs, (const __half *) ksc, vqs, (const __half *) vsc, q, sel,
             partial_, mbuf_, lbuf_, n_sel);
+        mark(PC_QSA);
         k_attn_combine<<<N_Q_HEADS, HEAD_DIM>>>(partial_, mbuf_, lbuf_, out, n_chunks);
     }
 
-    void   timer_start() override { HIP_CHECK(hipEventRecord(ev0_, 0)); }
+    void set_profile(bool on) override {
+        prof_ = on;
+        if (on && ev_.empty()) {
+            ev_.resize(PROF_MAX_EVENTS + 1);
+            ev_cls_.resize(PROF_MAX_EVENTS + 1);
+            for (auto & e : ev_) HIP_CHECK(hipEventCreate(&e));
+        }
+    }
+    void prof_reset() override {
+        for (int i = 0; i < PC_N; ++i) prof_us_[i] = 0.0;
+        tokens_profiled_ = 0;
+        blocking_in_body_ = 0;
+        launches_in_body_ = 0;
+    }
+    void prof_end_token() override {
+        blocking_in_body_ += blocking_ - blocking_at_token_start_;
+        launches_in_body_ += launches_ - launches_at_token_start_;
+        ++tokens_profiled_;
+        if (!prof_ || n_ev_ == 0) { n_ev_ = 0; return; }
+        // one closing event, then ONE synchronisation for the whole token
+        HIP_CHECK(hipEventRecord(ev_[n_ev_], 0));
+        HIP_CHECK(hipEventSynchronize(ev_[n_ev_]));
+        for (int i = 0; i < n_ev_; ++i) {
+            float ms = 0.0f;
+            HIP_CHECK(hipEventElapsedTime(&ms, ev_[i], ev_[i + 1]));
+            prof_us_[ev_cls_[i]] += (double) ms * 1000.0;
+        }
+        n_ev_ = 0;
+    }
+    void prof_report(FILE * out, int n_tokens) override {
+        const double n = n_tokens > 0 ? (double) n_tokens : 1.0;
+        double total = 0.0;
+        for (int c = 0; c < PC_N; ++c) total += prof_us_[c];
+        for (int c = 0; c < PC_N; ++c)
+            std::fprintf(out, "prof_%s_us=%.2f\n", prof_name(c), prof_us_[c] / n);
+        std::fprintf(out, "prof_total_us=%.2f\n", total / n);
+        std::fprintf(out, "prof_host_syncs_per_token=%.2f\n", (double) blocking_in_body_ / n);
+        std::fprintf(out, "prof_launches_per_token=%.2f\n", (double) launches_in_body_ / n);
+        if (n_ev_ >= PROF_MAX_EVENTS)
+            std::fprintf(out, "prof_WARNING=event pool exhausted, times are a lower bound\n");
+    }
+
+    void   timer_start() override {
+        blocking_at_token_start_ = blocking_;
+        launches_at_token_start_ = launches_;
+        HIP_CHECK(hipEventRecord(ev0_, 0));
+    }
     double timer_stop_ms() override {
         HIP_CHECK(hipEventRecord(ev1_, 0));
         HIP_CHECK(hipEventSynchronize(ev1_));
@@ -1206,23 +1479,67 @@ public:
     }
 
 private:
+    // Chooses the split so that row_groups*nsplit reaches GEMV_TARGET_WGS,
+    // never splitting finer than one unit (a Q8_0 block, or 32 elements)
+    // per split, and never past what the partial buffer holds.
     void gemv_at(const Mat & W, const void * base, const float * x, float * y) {
         const int rows = (int) W.rows, K = (int) W.K;
+        const int row_groups = ceil_div(rows, GEMV_WAVES);
+        const int units = (W.type == FK_Q_Q8_0) ? K / FK_Q8_0_BLOCK_WEIGHTS
+                                                : ceil_div(K, WAVE);
+        int nsplit = (row_groups >= GEMV_MIN_WGS) ? 1 : ceil_div(GEMV_TARGET_WGS, row_groups);
+        if (nsplit > units) nsplit = units;
+        if (nsplit < 1) nsplit = 1;
+        while (nsplit > 1 && (size_t) nsplit * rows > GEMV_PART_FLOATS) nsplit >>= 1;
+
+        float * dst = (nsplit > 1) ? gemv_part_ : y;
+        const dim3 grid((unsigned) row_groups, (unsigned) nsplit);
+
+        mark(PC_TRUNK);
         switch (W.type) {
             case FK_Q_Q8_0:
-                k_gemv_q8_0<<<rows, WAVE>>>((const unsigned char *) base, W.row_bytes, x, y, rows, K);
+                k_gemv_q8_0<<<grid, GEMV_THREADS>>>((const unsigned char *) base, W.row_bytes,
+                                                     x, dst, rows, K, nsplit);
                 break;
             case FK_Q_BF16:
-                k_gemv_bf16<<<rows, WAVE>>>((const unsigned short *) base, W.K, x, y, rows, K);
+                k_gemv_bf16<<<grid, GEMV_THREADS>>>((const unsigned short *) base, W.K,
+                                                     x, dst, rows, K, nsplit);
                 break;
             case FK_Q_F32:
-                k_gemv_f32<<<rows, WAVE>>>((const float *) base, W.K, x, y, rows, K);
+                k_gemv_f32<<<grid, GEMV_THREADS>>>((const float *) base, W.K,
+                                                    x, dst, rows, K, nsplit);
                 break;
             default:
                 std::fprintf(stderr, "gemv: %s is in a format only the expert kernels read\n", W.name);
                 std::abort();
         }
+        if (nsplit > 1) {
+            ++launches_;
+            k_reduce_splits<<<ceil_div(rows, BLK), BLK>>>(gemv_part_, y, rows, nsplit);
+        }
     }
+
+    // ---- profiling state ----
+    void mark(int cls) {
+        ++launches_;                       // one op == one launch, except where noted
+        if (!prof_ || n_ev_ >= PROF_MAX_EVENTS) return;
+        HIP_CHECK(hipEventRecord(ev_[n_ev_], 0));
+        ev_cls_[n_ev_] = cls;
+        ++n_ev_;
+    }
+
+    bool       prof_ = false;
+    int        n_ev_ = 0;
+    long long  launches_ = 0;
+    long long  blocking_ = 0;              // host-blocking calls, counted always
+    long long  blocking_at_token_start_ = 0;
+    long long  launches_at_token_start_ = 0;
+    int        tokens_profiled_ = 0;
+    long long  blocking_in_body_ = 0;
+    long long  launches_in_body_ = 0;
+    double     prof_us_[PC_N] = {0};
+    std::vector<hipEvent_t> ev_;
+    std::vector<int>        ev_cls_;
 
     hipEvent_t ev0_{}, ev1_{};
     float * partial_ = nullptr;
@@ -1231,6 +1548,14 @@ private:
     uint32_t * cand_key_ = nullptr;
     int      * cand_idx_ = nullptr;
     int        cand_cap_ = 0;
+    // split-K partials: nsplit*rows stays near GEMV_TARGET_WGS*GEMV_WAVES by
+    // construction (nsplit rises only as rows falls), so this is small.
+    float *    gemv_part_ = nullptr;
+    static constexpr size_t GEMV_PART_FLOATS = 1u << 17;   // 128k floats = 512 KB
+    static constexpr int    STAGE_SLOTS = 8;
+    static constexpr size_t STAGE_BYTES = 1u << 16;        // 64 KB
+    void *     stage_[STAGE_SLOTS] = {nullptr};
+    int        stage_next_ = 0;
     size_t placed_ = 0;
 };
 

@@ -260,6 +260,21 @@ public:
     void scale(const float * x, float s, float * y, size_t n) override {
         for (size_t i = 0; i < n; ++i) y[i] = x[i] * s;
     }
+    void scale_silu(const float * x, float s, float * y, size_t n) override {
+        for (size_t i = 0; i < n; ++i) y[i] = siluf(x[i] * s);
+    }
+    void gdn_gate(const float * beta_raw, const float * alpha_raw, const float * dt,
+                  const float * ssm_a, float * beta_sig, float * a_softplus,
+                  float * gate, float * g_exp, int n) override {
+        for (int i = 0; i < n; ++i) {
+            beta_sig[i]   = sigmoidf(beta_raw[i]);
+            const float sp = softplusf(alpha_raw[i] + dt[i]);
+            a_softplus[i] = sp;
+            const float g = sp * ssm_a[i];      // ssm_a already holds -exp(A_log)
+            gate[i]       = g;
+            g_exp[i]      = std::exp(g);
+        }
+    }
     void mul_tiled(const float * x, const float * w, float * y, size_t n, size_t ne0_w) override {
         for (size_t i = 0; i < n; ++i) y[i] = x[i] * w[i % ne0_w];
     }
@@ -491,12 +506,17 @@ public:
             scores[b] = acc;
         }
     }
-    void qsa_expand(const float * blk_scores, const float * blk_bias, float * cell,
-                    int n_kv, int q_pos, int ratio) override {
+    void qsa_expand(const float * blk_scores, float * cell, int n_kv, int q_pos,
+                    int ratio, int tail_start) override {
+        const int n_blocks = (n_kv + ratio - 1) / ratio;
         for (int j = 0; j < n_kv; ++j) {
-            const int b = j / ratio;
-            cell[j] = (j <= q_pos) ? blk_scores[b] + blk_bias[b] : -INFINITY;
+            const int b      = j / ratio;
+            const int filled = std::min(ratio, n_kv - b * ratio);
+            const float bias = (b * ratio >= tail_start) ? 1e9f
+                             : (filled < ratio ? -INFINITY : 0.0f);
+            cell[j] = (j <= q_pos) ? blk_scores[b] + bias : -INFINITY;
         }
+        (void) n_blocks;
     }
     int topk_select(const float * scores, int n, int width, int * out) override {
         std::vector<int> idx;

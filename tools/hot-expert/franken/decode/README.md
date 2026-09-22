@@ -19,7 +19,7 @@ differ (`ggml_gated_delta_net`, `ggml_rope_multi`).
 franken_decode[_cpu] --model <any shard.gguf> --tokens <id> [<id> ...]
                      [--layers 0-15] [--oracle DIR] [--ctx N] [--threads N]
                      [--time N] [--min-cos X] [--quant-act] [--verbose]
-                     [--dump DIR] [--jitter X]
+                     [--dump DIR] [--jitter X] [--profile]
 ```
 
 `make` builds both and runs nothing. `make resources` prints the per-kernel
@@ -121,14 +121,18 @@ Ids `[248044, 785, 10945, 315, 1495, 374]` (the dump's own), six tokens fed
 one at a time, `--ctx 32`, against `~/bench/franken/oracle`. Logs in
 `~/bench/franken/cpu_l0*.log`, `jitter*.log`.
 
-**Layer 0 is EXACT.** With `--quant-act` every tap of layer 0 up to and
-including the Gated DeltaNet output reads `cos=1.000000 maxabs=0`:
+**Layer 0 matches to the printed precision.** With `--quant-act` every tap of
+layer 0 up to and including the Gated DeltaNet output reads `cos=1.000000`:
 `hc_norm-0`, `hc_gate-0`, `hc_mixed-0`, `hc_inject-0`,
 `linear_attn_qkv_mixed-0`, `z-0`, `alpha-0`, `beta-0`, `a_softplus-0`,
 `beta_sigmoid-0`, `conv_output_silu-0`, `q_conv-0`, `k_conv-0`,
-`attn_output-0`, `shared_expert_gate_sigmoid-0`. The rest of the layer is at
-the floor: `linear_attn_out-0` 0.999996, `ffn_shexp-0` 0.999995,
-`ffn_moe_out-0` 0.999965, `hc_combine-0` 0.999995, `l_last-0` 0.999993.
+`attn_output-0`, `shared_expert_gate_sigmoid-0`. Only `hc_norm-0` is
+bit-identical (`maxabs=0`) — it is the one tap with no matmul in it; the
+others carry a `maxabs` of 1e-5 to 1e-2 against vectors whose elements are
+O(1)–O(10), i.e. the last-ulp disagreement of two f32 reductions.
+The rest of the layer is at the floor: `linear_attn_out-0` 0.999996,
+`ffn_shexp-0` 0.999995, `ffn_moe_out-0` 0.999965, `hc_combine-0` 0.999995,
+`l_last-0` 0.999993.
 Without the arm (the engine's real numerics, f32 activations) the same points
 are 0.99988–0.99999 — that difference is llama.cpp's activation quantisation
 and **this engine is the more accurate side**.
@@ -171,3 +175,72 @@ The clean fix is one line in deliverable A: **dump the selected expert ids
 per layer** (`ffn_moe_topk_ids`). With those, routing can be compared as a
 set and, if needed, forced identical — and the arithmetic bar becomes
 meaningful at every depth instead of only at layers 0–6.
+
+## The 12.9 ms token, and what was done about it (2026-09-22, second cut)
+
+The first GPU run measured `layers0_15_ms_median=12.9059` (n=32) — about 5x
+the bytes (~1.8 GB of weights for these 16 layers is ~2.2 ms at the 800 GB/s
+of §M5). Three things were wrong, and `--profile` now measures which of them
+mattered.
+
+**1. Host-blocking calls inside the layer body.** Three are gone:
+
+- the QSA per-block bias was built on the host and uploaded **once per QSA
+  layer** — a blocking `hipMemcpy` in the middle of the loop. It is a closed
+  form of the position, so `k_qsa_expand` computes it.
+- the PLE row upload happened inside `layer_ple`. It is now done by `step()`
+  before the body, with everything else the token needs.
+- `--verbose` downloaded the routed ids **per layer**, which is 16 device
+  syncs a token — and `--verbose` was on in the run that measured 12.9 ms.
+  The ids are now logged device-to-device and read back after the body.
+
+Per-token uploads also go through a pinned staging ring and `hipMemcpyAsync`,
+so they are stream-ordered rather than blocking. `prof_host_syncs_per_token`
+must read **0**; anything else is a bug.
+
+**2. Launch geometry: most of the trunk could not fill the card.** One wave
+per output row is right for the two wide projections and starves a 96-CU /
+192-SIMD card on everything else:
+
+| tensor | rows | K | bytes | old WGs | waves/SIMD | new WGs |
+|---|---:|---:|---:|---:|---:|---:|
+| `attn_qkv` | 10240 | 2560 | 27.9M | 10240 | 53 | 1280 × 8 waves |
+| `ssm_out` | 2560 | 6144 | 16.7M | 2560 | 13 | 2240 |
+| `hc_*_down` (×4/layer) | 320 | 10240 | 3.5M | **320** | **1.7** | 2080 |
+| `ffn_gate_inp` | 512 | 2560 | 5.2M | **512** | **2.7** | 2048 |
+| `ssm_alpha`/`beta` (×2) | 48 | 2560 | 0.5M | **48** | **0.25** | 480 |
+| `hc_*_inject` (×4/layer) | 4 | 10240 | 0.16M | **4** | **0.02** | 320 |
+| `ffn_gate_inp_shexp` | 1 | 2560 | 0.01M | **1** | **0.005** | 80 |
+
+A workgroup is now 256 threads = 8 waves, one row each, and K is split across
+`nsplit` workgroups chosen so `row_groups × nsplit` reaches 2048 — but only
+when `row_groups` is under 512, so the two already-full GEMVs are untouched.
+Split partials are summed by `k_reduce_splits` in a **fixed order**, so the
+result stays reproducible (an `atomicAdd` would not, and the oracle depends
+on it). The Q8_0 inner loop keeps decode_quant.h's lane mapping — a wave
+reads one block's 32 contiguous `qs` bytes, the widest request ggml's
+34-byte AoS stride allows without an unaligned dword load — but unrolls four
+blocks instead of two, so four requests are in flight per wave.
+
+The reductions (`rms_norm`, `l2_norm`, `gated_rms_norm`, `ple_gate`) have a
+grid fixed by the model (HC=4 groups for the hc modules), so the only lever
+is width: the block size is now chosen by the host from `ne0` up to 1024,
+with dynamic LDS.
+
+**3. Launch count.** A dependent chain of trivial kernels pays a kernel
+latency per link whatever its size, and §M5's "240 launches a token are free"
+was measured on five substantial kernels a layer, not on the mostly-trivial
+ones a layer here (`prof_launches_per_token` reports the exact figure; it was
+never counted before this flag existed). Two fusions that
+keep every oracle tap are in: `scale`+`silu` in `build_hc_mix` (32 launches a
+token) and the whole GDN gate chain — `sigmoid(beta)`, `softplus(alpha+dt)`,
+`*ssm_a`, `exp` — as one launch over 48 elements instead of five (48 a
+token). `prof_launches_per_token` reports the rest; if `prof_elem_hc_us` is
+still large against its bytes, the remaining elementwise chains
+(`sigmoid`+`hc_collapse`, the shared-expert gate and add, the QSA output
+gate) are the next candidates and are the same pattern.
+
+**None of this has been run.** The CPU path is unchanged and was re-checked
+against its own pre-change dump: 538 of 538 points `cos=1.000000`, STEP2
+PASS — so the GPU-side rework cannot have moved the math, and
+`--dump`/`--oracle` will say whether it moved the kernels.

@@ -81,7 +81,10 @@ echo "--- rig-side acceptance (accept_live.sh)"
 # PIPESTATUS, not the pipeline's: `ssh … | grep -v …` reports grep's status, so a FAILING
 # accept_live was reported as PASS on 2026-09-09 — the same "gate that cannot fail" defect
 # this file exists to prevent, in this file.
-ssh "$RIG" '~/src/colibri/tools/hot-expert/accept_live.sh' 2>&1 | grep -v "^\[pin\]\|^CKPT\|^20[0-9][0-9]-"
+# When serve_alt.sh has an alternative behind the gateway, its log is not ~/glm53_server.log;
+# accept_live/owui_ui_turn poll the log for the [req] line and would wait 60 min on the wrong
+# file (2026-09-22, the first Franken serve). Ask serve_alt status for the live log.
+ssh "$RIG" 'L=$(~/src/colibri/tools/hot-expert/serve_alt.sh status 2>/dev/null | sed -n "s/.*gateway log \(.*\)$/\1/p" | head -1); GLM53_LOG="${L:-$HOME/glm53_server.log}" ~/src/colibri/tools/hot-expert/accept_live.sh' 2>&1 | grep -v "^\[pin\]\|^CKPT\|^20[0-9][0-9]-"
 [ "${PIPESTATUS[0]}" = 0 ] || FAIL=1
 echo "=== accept_ui $([ $FAIL = 0 ] && echo PASS || echo FAIL) $(date +%Y-%m-%dT%H:%M:%S%z)"
 exit $FAIL

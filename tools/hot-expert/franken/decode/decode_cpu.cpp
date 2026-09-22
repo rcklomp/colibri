@@ -556,19 +556,16 @@ public:
             quant_row(v + (size_t) h * HEAD_DIM, vqs + e, vsc + sb);
         }
     }
-    void idx_raw_store(const float * kr, float * raw, int cell) override {
-        std::memcpy(raw + (size_t) cell * IDX_DIM, kr, IDX_DIM * sizeof(float));
-    }
-    void idx_pool_block(const float * raw, int blk, int n_filled, const float * k_norm,
-                        float eps, uint16_t * pooled, float * dbg_pooled, float * dbg_roped) override {
+    void idx_pool_block(const float * k_new, float * sum, float * raw0, int blk,
+                        int n_filled, const float * k_norm, float eps,
+                        uint16_t * pooled, float * dbg_pooled, float * dbg_roped) override {
         float p[IDX_DIM];
-        for (int i = 0; i < IDX_DIM; ++i) p[i] = 0.0f;
-        for (int m = 0; m < QSA_RATIO; ++m) {
-            const int cell = (m < n_filled) ? blk * QSA_RATIO + m : 0;   // unset slots read cell 0
-            const float * r = raw + (size_t) cell * IDX_DIM;
-            for (int i = 0; i < IDX_DIM; ++i) p[i] += r[i];
+        for (int i = 0; i < IDX_DIM; ++i) {
+            const float kv = k_new[i];
+            if (blk == 0 && n_filled == 1) raw0[i] = kv;       // cell 0 is the fill value
+            sum[i] = (n_filled == 1) ? kv : sum[i] + kv;       // members arrive in order
+            p[i] = (sum[i] + (float)(QSA_RATIO - n_filled) * raw0[i]) * (1.0f / (float) QSA_RATIO);
         }
-        for (int i = 0; i < IDX_DIM; ++i) p[i] *= 1.0f / (float) QSA_RATIO;
         if (dbg_pooled) std::memcpy(dbg_pooled, p, sizeof(p));
 
         rms_norm_mul(p, k_norm, p, IDX_DIM, 1, IDX_DIM, eps);

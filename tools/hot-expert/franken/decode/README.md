@@ -437,3 +437,58 @@ under the rig lock with the gateway stopped. `--ctx` sizes the QSA caches
 §9.1's figure. `vram_report` prints used/free/total per card after placement
 and again after the scratch, so the fullest card's headroom is a measurement
 rather than an estimate. Nothing here has been run on a GPU.
+
+### Step 3 fix (2026-09-22): the placement bug, and the cache budget
+
+The first GPU run died at `--ctx 262144` **and again at `--ctx 4096`** with
+`out of VRAM placing blk.18.ffn_down_exps.weight` on empty cards. It was not
+the caches.
+
+**`hipMalloc`, `hipMemcpy` and a kernel launch all act on the CURRENT device,
+and the current device is process-wide state — not something a stream
+carries.** `GpuBackend` set it once in its constructor, so after
+`make_gpu_backend(0..2)` the current device was 2 and every later allocation
+went there whichever backend was asked. Placement filled one card with all 48
+layers and died at layer 18: 24 GB / ~1.34 GB a layer is 17.9. Step 2 never
+saw it because with a single backend the constructor's `hipSetDevice` was also
+the right one for everything after it.
+
+Every entry point that allocates, copies or launches now ensures its own
+device first (`dev_ensure`, a compare against a process-global, so the cost is
+one predictable branch on the launches that do not switch). And the failure is
+caught where it happens: `verify_placement` fails early and says so when a card
+holds under 80 % of what it was asked to place, instead of a message about the
+wrong tensor a dozen layers later. `vram_dev<i>_used_gb=` is printed **before**
+placement, after it, and after the caches.
+
+**The cache sizing was also wrong, and is now the design's.** The indexer kept
+every token's RAW key in f32 to re-pool from — 512 B a token a layer, *eight
+times* the 64 B design §9.1 budgets for the pooled bf16 key, and 134 MB a layer
+at 256k. It does not need them: a block's members arrive in order, so
+
+```
+pooled = (sum_of_members_so_far + (r - n_filled) * key_of_cell_0) / r
+```
+
+is the reference's formula exactly — unset slots read cell 0
+(`llama-memory-hybrid-idx.cpp:395`) — from a running sum and one saved key,
+`IDX_DIM` floats each. Two more buffers stopped scaling with `ctx`: the f32
+shadows of the pooled cache (67 MB a device, for two taps the comparator marks
+INCOMPARABLE at any other cache depth anyway) and the selection array, which is
+capped by the *budget*, not the cache. The attention split scratch was already
+independent of `ctx` (33 chunks × 24 heads × 256 dims = 811 KB).
+
+Measured by the new `kv_bytes_dev<i>=` line at `--ctx 262144`:
+
+```
+kv_bytes_dev0=1.208 GB  (qsa_layers=4 x 302.0 MB, 1152 B/token/layer)
+gdn_state_dev0=0.040 GB (gdn_layers=12)
+```
+
+1152 B/token/layer is 1088 (K and V, 2 heads × 256 dims in q8_0) + 64 (one
+pooled bf16 indexer key per 4 cells) — design §9.1's number, and 1.208 GB a
+device against its ~1.2 GB. With ~21.5 GB of weights the fullest card sits at
+~22.8 GB of 25.77.
+
+The CPU graph is **bit-identical** after the rework: 538 of 538 taps
+`cos=1.000000` against the step-2 dump.

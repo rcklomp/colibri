@@ -942,18 +942,14 @@ __global__ void k_kv_store_q8_0(const float * __restrict__ k, const float * __re
     else       { kqs[e] = (int8_t) q; if (lane == 0) ksc[sb] = sc; }
 }
 
-__global__ void k_idx_raw_store(const float * __restrict__ kr, float * __restrict__ raw, int cell) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < IDX_DIM) raw[(size_t) cell * IDX_DIM + i] = kr[i];
-}
-
-// One workgroup of IDX_DIM threads: mean-pool the block's members, rms-norm
-// with index_k_norm, IMRoPE at the block's first token position, store bf16.
-// Missing members read cell 0 -- set_input_qsa zero-fills blk_cells
-// (llama-memory-hybrid-idx.cpp:395) and never revisits an incomplete block's
-// pooled value, because the tail block's +1e9 bias selects it regardless.
+// One workgroup of IDX_DIM threads. A block's members arrive in order, so a
+// running SUM plus cell 0's key reproduces set_input_qsa's formula exactly --
+// unset slots read cell 0 (llama-memory-hybrid-idx.cpp:395) -- without keeping
+// every token's raw key. That f32 cache was 512 B a token a layer, eight times
+// what design 9.1 budgets for the pooled bf16 key and 134 MB a layer at 256k.
 __global__ __launch_bounds__(IDX_DIM)
-void k_idx_pool_block(const float * __restrict__ raw, int blk, int n_filled,
+void k_idx_pool_block(const float * __restrict__ k_new, float * __restrict__ sum,
+                      float * __restrict__ raw0, int blk, int n_filled,
                       const float * __restrict__ k_norm, float eps,
                       unsigned short * __restrict__ pooled,
                       float * __restrict__ dbg_pooled, float * __restrict__ dbg_roped) {
@@ -961,12 +957,11 @@ void k_idx_pool_block(const float * __restrict__ raw, int blk, int n_filled,
     __shared__ float s_r[IDX_DIM];
     const int i = threadIdx.x;
 
-    float p = 0.0f;
-    for (int m = 0; m < QSA_RATIO; ++m) {
-        const int cell = (m < n_filled) ? blk * QSA_RATIO + m : 0;
-        p += raw[(size_t) cell * IDX_DIM + i];
-    }
-    p *= 1.0f / (float) QSA_RATIO;
+    const float kv = k_new[i];
+    if (blk == 0 && n_filled == 1) raw0[i] = kv;      // cell 0 is the fill value
+    const float s = (n_filled == 1) ? kv : sum[i] + kv;
+    sum[i] = s;
+    float p = (s + (float)(QSA_RATIO - n_filled) * raw0[i]) * (1.0f / (float) QSA_RATIO);
     if (dbg_pooled) dbg_pooled[i] = p;
 
     s_v[i] = p * p;
@@ -1385,6 +1380,26 @@ void k_argmax_final(const float * __restrict__ pv, const int * __restrict__ pi,
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
+// THE STEP-3 CRASH, and why it looked like a cache-sizing bug.
+//
+// hipMalloc, hipMemcpy and a kernel launch all act on the CURRENT device, and
+// the current device is process-wide state -- not something a stream carries.
+// GpuBackend set it once in its constructor, so after `make_gpu_backend(0..2)`
+// the current device was 2 and EVERY later allocation went there, whichever
+// backend was asked. Placement then filled one card with all 48 layers and
+// died at layer 18: 24 GB / ~1.34 GB a layer is 17.9. Step 2 never saw it
+// because with one backend the constructor's hipSetDevice was also the right
+// one for everything after it.
+//
+// So every entry point that allocates, copies or launches now ensures its own
+// device first. The check is a compare against a process-global, so the cost
+// is one predictable branch on the ~1 160 launches a token that do not switch.
+inline int & cur_device_slot() { static int d = -1; return d; }
+inline void dev_ensure(int d) {
+    int & cur = cur_device_slot();
+    if (cur != d) { HIP_CHECK(hipSetDevice(d)); cur = d; }
+}
+
 // A reduction workgroup wide enough to walk ne0 in a few steps, capped at the
 // hardware maximum; the LDS is sized to match.
 inline int red_threads(int ne0) {
@@ -1463,6 +1478,7 @@ public:
         // and grown on demand by topk_select()
     }
     ~GpuBackend() override {
+        dev_ensure(dev_);
         HIP_IGNORE(hipFree(partial_)); HIP_IGNORE(hipFree(mbuf_)); HIP_IGNORE(hipFree(lbuf_));
         HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
         HIP_IGNORE(hipFree(gemv_part_));
@@ -1496,24 +1512,46 @@ public:
 
     void vram_report(FILE * out, const char * tag) override {
         size_t freeb = 0, totalb = 0;
-        HIP_CHECK(hipSetDevice(dev_));
+        dev_ensure(dev_);
         HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
-        std::fprintf(out, "vram dev%d %s: used=%.2f GB free=%.2f GB total=%.2f GB placed=%.2f GB\n",
-                     dev_, tag, (totalb - freeb) / 1e9, freeb / 1e9, totalb / 1e9, placed_ / 1e9);
+        std::fprintf(out, "vram_dev%d_used_gb=%.2f free_gb=%.2f total_gb=%.2f placed_gb=%.2f  (%s)\n",
+                     dev_, (totalb - freeb) / 1e9, freeb / 1e9, totalb / 1e9,
+                     placed_ / 1e9, tag);
+    }
+
+    // Fails EARLY and loudly when a device holds far less than it was asked to
+    // place -- the signature of the bug above, where every card but one came
+    // out near-empty and the run died a dozen layers later with a message
+    // about the wrong thing.
+    bool verify_placement(FILE * out) override {
+        size_t freeb = 0, totalb = 0;
+        dev_ensure(dev_);
+        HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
+        const double used = (totalb - freeb) / 1e9, want = placed_ / 1e9;
+        if (want > 1.0 && used < want * 0.8) {
+            std::fprintf(out, "PLACEMENT ERROR dev%d: %.2f GB was placed here but the card "
+                              "reports only %.2f GB used -- the allocations went to another "
+                              "device (check hipSetDevice before hipMalloc)\n",
+                         dev_, want, used);
+            return false;
+        }
+        return true;
     }
     bool is_gpu() const override { return true; }
 
     float * alloc_f32(size_t n) override { return (float *) alloc_raw(n * sizeof(float)); }
     int *   alloc_i32(size_t n) override { return (int   *) alloc_raw(n * sizeof(int)); }
     void *  alloc_raw(size_t b) override {
+        dev_ensure(dev_);
         void * p = nullptr;
         if (b == 0) b = 4;
         HIP_CHECK(hipMalloc(&p, b));
         HIP_CHECK(hipMemset(p, 0, b));
         return p;
     }
-    void free_buf(void * p) override { HIP_IGNORE(hipFree(p)); }
+    void free_buf(void * p) override { dev_ensure(dev_); HIP_IGNORE(hipFree(p)); }
     void upload(void * d, const void * s, size_t b) override {
+        dev_ensure(dev_);
         if (b <= STAGE_BYTES) {
             void * st = stage_[stage_next_];
             stage_next_ = (stage_next_ + 1) % STAGE_SLOTS;
@@ -1525,18 +1563,24 @@ public:
         HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyHostToDevice));
     }
     void download(void * d, const void * s, size_t b) override {
+        dev_ensure(dev_);
         ++blocking_;                       // the host reads it: this always blocks
         HIP_CHECK(hipStreamSynchronize(stream_));
         HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyDeviceToHost));
     }
-    void sync() override { ++blocking_; HIP_CHECK(hipStreamSynchronize(stream_)); }
+    void sync() override { dev_ensure(dev_); ++blocking_; HIP_CHECK(hipStreamSynchronize(stream_)); }
 
     const void * place(const void * host, size_t bytes, const char * what) override {
+        dev_ensure(dev_);                  // or the bytes land on another card
         void * p = nullptr;
         const hipError_t e = hipMalloc(&p, bytes);
         if (e != hipSuccess) {
-            std::fprintf(stderr, "out of VRAM placing %s (%.2f MB): %s\n",
-                         what, bytes / 1e6, hipGetErrorString(e));
+            size_t fb = 0, tb = 0;
+            HIP_IGNORE(hipMemGetInfo(&fb, &tb));
+            std::fprintf(stderr, "out of VRAM placing %s (%.2f MB) on device %d: %s\n"
+                                 "  this card: %.2f GB free of %.2f GB, %.2f GB placed here so far\n",
+                         what, bytes / 1e6, dev_, hipGetErrorString(e),
+                         fb / 1e9, tb / 1e9, placed_ / 1e9);
             std::abort();
         }
         HIP_CHECK(hipMemcpy(p, host, bytes, hipMemcpyHostToDevice));
@@ -1753,15 +1797,12 @@ public:
         mark(PC_QSA);
         k_kv_store_q8_0<<<grid, WAVE, 0, stream_>>>(k, v, kqs, (__half *) ksc, vqs, (__half *) vsc, cell);
     }
-    void idx_raw_store(const float * kr, float * raw, int cell) override {
+    void idx_pool_block(const float * k_new, float * sum, float * raw0, int blk,
+                        int n_filled, const float * kn, float eps, uint16_t * pooled,
+                        float * dbg_p, float * dbg_r) override {
         mark(PC_QSA);
-        k_idx_raw_store<<<ceil_div(IDX_DIM, BLK), BLK, 0, stream_>>>(kr, raw, cell);
-    }
-    void idx_pool_block(const float * raw, int blk, int n_filled, const float * kn,
-                        float eps, uint16_t * pooled, float * dbg_p, float * dbg_r) override {
-        mark(PC_QSA);
-        k_idx_pool_block<<<1, IDX_DIM, 0, stream_>>>(raw, blk, n_filled, kn, eps,
-                                         (unsigned short *) pooled, dbg_p, dbg_r);
+        k_idx_pool_block<<<1, IDX_DIM, 0, stream_>>>(k_new, sum, raw0, blk, n_filled,
+                                         kn, eps, (unsigned short *) pooled, dbg_p, dbg_r);
     }
     void idx_scan(const uint16_t * pooled, const float * q, float * s, int n_blocks) override {
         const int nsub = IDXS_THREADS / WAVE;
@@ -1786,6 +1827,7 @@ public:
         k_qsa_expand<<<ceil_div(n_kv, BLK), BLK, 0, stream_>>>(bs, c, sel, n_kv, q, r, tail, sel_identity);
     }
     int topk_select(const float * scores, int n, int width, int * out) override {
+        dev_ensure(dev_);
         if (n > cand_cap_) {
             HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
             cand_cap_ = n;
@@ -1827,6 +1869,7 @@ public:
         launches_in_body_ = 0;
     }
     void prof_end_token() override {
+        dev_ensure(dev_);
         blocking_in_body_ += blocking_ - blocking_at_token_start_;
         launches_in_body_ += launches_ - launches_at_token_start_;
         ++tokens_profiled_;
@@ -1867,11 +1910,13 @@ public:
     }
 
     void   timer_start() override {
+        dev_ensure(dev_);
         blocking_at_token_start_ = blocking_;
         launches_at_token_start_ = launches_;
         HIP_CHECK(hipEventRecord(ev0_, stream_));
     }
     double timer_stop_ms() override {
+        dev_ensure(dev_);
         HIP_CHECK(hipEventRecord(ev1_, stream_));
         HIP_CHECK(hipEventSynchronize(ev1_));
         float ms = 0.0f;
@@ -1882,6 +1927,7 @@ public:
 private:
     // ---- profiling state ----
     void mark(int cls, int gemv_group = -1, size_t bytes = 0) {
+        dev_ensure(dev_);                  // every op runs on its OWN card
         ++launches_;                       // one op == one launch, except where noted
         if (gemv_group >= 0 && gemv_group < GG_N) gemv_bytes_[gemv_group] += (double) bytes;
         if (!prof_ || n_ev_ >= PROF_MAX_EVENTS) return;

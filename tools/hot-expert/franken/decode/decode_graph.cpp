@@ -105,9 +105,14 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
 
         S.blkscore  = A(max_blocks);
         S.cellscore = A(cfg_.ctx);
-        S.pool_raw  = A((size_t) max_blocks * IDX_DIM);  // f32 shadow of the pooled cache,
-        S.pool_rope = A((size_t) max_blocks * IDX_DIM);  // pre- and post-norm/rope (taps)
-        S.sel       = AI(cfg_.ctx);
+        // This token's block only. They used to be max_blocks long (67 MB a
+        // device at 256k) to tap the whole pooled tensor -- for two points
+        // the comparator marks INCOMPARABLE at any other cache depth anyway.
+        S.pool_raw  = A(IDX_DIM);
+        S.pool_rope = A(IDX_DIM);
+        // the selection is capped by the BUDGET, not the cache: the identity
+        // path only fires while n_kv <= indexer_top_k + r - 1
+        S.sel       = AI(std::min(cfg_.ctx, MAX_SEL));
 
         S.logits   = A(N_EXPERT);
         S.wts      = A(N_EXPERT_USED);
@@ -173,7 +178,9 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
             st.vqs = (int8_t   *) AR(n_qs);
             st.ksc = (uint16_t *) AR(n_sc * sizeof(uint16_t));
             st.vsc = (uint16_t *) AR(n_sc * sizeof(uint16_t));
-            st.idx_raw    = A((size_t) cfg_.ctx * IDX_DIM);
+            st.idx_new    = A(IDX_DIM);
+            st.idx_sum    = A(IDX_DIM);
+            st.idx_raw0   = A(IDX_DIM);
             st.idx_pooled = (uint16_t *) AR((size_t) max_blocks * IDX_DIM * sizeof(uint16_t));
         }
     }
@@ -374,32 +381,30 @@ void DecodeRunner::layer_qsa(const LayerWeights & L, LayerState & st, int il, Re
     // wq, wk, wv and the two indexer projections all read `mixed_`, so they
     // are ONE kernel -- and the indexer key is written STRAIGHT into its cache
     // cell, which removes the separate store. The batch mixes Q8_0 and BF16.
-    float * idx_cell = st.idx_raw + (size_t) pos_ * IDX_DIM;
     {
         GemvJob jobs[5];
         jobs[0].W = &L.wq;    jobs[0].out = qfull_;
         jobs[1].W = &L.wk;    jobs[1].out = kraw_;
         jobs[2].W = &L.wv;    jobs[2].out = vcur_;
         jobs[3].W = &L.idx_q; jobs[3].out = idxraw_;
-        jobs[4].W = &L.idx_k; jobs[4].out = idx_cell;
+        jobs[4].W = &L.idx_k; jobs[4].out = st.idx_new;
         bep_->gemv_batch(jobs, 5, mixed_, GG_QSA_PROJ);
     }
-    rec.tap(*bep_, "indexer_k_raw", il, idx_cell, IDX_DIM);
+    rec.tap(*bep_, "indexer_k_raw", il, st.idx_new, IDX_DIM);
 
     // Only the block this token joined can change; every earlier block is
     // already final. Missing members read cell 0, which is what
     // set_input_qsa's zero-filled blk_cells produces (llama-memory-hybrid-idx.cpp:395).
     const int blk      = pos_ / r;
     const int n_filled = n_kv - blk * r;
-    bep_->idx_pool_block(st.idx_raw, blk, n_filled, L.idx_k_norm, eps_, st.idx_pooled,
-                       pool_raw_  + (size_t) blk * IDX_DIM,
-                       pool_rope_ + (size_t) blk * IDX_DIM);
+    bep_->idx_pool_block(st.idx_new, st.idx_sum, st.idx_raw0, blk, n_filled,
+                         L.idx_k_norm, eps_, st.idx_pooled, pool_raw_, pool_rope_);
     // The dump's `indexer_k_pooled` / `indexer_k` are [idx_dim, n_blocks], so
     // they cover EVERY block, not this token's. Each block's value is final
     // once its last member arrives, so the f32 shadow of the pooled cache
     // that idx_pool_block fills as it goes is exactly that tensor.
-    rec.tap(*bep_, "indexer_k_pooled", il, pool_raw_,  (size_t) n_blocks * IDX_DIM);
-    rec.tap(*bep_, "indexer_k",        il, pool_rope_, (size_t) n_blocks * IDX_DIM);
+    rec.tap(*bep_, "indexer_k_pooled", il, pool_raw_,  IDX_DIM);
+    rec.tap(*bep_, "indexer_k",        il, pool_rope_, IDX_DIM);
 
     // the [q|gate] split, the three QK-norms, the three IMRoPEs and the
     // output gate's sigmoid -- nine launches with grids as small as four
@@ -655,6 +660,34 @@ int DecodeRunner::step(int32_t token, const float * ple_emb, Recorder & rec) {
 
     ++pos_;
     return greedy;
+}
+
+// Design 9.1's KV budget, as arithmetic rather than assertion: per QSA layer
+// per cell, K and V at 2 heads x 256 dims in q8_0 (32 int8 plus one f16 a
+// block = 34 B per 32 values) plus one pooled bf16 indexer key per `ratio`
+// cells.
+void DecodeRunner::report_cache_bytes(FILE * out) const {
+    const int max_blocks = (cfg_.ctx + QSA_RATIO - 1) / QSA_RATIO;
+    const size_t per_layer =
+        2 * ((size_t) cfg_.ctx * N_KV_HEADS * HEAD_DIM)                       // K,V int8
+      + 2 * ((size_t) cfg_.ctx * N_KV_HEADS * (HEAD_DIM / 32) * sizeof(uint16_t))
+      + (size_t) max_blocks * IDX_DIM * sizeof(uint16_t)                      // pooled keys
+      + 3 * IDX_DIM * sizeof(float);                                          // sum, raw0, new
+    for (int d = 0; d < model_.n_devices(); ++d) {
+        int qsa = 0, gdn = 0;
+        for (int il = model_.il0(); il <= model_.il1(); ++il) {
+            if (model_.dev_of(il) != d) continue;
+            if (is_recurrent_layer(il)) ++gdn; else ++qsa;
+        }
+        const size_t gdn_bytes = (size_t) gdn *
+            ((size_t) GDN_CONV_K * GDN_CONV_DIM +
+             (size_t) GDN_V_HEADS * GDN_STATE * GDN_STATE) * sizeof(float);
+        std::fprintf(out,
+            "kv_bytes_dev%d=%.3f GB  (qsa_layers=%d x %.1f MB at ctx=%d, "
+            "%.0f B/token/layer)  gdn_state_dev%d=%.3f GB (gdn_layers=%d)\n",
+            d, (double)((size_t) qsa * per_layer) / 1e9, qsa, per_layer / 1e6, cfg_.ctx,
+            (double) per_layer / cfg_.ctx, d, (double) gdn_bytes / 1e9, gdn);
+    }
 }
 
 std::vector<float> DecodeRunner::logits_host() {

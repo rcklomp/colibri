@@ -110,6 +110,10 @@ public:
     // Wall/GPU time of the last step's layer body, milliseconds.
     double last_body_ms() const { return last_body_ms_; }
 
+    // Bytes of QSA cache this device holds, and the per-token rate, so the
+    // sizing is a printed number rather than a belief (`kv_bytes_dev<i>=`).
+    void report_cache_bytes(FILE * out) const;
+
 private:
     struct LayerState {
         float *    conv_ring  = nullptr;  // GDN: [GDN_CONV_K][GDN_CONV_DIM]
@@ -119,7 +123,12 @@ private:
         uint16_t * ksc        = nullptr;
         int8_t *   vqs        = nullptr;
         uint16_t * vsc        = nullptr;
-        float *    idx_raw    = nullptr;  // [ctx][IDX_DIM] raw indexer keys
+        // No raw-key cache: a running sum plus cell 0's key is all the
+        // reference's pooling formula reads (decode_backend.h), so the
+        // indexer costs the 64 B a token design 9.1 budgets, not 576.
+        float *    idx_new    = nullptr;  // [IDX_DIM] this token's key
+        float *    idx_sum    = nullptr;  // [IDX_DIM] members of the current block
+        float *    idx_raw0   = nullptr;  // [IDX_DIM] cell 0's key, the fill value
         uint16_t * idx_pooled = nullptr;  // [ctx/ratio][IDX_DIM] bf16 pooled keys
     };
 

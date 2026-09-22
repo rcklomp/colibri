@@ -167,9 +167,20 @@ int main(int argc, char ** argv) {
                     be->name(), n_devices, il0, il1, ctx, tokens.size(),
                     (int) with_head, (int) quant_act);
 
+        const int n_report = use_cpu ? 1 : n_devices;
+        // BEFORE the weights, so "the card was empty" is a measurement
+        for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "before placement");
+
         DecodeModel model(model_path, devs, il0, il1, with_head);
         std::printf("placed=%.2f GB rms_eps=%g\n", model.placed_bytes() / 1e9, model.rms_eps());
-        for (int d = 0; d < (use_cpu ? 1 : n_devices); ++d) devs[d]->vram_report(stdout, "after placement");
+        for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after placement");
+
+        // Fail HERE, not a dozen layers into the next allocation with a
+        // message about the wrong tensor: if a card holds far less than it was
+        // asked to place, the allocations went somewhere else.
+        bool placement_ok = true;
+        for (int d = 0; d < n_report; ++d) placement_ok &= devs[d]->verify_placement(stdout);
+        if (!placement_ok) { std::printf("STEP3 FAIL (placement)\n"); return 1; }
 
         // The PLE gather is host work by design (9.1) and depends on the whole
         // token prefix, so it is computed once for the sequence. ../ple.cpp's
@@ -188,8 +199,10 @@ int main(int argc, char ** argv) {
         cfg.verbose = verbose;
         cfg.jitter  = jitter;
         cfg.log_routing = !routing_dir.empty();
+        // weights first, then the caches and scratch, each on its owning card
         DecodeRunner run(model, cfg);
-        for (int d = 0; d < (use_cpu ? 1 : n_devices); ++d) devs[d]->vram_report(stdout, "after scratch");
+        run.report_cache_bytes(stdout);
+        for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after caches+scratch");
 
         Recorder rec;
         RoutingOracle routing;
@@ -320,7 +333,7 @@ int main(int argc, char ** argv) {
             }
             std::printf("layers%d_%d_ms_median=%.4f n=%d\n", il0, il1, median(ms), time_n);
             if (profile) {
-                for (int d = 0; d < (use_cpu ? 1 : n_devices); ++d) {
+                for (int d = 0; d < n_report; ++d) {
                     std::printf("--- device %d ---\n", d);
                     devs[d]->prof_report(stdout, time_n);
                 }

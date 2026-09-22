@@ -14,6 +14,18 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 53 (2026-09-22 18:30 CEST, 16:30 UTC) -- STEP 2b: 11.7 -> 7.6 ms for 16
+> layers on one card (record §L0-STEP2, commit c0633eb).** Batched GEMVs
+> over shared activations, epilogue fusions, no top-k when the context fits
+> the budget: 931 -> 389 launches, GPU still = CPU graph (534/534). Big
+> projections at 434-497 GB/s (55-60 % of the bound); the remaining trunk
+> gap is the small matrices (hc, shared expert, router: 128-245 GB/s,
+> latency-bound) and the ~2 ms launch floor of 389 launches. Extrapolated:
+> ~23 ms a token over three cards (43 tok/s) at short context vs llama.cpp's
+> 34-40 -- already past the design's >= 40 target, projected. Next: split-K
+> for every matrix under ~10 MB, further epilogue fusion; then step 3
+> (three cards + lm_head, greedy text oracle).**
+>
 > **Rev 52 (2026-09-22 17:50 CEST, 15:50 UTC) -- L0 STEP 2 RUNS (record
 > §L0-STEP2, design rev 9).** The one-card decode loop over layers 0-15
 > exists (`tools/hot-expert/franken/decode/`, 35 kernels, one graph with a

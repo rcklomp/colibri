@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 4)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 5)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -16,6 +16,7 @@ open, the measurement that closes it is named.
 | host→device streaming | 61 GB/s with three cards, 28 with one; Vulkan copies reach HIP's rate on the right queue family | §PCIE-STREAM, §VK-STREAM (F0) |
 | CPU expert path | ~985 MB/token at 22 GB/s ≈ 45 ms/token for GLM's misses; 8 cores | §G11 |
 | a synchronous GPU call | 0.25–0.4 ms whatever the matrix (Vulkan/RADV) | §F3-STEP2A, HANDOFF §5 |
+| HIP on gfx1100 (M5): async launch 3.0 µs; launch+sync 24 µs; cross-stream event 31 µs; hipGraph node 2.75 µs (saves 7 %); 10 KB P2P card→card 28–32 µs, via host 50–58 µs; P2P bandwidth 16–24 GB/s; VRAM read 800 GB/s; **a 48-layer synthetic token of 240 plain launches runs at 794 GB/s = the memory bound** | §M5 (2026-09-22) |
 | RCCL tensor parallelism | loses on arithmetic: 25 µs × ~80 hops per token | plan §1 (measured 09-16) |
 | resident MoE on three cards, llama.cpp | 75 tok/s at 18k (gpt-oss-120b); 17.6 with all experts in RAM | §GPTOSS-3CARD |
 | one card, resident 35B, hipFire kernels | 131 → 79 tok/s down the ladder, 164 short | plan §1 |
@@ -124,9 +125,9 @@ exists) as a workload parameter, not skipped.
 | M2 | expert usage histograms and per-layer miss bytes for Qwen3.8 and DeepSeek at 256k-scale prompts; hit rate of router lookahead | Colibri's histogram tooling ported to read llama.cpp's router output (a debug hook, CPU) | §3.1, §3.2, §3.3 |
 | M3 | KV bytes per token per model at 256k; attention time per layer at 32k/128k/256k, candidate kernels | from llama.cpp's own graph on one card, timers | §2 row 2, §3.4 |
 | M4 | streaming prefill on three cards: Colibri's F2 ring driven from three queues at once, AND the shared-link pair contending deliberately | `vk_stream_probe`-style, real expert sizes | the ≤ 1 ms/token projection; the pair's real joint bandwidth (§3.3) |
-| M5 | pipeline boundary cost: P2P copy of one hidden vector card→card, and one layer-range's whole-token command stream on hipFire's kernels | microbenchmark | §1(b), §1(c) |
+| M5 (**done 2026-09-22, §M5**) | pipeline boundary cost: P2P copy of one hidden vector card→card, and a whole-token command stream | `tools/hot-expert/m1/m5_bench.hip` | §1(b), §1(c) confirmed: boundaries ~30 µs, a whole-token stream of plain kernels reaches the VRAM bandwidth bound; hipGraph unnecessary; projection ~125 tok/s bandwidth-bound for Qwen3.8 resident before attention |
 
-Order: M0 done, M0b in flight, M1 and M3 in parallel (no gateway stop for either),
+Order: M0 and M5 done, M1 (harness in build) and M3 next,
 M2, then M5, then M4. Tier: M1/M5 are kernel work (Opus writes the
 benchmarks from the two codebases; the orchestrator reads the hot loops
 first); M2/M3/M4 are Sonnet ports of existing tooling.

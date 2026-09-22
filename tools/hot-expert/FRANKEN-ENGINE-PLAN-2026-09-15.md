@@ -14,6 +14,19 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 48 (2026-09-22 10:45 CEST, 08:45 UTC) -- M5 MEASURED (record §M5, design
+> rev 5): the launch/sync floor on gfx1100 under HIP is 3 µs async, 24 µs
+> blocking, 31 µs cross-stream, ~30 µs per P2P boundary; a synthetic 48-layer
+> token of 240 plain launches on one card runs at 794 GB/s, the VRAM bandwidth
+> bound (800 measured) -- hipGraph saves 7 %. §1(b)/(c) of the design are
+> confirmed on this hardware. Projection, labelled: Qwen3.8 fully resident is
+> ~125 tok/s bandwidth-bound before attention, against llama.cpp's 24-29;
+> llama.cpp's gap is its 22 host-mediated graph splits, CPU-side ops and (to
+> be measured, M1) its expert kernels at N=640, not the launch floor. M1
+> harness (llama.cpp's mul_mat_id path and hipFire's kernels on the real
+> shapes) in build; M3 (KV bytes: 1 088 + 408 MiB per card at 256k already
+> read from M0d's log = ~18 KB a token; attention time per layer) next.**
+>
 > **Rev 47 (2026-09-22 09:30 CEST, 07:30 UTC) -- M0 MEASURED (record §F11-M0,
 > design rev 3).** Qwen3.8-Flash-Next UD-IQ4_XS under llama.cpp fit, a 32k
 > against a 256k window: `llama-fit-params` places the SAME tensors at both

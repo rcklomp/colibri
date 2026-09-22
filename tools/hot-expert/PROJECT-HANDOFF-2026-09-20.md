@@ -74,7 +74,7 @@ cherry-pick, ours go out as PRs through `upstream_lint.sh` (#1521, #1524 sent).
 | Gateway env (`~/start_glm53.sh`) | `GLM53_VK_SWIGLU_CLAMP=1 COLI_PREFILL_STREAM=1 GLM53_PREFILL_CHUNK=512 GLM53_MLA_ATTN_GPU=1 GLM53_MOE_ONE_TEAM=1 GLM53_I4_FAST=2 COLI_KDA_GPU=2`, prefix checkpoints + pin, `--max-tokens 4096 --kv-slots 4`, tier caps 1695/1695 |
 | Acceptance | `accept_ui.sh` PASS 18:10 CEST (first token in the browser 2.07 s), `accept_live.sh` PASS 16:10 UTC, engine alive, rig lock free |
 | Branch | `hot-expert-tier`; Mac = Gitea (`origin`) = rig; `doc_currency.sh` PASS |
-| Plan revs | Franken plan rev 37, prefill roadmap rev 38, decode roadmap closed (as of 09-20; on 2026-09-22: plan rev 49, prefill roadmap rev 45, design rev 6) |
+| Plan revs | Franken plan rev 37, prefill roadmap rev 38, decode roadmap closed (as of 09-20; on 2026-09-22: plan rev 50, prefill roadmap rev 45, design rev 7) |
 | Rollback | `serve_candidate.sh` with `glm53.f8` / `.f7` / `.f2` / `.f2base` and the matching `~/bench/start_glm53.sh.pre-*` |
 
 What the owner gets from GLM-5.3 today, against where each track started:

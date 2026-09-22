@@ -14,6 +14,22 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 50 (2026-09-22 12:30 CEST, 10:30 UTC) -- M3 CLOSED, GO/NO-GO PASSED
+> (record §M3 v2, design rev 7).** Opus-tier kernels: wave-per-block indexer
+> scan (775 GB/s streamed from VRAM at 256k), single-launch radix-select
+> top-k (28 µs), flash-style sparse attention (38 µs). A QSA layer is 60 /
+> 92 / 142 µs at 32k / 128k / 256k with 12 rotating cache copies defeating
+> the 96 MB Infinity Cache (the single-copy run read 2.3 TB/s and was not
+> recorded as the result); 1.7 ms a token for 12 layers + 0.57 ms GDN =
+> 2.3 ms of attention at 256k against a 10-12 ms go/no-go. The first cut's
+> 2 ms top-k was a host bisection with a memcpy per round. Every term of the
+> resident token is now measured on this hardware: ~10-12 ms a token, 80-100
+> tok/s at 256k projected (design §6). M0, M1, M3, M5 done; **L0 may start**
+> (design §7: Qwen3.8 resident on three cards, layer-range pipeline,
+> hipFire-class trunk and expert kernels with K_TOP=10 and a group-128/64
+> format, M3's attention kernels, Colibri's gateway). M2/M4 are for the
+> streamed models.**
+>
 > **Rev 49 (2026-09-22 12:00 CEST, 10:00 UTC) -- M1 MEASURED, M3 FIRST CUT
 > (record §M1, §M3; design rev 6).** M1 on Qwen3.8's real expert shapes:
 > hipFire's MoE GEMV kernels 452 GB/s at batch 1 and 826 (= the VRAM bound)

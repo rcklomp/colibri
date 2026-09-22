@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 6)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 7)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -123,18 +123,20 @@ exists) as a workload parameter, not skipped.
 | M0c, M0d (**done**) | 256k at fit margin 1 024 vs 3 072 MiB, GTT sampled; then the server's own fit log | `~/bench/f11_fit4.sh`, `f11_fit5.sh` | not eviction (GTT flat); llama.cpp's fit puts 5 layers of expert gate/up on the CPU at 256k; ~0.5 ms per CPU expert evaluation |
 | M1 (**done 2026-09-22, §M1**) | expert kernel head to head on gfx1100 on Qwen3.8's real expert shapes (512 experts of 640×2560 / 2560×640), batch 1 and 32 | `tools/hot-expert/m1/m1_ggml.cpp`, `m1_hipfire.hip` | §2 row 3 decided: hipFire's kernel shape (452 GB/s at batch 1, 826 = the bound at batch 32) over llama.cpp's mmvq MoE path (174 / 271); two ports needed: runtime K_TOP (10) and a group-128/64 format for K=640. Colibri's Vulkan path not run: §F3-STEP2A's 0.3 ms per call already rules it out for the resident trunk |
 | M2 | expert usage histograms and per-layer miss bytes for Qwen3.8 and DeepSeek at 256k-scale prompts; hit rate of router lookahead | Colibri's histogram tooling ported to read llama.cpp's router output (a debug hook, CPU) | §3.1, §3.2, §3.3 |
-| M3 (**first cut 2026-09-22, §M3; NOT closed**) | KV bytes per token at 256k; QSA attention time per layer at 32k/128k/256k | `tools/hot-expert/m1/m3_attn.hip` | KV 16.1 KB/token from the shapes, 17.9 measured; only the indexer scan (67 MB/layer at 256k, 0.28 ms) depends on depth; first-cut top-k (2.05 ms) and sparse attention (0.48 ms) are 20–50× above their bytes → 38 ms/token now, ~2 ms at the bound. **Closes when the two kernels are rewritten and re-measured; the go/no-go waits for that** |
+| M3 (**done 2026-09-22, §M3**) | KV bytes per token at 256k; QSA attention time per layer at 32k/128k/256k | `tools/hot-expert/m1/m3_attn.hip` (v2 kernels: wave-per-block scan, radix-select top-k, flash-style sparse attention) | KV 16.1 KB/token from the shapes, 17.9 measured; QSA layer 60 / 92 / 142 µs streamed from VRAM (scan at 775 GB/s), 1.7 ms/token at 256k + GDN 0.57 ms. **Go/no-go passed by 4×.** The first cut (naive kernels, 38 ms/token) is history in §M3 |
 | M4 | streaming prefill on three cards: Colibri's F2 ring driven from three queues at once, AND the shared-link pair contending deliberately | `vk_stream_probe`-style, real expert sizes | the ≤ 1 ms/token projection; the pair's real joint bandwidth (§3.3) |
 | M5 (**done 2026-09-22, §M5**) | pipeline boundary cost: P2P copy of one hidden vector card→card, and a whole-token command stream | `tools/hot-expert/m1/m5_bench.hip` | §1(b), §1(c) confirmed: boundaries ~30 µs, a whole-token stream of plain kernels reaches the VRAM bandwidth bound; hipGraph unnecessary; projection ~125 tok/s bandwidth-bound for Qwen3.8 resident before attention |
 
-Order: M0, M5, M1 done; M3 kernels v2 (top-k, sparse attention) next, then
+Order: M0, M5, M1, M3 done -- L0 may start (rev 7); M2 and M4 are needed for the streamed models (L0b, L5), not for L0; then
 M2, then M5, then M4. Tier: M1/M5 are kernel work (Opus writes the
 benchmarks from the two codebases; the orchestrator reads the hot loops
 first); M2/M3/M4 are Sonnet ports of existing tooling.
 
 **Go/no-go (rev 2):** M3 > 10-12 ms per token at 256k, or M1 showing no
 kernel within 2x of bandwidth-bound on gfx1100, and the 40 tok/s projection
-in §6 is withdrawn before anything is built on it.
+in §6 is withdrawn before anything is built on it. **Rev 7: both passed --
+M3 2.3 ms (§M3), M1 hipFire's kernels at 56 % of the bound at batch 1 and
+at the bound at batch 32 (§M1). The projection stands and is sharpened in §6.**
 
 ## 5. What this design refuses
 
@@ -148,11 +150,13 @@ in §6 is withdrawn before anything is built on it.
 ## 6. Targets (projected, to be refuted by the program)
 
 Decode at 256k for Qwen3.8-Flash-Next with ALL experts resident (rev 4;
-§F11-M0 point 2): the bandwidth bound is ~7.5 ms/token for ~6.2 GB of VRAM
-reads over three cards in sequence; the resident work at hipFire-class
-efficiency is ~10 ms/token (from 80–130 tok/s on a comparable active size);
-no miss wave for this model; attention at 256k unknown (M3). If M3 is ≤ 10 ms, the target is **≥ 40 tok/s
-at 256k** against llama.cpp's 6 today. Prefill ≤ 1 ms/token → **a cold 256k
+§F11-M0 point 2): the bandwidth bound is ~7.8 ms/token for ~6.2 GB of VRAM
+reads over three cards in sequence (§M5 measured 794 of 800 GB/s on a
+whole-token stream); hipFire-class expert kernels reach 56 % of it at batch
+1 (§M1), so 9–10 ms for the weights is the honest expectation; attention
+1.7 ms + GDN 0.6 ms at 256k (§M3, measured); boundaries 0.06 ms (§M5). **Rev 7:
+~10–12 ms a token, 80–100 tok/s at 256k, every term measured on this
+hardware; the target stays ≥ 40 tok/s at 256k** against llama.cpp's 6 today. Prefill ≤ 1 ms/token → **a cold 256k
 prompt in ~5 min** against 17. Both are arithmetic until M1/M3/M4 say
 otherwise, and the plan's own rule applies: step 0 is a measurement.
 

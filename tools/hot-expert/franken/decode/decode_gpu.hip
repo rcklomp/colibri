@@ -1854,6 +1854,7 @@ public:
 
     void set_profile(bool on) override {
         prof_ = on;
+        dev_ensure(dev_);   // events belong to the device current at creation (M5 bug class)
         if (on && ev_.empty()) {
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);

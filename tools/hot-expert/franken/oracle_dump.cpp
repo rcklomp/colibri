@@ -17,6 +17,19 @@
 // several of the names on the brief's list (result_norm, result_output,
 // ple_embd, and this file's own extra probes model.input_embed / hc_init)
 // are called with il == -1 and so never carry a "-<il>" suffix.
+//
+// Two extensions on top of the original 1256/1257-tap dump (same rules:
+// CPU only, no GPU, docker without --device):
+//   --greedy N   decode N further tokens greedily (argmax, no sampler
+//                state) after the prompt, print/write the ids and (via
+//                llama_token_to_piece) the text.
+//   ffn_moe_topk the per-token selected-expert-id tensor build_moe_ffn
+//                names (llama-graph.cpp:2058), I32 [n_expert_used,
+//                n_tokens]. Captured for EVERY position of EVERY decode
+//                call (prompt AND each greedy step), unlike the rest of
+//                WANTED which stays last-token-only and prompt-only (see
+//                CbCtx::prompt_phase) so the original 1256-tap dump that
+//                Deliverable B already validated against is unchanged.
 
 #include "llama.h"
 #include "ggml.h"
@@ -31,7 +44,9 @@
 #include <map>
 #include <set>
 #include <string>
+#include <sstream>
 #include <sys/stat.h>
+#include <tuple>
 #include <vector>
 
 // ---------------------------------------------------------------------
@@ -55,6 +70,10 @@ static const std::set<std::string> WANTED = {
     // extra probes for "the model's input embedding after the PLE add, if
     // it is named" -- see the report for why neither is actually that.
     "model.input_embed", "hc_init",
+    // per-token selected-expert ids (build_moe_ffn, llama-graph.cpp); see
+    // the "special case" comment in cb_eval() -- unlike everything else in
+    // this set, it is captured every position of every decode call.
+    "ffn_moe_topk",
 };
 
 struct Hit {
@@ -122,6 +141,25 @@ struct CbCtx {
     // one. Track how many times each t->name has been dumped so a second
     // occurrence gets "<name>-<il>.2.f32" instead of overwriting the first.
     std::map<std::string, int> occurrence;
+
+    // true only while decoding the original prompt batch; set false before
+    // the first greedy step so the WANTED single-column taps stay exactly
+    // the dump Deliverable B already validated (no extra occurrences pile
+    // up across 16 more forward passes). ffn_moe_topk ignores this flag.
+    bool prompt_phase = true;
+
+    // absolute position of column 0 of the tensor currently being
+    // processed; main() advances it by the ubatch's token count right
+    // after each llama_decode() call returns.
+    int64_t position_base = 0;
+
+    // per-layer, position-ordered, flat [n_expert_used] blocks of expert
+    // ids, accumulated across every decode call (prompt + every greedy step).
+    std::map<int, std::vector<int32_t>> moe_ids;
+    std::map<int, int64_t> moe_n_expert_used;
+    // one "<il> <pos>: <id> <id> ..." entry per (il, position); sorted by
+    // (pos, il) before being written so the file reads as a timeline.
+    std::vector<std::tuple<int64_t, int, std::string>> moe_lines;
 };
 
 static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -131,6 +169,12 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     int il;
     if (!split_name(t->name, base, il)) {
         return false; // not one of ours: no need to force materialisation
+    }
+
+    const bool is_moe_topk = (base == "ffn_moe_topk");
+
+    if (!is_moe_topk && !ctx->prompt_phase) {
+        return false; // the rest of WANTED is prompt-only, see CbCtx::prompt_phase
     }
 
     if (ask) {
@@ -147,6 +191,34 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         ctx->host_buf.resize(n_bytes);
         ggml_backend_tensor_get(t, ctx->host_buf.data(), 0, n_bytes);
         data = ctx->host_buf.data();
+    }
+
+    if (is_moe_topk) {
+        // I32 [n_expert_used, n_tokens] -- every position of this call, not
+        // just the last, accumulated across every decode call so far.
+        if (t->type != GGML_TYPE_I32) {
+            fprintf(stderr, "oracle_dump: %s has unexpected type %s, expected i32, skipping\n",
+                    t->name, ggml_type_name(t->type));
+            return true;
+        }
+        const int64_t n_used   = t->ne[0];
+        const int64_t n_tokens = t->ne[1];
+        ctx->moe_n_expert_used[il] = n_used;
+        auto & vec = ctx->moe_ids[il];
+        for (int64_t pos_i = 0; pos_i < n_tokens; ++pos_i) {
+            std::ostringstream line;
+            line << il << " " << (ctx->position_base + pos_i) << ":";
+            for (int64_t k = 0; k < n_used; ++k) {
+                size_t off = (size_t) pos_i * t->nb[1] + (size_t) k * t->nb[0];
+                int32_t id = *(const int32_t *)(data + off);
+                vec.push_back(id);
+                line << " " << id;
+            }
+            ctx->moe_lines.emplace_back(ctx->position_base + pos_i, il, line.str());
+        }
+        fprintf(stderr, "oracle_dump: moe_ids layer %d: %lld position(s) starting at %lld (n_expert_used=%lld)\n",
+                il, (long long) n_tokens, (long long) ctx->position_base, (long long) n_used);
+        return true;
     }
 
     if (ggml_is_quantized(t->type)) {
@@ -236,6 +308,7 @@ int main(int argc, char ** argv) {
     std::string out_dir = "./oracle";
     std::vector<llama_token> tokens;
     int n_threads = 8;
+    int n_greedy = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -245,6 +318,8 @@ int main(int argc, char ** argv) {
             out_dir = argv[++i];
         } else if (a == "--threads" && i + 1 < argc) {
             n_threads = atoi(argv[++i]);
+        } else if (a == "--greedy" && i + 1 < argc) {
+            n_greedy = atoi(argv[++i]);
         } else if (a == "--tokens") {
             while (i + 1 < argc && isdigit((unsigned char) argv[i + 1][0])) {
                 tokens.push_back((llama_token) atoi(argv[++i]));
@@ -256,7 +331,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s --model <first-shard.gguf> --tokens <id...> [--out <dir>] [--threads N]\n", argv[0]);
+        fprintf(stderr, "usage: %s --model <first-shard.gguf> --tokens <id...> [--out <dir>] [--threads N] [--greedy N]\n", argv[0]);
         return 1;
     }
     if (tokens.empty()) {
@@ -289,7 +364,7 @@ int main(int argc, char ** argv) {
     cb_ctx.out_dir = out_dir;
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx           = std::max<uint32_t>(64, (uint32_t) tokens.size() + 8);
+    cparams.n_ctx           = std::max<uint32_t>(64, (uint32_t) tokens.size() + (uint32_t) n_greedy + 8);
     cparams.n_batch         = (uint32_t) tokens.size();
     cparams.n_ubatch        = (uint32_t) tokens.size();
     cparams.n_threads       = n_threads;
@@ -313,12 +388,88 @@ int main(int argc, char ** argv) {
         llama_model_free(model);
         return 1;
     }
+    cb_ctx.position_base += (int64_t) tokens.size();
 
     fprintf(stderr, "oracle_dump: decode done, %d tensors dumped\n", cb_ctx.n_dumped);
+
+    // --- greedy generation (argmax, temperature 0, no sampler state) ---
+    std::vector<llama_token> greedy_ids;
+    std::string greedy_text;
+    if (n_greedy > 0) {
+        cb_ctx.prompt_phase = false; // freeze the WANTED single-column taps at the prompt's dump
+
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+        llama_token next_tok = -1;
+        for (int step = 0; step < n_greedy; ++step) {
+            const float * logits = llama_get_logits_ith(ctx, -1);
+            if (!logits) {
+                fprintf(stderr, "oracle_dump: no logits available at greedy step %d\n", step);
+                break;
+            }
+            int32_t best = 0;
+            float best_val = logits[0];
+            for (int32_t v = 1; v < n_vocab; ++v) {
+                if (logits[v] > best_val) { best_val = logits[v]; best = v; }
+            }
+            next_tok = (llama_token) best;
+            greedy_ids.push_back(next_tok);
+
+            char piece[256];
+            int32_t n = llama_token_to_piece(vocab, next_tok, piece, sizeof(piece), 0, true);
+            if (n > 0) {
+                greedy_text.append(piece, n);
+            } else if (n < 0) {
+                fprintf(stderr, "oracle_dump: llama_token_to_piece buffer too small for token %d\n", next_tok);
+            }
+
+            rc = llama_decode(ctx, llama_batch_get_one(&next_tok, 1));
+            if (rc != 0) {
+                fprintf(stderr, "oracle_dump: llama_decode failed at greedy step %d, rc=%d\n", step, rc);
+                break;
+            }
+            cb_ctx.position_base += 1;
+        }
+
+        fprintf(stderr, "greedy_ids: ");
+        for (size_t i = 0; i < greedy_ids.size(); ++i) fprintf(stderr, "%s%d", i ? " " : "", greedy_ids[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "greedy_text: %s\n", greedy_text.c_str());
+
+        std::ofstream gf(out_dir + "/greedy.txt");
+        gf << "greedy_ids:";
+        for (auto id : greedy_ids) gf << " " << id;
+        gf << "\n";
+        gf << "greedy_text: " << greedy_text << "\n";
+        gf.close();
+    }
+
+    // --- per-layer, per-position MoE expert ids, prompt + every greedy step ---
+    if (!cb_ctx.moe_ids.empty()) {
+        for (auto & kv : cb_ctx.moe_ids) {
+            int il = kv.first;
+            int64_t n_used = cb_ctx.moe_n_expert_used[il];
+            std::string path = out_dir + "/moe_ids-" + std::to_string(il) + ".i32";
+            std::ofstream f(path, std::ios::binary);
+            f.write((const char *) kv.second.data(), (std::streamsize)(kv.second.size() * sizeof(int32_t)));
+            f.close();
+            fprintf(stderr, "oracle_dump: wrote %s (%zu positions x %lld experts)\n",
+                    path.c_str(), kv.second.size() / (size_t) std::max<int64_t>(1, n_used), (long long) n_used);
+        }
+        std::sort(cb_ctx.moe_lines.begin(), cb_ctx.moe_lines.end());
+        std::ofstream mf(out_dir + "/moe_ids.txt");
+        for (auto & line : cb_ctx.moe_lines) {
+            mf << std::get<2>(line) << "\n";
+        }
+        mf.close();
+        fprintf(stderr, "oracle_dump: wrote %s/moe_ids.txt (%zu lines)\n", out_dir.c_str(), cb_ctx.moe_lines.size());
+    }
 
     // report which of the WANTED names never showed up at all
     std::set<std::string> seen_bases;
     for (auto & h : cb_ctx.hits) seen_bases.insert(h.base);
+    if (!cb_ctx.moe_ids.empty()) seen_bases.insert("ffn_moe_topk"); // handled outside cb_ctx.hits
     for (auto & w : WANTED) {
         if (!seen_bases.count(w)) {
             fprintf(stderr, "oracle_dump: NOT FOUND in this build's graph: %s\n", w.c_str());

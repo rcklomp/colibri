@@ -302,6 +302,15 @@ public:
                             int sel_identity) = 0;
     // Returns how many were selected (min(width, visible)); fills `out`.
     virtual int  topk_select(const float * scores, int n, int width, int * out) = 0;
+    // Size the top-k candidate lists ONCE, from --ctx. They are indexed by
+    // cache depth, which grows by one cell a token, so growing them on demand
+    // meant a hipMalloc AND a hipFree per QSA layer per token -- and hipFree
+    // SYNCHRONISES THE DEVICE, so each one drained the queue and the host sat
+    // waiting for whatever was outstanding. That is why the cost appeared only
+    // once the cache passed the budget (below it the selection is the identity
+    // and topk_select is never called) and why it grew with depth: the deeper
+    // the cache, the more queued work each of those 48 syncs a token waited on.
+    virtual void reserve_topk(int n) { (void) n; }
     // build_layer_attn's per-head post-processing in one op: the [q|gate]
     // split of attn_q's interleaved rows, the QK-norms, IMRoPE on q, k and
     // the indexer query, and the output gate's sigmoid.

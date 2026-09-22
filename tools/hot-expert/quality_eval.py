@@ -69,7 +69,7 @@ MMLU_DATASET = "TIGER-Lab/MMLU-Pro"
 MMLU_CONFIG = "default"
 MMLU_SPLIT = "test"
 MMLU_PAGE = 100                 # datasets-server refuses length > 100 (verified 2026-09-21)
-MMLU_PER_CATEGORY = 5
+MMLU_PER_CATEGORY = int(os.environ.get("MMLU_PER_CATEGORY", "5"))   # 15 for the 210-item run of 2026-09-22
 MMLU_EXPECTED_CATEGORIES = 14
 MMLU_SAMPLE_SEED = 20260921     # today's date, fixed -- documented, not re-derived per run
 LETTERS = "ABCDEFGHIJ"
@@ -479,6 +479,7 @@ def extract_choice(result):
 EXPECT_SUBSTR = {
     "qwen38": "Qwen3.8-Flash-Next",
     "deepseek": "DeepSeek-V4-Flash",
+    "glm-llama": "GLM-5.3-Flash-UD-IQ4_XS",
 }
 
 
@@ -834,7 +835,7 @@ def build_parser():
     pf.set_defaults(func=cmd_fetch)
 
     pr = sub.add_parser("run", help="evaluate one server, append to its jsonl")
-    pr.add_argument("--expect", required=True, choices=["qwen38", "deepseek", "glm"])
+    pr.add_argument("--expect", required=True, choices=["qwen38", "deepseek", "glm", "glm-llama"])
     pr.add_argument("--url", required=True, help="e.g. http://127.0.0.1:8081")
     pr.add_argument("--key-file", required=True)
     pr.add_argument("--model-id", required=True, help="the `model` field to send, e.g. glm-5.3-flash")

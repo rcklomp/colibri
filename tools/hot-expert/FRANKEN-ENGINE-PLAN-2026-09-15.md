@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 57 (2026-09-22 21:50 CEST, 19:50 UTC) -- PREFILL 7.7 -> 3.0 -> 1.63 ms
+> A TOKEN (record §L0-PREFILL-2).** Chunk pipelining across the cards (94-100 %
+> busy, bit-identical, default on) and an LDS-tiled trunk GEMM behind
+> --gemm-lds 1 (last-bits order change, measured). 8 192 tokens in 13.4 s;
+> prefill is at llama.cpp's rate, 1.6x the <= 1 ms target. RDNA3's int8 dot
+> IS reachable (`__builtin_amdgcn_sudot4` -> v_dot4_i32_iu8) but that GEMM
+> variant has a numerics bug and no speed gain; off. Running now: the
+> 262 000-token prefill and decode at that depth -- the design's headline.**
+>
 > **Rev 56 (2026-09-22 21:00 CEST, 19:00 UTC) -- PREFILL BISECTED AND PROFILED
 > (record §L0-PREFILL).** The chunked run's divergence is entirely the
 > expert row-gather's summation order (with it off: bit-identical on the

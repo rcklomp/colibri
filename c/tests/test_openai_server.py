@@ -118,6 +118,71 @@ class TemplateTest(unittest.TestCase):
                          "<|im_start|>user\nHi<|im_end|>\n"
                          "<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
+    def test_qwen38_follow_up_prompt_extends_the_generation_prompt(self):
+        """A follow-up turn's prompt must CONTAIN the previous turn's prompt plus
+        what the engine generated, as a literal prefix.
+
+        This is the invariant every engine's prefix reuse rests on: the engine's
+        KV slot holds `render(turn 1) + generated`, and the next request is a
+        fresh render of the whole conversation. Reuse is the longest common
+        prefix of the two, so anything the renderer writes DIFFERENTLY the second
+        time around -- one space, one missing tag -- cuts reuse off at that
+        point, whatever the engine does.
+
+        The trap this pins is the empty thinking block. With thinking off the
+        generation prompt ends `<|im_start|>assistant\n<think>\n\n</think>\n\n`
+        and the model's answer follows it; re-rendering that same assistant turn
+        without the block would move every token of the answer and make a
+        follow-up reuse nothing past the assistant header. It does not (an
+        assistant turn with no reasoning_content renders as
+        `<think>\n\n</think>\n\n` + text), and this test is what keeps it that
+        way -- 2026-09-23, after a live follow-up was read as exactly that bug.
+        """
+        first = [{"role": "user", "content": "What is two plus two? One word."}]
+        answer = "Four"
+        second = first + [{"role": "assistant", "content": answer},
+                          {"role": "user", "content": "And three plus three? One word."}]
+        p1 = render_chat_qwen38(first, enable_thinking=False)
+        p2 = render_chat_qwen38(second, enable_thinking=False)
+        self.assertTrue(p1.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+        # The whole of turn 1, plus what the model produced, character for
+        # character. (Token for token follows: this vocabulary has no merge that
+        # spans `\n\n` and the answer -- checked against the served tokenizer,
+        # 2026-09-23 -- so an identical text prefix is an identical token prefix.)
+        self.assertTrue(p2.startswith(p1 + answer),
+                        "a follow-up must extend the generation prompt; got:\n%r\nvs\n%r"
+                        % (p2[:len(p1) + len(answer) + 40], p1 + answer))
+        # And the same with thinking ON, where the block carries the reasoning
+        # the client echoed back.
+        p1t = render_chat_qwen38(first, enable_thinking=True)
+        p2t = render_chat_qwen38(
+            first + [{"role": "assistant", "content": answer, "reasoning_content": "2+2=4"},
+                     {"role": "user", "content": "And three plus three? One word."}],
+            enable_thinking=True)
+        self.assertTrue(p1t.endswith("<|im_start|>assistant\n<think>\n"))
+        self.assertTrue(p2t.startswith(p1t + "2+2=4\n</think>\n\n" + answer))
+
+    def test_qwen38_thinking_off_closes_the_block_in_the_prompt(self):
+        """Thinking off is a CLOSED block in the prompt, not a request to stop.
+
+        It matters twice over. The gateway makes Qwen3.8 think when the client
+        asks for nothing (`if ARCH == "qwen38" and COLI_THINK != "0"`), which is
+        the model's own template default; served into the owner's Open WebUI
+        that put a reasoning_content block in front of every answer, where the
+        GLM path he is used to serves with thinking off. And the shape of the
+        closed block is what the follow-up test above depends on: whatever the
+        prompt ends with at generation time has to be what a later turn
+        re-renders in that same spot.
+        """
+        on = render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                                enable_thinking=True, reasoning_effort="xhigh")
+        off = render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                                 enable_thinking=False)
+        self.assertTrue(on.endswith("<|im_start|>assistant\n<think>\n"))
+        self.assertTrue(off.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+        self.assertIn("Reasoning effort is set to xhigh.", on)
+        self.assertNotIn("Reasoning effort", off)
+
     def test_qwen38_still_rejects_non_text_content(self):
         # Tools are wired up now; images are not. The engine is text-only, so a
         # picture must still be refused rather than silently dropped.

@@ -845,3 +845,45 @@ were taken. **The CPU binary cannot answer this** — it has one backend, no
 streams and no overlap to lose, so its `snap=` is a memcpy and its
 `prefill_ms_per_token` measures nothing about the pipeline. Nothing here claims
 a GPU measurement.
+
+### Step 4, check 3 (2026-09-23): the renderer was not the problem
+
+The third serve passed everything but `accept_live.sh` check 3, with
+`prompt=203 reused=161 (need >=171)`, and the reading offered was that the
+gateway re-renders a previous assistant turn without the empty thinking block
+the prompt had at generation time, so the sequences diverge at the assistant
+header. **They do not.** Rendered and tokenized against the served tokenizer:
+
+```
+p1 = <|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+p2 = p1 + "Four" + <|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+p2.startswith(p1 + answer) -> True;  tokens(p2)[:24] == tokens(p1)  -> True
+```
+
+`render_chat_qwen38` renders an assistant turn as
+`<think>\n{reasoning.strip()}\n</think>\n\n{text}`, which with no
+`reasoning_content` **is** `<think>\n\n</think>\n\n` + text — the same bytes the
+generation prompt ended with. The invariant is now a test
+(`test_qwen38_follow_up_prompt_extends_the_generation_prompt`, 172/172 pass).
+
+What the numbers actually say: turn 1 was `prompt=160 emitted=1 limited=0`, so
+the engine held 161 tokens, and it reused **161** — every token it had, which
+is exactly `ledger_expect_reuse`'s prediction of `prompt + completion`. The
+remaining 42 are the tail the second prompt adds *after* the previous answer,
+and none of it has ever been through the model. That tail is the template's:
+for the same two turns, GLM's costs 21 tokens and Qwen3.8's costs 38, against a
+check that allows 32. The full table and the reasoning are in
+`GATEWAY-PROTOCOL.md` §"Two things §5 cannot tell you".
+
+So check 3 as written cannot pass on this template with any engine, and the
+honest options are the owner's to pick, not this code's: make the check's
+tolerance template-aware (Qwen needs ~44 where GLM needs 32), or accept a
+documented SKIP for the qwen38 family the way check 2b already is. Nothing here
+moves a gate's bar to make a number look better.
+
+One engine-side option was considered and rejected: after generating, feed the
+turn-closing tokens the next prompt is certain to contain (`<|im_end|>\n`) so
+the checkpoint covers them. It buys 2 tokens of the 42, and it would make
+`reused` come out at `prompt + completion + 2` — which is a MISMATCH against
+`ledger_expect_reuse` for any family whose ledger is on. Two tokens is not
+worth teaching this engine to disagree with the gateway's arithmetic.

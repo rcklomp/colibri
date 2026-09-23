@@ -765,3 +765,41 @@ the DONE frame.** `accept_live.sh` check 3 and `owui_ui_turn.sh` both run
 `c/glm53.c:6717`'s verbose line. An engine that gets the DONE field perfectly
 right and does not print that line reads as `reused=0` (owui_ui_turn.sh's own
 default) and as "integer expected" (accept_live.sh check 3). Print it.
+
+### Two things §5 cannot tell you, measured on the served engine (2026-09-23)
+
+**The ledger, and therefore `accept_live.sh` check 2b, is off BY CODE for every
+family but `glm53`.** `ledger_enabled()` is `ARCH == "glm53" and
+os.environ.get("COLI_LEDGER", "1") == "1"` (`c/openai_server.py:2703-2706`), so
+no environment setting turns it on for a `qwen38`-family engine and 2b reports
+SKIP however the gateway is launched. That is not a misconfiguration to chase.
+Widening the gate is a gateway change with a cost attached: `_ledger_record`
+reads `plan.parts`, and `parts` is produced by `render_chat_glm53` alone
+(`c/openai_server.py:1998`), so a ledger running on another family would build
+part-less entries and can log `ledger=broken` -- which check 2b FAILS on, i.e.
+the change would turn a SKIP into a FAIL. The engine still reports `reused`
+honestly on the wire and in its `REUSE` line; nothing cross-checks it.
+
+**A follow-up turn's reuse is bounded by the chat template, not by the engine,
+and check 3's tolerance is calibrated on GLM's.** Check 3 requires
+`reused >= prompt_tokens - 32` on the second turn of a two-turn API
+conversation. What an engine can possibly reuse is everything it ground for
+turn 1: `prompt + completion` tokens, which is exactly what
+`ledger_expect_reuse` predicts. Everything the second prompt adds after that --
+closing the assistant turn, the new user turn, the new assistant header, the
+thinking block -- has never been through the model and must be prefilled. That
+tail is a property of the TEMPLATE. Rendered by this gateway and tokenized with
+each model's own tokenizer, for the same two turns of check 3 (a 14-digit
+nonce in each question, a one-token answer):
+
+| template | turn 1 prompt | turn 2 prompt | tail beyond the engine's state |
+|---|---|---|---|
+| GLM-5.3 (`<\|user\|>`, `<\|assistant\|>`) | 30 | 52 | **21** |
+| Qwen3.8 (`<\|im_start\|>user\n`, `<\|im_end\|>\n`, `<think>\n\n</think>\n\n`) | 37 | 76 | **38** |
+
+21 passes a 32-token tolerance; 38 cannot, and no engine behaviour changes
+that. The live run bears it out exactly: turn 1 `prompt=160 emitted=1
+limited=0`, turn 2 `prompt=203 reused=161` -- and 161 IS 160 + 1 - 0, the
+ledger's own prediction, i.e. every token the engine had. A gate that reads
+"the engine is not reusing enough" is, here, reading the cost of Qwen's turn
+scaffolding.

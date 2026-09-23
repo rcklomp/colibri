@@ -256,6 +256,10 @@ stop_gateway() {
   # would leave franken_decode holding ~22 GB on each card, and the very next step
   # (assert_vram_free) would then refuse to start anything at all -- with nothing saying why.
   pkill -9 -x franken_decode 2>/dev/null || true
+  # The engine runs inside the ROCm 7.14 image (~/bench/franken_decode_docker.sh, container
+  # `franken_engine`): a host-side pkill by name did not reach it twice on 2026-09-23 and
+  # the swap back found 24 GB still on the cards. Stop the container explicitly.
+  docker stop -t 5 franken_engine >/dev/null 2>&1 || true
   wait_no_glm53 && wait_no_franken
 }
 
@@ -523,7 +527,9 @@ cmd_alt() {
 # is exactly the failure five F3 chains produced on 2026-09-20).
 start_franken() {
   [ -x "$F_START" ] || { echo "FATAL: $F_START is not executable"; return 1; }
-  SKIP_WARM=1 setsid nohup "$F_START" > "$F_LOG" 2>&1 < /dev/null &
+  # FRANKEN_LOG is what start_franken.sh echoes back as `gateway log <path>`,
+  # so the file and the thing that names it can never drift apart.
+  FRANKEN_LOG="$F_LOG" SKIP_WARM=1 setsid nohup "$F_START" > "$F_LOG" 2>&1 < /dev/null &
   local i
   for i in $(seq 1 240); do
     if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $(cat "$KEY_FILE")" \
@@ -561,11 +567,15 @@ cmd_franken() {
   echo "[5/7] sending one real chat completion to verify"
   if ! send_test_chat "$F_LABEL"; then restore_glm "the Franken test chat failed"; exit 1; fi
   echo "[6/7] accept_live.sh -- the owner's own path, including the request AFTER the one it tests"
-  # Not fatal, and that is deliberate: this engine implements plain per-slot reuse and no prefix
-  # CHECKPOINTS, so check 3 (the API two-turn with memory, which is the checkpoint path on GLM)
-  # may not behave identically. A FAIL here is a result to read, not a reason to throw the box
-  # back to GLM automatically -- the owner asked to judge this engine's answers.
-  "$HERE/accept_live.sh" || echo "NOTE: accept_live.sh did not pass -- see its output above; the engine is still serving"
+  # GLM53_LOG IS NOT OPTIONAL HERE. accept_live.sh and owui_ui_turn.sh both read
+  # "${GLM53_LOG:-$HOME/glm53_server.log}" -- GLM's log -- and every number they report comes out
+  # of it: the [req] line they wait for, and the " REUSE <id> " line they take `reused` from. Run
+  # against this gateway without it, check 1 polls a file nothing is writing to and waits its full
+  # 60 minutes (18 of them spent on 2026-09-23 before it was killed). It is exported, not just set,
+  # because accept_live.sh calls owui_ui_turn.sh as a child and that one reads it too.
+  # Not fatal, and that is deliberate: a FAIL here is a result to read, not a reason to throw the
+  # box back to GLM automatically -- the owner asked to judge this engine's answers.
+  GLM53_LOG="$F_LOG" "$HERE/accept_live.sh" || echo "NOTE: accept_live.sh did not pass -- see its output above; the engine is still serving"
   echo "[7/7] handing the rig lock to the running engine (safe to exit this script now)"
   # The keeper's liveness IS the engine's liveness: tail --pid exits when that pid does, so a
   # crashed engine leaves a stale lock that rig_lock_holder's existing kill -0 rule clears.
@@ -610,7 +620,12 @@ cmd_status() {
     echo "serving: GLM-5.3 (model id 'glm-5.3-flash') via the Colibri gateway on port $ALT_PORT"
   elif pgrep -f "openai_[s]erver.py" >/dev/null && franken_alive; then
     echo "serving: $F_LABEL via the Colibri gateway on port $ALT_PORT (Open WebUI shows it as 'glm-5.3-flash')"
-    echo "engine pid: $(pgrep -x franken_decode | head -1), gateway log $F_LOG"
+    # The launcher prints `gateway log <path>` into its own log; read it back rather than
+    # assuming, so a run started with a different FRANKEN_LOG still reports the truth.
+    local flog
+    flog=$(grep -h "gateway log " "$F_LOG" 2>/dev/null | tail -1 | sed 's/.*gateway log //')
+    echo "engine pid: $(pgrep -x franken_decode | head -1), gateway log ${flog:-$F_LOG}"
+    echo "accept_live against it: GLM53_LOG=${flog:-$F_LOG} $HERE/accept_live.sh"
   else
     echo "serving: NOTHING recognizable on port $ALT_PORT -- run '$HERE/serve_alt.sh glm' to restore GLM"
   fi

@@ -884,6 +884,24 @@ size_t DecodeRunner::kv_bytes(int len) const {
     return n;
 }
 
+void DecodeRunner::sync_devices() {
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+}
+
+void DecodeRunner::save_rec_async(void * dst) {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    char * p = (char *) dst;
+    for (const auto & s : pieces) { s.be->download_async(p, s.ptr, s.bytes); p += s.bytes; }
+}
+
+void DecodeRunner::save_kv_async(void * dst, int len) {
+    std::vector<KvPiece> plan;
+    kv_plan(plan, len, len);
+    char * base = (char *) dst;
+    for (const auto & p : plan) p.be->download_async(base + p.off, p.ptr, p.bytes);
+}
+
 void DecodeRunner::save_kv(void * dst, int len) {
     std::vector<KvPiece> plan;
     kv_plan(plan, len, len);

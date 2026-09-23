@@ -181,6 +181,21 @@ public:
     void   save_rec(void * dst);
     void   load_rec(const void * src, int pos);
 
+    // The same copy with NOTHING waited on: stream-ordered behind the chunk
+    // that has just run and in front of the chunk that comes next
+    // (Backend::download_async). This is what keeps a serving checkpoint out
+    // of the prefill's critical path -- the first served run took a snapshot
+    // per chunk with the blocking save above and prefilled at 7.4 ms a token,
+    // the UNPIPELINED rate, because every chunk ended in a full device drain
+    // (record L0-PREFILL-2: 7.7 unpipelined, 3.0 pipelined, 1.63 with
+    // --gemm-lds 1). `dst` must come from Backend::alloc_pinned, and is only
+    // safe to read after sync_devices().
+    void   save_rec_async(void * dst);
+    void   save_kv_async(void * dst, int len);
+    // Drains every device. One call ends the "in flight" state of every
+    // async save issued before it.
+    void   sync_devices();
+
     // ---- the POSITIONAL half of a slot, cells [0, len) ---------------------
     //
     // Restoring the recurrent state alone is only enough while the slot's own

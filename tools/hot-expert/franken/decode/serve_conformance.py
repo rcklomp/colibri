@@ -196,6 +196,10 @@ class Engine:
             "FRANKEN_CTX": str(args.ctx),
             "FRANKEN_THREADS": str(args.threads),
             "KV_SLOTS": "1",
+            # The schedule's FLOOR, pinned to the chunk so the expectations
+            # below stay arithmetic. In service it is 512 and the template's
+            # turn boundaries carry the precision (phase 3 covers those).
+            "FRANKEN_SNAP_EVERY": str(args.chunk),
             # The gateway always sets these two; the engine must not care.
             "SERVE_BATCH": "1",
             "NGEN": "4096",
@@ -455,6 +459,44 @@ def main():
     finally:
         eng2.close()
         log("== engine stderr: %s ==" % eng2.err.name)
+
+    # ---- phase 3: the template's turn boundaries are the schedule ---------
+    # accept_live.sh check 2 wants reuse within 256 tokens of where two UI
+    # chats diverge, and that point is not a multiple of anything -- it is the
+    # start of the last user turn. With the interval far too coarse to help,
+    # the boundary token is the only thing that can carry it.
+    log("\n== phase 3: FRANKEN_SNAP_EVERY=1000000, boundary checkpoints only ==")
+    eng3 = Engine(args, {"FRANKEN_SNAP_EVERY": "1000000"}, log)
+    w3 = eng3.wire
+    try:
+        w3.wait_ready()
+        # <|im_start|> is a real special token of this vocab, so the engine
+        # tokenizes it as one and takes a checkpoint there.
+        head = ("<|im_start|>system\n" + SHARED + "<|im_end|>\n")
+        qa = head + "<|im_start|>user\nWhat is the capital of Kenya?<|im_end|>\n<|im_start|>assistant\n"
+        qb = head + "<|im_start|>user\nWhat is the capital of Chile, and why?<|im_end|>\n<|im_start|>assistant\n"
+        w3.submit(1, 0, qa, 2)
+        a3 = collect(w3, 1)
+        w3.submit(2, 0, qb, 2)
+        b3 = collect(w3, 2)
+        # The two prompts share everything up to the user turn's content, so a
+        # checkpoint at the boundary token reuses all of it: well inside
+        # accept_live check 2's `prompt_tokens - 256`.
+        # accept_live check 2's own bar is prompt-256, which at this test's
+        # scale would pass with no reuse at all; -32 (check 3's tolerance) is
+        # the same statement made meaningful for a 100-token prompt.
+        check("phase 3: a second chat reuses the shared head (check 2's shape)",
+              b3.reused >= b3.prompt_tokens - 32 and b3.reused > 0,
+              "prompt=%d reused=%d (bar %d)" % (b3.prompt_tokens, b3.reused,
+                                                b3.prompt_tokens - 32))
+        r3 = eng3.req_line(2)
+        check("phase 3: only the diverging tail is re-prefilled",
+              int(r3.get("chunks", -1)) == ceil_div(b3.prompt_tokens - b3.reused, args.chunk),
+              "chunks=%s of %d" % (r3.get("chunks"),
+                                   ceil_div(b3.prompt_tokens - b3.reused, args.chunk)))
+    finally:
+        eng3.close()
+        log("== engine stderr: %s ==" % eng3.err.name)
 
     print("\n%d check(s) failed%s" % (len(failures),
           (": " + ", ".join(failures)) if failures else ""))

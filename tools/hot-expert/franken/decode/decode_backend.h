@@ -49,6 +49,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "decode_shapes.h"
@@ -147,6 +148,29 @@ public:
     virtual void    upload(void * dst, const void * src, size_t bytes) = 0;
     virtual void    download(void * dst, const void * src, size_t bytes) = 0;
     virtual void    sync() = 0;
+
+    // -- a copy the HOST does not wait for (L0 step 4, 2026-09-23) ----------
+    //
+    // `download()` above is a stream synchronise plus a blocking hipMemcpy,
+    // because the host is about to READ what it asked for. A serving
+    // checkpoint is the other case: the bytes are wanted, nobody reads them
+    // now, and waiting for them costs the three-card prefill pipeline. On the
+    // engine's own stream a copy is ordered after everything already queued
+    // (so it sees the chunk that has just run) and before everything queued
+    // after it (so the next chunk cannot overwrite the state under it) --
+    // which is exactly the ordering a checkpoint needs, with no host wait at
+    // all. The destination is safe to read only after a later sync() of this
+    // device.
+    //
+    // It must be PINNED host memory or hipMemcpyAsync degrades to a
+    // synchronous copy (the same trap the upload staging ring exists for),
+    // hence alloc_pinned. The base implementations here are the CPU
+    // backend's: plain malloc and the blocking copy, both already correct.
+    virtual void *  alloc_pinned(size_t bytes) { return std::malloc(bytes); }
+    virtual void    free_pinned(void * p) { std::free(p); }
+    virtual void    download_async(void * dst, const void * src, size_t bytes) {
+        download(dst, src, bytes);
+    }
 
     // -- device boundaries (step 3, design 9.1/9.2) -------------------------
     //

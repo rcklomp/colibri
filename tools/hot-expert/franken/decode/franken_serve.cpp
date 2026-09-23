@@ -376,7 +376,8 @@ struct LlamaApi {
         // the rocm SDK wheels under ~/venvs/rocm; loading them BY ABSOLUTE PATH
         // and RTLD_GLOBAL first satisfies the soname for the loader (it checks
         // what is already loaded before it searches), so libllama then opens
-        // with no LD_LIBRARY_PATH from the caller. LD_LIBRARY_PATH is
+        // with no LD_LIBRARY_PATH from the caller (FRANKEN_LLAMA_PRELOAD
+        // overrides the list; the literal "none" disables it). LD_LIBRARY_PATH is
         // deliberately NOT how start_franken.sh solves it: that directory also
         // holds a libamdhip64 of a different ROCm than the one this box runs,
         // and putting it in front of the system path would swap the HIP
@@ -384,13 +385,28 @@ struct LlamaApi {
         // library it never calls. A missing preload is not an error by itself
         // (the caller may have arranged the path some other way); the dlopen
         // below is what decides.
-        for (const std::string & dep : split_paths(env_str("FRANKEN_LLAMA_PRELOAD",
-                                                           FRANKEN_LLAMA_PRELOAD_DEFAULT))) {
-            if (dep.empty()) continue;
-            if (!dlopen(dep.c_str(), RTLD_LAZY | RTLD_GLOBAL))
-                logf("preload %s: %s (continuing)", dep.c_str(), dlerror());
-        }
+        //
+        // The preload is a FALLBACK, tried only after a plain dlopen has
+        // failed: inside the ROCm 7.14 image this engine is built in (which is
+        // how it is run when the host's ROCm is too old -- see
+        // ~/bench/franken_decode_docker.sh) the real libraries are on the
+        // path, and preloading the wheel's older pair in front of them would
+        // be gratuitous. Trying the plain open first means the process ends up
+        // with whichever set actually belongs there.
         void * h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            const char * first = dlerror();
+            logf("dlopen %s: %s -- trying the preload", so.c_str(), first ? first : "?");
+            for (const std::string & dep : split_paths(env_str("FRANKEN_LLAMA_PRELOAD",
+                                                               FRANKEN_LLAMA_PRELOAD_DEFAULT))) {
+                if (dep.empty() || dep == "none") continue;
+                if (!dlopen(dep.c_str(), RTLD_LAZY | RTLD_GLOBAL)) {
+                    const char * e = dlerror();
+                    logf("preload %s: %s (continuing)", dep.c_str(), e ? e : "?");
+                }
+            }
+            h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+        }
         if (!h) {
             // dlerror() CLEARS the error, so it is read exactly once. Calling
             // it twice in one expression (`dlerror() ? dlerror() : "?"`) hands

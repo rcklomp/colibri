@@ -14,6 +14,17 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 63 (2026-09-23 12:15 CEST, 10:15 UTC) -- FIRST PERF PASS (record
+> §L0-PERF-1).** Prefill 1.63 -> 1.40 ms/token; cold 262k prompt 467 -> 354 s
+> (5.9 min; llama.cpp 17; target ~5). Down gather bit-identical and on (the
+> divergence was fp-contract chosen per kernel; ISA-proven), QSA rows
+> batched (0.19 -> 0.04 ms). Decode: four ISA-exact GEMV changes cut
+> launches 1 198 -> 1 004 and won nothing (23.0 / 25.8 ms): the small
+> matrices are floor-bound at ~7 µs a launch. Next for decode: measure a HIP
+> graph of the real token body (M5 said 7 % on empty kernels; dependent
+> real kernels may differ), and card 0's slower small-GEMV set. Reply cap
+> for the Franken gateway raised to 16 384.**
+>
 > **Rev 62 (2026-09-23 10:00 CEST, 08:00 UTC) -- L0 QUALITY MEASURED, GATE MET
 > (record §L0-QUALITY).** Franken engine as served vs llama.cpp's Qwen3.8,
 > same 70 MMLU-Pro items, reasoning xhigh, 16k budget: 77.1 % vs 80.0 %,

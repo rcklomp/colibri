@@ -80,9 +80,43 @@
 // path, see main()) and stops there; it never calls llama_decode on them.
 // The real forward-pass path (tokenize, decode in --batch chunks, capture,
 // aggregate) is exercised on a small model instead (see the report).
+//
+// GPU-run placement (2026-09-23, added after the orchestrator's first real
+// GPU run OOM'd both models at load, ~/bench/m2/{deepseek,glm}/run.log):
+// "allocating 29719 MiB (DeepSeek) / 46500 MiB (GLM) on device 0: out of
+// memory". Cause: --fit (common_fit_params()) is a common/ convenience --
+// it only adjusts model/context params that are still at
+// llama_model_default_params()'s own defaults (n_gpu_layers == -1,
+// tensor_split == nullptr), and this tool had already set n_gpu_layers to a
+// CLI value (999, not -1) and, whenever --fit was on, a heap-allocated
+// all-zero tensor_split buffer (non-null, so also no longer "default") --
+// so fit's own logic left both alone, split_mode stayed at its default
+// LAYER, and the two real device breakdown lines this tool now knows to
+// distrust ("ROCm0 29719 555 532", "ROCm1 30283 556 772", ...) show it
+// tried to fit the WHOLE quantised model (routed experts included) across
+// three 24 GB cards regardless -- 91 GB / 149 GB do not fit 73.5 GB no
+// matter how evenly they are split. Fix: routed-expert tensors (by far
+// most of either model's bytes) are placed on the CPU buffer type
+// unconditionally via llama_model_params.tensor_buft_overrides, matched
+// with the same std::regex_search llama.cpp's own loader uses
+// (llama-model-loader.cpp, "check overrides"), so they never need to fit
+// in VRAM at all; everything else (dense trunk, attention/indexer, shared
+// experts -- all small next to the routed experts) is offloaded under an
+// explicit LLAMA_SPLIT_MODE_LAYER split with an even (non-null, non-zero)
+// tensor_split across --n-devices GPUs. This is unconditional (not gated
+// behind --fit); --fit remains available for context-size margin only and
+// is now close to a no-op since the fields it used to be able to adjust
+// are no longer left at their defaults. common_fit_print() (same
+// libllama-common.so declaration as common_fit_params(), read-only, no
+// allocation) is still called right before the model load, now reflecting
+// this placement, to print the per-device byte estimate command asks for;
+// on the CPU-only build/test box it finds zero ROCm devices (as every
+// other CPU run here does) and prints an empty/host-only estimate, not a
+// GPU touch.
 
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h" // ggml_backend_cpu_buffer_type(), for the expert-tensor override
 #include "gguf_model.h"
 
 // common/fit.h: declaration-only use of common_fit_params()/common_fit_print(),
@@ -101,6 +135,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -123,6 +158,14 @@ struct Args {
     double      budget_gb = 8.0;
     bool        fit = false;
     int32_t     fit_margin_mb = 1024;
+    // 2026-09-23, GPU run failure (see the file header comment above main()):
+    // route every routed-expert tensor to the CPU buffer type regardless of
+    // n_gpu_layers, and split what remains evenly by layer across n_devices
+    // GPUs. cpu_experts is on by default -- a GPU run without it reproduces
+    // the OOM this fix is for.
+    bool        cpu_experts = true;
+    std::string cpu_experts_pattern = "ffn_(up|down|gate)(_shexp)?_exps";
+    int32_t     n_devices = 3;
     bool        parse_only = false; // load model + vocab, no llama_decode at all
     bool        selftest = false;   // no model at all: run_selftest() on synthetic data
 };
@@ -132,7 +175,17 @@ void usage(const char * argv0) {
         "usage: %s --model <first-shard.gguf> --prompt-file <path> --out <dir>\n"
         "          [--ctx N] [--batch N] [--n-gpu-layers N] [--threads N]\n"
         "          [--max-tokens N] [--layers-limit N] [--budget-gb F]\n"
-        "          [--fit on|off] [--fit-margin-mb N] [--parse-only] [--selftest]\n"
+        "          [--fit on|off] [--fit-margin-mb N] [--cpu-experts on|off]\n"
+        "          [--cpu-experts-pattern REGEX] [--n-devices N] [--parse-only] [--selftest]\n"
+        "\n"
+        "--cpu-experts (default on): every tensor whose name matches\n"
+        "  --cpu-experts-pattern (default \"ffn_(up|down|gate)(_shexp)?_exps\",\n"
+        "  matched with std::regex_search exactly as llama.cpp's own\n"
+        "  tensor_buft_overrides matcher does) is forced to the CPU buffer type;\n"
+        "  --n-gpu-layers (default 999) and an even --n-devices-way tensor_split\n"
+        "  under LLAMA_SPLIT_MODE_LAYER place everything else. Needed because a\n"
+        "  raw libllama n_gpu_layers=999 load has no VRAM-fitting logic of its\n"
+        "  own -- see the file header comment for the OOM this replaces.\n"
         "\n"
         "--parse-only: load the model and vocab, confirm the GGUF opens via\n"
         "  franken::GgufModel and via libllama, and exit -- no llama_decode() is\n"
@@ -163,6 +216,9 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (s == "--budget-gb") a.budget_gb = atof(next("--budget-gb").c_str());
         else if (s == "--fit") { std::string v = next("--fit"); a.fit = (v == "on"); }
         else if (s == "--fit-margin-mb") a.fit_margin_mb = atoi(next("--fit-margin-mb").c_str());
+        else if (s == "--cpu-experts") { std::string v = next("--cpu-experts"); a.cpu_experts = (v == "on"); }
+        else if (s == "--cpu-experts-pattern") a.cpu_experts_pattern = next("--cpu-experts-pattern");
+        else if (s == "--n-devices") a.n_devices = atoi(next("--n-devices").c_str());
         else if (s == "--parse-only") a.parse_only = true;
         else if (s == "--selftest") a.selftest = true;
         else if (s == "--help" || s == "-h") { usage(argv[0]); exit(0); }
@@ -515,6 +571,35 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
+
+        // Self-check for the CPU-expert placement below (2026-09-23 GPU OOM
+        // fix, see the file header comment): count, from the GGUF's own
+        // tensor list (metadata only, no data read), how many tensors
+        // args.cpu_experts_pattern actually matches, with the exact same
+        // std::regex_search semantics llama.cpp's own tensor_buft_overrides
+        // matcher uses (llama-model-loader.cpp's "check overrides", matched
+        // against the tensor's full "blk.<il>.<name>[.<suffix>]" string, not
+        // anchored) -- so a pass here means the real GPU load will route the
+        // same tensors, without needing a GPU to find out. Also reports how
+        // many distinct blk.<il> layers were matched (DeepSeek: expect all
+        // 43; GLM: expect close to but under block_count=46, since a few
+        // early layers are dense -- see the layer=3 probe above).
+        {
+            std::regex re(args.cpu_experts_pattern);
+            size_t matched_tensors = 0;
+            std::set<int> matched_layers;
+            for (const auto & t : gm->tensors()) {
+                if (std::regex_search(t.name, re)) {
+                    matched_tensors++;
+                    int il = -1;
+                    if (std::sscanf(t.name.c_str(), "blk.%d.", &il) == 1) matched_layers.insert(il);
+                }
+            }
+            fprintf(stderr, "moe_hist: cpu_experts_pattern=\"%s\" matches %zu tensors across %zu layers "
+                    "(of %u total blocks)\n",
+                    args.cpu_experts_pattern.c_str(), matched_tensors, matched_layers.size(),
+                    gm->hparams().block_count);
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "moe_hist: GgufModel::open failed (%s) -- not a split GGUF? "
                 "continuing without it: no (d) miss-bytes calc, expert counts inferred "
@@ -540,6 +625,35 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = args.n_gpu_layers;
+    mparams.split_mode   = LLAMA_SPLIT_MODE_LAYER;
+
+    // Even, non-null, non-zero tensor_split across --n-devices GPUs. A null
+    // (the llama_model_default_params() default) or an all-zero buffer is
+    // exactly what the 2026-09-23 fix (file header comment) traced the OOM
+    // to; kept alive for the load call below.
+    std::vector<float> tensor_split(llama_max_devices(), 0.0f);
+    for (int32_t i = 0; i < args.n_devices && (size_t) i < tensor_split.size(); ++i) {
+        tensor_split[i] = 1.0f;
+    }
+    mparams.tensor_split = tensor_split.data();
+
+    // Force every routed-expert tensor to the CPU buffer type,
+    // UNCONDITIONALLY (not gated behind --fit -- see the file header
+    // comment for why that did not work). A histogram only needs the
+    // router's selection, so a CPU expert matmul costs nothing this tool
+    // cares about; what n_gpu_layers/tensor_split above place on the GPUs
+    // is everything else (dense trunk, attention/indexer, shared experts --
+    // small next to the routed experts on both models). Kept alive for the
+    // load call below; a 2-entry array ({pattern,buft}, {nullptr,nullptr}
+    // terminator per llama.h's own convention), not
+    // llama_max_tensor_buft_overrides()-sized, because nothing here appends
+    // to it (contrast the old --fit path, removed below).
+    std::vector<llama_model_tensor_buft_override> cpu_overrides;
+    if (args.cpu_experts) {
+        cpu_overrides.push_back({ args.cpu_experts_pattern.c_str(), ggml_backend_cpu_buffer_type() });
+        cpu_overrides.push_back({ nullptr, nullptr });
+        mparams.tensor_buft_overrides = cpu_overrides.data();
+    }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = (uint32_t) std::max(64, args.n_ctx);
@@ -548,32 +662,31 @@ int main(int argc, char ** argv) {
     cparams.n_threads       = args.n_threads;
     cparams.n_threads_batch = args.n_threads;
 
-    // ---- --fit: common_fit_params() from libllama-common.so (declaration
-    // only, see fit.h include above and the Makefile). Off by default; this
-    // tool never calls it during its own CPU-only test (no GPU present in
-    // the build container to fit against), it exists so the orchestrator's
-    // GPU run of this same binary can pass --fit on the way llama-server
-    // does (common/common.cpp's common_init_result ctor is the pattern
-    // followed here). ----
-    std::vector<float>  tensor_split(llama_max_devices(), 0.0f);
-    std::vector<llama_model_tensor_buft_override> overrides;
+    // ---- --fit: now a near no-op, kept only for interface compatibility.
+    // common_fit_params() (common/fit.h, declaration-only against the
+    // prebuilt libllama-common.so) only touches model/context params still
+    // at llama_model_default_params()'s own defaults, and every placement
+    // field it could touch (n_gpu_layers, split_mode, tensor_split,
+    // tensor_buft_overrides) is now explicitly set above -- which is
+    // exactly the fix: relying on fit to derive placement is what produced
+    // the 2026-09-23 OOM (file header comment). Off by default either way.
     if (args.fit) {
-        overrides.assign(llama_max_tensor_buft_overrides(), llama_model_tensor_buft_override{});
-        mparams.tensor_split = tensor_split.data();
-        mparams.tensor_buft_overrides = overrides.data();
-
-        std::vector<size_t> margins(llama_max_devices(), (size_t) args.fit_margin_mb * 1024 * 1024);
-        common_params_fit_status rc = common_fit_params(
-            args.model.c_str(), &mparams, &cparams,
-            tensor_split.data(), overrides.data(), margins.data(),
-            /*n_ctx_min=*/ 4096, /*extra=*/ nullptr, GGML_LOG_LEVEL_ERROR);
-        if (rc == COMMON_PARAMS_FIT_STATUS_ERROR) {
-            fprintf(stderr, "moe_hist: common_fit_params hard-errored, continuing with unfitted params\n");
-        } else if (rc == COMMON_PARAMS_FIT_STATUS_FAILURE) {
-            fprintf(stderr, "moe_hist: common_fit_params could not fit within the given margins, continuing anyway\n");
-        }
-        common_fit_print(args.model.c_str(), &mparams, &cparams);
+        fprintf(stderr, "moe_hist: --fit is now a no-op for placement (see the file header "
+                "comment) -- n_gpu_layers/split_mode/tensor_split/tensor_buft_overrides are "
+                "already explicit by the time --fit would run\n");
     }
+
+    // Per-device byte estimate, printed before the load call as asked:
+    // common_fit_print() (same libllama-common.so declaration as
+    // common_fit_params(), read-only -- no allocation, only a device memory
+    // query) reflects the placement set above, so the routed experts no
+    // longer show up against any GPU device's budget. Unconditional (not
+    // behind --fit): on the CPU-only build/test box (no --device flag) it
+    // finds zero ROCm devices, same as every other run here, and prints an
+    // estimate with no GPU line rather than touching one.
+    fprintf(stderr, "moe_hist: load estimate (per llama.cpp's own common_fit_print;"
+            " empty/host-only on a --device-less box):\n");
+    common_fit_print(args.model.c_str(), &mparams, &cparams);
 
     llama_model * model = llama_model_load_from_file(args.model.c_str(), mparams);
     if (!model) {

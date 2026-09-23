@@ -14,6 +14,16 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 65 (2026-09-23 23:15 CEST) -- M2 MEASURED (record §M2, design rev 13).**
+> DeepSeek-V4-Flash misses 60 MB a token with 60 GB of experts resident: a
+> near-resident model, next after Qwen3.8 on the engine. GLM-5.3 misses
+> ~1.0-1.4 GB a token: streaming-bound, a ~30-45 tok/s ceiling at the
+> 61 GB/s aggregate against 5 today. Placement by histogram is the lever;
+> temporal lookahead is weak. The prefill "regression" of rev 64 was the PLE
+> page cache in the benchmark path, not code (A,B,B,A). Next: M4 (three
+> cards streaming at once), then L5 DeepSeek (resident route), then GLM on
+> the streamed path (L0b/L1/L2).**
+>
 > **Rev 64 (2026-09-23 -- DECODE >= 40 TOK/S AT 256K (record §L0-PERF-2).**
 > HIP-graph replay of each card's token, bit-identical (greedy exact): decode
 > 24.4 ms = 40.9 tok/s at 262k depth (25.8 before), 21.6-22.2 ms short. The

@@ -117,8 +117,16 @@ print(f"p2={p2} t2={t2:.1f}")
 PY
 )
 r2=$(grep " REUSE " "$LOG" | tail -1 | awk '{print $(NF-1)}'); p2=$(v p2 "$T"); t2=$(v t2 "$T")
-if [ -n "$p2" ] && [ "$r2" -ge $((p2 - 32)) ] && [ "${t2%.*}" -le 15 ]; then say "3. API follow-up turn (pin)" "PASS prompt=$p2 reused=$r2 total=${t2}s";
-else say "3. API follow-up turn (pin)" "FAIL prompt=$p2 reused=$r2 total=${t2}s (need reused>=$((p2-32)), <=15 s)"; FAIL=1; fi
+# The tolerance is the template's: what a follow-up adds AFTER the previous answer is the
+# turn markers of the new user turn and the new assistant header, which no engine can have
+# seen. GLM-5.3's are 1-token markers (21 tokens here); Qwen3.8's chat template costs 38
+# (<|im_start|>user\n, <|im_end|>\n, <|im_start|>assistant\n, the closed think block).
+# Measured 2026-09-23 on the Franken engine, which reused every token it held (161 of 161)
+# and still missed the GLM-calibrated 32. Family from serve_alt status; GLM stays at 32.
+TOL=32; "$HERE/serve_alt.sh" status 2>/dev/null | grep -qi "franken\|qwen3.8" && TOL=48
+r2=${r2:-0}
+if [ -n "$p2" ] && [ "$r2" -ge $((p2 - TOL)) ] && [ "${t2%.*}" -le 15 ]; then say "3. API follow-up turn (pin)" "PASS prompt=$p2 reused=$r2 total=${t2}s (tol $TOL)";
+else say "3. API follow-up turn (pin)" "FAIL prompt=$p2 reused=$r2 total=${t2}s (need reused>=$((p2-TOL)), <=15 s)"; FAIL=1; fi
 # The engine must be idle before the cancel check, or it measures a backlog rather than the
 # cancel path (2026-09-09: a 160 MB checkpoint store plus a queue read as 300 s).
 for i in $(seq 1 60); do

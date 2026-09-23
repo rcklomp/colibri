@@ -846,6 +846,248 @@ streams and no overlap to lose, so its `snap=` is a memcpy and its
 `prefill_ms_per_token` measures nothing about the pipeline. Nothing here claims
 a GPU measurement.
 
+## Decode step 1 (2026-09-23): what the 7.6 ms a card is made of, and four changes to it
+
+§L0-256K left decode at **26.1 ms a token at 256k depth (38.4 tok/s)**, ~7.6 ms
+of GPU time a card, and named the owner: "the small-matrix trunk GEMVs and the
+~390-launch floor". This section is what those two actually are, measured off
+the numbers already in the record rather than guessed, and the four changes
+that follow from it. **Nothing here has been run on a GPU.**
+
+### The diagnosis: achieved bandwidth tracks the CONTIGUOUS RUN A WAVE READS
+
+Step 2b reported per-projection GB/s and they look scattered — 128 to 497 — until
+they are put next to the bytes ONE WAVE reads in a row. A wave owns one output
+row of one split, so that run is `row_bytes / nsplit`, and with
+`--gemv-min-rows 1024` the only decode batch that splits at all is
+`hc_down`+`hc_inject` (324 rows):
+
+| group | rows | K | nsplit | **contiguous bytes a wave** | measured GB/s |
+|---|---:|---:|---:|---:|---:|
+| `shexp_down` | 2560 | 640 | 1 | 680 | 141 |
+| `hc_down_inject` | 324 | 10240 | **50** | **238** | **128** |
+| `hc_up` | 10240 | 320 | 1 | 340 | 199 |
+| `ffn_router_shexp` | 1793 | 2560 | 1 | 2720 | 245 |
+| `qsa_q_k_v_indexer` | 7808 | 2560 | 1 | 2720 | 434 |
+| `gdn_qkv_gate_beta_alpha` | 16480 | 2560 | 1 | 2720 | 461 |
+| `ple` | 20480 | 2560 | 1 | 2720 | 484 |
+| `attn_output` | 2560 | 6144 | 1 | 6528 | 493 |
+| `ssm_out` | 2560 | 6144 | 1 | 6528 | 497 |
+
+Two things fall out and neither is what "small matrices do not fill the card"
+suggests. **Wave count is not the problem** — `hc_down_inject` runs 16 400 waves
+and `ffn_router_shexp` 1 793, and the 1 793-wave one is the faster of the two.
+**Bytes per launch are not the problem either** — `ffn_router_shexp` moves
+4.9 MB at 245 GB/s and `attn_output` moves 16.7 MB at 493.
+
+What does fit is a straight line through the whole table in *launch* terms:
+`t ≈ 7 µs + MB / rate`, with the marginal rate rising from ~340 GB/s where a
+wave reads a few hundred bytes to ~630 GB/s where it reads kilobytes. The 7 µs
+is the launch floor — and it is the same number step 2b measured the hard way,
+931 → 389 launches for 11.73 → 7.62 ms, i.e. **7.6 µs a launch removed**.
+
+`ffn_router_shexp` at 245 with a 2 720-byte run is the one row that does not fit
+the run-length story, and it is the one row where 1 793 rows is 224 workgroups —
+9.3 waves a SIMD, under half the card. So both effects are real and they are
+separable: run length sets the rate, wave count sets whether the card is full,
+and the launch floor is a flat ~7 µs on top of both.
+
+`--profile` now reports the sub-10 MB set as a class of its own,
+**`prof_gemv_small_us` / `_mb` / `_gbs` / `_launches`**, because that set —
+`hc_down_inject`, `hc_up`, `ffn_router_shexp`, `shexp_down` — is 1.99 ms of the
+4.40 ms trunk for 278 MB of the 1 295 MB, and it is what the four changes aim at.
+
+### 1. The split rides on grid.x, so the card reads the tensor in order
+
+`hc_down`'s 50 splits were `blockIdx.y` and its 41 row groups `blockIdx.x`.
+Workgroups dispatch with **x fastest**, so the card ran all 41 row groups of
+split 0, then all 41 of split 1: it touched the tensor at 50 scattered offsets
+in 238-byte pieces, 41 rows (446 KB) apart. Swap the axes and 50 consecutive
+workgroups sweep the SAME eight rows along K, in order.
+
+This is an **address** change and not an arithmetic one — split `s` still owns
+`split_range`'s block range `s`, still writes partial `s`, and the reduce still
+sums `s = 0 .. nsplit-1`. It is the cheapest line in this section and, on the
+table above, the one with the most to gain: `hc_down_inject` is 913 µs a card a
+token at 128 GB/s against 3.65 MB of bytes.
+
+It is done **only at TILE == 1**, from the template parameter, so the prompt
+chunk's kernel is byte-for-byte the one it was (checked: the `<8,1>` ISA is
+op-for-op `<8>`'s, 135 VGPR, occupancy 10, unchanged).
+
+### 2. The split reduce happens inside the GEMV
+
+`k_reduce_splits_gemm` was a second launch for a kernel that reads 50 floats a
+row. `cnt` is now one counter per output row: each wave stores its partial,
+fences, and increments; the wave that comes back `nsplit-1` has every partial
+visible and sums them **in s order — k_reduce_splits_gemm's loop, copied, not
+approximated** — applies the epilogue and writes the destination, then puts the
+counter back to 0 so the next launch finds it as this one did.
+
+32 launches a card a token (`hc_down_inject` is the only split GEMV on the
+decode path). `--gemv-fused-reduce 0` restores the two-launch form, and the two
+must agree bit for bit; the knob exists because the fence/counter pairing is new
+here, not because a bit can move. The ISA confirms the pairing:
+`s_waitcnt_vscnt 0` + `buffer_gl1_inv` + `buffer_gl0_inv` before
+`global_atomic_add_u32 ... glc`, and the invalidate pair again after it.
+
+### 3. `build_hc_mix`'s collapse rides on the gate GEMV's workgroup
+
+```
+mixed[i] = mean over the HC streams of xn[c][i] * sigmoid(gate[c][i])
+```
+
+`hc_up`'s 10 240 rows are HC streams of `n_embd`, and the collapse wants all HC
+of them for ONE embedding index. A workgroup is `GEMV_WAVES` = 8 = 2*HC waves,
+so instead of eight consecutive rows it now takes **two indices and every stream
+of each** — same rows, same per-row dot, different wave → row map — and the
+gate values it has just produced are exactly what the collapse reads. Same
+expression, same order (`c = 0` first, then 1..HC-1), same scale.
+
+32 launches a card a token, plus one at the head. `gate` is still written, so
+`hc_gate` is still an oracle tap; `--gemv-fuse-collapse 0` is the old pair.
+It is expressed as ONE backend call, `gemv_hc_gate_collapse`, whose DEFAULT
+implementation is the two ops — which is what the CPU backend runs, unchanged.
+
+### 4. More loads in flight, at constant summation order
+
+The baseline ISA waits on `vmcnt(6)` of eight outstanding loads: the compiler
+pipelines about one iteration ahead, so a wave whose row is ten blocks long
+(`hc_up` at K = 320) never gets more than two rounds of memory latency in
+flight. `--gemv-burst N` issues `N * GEMV_UNROLL` weight loads before the first
+multiply.
+
+**It is not a deeper unroll.** The accumulator count stays `GEMV_UNROLL`, block
+`g` still lands in `acc[g % GEMV_UNROLL]`, and the order within each accumulator
+is still increasing `g` — which is exactly what the unroll-4 loop does across
+its iterations. It consumes a multiple of `GEMV_UNROLL` blocks, so the loops
+after it see the same alignment and the same tail.
+
+**And that claim is checked the way PREFILL.md section 8 had to check the down
+gather**, because this file has already been bitten once by a reassociation that
+was not one: `-ffp-contract=fast` lets `acc += w*x` compile to either
+`v_fma` or `v_mul` + `v_add`, the backend picks by how much ILP it has, and
+*more ILP is exactly what this change adds*. So the ISA was read, not assumed:
+
+| kernel | Q8_0 loop body | closing |
+|---|---|---|
+| `<1>` (before) | 4 cvt, 4 `v_fma_mix`, 4 fmac | 1 `v_fma_f32` |
+| `<1,1>` | 4 cvt, 4 `v_fma_mix`, 4 fmac | 1 `v_fma_f32` |
+| `<1,2>` | 8 cvt, 8 `v_fma_mix`, 8 fmac | 4 fused |
+| `<1,4>` | 16 cvt, 16 `v_fma_mix`, 16 fmac | 4 fused |
+| `<8>` (before) / `<8,1>` | 4 cvt, 4 `v_fma_mix` | — |
+
+`<1,1>` is op-for-op the kernel it replaced and `<8,1>` is op-for-op the prompt
+chunk's, so the burst is the only thing that moves. **Every multiply-accumulate
+is fused at every burst** — not one `v_mul_f32`/`v_add_f32` pair appears — so
+the contraction decision did not change with the ILP.
+
+`make resources`: all three TILE = 1 instantiations are **88 VGPR (from 58),
+occupancy 16 waves/SIMD, 32 B of LDS, 0 spills, 0 scratch**. Occupancy is the
+number that matters and it is at the ceiling — the TILE = 8 kernel's problem was
+135 VGPR buying 10 waves, and 88 is comfortably under the 96 that 16 waves
+allows. `<8,1>` is unchanged at 135/10.
+
+### What this is expected to be worth, and what it is not
+
+Against the 4.40 ms of trunk GEMV and 0.90 ms of elementwise a card:
+
+| change | launches saved | what it attacks | expected |
+|---|---:|---|---|
+| 1. split on grid.x | 0 | `hc_down_inject` 913 µs at 128 GB/s | ~0.5 ms |
+| 2. reduce in kernel | 32 | the launch floor | ~0.2 ms |
+| 3. collapse in the GEMV | 33 | the launch floor | ~0.25 ms |
+| 4. burst | 0 | `hc_up`, `shexp_down`, `gdn_proj` latency | 0.2-0.4 ms |
+
+so ~7.6 → ~6.4-6.6 ms a card, launches ~389 → ~325. **That is short of the
+6.0 ms and the 250 launches the brief asks for, and the honest reason is that
+the remaining launches are not fusions that were missed.** What is left per
+layer is `hc_combine_norm` (×2), `hc_collapse`'s partner ops, `conv_slide`,
+`l2_norm`, `gated_rms_norm`, `silu_mul`, and each one is either a reduction
+whose consumer is on another workgroup or a buffer hazard between workgroups;
+folding them needs either grid-wide synchronisation (which costs what the launch
+costs) or recomputing a reduction per consumer. Two levers that WOULD close the
+rest, both bigger than this change:
+
+- **HIP graph capture of the token body.** 389 dependent dispatches at a ~7 µs
+  floor is ~2.7 ms of the 7.6; a captured graph replays them without the
+  per-dispatch round trip and fuses nothing, so it cannot move a bit. This is
+  the single largest remaining item and it is not a kernel change.
+- **`silu_mul` into `moe_down`** (16 launches) and the MoE tail into
+  `hc_combine_norm` (32) are both reachable, but both move a
+  multiply-accumulate into a different ILP context, which is exactly what
+  `-ffp-contract=fast` decides on — so each needs its own ISA check, and
+  neither should be taken on the strength of a launch count.
+
+### The knobs, and what each is for
+
+| knob | env | default | off means |
+|---|---|---|---|
+| `--gemv-fused-reduce 0\|1` | `FRANKEN_GEMV_FUSED_REDUCE` | 1 | the second launch is back |
+| `--gemv-fuse-collapse 0\|1` | `FRANKEN_GEMV_FUSE_COLLAPSE` | 1 | `hc_collapse` is its own launch |
+| `--gemv-burst 1\|2\|4` | `FRANKEN_GEMV_BURST` | 4 | 1 is the pre-change loop exactly |
+
+All three default ON and all three are bit-identical either way, so they are
+A/B switches for attribution rather than a numerics decision. The grid-axis swap
+(change 1) has no knob: it moves no arithmetic at all, only an address.
+
+### The gates
+
+**CPU, run (no GPU):** the graph rewiring — `hc_mix` and the head now call
+`gemv_hc_gate_collapse` — must not move the CPU path, which takes the default
+two-op implementation. `franken_decode_cpu --layers 0-47 --chunk 1` against the
+pre-change dump: see the commit body.
+
+**GPU, NOT run here.** Under the rig lock with the gateway stopped:
+
+```
+cd ~/src/colibri-m1/tools/hot-expert/franken/decode
+M=~/models/Qwen3.8-Flash-Next/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+T="248044 785 10945 315 1495 374"
+
+# (a) the pre-change path, out of the SAME binary: all three knobs off
+./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 --ctx 512 \
+  --chunk 1 --greedy 16 --gemv-fused-reduce 0 --gemv-fuse-collapse 0 --gemv-burst 1 \
+  --dump ~/bench/franken/dec1_off
+
+# (b) the defaults against it -- must be every tap cos=1.000000, maxabs=0
+./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 --ctx 512 \
+  --chunk 1 --greedy 16 --oracle ~/bench/franken/dec1_off
+
+# (c) and against the CPU graph, which is the oracle of record
+./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 --ctx 512 \
+  --chunk 1 --greedy 16 --dump ~/bench/franken/dec1_on
+./franken_decode_cpu --model $M --tokens $T --devices 3 --layers 0-47 --ctx 512 \
+  --chunk 1 --threads 8 --oracle ~/bench/franken/dec1_on
+
+# (d) the prompt chunk is untouched, and this says so
+./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 --ctx 512 \
+  --chunk 6 --greedy 16 --oracle ~/bench/franken/dec1_off
+```
+
+Timing, all three cards, 256k allocated — the headline is (f):
+
+```
+# (e) short depth, and the attribution
+./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 \
+  --ctx 262144 --time 32
+./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 \
+  --ctx 262144 --time 32 --profile      # prof_gemv_small_*, prof_launches_per_token
+
+# (f) 256k depth, the §L0-256K point: 26.06 ms/token is what this must beat
+./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 \
+  --ctx 262144 --chunk 256 --gemm-lds 1 --time-prefill 262000 --time 32
+
+# (g) the A/B, interleaved A,B,B,A as CLAUDE.md requires, at short depth
+for k in "" "--gemv-burst 1" "--gemv-fused-reduce 0" "--gemv-fuse-collapse 0"; do
+  ./franken_decode --model $M --tokens $T --devices 3 --layers 0-47 \
+    --ctx 262144 --time 32 $k
+done
+```
+
+`--time 32` prints `layers0_47_ms_median` and `issue_ms`; `--profile` costs the
+first card and must not be in the headline run (§L0-STEP3).
+
 ### Step 4, check 3 (2026-09-23): the renderer was not the problem
 
 The third serve passed everything but `accept_live.sh` check 3, with

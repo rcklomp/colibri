@@ -191,6 +191,17 @@ __device__ __forceinline__ void split_range(int n_units, int nsplit, int split,
 #ifndef GEMV_UNROLL
 #define GEMV_UNROLL 4
 #endif
+// How many GEMV_UNROLL groups of blocks a decode wave has in flight at once.
+// It is NOT the accumulator count and must never become it: see the burst loop
+// in k_gemm_batch. Instantiated for 1, 2 and 4; --gemv-burst picks one.
+#ifndef GEMV_BURST
+#define GEMV_BURST 4
+#endif
+// A GEMV launch reading fewer weight bytes than this is charged to
+// prof_gemv_small_*. On the decode token that set is exactly hc_down+inject,
+// hc_up, ffn_router_shexp and shexp_down -- the four groups measured at
+// 128-245 GB/s in record SS-L0-STEP2, against 434-497 for the rest.
+#define GEMV_SMALL_BYTES ((size_t) 10 * 1024 * 1024)
 
 struct GemvDesc {
     const void * base;
@@ -281,16 +292,57 @@ __device__ __forceinline__ int desc_of(const GemvBatchD & b, int row) {
                 ? d_silu(x[(size_t)(t0 + (j)) * b.K + (i)]) * x2[(size_t)(t0 + (j)) * b.K + (i)] \
                 : x[(size_t)(t0 + (j)) * b.K + (i)]))
 
-template <int TILE>
+//
+// THREE THINGS THE DECODE TOKEN (TILE == 1) DOES AND THE PROMPT CHUNK DOES NOT.
+// All three are compile-time branches on TILE, so the T > 1 path below is the
+// same instruction stream it was, and none of them touches the arithmetic:
+//
+//  (a) THE SPLIT RIDES ON grid.x, NOT grid.y. Workgroups are dispatched with x
+//      fastest, so with the split on y the 50 workgroups that between them read
+//      one row of hc_down were dispatched 41 apart and the card walked the
+//      tensor in 238-byte pieces at 50 scattered offsets. Put the split on x
+//      and consecutive workgroups sweep the SAME eight rows along K, in order.
+//      That is the whole of the difference between the measured 128 GB/s of
+//      hc_down+inject (nsplit 50, 238 B a wave) and the 461-497 GB/s of the
+//      groups that run unsplit (2 720-6 528 B a wave) -- achieved bandwidth on
+//      this card tracks the contiguous run a wave reads, and nothing else in
+//      that table explains it. `split` and `rgrp` are the only readers of
+//      blockIdx, so this is an ADDRESS change and not an arithmetic one:
+//      split s still owns block range s of split_range and still writes
+//      partial s, so the reduce sums the same numbers in the same order.
+//
+//  (b) THE SPLIT REDUCE HAPPENS IN THIS KERNEL. `cnt` is one counter per output
+//      row; the wave that finds itself last for its row sums the nsplit
+//      partials in s order -- literally k_reduce_splits_gemm's loop -- and
+//      writes the destination. Same order, same bits, one launch instead of
+//      two. On the decode token hc_down+inject is the ONLY split GEMV, so this
+//      is 32 launches a card a token.
+//
+//  (c) THE hc COLLAPSE RIDES ON hc_up'S EPILOGUE. See the `collapse` block at
+//      the bottom.
+template <int TILE, int BURST>
 __global__ __launch_bounds__(GEMV_THREADS)
 void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
                   const float * __restrict__ x2, int nsplit,
-                  float * __restrict__ part, int stage_x, int T) {
+                  float * __restrict__ part, int stage_x, int T,
+                  int * __restrict__ cnt, float * __restrict__ collapse_out,
+                  const float * __restrict__ collapse_xn) {
     extern __shared__ float sx[];
+    // One float a wave, written only on the fused-collapse path.
+    __shared__ float sgate[GEMV_WAVES];
 
     const int wave = threadIdx.x / WAVE;
     const int lane = threadIdx.x % WAVE;
-    const int grow = blockIdx.x * GEMV_WAVES + wave;
+    const int split = (TILE == 1) ? (int) blockIdx.x : (int) blockIdx.y;
+    const int rgrp  = (TILE == 1) ? (int) blockIdx.y : (int) blockIdx.x;
+    // hc_up's rows are HC streams of N_EMBD and hc_collapse needs all HC of
+    // them for one embedding index. A workgroup of GEMV_WAVES == 2*HC waves
+    // therefore takes TWO indices and every stream of each, instead of eight
+    // consecutive rows. Same rows, same per-row dot, different wave -> row map.
+    const bool collapse = (TILE == 1) && (collapse_out != nullptr);
+    const int grow = collapse
+                   ? ((wave & (HC - 1)) * N_EMBD + rgrp * (GEMV_WAVES / HC) + (wave / HC))
+                   : (rgrp * GEMV_WAVES + wave);
     const int t0   = blockIdx.z * TILE;
     const int nt   = min(TILE, T - t0);
     if (nt <= 0) return;
@@ -300,7 +352,7 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     // splits on 256-element boundaries; everything else splits on 32.
     const int gran = (b.has_q6k ? 256 : WAVE);
     int c0, c1;
-    split_range((b.K + gran - 1) / gran, nsplit, blockIdx.y, &c0, &c1);
+    split_range((b.K + gran - 1) / gran, nsplit, split, &c0, &c1);
     const int e0 = c0 * gran;
     const int e1 = min(b.K, c1 * gran);
     const int slice = e1 - e0;
@@ -335,6 +387,41 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
         const unsigned char * rp = (const unsigned char *) d.base + (size_t) row * d.row_stride;
         int bl = e0 >> 5;
         const int bend = e1 >> 5;
+        // MORE LOADS IN FLIGHT, SAME SUMMATION ORDER. The loop below issues
+        // GEMV_UNROLL weight loads and consumes them; the compiler pipelines
+        // about one extra iteration ahead (the baseline ISA waits on vmcnt(6)
+        // of eight outstanding loads), so a wave whose row is only ten blocks
+        // long -- hc_up at K = 320, shexp_down at K = 640 after its split --
+        // never gets more than two rounds of memory latency in flight and runs
+        // at 141-199 GB/s against the 461-497 of the long rows.
+        //
+        // This loop issues BURST*GEMV_UNROLL of them BEFORE the first multiply.
+        // It is not a deeper unroll: the accumulator count stays GEMV_UNROLL
+        // and block g still lands in acc[g % GEMV_UNROLL], in increasing g --
+        // which is exactly what the loop below does across its iterations. It
+        // consumes a multiple of GEMV_UNROLL blocks, so the loops after it see
+        // the same alignment and the same tail. Bit-identical by construction,
+        // and checked the way the down-gather divergence had to be checked
+        // (PREFILL.md section 8): the -ffp-contract=fast decision is read out
+        // of the ISA, not assumed -- `acc += w*x` must stay v_fmac/v_fma here
+        // as it is at BURST 1, or the bits move even though the order did not.
+        if constexpr (TILE == 1 && BURST > 1) {
+            constexpr int NB = GEMV_UNROLL * BURST;
+            for (; bl + NB - 1 < bend; bl += NB) {
+                float w[NB], xv[NB];
+#pragma unroll
+                for (int u = 0; u < NB; ++u) {
+                    const unsigned char * bp = rp + (size_t)(bl + u) * FK_Q8_0_BLOCK_BYTES;
+                    w[u] = fk_q8_0_block_d(bp) *
+                           (float)((const signed char *)(bp + FK_Q8_0_OFF_QS))[lane];
+                }
+#pragma unroll
+                for (int u = 0; u < NB; ++u) xv[u] = GEMM_X(0, ((bl + u) << 5) + lane);
+#pragma unroll
+                for (int u = 0; u < NB; ++u)
+                    acc[0][u & (GEMV_UNROLL - 1)] += w[u] * xv[u];
+            }
+        }
         for (; bl + GEMV_UNROLL - 1 < bend; bl += GEMV_UNROLL) {
             float w[GEMV_UNROLL];
 #pragma unroll
@@ -410,13 +497,69 @@ void k_gemm_batch(GemvBatchD b, const float * __restrict__ x,
     // The closing reassociation is the old one-column kernel's, per format:
     // (a0+a1)+(a2+a3) for Q8_0, a0+a1 for Q6_K, a0 alone otherwise -- the
     // unused slots are zero, so one expression covers all three.
+    float my_gate = 0.0f;                  // the collapse path's own epilogue value
 #pragma unroll
     for (int j = 0; j < TILE; ++j) {
         if (j >= nt) break;
         const float sum = wave_sum((acc[j][0] + acc[j][1]) + (acc[j][2] + acc[j][3]));
         if (lane != 0) continue;
-        if (nsplit > 1) part[((size_t) blockIdx.y * T + (t0 + j)) * b.total_rows + grow] = sum;
-        else            d.out[(size_t)(t0 + j) * d.rows + row] = apply_epi(sum, d.epi, d.arg);
+        if (nsplit > 1) {
+            float * pp = part + (((size_t) split * T + (t0 + j)) * b.total_rows + grow);
+            // The wave that closes this row reads it back, so the store must
+            // leave the write-through L0 behind it; the fence below orders it.
+            if (cnt) *(volatile float *) pp = sum;
+            else     *pp = sum;
+        } else {
+            const float v = apply_epi(sum, d.epi, d.arg);
+            d.out[(size_t)(t0 + j) * d.rows + row] = v;
+            my_gate = v;
+        }
+    }
+
+    // ---- (b) the split reduce, without a second launch -------------------
+    // Each row's nsplit workgroups arrive in any order; the last one to
+    // increment this row's counter has, by the fence pairing, every partial
+    // visible and sums them s = 0 .. nsplit-1 -- k_reduce_splits_gemm's loop,
+    // copied rather than approximated, because the oracle is bit-for-bit. The
+    // counter goes back to 0 so the next launch finds it as this one did.
+    if (TILE == 1 && nsplit > 1 && cnt) {
+        if (lane == 0) {
+            __threadfence();
+            if (atomicAdd(&cnt[grow], 1) == nsplit - 1) {
+                __threadfence();
+                const volatile float * p = (const volatile float *) part;
+                float a = 0.0f;
+                for (int s = 0; s < nsplit; ++s)
+                    a += p[((size_t) s * T + t0) * b.total_rows + grow];
+                d.out[(size_t) t0 * d.rows + row] = apply_epi(a, d.epi, d.arg);
+                cnt[grow] = 0;
+            }
+        }
+        return;
+    }
+
+    // ---- (c) build_hc_mix's collapse, on the gate GEMV's own workgroup ----
+    //   mixed[i] = mean over the HC streams of xn[c][i] * sigmoid(gate[c][i])
+    // The wave -> row map above put all HC streams of two indices in this
+    // workgroup, so the gate values it just produced are all the collapse
+    // needs. Same expression, same order (c = 0 first, then 1..HC-1), same
+    // scale, so it is k_hc_collapse's arithmetic without k_hc_collapse's
+    // launch -- and `gate` is still written, so hc_gate stays an oracle tap.
+    if (collapse) {
+        if (lane == 0) sgate[wave] = my_gate;
+        __syncthreads();
+        constexpr int PER = GEMV_WAVES / HC;
+        if ((int) threadIdx.x < PER) {
+            const int i = rgrp * PER + (int) threadIdx.x;
+            if (i < N_EMBD) {
+                const int w0 = (int) threadIdx.x * HC;        // wave == sub*HC + c
+                float a = collapse_xn[i] * sgate[w0];
+#pragma unroll
+                for (int c = 1; c < HC; ++c)
+                    a += collapse_xn[(size_t) c * N_EMBD + i] * sgate[w0 + c];
+                collapse_out[i] = a * (1.0f / (float) HC);
+            }
+        }
     }
 }
 
@@ -1844,9 +1987,50 @@ void k_idx_pool_chunk(const float * __restrict__ k_new, float * __restrict__ sum
 // elements per head in registers, so the pooled-key array is streamed once
 // and nothing else is touched.
 #define IDXS_THREADS 256
+// ------------------------------------------- the QSA row block (item 3) --
+//
+// The four kernels below used to be launched once per query row from the host
+// loop in decode_graph.cpp: ~1 000 launches a QSA layer at T = 256, ~12 000 a
+// chunk, 0.19 ms a prompt token a card of pure issue cost. They now take a ROW
+// AXIS. Every per-row quantity is a closed form of the row's POSITION -- n_kv,
+// n_blocks, the incomplete tail, the budget, whether the top-k is the identity
+// -- so nothing is uploaded per row and the host enqueues one launch a stage
+// for the whole block.
+//
+// NUMERICS ARE UNTOUCHED BY CONSTRUCTION: a row reads and writes its own slice
+// of every buffer, the arithmetic per row is the code that was there before,
+// and no reduction crosses rows. What changes is the grid.
+struct QsaRowsD {
+    int    pos0;         // position of row 0 of this block
+    int    ratio;        // the layer's compress ratio
+    int    budget;       // IDX_TOP_K + ratio - 1
+    size_t blk_stride;   // row pitch of blk_scores
+    size_t cell_stride;  // row pitch of cell_scores
+    size_t sel_stride;   // row pitch of the selection
+    size_t cand_stride;  // row pitch of the radix candidate lists
+    size_t part_stride;  // row pitch of the attention partials
+    size_t ml_stride;    // row pitch of mbuf / lbuf
+};
+__device__ __forceinline__ int qsa_n_kv(const QsaRowsD & j, int t) { return j.pos0 + t + 1; }
+__device__ __forceinline__ int qsa_n_blocks(const QsaRowsD & j, int t) {
+    return (qsa_n_kv(j, t) + j.ratio - 1) / j.ratio;
+}
+// "the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus
+// the tail" (qwen4exp.cpp:613). min() of that and the cache is BOTH the width
+// the radix select is asked for and the count the attention reads, and when it
+// equals n_kv the selection is the identity and the select does not run.
+__device__ __forceinline__ int qsa_n_sel(const QsaRowsD & j, int t) {
+    const int n = qsa_n_kv(j, t);
+    return n < j.budget ? n : j.budget;
+}
+
 __global__ __launch_bounds__(IDXS_THREADS)
 void k_idx_scan(const unsigned short * __restrict__ pooled, const float * __restrict__ q,
-                float * __restrict__ scores, int n_blocks) {
+                float * __restrict__ scores, QsaRowsD j) {
+    const int row  = blockIdx.y;
+    const int n_blocks = qsa_n_blocks(j, row);
+    q      += (size_t) row * IDX_N_HEADS * IDX_DIM;
+    scores += (size_t) row * j.blk_stride;
     const int lane = threadIdx.x & (WAVE - 1);
     const int sub  = threadIdx.x / WAVE;
     const int nsub = IDXS_THREADS / WAVE;
@@ -1891,11 +2075,18 @@ void k_idx_scan(const unsigned short * __restrict__ pooled, const float * __rest
 // doing four passes of LDS histograms and scans over 70 scores.
 __global__ void k_qsa_expand(const float * __restrict__ blk_scores,
                              float * __restrict__ cell, int * __restrict__ sel,
-                             int n_kv, int q_pos, int ratio, int tail_start,
-                             int sel_identity) {
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+                             QsaRowsD jr) {
+    const int row = blockIdx.y;
+    const int j   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n_kv      = qsa_n_kv(jr, row);
     if (j >= n_kv) return;
-    if (sel_identity) sel[j] = j;
+    const int ratio     = jr.ratio;
+    const int q_pos     = jr.pos0 + row;
+    const int tail_start = ((q_pos + 1) / ratio) * ratio;
+    blk_scores += (size_t) row * jr.blk_stride;
+    cell       += (size_t) row * jr.cell_stride;
+    sel        += (size_t) row * jr.sel_stride;
+    if (qsa_n_sel(jr, row) >= n_kv) sel[j] = j;       // the identity selection
     const int b      = j / ratio;
     const int filled = min(ratio, n_kv - b * ratio);
     const float bias = (b * ratio >= tail_start) ? 1e9f
@@ -1923,17 +2114,30 @@ __device__ __forceinline__ uint32_t ord_key(float f) {
 }
 
 __global__ __launch_bounds__(TOPK_THREADS)
-void k_topk_radix_select(const float * __restrict__ scores, int n, int k_want,
+void k_topk_radix_select(const float * __restrict__ scores,
                          uint32_t * __restrict__ cand_key, int * __restrict__ cand_idx,
-                         int * __restrict__ out) {
+                         int * __restrict__ out, QsaRowsD jr) {
     __shared__ uint32_t s_hist[TOPK_HI_BINS];
     __shared__ uint32_t s_scan[TOPK_THREADS];
     __shared__ int      s_found;
     __shared__ uint32_t s_above, s_prefix;
     __shared__ int      s_need, s_cand, s_out, s_tie;
 
+    // One workgroup a row. A row whose budget covers its whole cache already
+    // has its selection -- k_qsa_expand wrote the identity -- and returns
+    // before the first __syncthreads(), which is uniform across the workgroup
+    // and therefore safe.
+    const int row  = blockIdx.x;
+    const int n    = qsa_n_kv(jr, row);
+    const int kw   = qsa_n_sel(jr, row);
+    if (kw >= n) return;
+    scores   += (size_t) row * jr.cell_stride;
+    out      += (size_t) row * jr.sel_stride;
+    cand_key += (size_t) row * jr.cand_stride;
+    cand_idx += (size_t) row * jr.cand_stride;
+
     const int t = threadIdx.x;
-    const int k = k_want < n ? k_want : n;
+    const int k = kw < n ? kw : n;
 
     for (int i = t; i < TOPK_HI_BINS; i += TOPK_THREADS) s_hist[i] = 0u;
     if (t == 0) { s_cand = 0; s_out = 0; s_tie = 0; s_found = 0; s_above = 0u; }
@@ -2052,9 +2256,22 @@ void k_attn_flash_split(const int8_t * __restrict__ Kqs, const __half * __restri
                         const int8_t * __restrict__ Vqs, const __half * __restrict__ Vsc,
                         const float * __restrict__ Q, const int * __restrict__ sel,
                         float * __restrict__ partial, float * __restrict__ mbuf,
-                        float * __restrict__ lbuf, int n_sel) {
+                        float * __restrict__ lbuf, QsaRowsD jr) {
     __shared__ float sh_p[ATTN_WAVES][ATTN_CHUNK];
     __shared__ int   sh_tok[ATTN_CHUNK];
+
+    // grid.z is the query row. Rows of a block have different n_sel -- the
+    // budget is min(n_kv, indexer_top_k + r - 1) and n_kv grows by one a row
+    // -- so the grid is sized for the LAST row and a workgroup past its own
+    // row's chunk count returns. The return is uniform over the workgroup.
+    const int row   = blockIdx.z;
+    const int n_sel = qsa_n_sel(jr, row);
+    if (blockIdx.x * ATTN_CHUNK >= n_sel) return;
+    sel     += (size_t) row * jr.sel_stride;
+    Q       += (size_t) row * N_Q_HEADS * HEAD_DIM;
+    partial += (size_t) row * jr.part_stride;
+    mbuf    += (size_t) row * jr.ml_stride;
+    lbuf    += (size_t) row * jr.ml_stride;
 
     const int chunk = blockIdx.x;
     const int kvh   = blockIdx.y;
@@ -2154,7 +2371,15 @@ __global__ __launch_bounds__(HEAD_DIM)
 void k_attn_combine(const float * __restrict__ partial, const float * __restrict__ mbuf,
                     const float * __restrict__ lbuf, const float * __restrict__ gsig,
                     float * __restrict__ out, float * __restrict__ out_gated,
-                    int n_chunks) {
+                    QsaRowsD jr) {
+    const int row       = blockIdx.y;
+    const int n_chunks  = (qsa_n_sel(jr, row) + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    partial   += (size_t) row * jr.part_stride;
+    mbuf      += (size_t) row * jr.ml_stride;
+    lbuf      += (size_t) row * jr.ml_stride;
+    gsig      += (size_t) row * N_Q_HEADS * HEAD_DIM;
+    out       += (size_t) row * N_Q_HEADS * HEAD_DIM;
+    out_gated += (size_t) row * N_Q_HEADS * HEAD_DIM;
     const int h = blockIdx.x;
     const int d = threadIdx.x;
     float M = ATTN_NEG_INF;
@@ -2267,7 +2492,17 @@ enum ProfClass {
     PC_ROUTER,
     PC_EXP_GATE_UP,
     PC_EXP_DOWN,
+    // Only at T > 1, and only for the stages --expert-gather has turned on:
+    // the counting sort plus the row-gather kernels, charged apart from the
+    // per-assignment path above so the profile says how much of the expert
+    // time the amortisation is actually carrying.
+    PC_EXP_GATHER,
     PC_EXP_COMBINE,
+    // The batched query-row stage of a QSA layer: scan, expand, radix select,
+    // attention split and combine for a whole block of rows. Apart from
+    // PC_QSA, which keeps the per-chunk work (cache writes, pooling,
+    // qk_post, rope) that is not per query row.
+    PC_QSA_ROWS,
     PC_COPY,        // device-to-device copies
     PC_BOUNDARY,    // the hyper-connection residual crossing to the next card
     PC_ARGMAX,      // greedy sampling on the device
@@ -2289,7 +2524,9 @@ const char * prof_name(int c) {
         case PC_ROUTER:       return "router";
         case PC_EXP_GATE_UP:  return "expert_gate_up";
         case PC_EXP_DOWN:     return "expert_down";
+        case PC_EXP_GATHER:   return "expert_gather";
         case PC_EXP_COMBINE:  return "expert_combine";
+        case PC_QSA_ROWS:     return "qsa_rows";
         case PC_COPY:         return "copy";
         case PC_BOUNDARY:     return "boundary_p2p";
         case PC_ARGMAX:       return "argmax";
@@ -2316,12 +2553,15 @@ public:
             HIP_CHECK(hipHostMalloc(&stage_[i], stage_bytes_, hipHostMallocDefault));
         // the attention/top-k scratch is sized for the worst case the runner
         // can present; both are small and allocated once
-        const int max_chunks = ceil_div(MAX_SEL, ATTN_CHUNK);
-        HIP_CHECK(hipMalloc(&partial_, (size_t) max_chunks * N_Q_HEADS * HEAD_DIM * sizeof(float)));
-        HIP_CHECK(hipMalloc(&mbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
-        HIP_CHECK(hipMalloc(&lbuf_,    (size_t) max_chunks * N_Q_HEADS * sizeof(float)));
+        // One row's worth here; reserve_qsa_rows() grows it to the row block
+        // the runner asks for. A row is 811 KB of partials at MAX_SEL, which
+        // is why the block is bounded at all.
+        alloc_attn_rows(1);
         HIP_CHECK(hipMalloc(&gemv_part_, GEMV_PART_FLOATS * sizeof(float)));
         part_floats_ = GEMV_PART_FLOATS;
+        HIP_CHECK(hipMalloc(&gemv_cnt_, GEMV_CNT_ROWS * sizeof(int)));
+        HIP_CHECK(hipMemset(gemv_cnt_, 0, GEMV_CNT_ROWS * sizeof(int)));
+        cnt_rows_ = GEMV_CNT_ROWS;
         HIP_CHECK(hipMalloc(&amax_v_, ARGMAX_BLOCKS * sizeof(float)));
         HIP_CHECK(hipMalloc(&amax_i_, ARGMAX_BLOCKS * sizeof(int)));
         HIP_CHECK(hipEventCreateWithFlags(&bnd_, hipEventDisableTiming));
@@ -2336,7 +2576,7 @@ public:
         dev_ensure(dev_);
         HIP_IGNORE(hipFree(partial_)); HIP_IGNORE(hipFree(mbuf_)); HIP_IGNORE(hipFree(lbuf_));
         HIP_IGNORE(hipFree(cand_key_)); HIP_IGNORE(hipFree(cand_idx_));
-        HIP_IGNORE(hipFree(gemv_part_));
+        HIP_IGNORE(hipFree(gemv_part_)); HIP_IGNORE(hipFree(gemv_cnt_));
         HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
         HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
         for (int i = 0; i < STAGE_SLOTS; ++i) {
@@ -2543,6 +2783,24 @@ public:
 
     void gemv_batch(const GemvJob * jobs, int n, const float * x, int group,
                     int x_mode, const float * x2, int T) override {
+        gemv_batch_impl(jobs, n, x, group, x_mode, x2, T, nullptr, nullptr);
+    }
+
+    // build_hc_mix's gate projection and the collapse that consumes it. The
+    // fused form needs the decode token's geometry (T == 1, no split, hc_up's
+    // exact row count); anything else falls back to the two launches, which is
+    // what the base class does and what the CPU backend always does.
+    void gemv_hc_gate_collapse(const GemvJob & up, const float * lo, const float * xn,
+                               float * out_mixed, int group, int T) override {
+        const bool fused = gemv_batch_impl(&up, 1, lo, group, GX_PLAIN, nullptr, T,
+                                           gemv_fuse_collapse_ ? out_mixed : nullptr, xn);
+        if (!fused) hc_collapse(xn, up.out, out_mixed, T);
+    }
+
+    // Returns true when `collapse_out` was folded into the launch.
+    bool gemv_batch_impl(const GemvJob * jobs, int n, const float * x, int group,
+                         int x_mode, const float * x2, int T,
+                         float * collapse_out, const float * collapse_xn) {
         GemvBatchD b{};
         b.n = n < GEMV_BATCH_MAX ? n : GEMV_BATCH_MAX;
         b.K = (int) jobs[0].W->K;
@@ -2611,7 +2869,7 @@ public:
                 k_gemm_lds_i8<<<grid, GEMM_LDS_THREADS, 0, stream_>>>(b, x, x2, T);
             else
                 k_gemm_lds<<<grid, GEMM_LDS_THREADS, 0, stream_>>>(b, x, x2, T);
-            return;
+            return false;
         }
         if (T > 1) ++gemm_tile_calls_;
 
@@ -2652,18 +2910,48 @@ public:
         const int stage  = (gemv_lds_ && (size_t) nt_max * slice <= GEMV_LDS_MAX_FLOATS) ? 1 : 0;
         const size_t lds = stage ? (size_t) nt_max * slice * sizeof(float) : 0;
 
+        // The decode token reduces its splits inside the kernel (one counter
+        // per output row) and, for hc_up, collapses inside it too. Both are
+        // knobs because both are new, not because either can move a bit.
+        int * cnt = nullptr;
+        if (tile == 1 && nsplit > 1 && gemv_fused_reduce_) {
+            ensure_cnt((size_t) b.total_rows);
+            cnt = gemv_cnt_;
+        }
+        float *       col_out = nullptr;
+        const float * col_xn  = nullptr;
+        if (collapse_out && tile == 1 && nsplit == 1 && b.n == 1 && T == 1 &&
+            b.total_rows == HC * N_EMBD && (GEMV_WAVES % HC) == 0 &&
+            row_groups == N_EMBD / (GEMV_WAVES / HC)) {
+            col_out = collapse_out; col_xn = collapse_xn;
+        }
+
         mark(PC_TRUNK, group, bytes * (size_t) T);
         last_op_ = "gemv_batch";
-        const dim3 grid((unsigned) row_groups, (unsigned) nsplit, (unsigned) n_tiles);
-        if (tile == 1) k_gemm_batch<1><<<grid, GEMV_THREADS, lds, stream_>>>(
-                           b, x, x2, nsplit, gemv_part_, stage, T);
-        else           k_gemm_batch<GEMM_TILE><<<grid, GEMV_THREADS, lds, stream_>>>(
-                           b, x, x2, nsplit, gemv_part_, stage, T);
-        if (nsplit > 1) {
+        // grid.x is the SPLIT at TILE == 1 and the row group at TILE > 1; see
+        // the kernel's header (a). n_tiles is 1 whenever tile == 1.
+        const dim3 grid = (tile == 1)
+                        ? dim3((unsigned) nsplit, (unsigned) row_groups, 1u)
+                        : dim3((unsigned) row_groups, (unsigned) nsplit, (unsigned) n_tiles);
+        if (tile == 1) {
+            switch (gemv_burst_) {
+                case 1:  k_gemm_batch<1, 1><<<grid, GEMV_THREADS, lds, stream_>>>(
+                             b, x, x2, nsplit, gemv_part_, stage, T, cnt, col_out, col_xn); break;
+                case 2:  k_gemm_batch<1, 2><<<grid, GEMV_THREADS, lds, stream_>>>(
+                             b, x, x2, nsplit, gemv_part_, stage, T, cnt, col_out, col_xn); break;
+                default: k_gemm_batch<1, 4><<<grid, GEMV_THREADS, lds, stream_>>>(
+                             b, x, x2, nsplit, gemv_part_, stage, T, cnt, col_out, col_xn); break;
+            }
+        } else {
+            k_gemm_batch<GEMM_TILE, 1><<<grid, GEMV_THREADS, lds, stream_>>>(
+                b, x, x2, nsplit, gemv_part_, stage, T, nullptr, nullptr, nullptr);
+        }
+        if (nsplit > 1 && !cnt) {
             ++launches_;
             k_reduce_splits_gemm<<<dim3((unsigned) ceil_div(b.total_rows, BLK), (unsigned) T),
                                    BLK, 0, stream_>>>(b, gemv_part_, nsplit, T);
         }
+        return col_out != nullptr;
     }
 
     // Sort the chunk's T*10 expert assignments and build the tile table.
@@ -2687,7 +2975,7 @@ public:
             HIP_CHECK(hipMalloc(&moe_tile_off_, (size_t) ntc * sizeof(int)));
             HIP_CHECK(hipMalloc(&moe_tile_cnt_, (size_t) ntc * sizeof(int)));
         }
-        mark(PC_ROUTER);
+        mark(PC_EXP_GATHER);
         last_op_ = "moe_sort";
         k_moe_sort<<<1, N_EXPERT, 0, stream_>>>(ids, n, moe_order_, moe_tile_exp_,
                                                 moe_tile_off_, moe_tile_cnt_, nt);
@@ -2718,7 +3006,25 @@ public:
         HIP_CHECK(hipMalloc(&gemv_part_, want * sizeof(float)));
         part_floats_ = want;
     }
+    // One counter per output row for the in-kernel split reduce. It is
+    // allocated once and is ALWAYS zero between launches -- the workgroup that
+    // closes a row puts its counter back -- so nothing here is per token.
+    void ensure_cnt(size_t rows) {
+        if (rows <= cnt_rows_) return;
+        dev_ensure(dev_);
+        size_t want = cnt_rows_ ? cnt_rows_ : GEMV_CNT_ROWS;
+        while (want < rows) want <<= 1;
+        HIP_IGNORE(hipFree(gemv_cnt_));
+        HIP_CHECK(hipMalloc(&gemv_cnt_, want * sizeof(int)));
+        HIP_CHECK(hipMemset(gemv_cnt_, 0, want * sizeof(int)));
+        cnt_rows_ = want;
+    }
     void set_gemv_lds(int on) override { gemv_lds_ = on; }
+    void set_gemv_fused_reduce(int on) override { gemv_fused_reduce_ = on; }
+    void set_gemv_fuse_collapse(int on) override { gemv_fuse_collapse_ = on; }
+    void set_gemv_burst(int n) override {
+        gemv_burst_ = (n == 1 || n == 2 || n == 4) ? n : GEMV_BURST;
+    }
     void set_sync_debug(bool on) override { sync_debug_ = on; }
     void set_debug_context(const char * phase, int layer) override {
         dbg_phase_ = phase; dbg_layer_ = layer;
@@ -2865,7 +3171,7 @@ public:
         if (T > 1 && (expert_gather_ & 1)) {
             const int nt = moe_sort(ids, T);
             const dim3 grid((unsigned) g.rows, (unsigned) nt, 2);
-            mark(PC_EXP_GATE_UP);
+            mark(PC_EXP_GATHER);
             last_op_ = "moe_gate_up_gather";
             if (g.type == FK_Q_IQ3_S) {
                 k_moe_gate_up_iq3s_gather<<<grid, WAVE, 0, stream_>>>(
@@ -2904,7 +3210,7 @@ public:
             // sort is reused unless something unexpected changed
             const int nt = moe_sort(ids, T);
             const dim3 grid((unsigned) d.rows, (unsigned) nt, 1);
-            mark(PC_EXP_DOWN);
+            mark(PC_EXP_GATHER);
             last_op_ = "moe_down_gather";
             if (d.type == FK_Q_IQ4_NL) {
                 k_moe_down_iq4nl_gather<<<grid, WAVE, 0, stream_>>>(
@@ -2965,9 +3271,14 @@ public:
         int wgs = ceil_div(n_blocks, nsub);
         if (wgs > 4096) wgs = 4096;
         if (wgs < 1) wgs = 1;
+        // n_blocks == ceil(n_kv / ratio), so a position that reproduces it is
+        // n_blocks*ratio - 1: the kernel derives the row's block count the
+        // same way for a block of one as for a block of 256.
+        QsaRowsD d = one_row(n_blocks * QSA_RATIO - 1, QSA_RATIO, MAX_SEL);
         mark(PC_QSA);
         last_op_ = "idx_scan";
-        k_idx_scan<<<wgs, IDXS_THREADS, 0, stream_>>>((const unsigned short *) pooled, q, s, n_blocks);
+        k_idx_scan<<<dim3((unsigned) wgs, 1), IDXS_THREADS, 0, stream_>>>(
+            (const unsigned short *) pooled, q, s, d);
     }
     void qsa_qk_post(const float * qfull, const float * kraw, const float * idxraw,
                      const float * q_norm, const float * k_norm, const float * iq_norm,
@@ -2982,20 +3293,125 @@ public:
     }
     void qsa_expand(const float * bs, float * c, int * sel, int n_kv, int q, int r,
                     int tail, int sel_identity) override {
+        (void) tail;                 // the kernel computes it from the position
+        // The cache is contiguous (cell j == position j), so n_kv == q + 1 and
+        // a budget of n_kv forces the identity the caller asked for.
+        QsaRowsD d = one_row(q, r, sel_identity ? n_kv : (IDX_TOP_K + r - 1));
         mark(PC_QSA);
         last_op_ = "qsa_expand";
-        k_qsa_expand<<<ceil_div(n_kv, BLK), BLK, 0, stream_>>>(bs, c, sel, n_kv, q, r, tail, sel_identity);
+        k_qsa_expand<<<dim3((unsigned) ceil_div(n_kv, BLK), 1), BLK, 0, stream_>>>(bs, c, sel, d);
     }
     void reserve_topk(int n) override {
-        if (n <= cand_cap_) return;
+        if (n <= cand_cap_ && qsa_rows_ <= cand_rows_) return;
         dev_ensure(dev_);
         HIP_IGNORE(hipFree(cand_key_));
         HIP_IGNORE(hipFree(cand_idx_));
-        cand_cap_ = n;
-        HIP_CHECK(hipMalloc(&cand_key_, (size_t) cand_cap_ * sizeof(uint32_t)));
-        HIP_CHECK(hipMalloc(&cand_idx_, (size_t) cand_cap_ * sizeof(int)));
+        if (n > cand_cap_) cand_cap_ = n;
+        cand_rows_ = qsa_rows_;
+        const size_t nc = (size_t) cand_cap_ * (size_t) cand_rows_;
+        HIP_CHECK(hipMalloc(&cand_key_, nc * sizeof(uint32_t)));
+        HIP_CHECK(hipMalloc(&cand_idx_, nc * sizeof(int)));
     }
 
+    // How many query rows of a chunk this card has scratch for. Everything a
+    // row needs that is NOT shared -- its cell scores, its radix candidates,
+    // its attention partials -- is counted, and the block is whatever fits in
+    // the budget (FRANKEN_QSA_ROW_MB, default 256). At ctx 262 144 a row is
+    // 1.0 MB of cell scores + 2.1 MB of candidates + 0.81 MB of partials, so
+    // the block is ~64 rows; at 8 192 it is the whole chunk. The runner walks
+    // the chunk in blocks of the answer, and a backend returning 1 gets the
+    // old row-at-a-time loop back.
+    int reserve_qsa_rows(int rows_max, int ctx) override {
+        dev_ensure(dev_);
+        const size_t per_row =
+              (size_t) ctx * sizeof(float)                              // cell scores
+            + (size_t) ctx * (sizeof(uint32_t) + sizeof(int))           // radix candidates
+            + (size_t) ceil_div(MAX_SEL, ATTN_CHUNK) * N_Q_HEADS * (HEAD_DIM + 2) * sizeof(float)
+            + (size_t) ceil_div(ctx, QSA_RATIO) * sizeof(float)         // block scores
+            + (size_t) MAX_SEL * sizeof(int);                           // the selection
+        size_t budget = (size_t) qsa_row_mb_ * 1024u * 1024u;
+        int rows = per_row ? (int)(budget / per_row) : rows_max;
+        if (rows < 1)        rows = 1;
+        if (rows > rows_max) rows = rows_max;
+        qsa_rows_ = rows;
+        alloc_attn_rows(rows);
+        return rows;
+    }
+
+    // One launch a stage for a whole block of rows. This is the only caller
+    // of the five QSA kernels in a T > 1 run, and at T = 1 it is a block of
+    // one -- same kernels, gridDim.y == 1, so the decode path cannot drift
+    // from the prefill path here any more than k_gemm_batch<1> lets it drift
+    // in the trunk (PREFILL.md section 9).
+    void qsa_rows(const QsaRows & j) override {
+        dev_ensure(dev_);
+        QsaRowsD d;
+        d.pos0 = j.pos0; d.ratio = j.ratio; d.budget = j.budget;
+        d.blk_stride  = j.blk_stride;
+        d.cell_stride = j.cell_stride;
+        d.sel_stride  = j.sel_stride;
+        d.cand_stride = (size_t) cand_cap_;
+        d.part_stride = part_stride_;
+        d.ml_stride   = ml_stride_;
+        const int rows     = j.rows;
+        const int last     = rows - 1;                      // the widest row
+        const int n_kv_max = j.pos0 + rows;                 // == n_kv of `last`
+        const int nblk_max = (n_kv_max + j.ratio - 1) / j.ratio;
+        const int nsel_max = n_kv_max < j.budget ? n_kv_max : j.budget;
+        const bool ident   = nsel_max >= n_kv_max;          // uniform over a block?
+
+        {   // the lightning indexer's scan over the pooled keys
+            const int nsub = IDXS_THREADS / WAVE;
+            int wgs = ceil_div(nblk_max, nsub);
+            if (wgs > 4096) wgs = 4096;
+            if (wgs < 1)    wgs = 1;
+            mark(PC_QSA_ROWS);
+            last_op_ = "idx_scan_rows";
+            k_idx_scan<<<dim3((unsigned) wgs, (unsigned) rows), IDXS_THREADS, 0, stream_>>>(
+                (const unsigned short *) j.pooled, j.idxq, j.blk, d);
+        }
+        {   // the per-cell expansion, the bias and (when it is) the identity
+            mark(PC_QSA_ROWS);
+            last_op_ = "qsa_expand_rows";
+            k_qsa_expand<<<dim3((unsigned) ceil_div(n_kv_max, BLK), (unsigned) rows),
+                           BLK, 0, stream_>>>(j.blk, j.cell, j.sel, d);
+        }
+        // The radix select runs only for the rows whose budget does NOT cover
+        // their cache. n_kv grows by one a row, so within a block the two
+        // cases can only split once -- and the kernel returns early for an
+        // identity row anyway, so one launch covers both.
+        if (!ident) {
+            if (n_kv_max > cand_cap_ || qsa_rows_ > cand_rows_) {
+                std::fprintf(stderr, "qsa_rows: growing the candidate list to %d x %d mid-run "
+                                     "(reserve_topk/reserve_qsa_rows were not called with --ctx)\n",
+                             n_kv_max, qsa_rows_);
+                reserve_topk(n_kv_max > 2 * cand_cap_ ? n_kv_max : 2 * cand_cap_);
+                d.cand_stride = (size_t) cand_cap_;
+            }
+            mark(PC_QSA_ROWS);
+            last_op_ = "topk_select_rows";
+            k_topk_radix_select<<<dim3((unsigned) rows), TOPK_THREADS, 0, stream_>>>(
+                j.cell, cand_key_, cand_idx_, j.sel, d);
+        }
+        {   // flash attention over the selection, split then combined
+            const int n_chunks = ceil_div(nsel_max, ATTN_CHUNK);
+            mark(PC_QSA_ROWS);
+            last_op_ = "attn_qsa_rows";
+            k_attn_flash_split<<<dim3((unsigned) n_chunks, N_KV_HEADS, (unsigned) rows),
+                                 ATTN_THREADS, 0, stream_>>>(
+                j.kqs, (const __half *) j.ksc, j.vqs, (const __half *) j.vsc,
+                j.q, j.sel, partial_, mbuf_, lbuf_, d);
+            mark(PC_QSA_ROWS);
+            last_op_ = "attn_qsa_rows";
+            k_attn_combine<<<dim3(N_Q_HEADS, (unsigned) rows), HEAD_DIM, 0, stream_>>>(
+                partial_, mbuf_, lbuf_, j.gsig, j.out, j.out_gated, d);
+        }
+        (void) last;
+    }
+
+    // A block of one. Kept because Backend's default qsa_rows() -- what the
+    // CPU arm runs -- is written against these, and because a caller with a
+    // single row should not have to build a job.
     int topk_select(const float * scores, int n, int width, int * out) override {
         dev_ensure(dev_);
         // Must never fire: the runner reserves --ctx at construction. Kept as
@@ -3007,24 +3423,29 @@ public:
             reserve_topk(n > 2 * cand_cap_ ? n : 2 * cand_cap_);
         }
         const int k = width < n ? width : n;
+        if (k >= n) return k;                     // the identity; nothing to select
+        QsaRowsD d = one_row(n - 1, QSA_RATIO, width);
         mark(PC_QSA);
         last_op_ = "topk_select";
-        k_topk_radix_select<<<1, TOPK_THREADS, 0, stream_>>>(scores, n, k, cand_key_, cand_idx_, out);
+        k_topk_radix_select<<<1, TOPK_THREADS, 0, stream_>>>(scores, cand_key_, cand_idx_, out, d);
         return k;
     }
     void attn_qsa(const int8_t * kqs, const uint16_t * ksc, const int8_t * vqs,
                   const uint16_t * vsc, const float * q, const int * sel, int n_sel,
                   const float * gsig, float * out, float * out_gated) override {
         const int n_chunks = ceil_div(n_sel, ATTN_CHUNK);
+        // n_sel is min(n_kv, budget); pos = n_sel - 1 with budget = n_sel
+        // reproduces exactly that for a block of one.
+        QsaRowsD d = one_row(n_sel - 1, QSA_RATIO, n_sel);
         mark(PC_QSA);
         last_op_ = "attn_qsa";
-        k_attn_flash_split<<<dim3(n_chunks, N_KV_HEADS), ATTN_THREADS, 0, stream_>>>(
+        k_attn_flash_split<<<dim3(n_chunks, N_KV_HEADS, 1), ATTN_THREADS, 0, stream_>>>(
             kqs, (const __half *) ksc, vqs, (const __half *) vsc, q, sel,
-            partial_, mbuf_, lbuf_, n_sel);
+            partial_, mbuf_, lbuf_, d);
         mark(PC_QSA);
         last_op_ = "attn_qsa";
-        k_attn_combine<<<N_Q_HEADS, HEAD_DIM, 0, stream_>>>(partial_, mbuf_, lbuf_, gsig,
-                                                out, out_gated, n_chunks);
+        k_attn_combine<<<dim3(N_Q_HEADS, 1), HEAD_DIM, 0, stream_>>>(
+            partial_, mbuf_, lbuf_, gsig, out, out_gated, d);
     }
 
     void set_profile(bool on) override {
@@ -3045,6 +3466,7 @@ public:
             ev_.resize(PROF_MAX_EVENTS + 1);
             ev_cls_.resize(PROF_MAX_EVENTS + 1);
             ev_grp_.resize(PROF_MAX_EVENTS + 1, -1);
+            ev_small_.resize(PROF_MAX_EVENTS + 1, 0);
             for (auto & e : ev_) HIP_CHECK(hipEventCreate(&e));
         }
     }
@@ -3053,6 +3475,7 @@ public:
         if (prof_defer_ && n_ev_ > 0) prof_flush();
         for (int i = 0; i < PC_N; ++i) prof_us_[i] = 0.0;
         for (int i = 0; i < GG_N; ++i) { gemv_us_[i] = 0.0; gemv_bytes_[i] = 0.0; }
+        gemv_small_us_ = 0.0; gemv_small_bytes_ = 0.0; gemv_small_launches_ = 0;
         tokens_profiled_ = 0;
         blocking_in_body_ = 0;
         launches_in_body_ = 0;
@@ -3072,6 +3495,7 @@ public:
             HIP_CHECK(hipEventElapsedTime(&ms, ev_[i], ev_[i + 1]));
             prof_us_[ev_cls_[i]] += (double) ms * 1000.0;
             if (ev_grp_[i] >= 0 && ev_grp_[i] < GG_N) gemv_us_[ev_grp_[i]] += (double) ms * 1000.0;
+            if (ev_small_[i]) gemv_small_us_ += (double) ms * 1000.0;
         }
         n_ev_ = 0;
     }
@@ -3091,6 +3515,7 @@ public:
         HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         ev_cls_[n_ev_] = PC_GAP;
         ev_grp_[n_ev_] = -1;
+        ev_small_[n_ev_] = 0;
         ++n_ev_;
         // Reducing costs one sync; at ~400 events a chunk this is roughly
         // once every twenty chunks, which is why it is cheaper than the
@@ -3124,6 +3549,14 @@ public:
             std::fprintf(out, "prof_gemv_%s_us=%.2f prof_gemv_%s_mb=%.2f prof_gemv_%s_gbs=%.1f\n",
                          gemv_group_name(g), us, gemv_group_name(g), mb,
                          gemv_group_name(g), us > 0.0 ? mb / us * 1e3 : 0.0);
+        }
+        {   // the sub-10 MB set, across groups
+            const double us = gemv_small_us_ / n;
+            const double mb = gemv_small_bytes_ / n / 1e6;
+            std::fprintf(out, "prof_gemv_small_us=%.2f prof_gemv_small_mb=%.2f "
+                              "prof_gemv_small_gbs=%.1f prof_gemv_small_launches=%.2f\n",
+                         us, mb, us > 0.0 ? mb / us * 1e3 : 0.0,
+                         (double) gemv_small_launches_ / n);
         }
         std::fprintf(out, "prof_host_syncs_per_token=%.2f\n", (double) blocking_in_body_ / n);
         std::fprintf(out, "prof_launches_per_token=%.2f\n", (double) launches_in_body_ / n);
@@ -3180,6 +3613,12 @@ private:
         last_cls_ = cls;
         ++launches_;                       // one op == one launch, except where noted
         if (gemv_group >= 0 && gemv_group < GG_N) gemv_bytes_[gemv_group] += (double) bytes;
+        // The sub-GEMV_SMALL_BYTES set, across groups: the launches that cannot
+        // fill the card from their own bytes and therefore carry the launch
+        // floor. It is reported separately so a change aimed at them is
+        // attributable to them.
+        const bool small = (gemv_group >= 0 && bytes > 0 && bytes < GEMV_SMALL_BYTES);
+        if (small) { gemv_small_bytes_ += (double) bytes; ++gemv_small_launches_; }
         if (!prof_ || n_ev_ >= PROF_MAX_EVENTS) return;
         // Record only when the CLASS CHANGES. The interval from event i to
         // event i+1 is charged to ev_cls_[i], so a run of ops in one class
@@ -3195,6 +3634,7 @@ private:
         HIP_CHECK(hipEventRecord(ev_[n_ev_], stream_));
         ev_cls_[n_ev_] = cls;
         ev_grp_[n_ev_] = gemv_group;
+        ev_small_[n_ev_] = small ? 1 : 0;
         ++n_ev_;
     }
 
@@ -3220,17 +3660,44 @@ private:
     double     prof_us_[PC_N] = {0};
     double     gemv_us_[GG_N]  = {0};
     double     gemv_bytes_[GG_N] = {0};
+    double     gemv_small_us_ = 0.0;
+    double     gemv_small_bytes_ = 0.0;
+    long long  gemv_small_launches_ = 0;
     std::vector<hipEvent_t> ev_;
     std::vector<int>        ev_cls_;
     std::vector<int>        ev_grp_;
+    std::vector<int>        ev_small_;
 
     hipEvent_t ev0_{}, ev1_{};
     float * partial_ = nullptr;
     float * mbuf_    = nullptr;
     float * lbuf_    = nullptr;
+    size_t  part_stride_ = 0, ml_stride_ = 0;
+    int     qsa_rows_ = 1;         // rows of a chunk this card has scratch for
     uint32_t * cand_key_ = nullptr;
     int      * cand_idx_ = nullptr;
     int        cand_cap_ = 0;
+    int        cand_rows_ = 0;
+
+    // A job describing ONE row at position `pos`, so the five QSA kernels
+    // have a single code path whatever the caller.
+    QsaRowsD one_row(int pos, int ratio, int budget) const {
+        QsaRowsD d;
+        d.pos0 = pos < 0 ? 0 : pos;
+        d.ratio = ratio; d.budget = budget;
+        d.blk_stride = d.cell_stride = d.sel_stride = 0;
+        d.cand_stride = 0; d.part_stride = 0; d.ml_stride = 0;
+        return d;
+    }
+    void alloc_attn_rows(int rows) {
+        const size_t max_chunks = (size_t) ceil_div(MAX_SEL, ATTN_CHUNK);
+        part_stride_ = max_chunks * N_Q_HEADS * HEAD_DIM;
+        ml_stride_   = max_chunks * N_Q_HEADS;
+        HIP_IGNORE(hipFree(partial_)); HIP_IGNORE(hipFree(mbuf_)); HIP_IGNORE(hipFree(lbuf_));
+        HIP_CHECK(hipMalloc(&partial_, part_stride_ * (size_t) rows * sizeof(float)));
+        HIP_CHECK(hipMalloc(&mbuf_,    ml_stride_   * (size_t) rows * sizeof(float)));
+        HIP_CHECK(hipMalloc(&lbuf_,    ml_stride_   * (size_t) rows * sizeof(float)));
+    }
     int        gemv_lds_ = 1;
     int        gemv_min_rows_ = 1024;
     // 0 = k_gemm_batch only, the ONE path that is bit-identical to decode.
@@ -3250,6 +3717,15 @@ private:
     float *    gemv_part_ = nullptr;
     size_t     part_floats_ = 0;
     static constexpr size_t GEMV_PART_FLOATS = 1u << 17;   // 128k floats = 512 KB
+    // A GEMV only splits when its row count is under --gemv-min-rows (1024 by
+    // default, and the only decode batch under it is hc_down+inject's 324), so
+    // 16k rows of counters is four times any setting that splits at all.
+    int *      gemv_cnt_ = nullptr;
+    size_t     cnt_rows_ = 0;
+    static constexpr size_t GEMV_CNT_ROWS = 1u << 14;
+    int        gemv_fused_reduce_  = 1;
+    int        gemv_fuse_collapse_ = 1;
+    int        gemv_burst_         = GEMV_BURST;
     static constexpr int    STAGE_SLOTS = 8;
     void *     stage_[STAGE_SLOTS] = {nullptr};
     hipEvent_t stage_ev_[STAGE_SLOTS] = {};

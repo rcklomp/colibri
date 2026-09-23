@@ -69,10 +69,28 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
     // Everything a TOKEN owns is sized T wide and laid out TOKEN-MAJOR
     // (design 9.4): row t of an n-wide activation is `buf + t*n`, so a row is
     // contiguous, a tiled GEMM's loads are coalesced and every row-wise
-    // kernel is the decode kernel with a grid axis. The QSA per-query
-    // buffers (blkscore/cellscore/sel) do NOT grow with T -- that stage
-    // loops, because its scratch is O(n_kv) and 256 rows of a 256k cache
-    // would be 268 MB.
+    // kernel is the decode kernel with a grid axis.
+    //
+    // The QSA per-query buffers are the exception, and the reason is the one
+    // the first version of this comment gave: cell_scores is O(n_kv) a ROW,
+    // so 256 rows of a 256k cache would be 268 MB of them (and 537 MB of
+    // radix-select candidates behind them). That is why the stage used to
+    // loop one row at a time. It no longer does -- ~12 000 launches a chunk
+    // was 0.19 ms a prompt token a card of pure issue cost -- but it does not
+    // widen to T either: the backend says how many rows it has scratch for
+    // (Backend::reserve_qsa_rows) and the chunk is walked in blocks of that
+    // many. blkscore / cellscore / sel are [qsa_rb_][stride].
+    blk_stride_  = (size_t) max_blocks;
+    cell_stride_ = (size_t) cfg_.ctx;
+    sel_stride_  = (size_t) std::min(cfg_.ctx, MAX_SEL);
+    qsa_rb_ = max_T_;
+    for (int d = 0; d < n_dev; ++d) {
+        const int r = model_.dev(d).reserve_qsa_rows(max_T_, cfg_.ctx);
+        if (r < qsa_rb_) qsa_rb_ = r;
+    }
+    if (qsa_rb_ < 1)      qsa_rb_ = 1;
+    if (qsa_rb_ > max_T_) qsa_rb_ = max_T_;
+
     pool_.resize(n_dev);
     for (int d = 0; d < n_dev; ++d) {
         Backend & be = model_.dev(d);
@@ -117,8 +135,8 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
         S.idxq     = A(T * IDX_N_HEADS * IDX_DIM);        // distinct from idxraw:
                                                           // qk_post reads one, writes the other
 
-        S.blkscore  = A(max_blocks);
-        S.cellscore = A(cfg_.ctx);
+        S.blkscore  = A((size_t) qsa_rb_ * blk_stride_);
+        S.cellscore = A((size_t) qsa_rb_ * cell_stride_);
         // This token's block only. They used to be max_blocks long (67 MB a
         // device at 256k) to tap the whole pooled tensor -- for two points
         // the comparator marks INCOMPARABLE at any other cache depth anyway.
@@ -126,7 +144,7 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
         S.pool_rope = A(IDX_DIM);
         // the selection is capped by the BUDGET, not the cache: the identity
         // path only fires while n_kv <= indexer_top_k + r - 1
-        S.sel       = AI(std::min(cfg_.ctx, MAX_SEL));
+        S.sel       = AI((size_t) qsa_rb_ * sel_stride_);
 
         S.logits   = A(T * N_EXPERT);
         S.wts      = A(T * N_EXPERT_USED);
@@ -268,12 +286,13 @@ void DecodeRunner::hc_mix(const LayerWeights & L, const float * w_norm, const Ma
     bep_->gemv_batch(jobs, 2, xn_, GG_HC_DOWN_INJECT, GX_PLAIN, nullptr, T_);
     rec.tap(*bep_, "hc_inject", il, out_inject + (size_t)(T_ - 1) * HC, HC, suffix);
 
+    // The gate projection and the collapse that eats it, as ONE op: the
+    // backend folds them into one launch when it can (decode_backend.h), and
+    // hgate_ is written either way, so hc_gate is still a tap.
     GemvJob up_job;
     up_job.W = &up; up_job.out = hgate_; up_job.epi = GE_SIGMOID;
-    bep_->gemv_batch(&up_job, 1, lo_, GG_HC_UP, GX_PLAIN, nullptr, T_);
+    bep_->gemv_hc_gate_collapse(up_job, lo_, xn_, out_mixed, GG_HC_UP, T_);
     rec.tap(*bep_, "hc_gate", il, hgate_ + (size_t)(T_ - 1) * HC_DIM, HC_DIM, suffix);
-
-    bep_->hc_collapse(xn_, hgate_, out_mixed, T_);
     rec.tap(*bep_, "hc_mixed", il, out_mixed + (size_t)(T_ - 1) * N_EMBD, N_EMBD, suffix);
 
     if (cfg_.jitter > 0.0f) jitter(out_mixed, (size_t) T_ * N_EMBD);
@@ -470,55 +489,76 @@ void DecodeRunner::layer_qsa(const LayerWeights & L, LayerState & st, int il, Re
     // every cell of the chunk in the cache BEFORE anything is scored
     bep_->kv_store_q8_0(kcur_, vcur_, st.kqs, st.ksc, st.vqs, st.vsc, pos_, T_);
 
-    // ---- per query row ---------------------------------------------------
-    // This stage loops rather than widening, because its scratch is O(n_kv)
-    // per row: 256 rows of a 256k cache would be 268 MB of cell scores. At
-    // T = 256 it is ~5 launches a row, ~1 000 a QSA layer, against the
-    // chunk's weight time (PREFILL.md section 4).
-    for (int t = 0; t < T_; ++t) {
-        const int p        = pos_ + t;
-        const int n_kv     = p + 1;                  // contiguous cache: cell j == position j
-        const int n_blocks = (n_kv + r - 1) / r;
-        const bool last    = (t == T_ - 1);
+    // ---- the query rows, in blocks of qsa_rb_ ----------------------------
+    //
+    // Every row does the same four things and differs only in its POSITION,
+    // and n_kv, n_blocks, tail_start, the budget and whether the top-k is the
+    // identity are all closed forms of it. So the rows are a grid axis
+    // (Backend::qsa_rows), not a host loop: at T = 256 the loop was ~1 000
+    // launches a QSA layer and ~12 000 a chunk, which the profile charged
+    // 0.19 ms a prompt token a card -- all of it issue cost. The block is
+    // bounded by scratch, not by T, because cell_scores is O(n_kv) a row.
+    //
+    // What each stage is, unchanged by the batching:
+    //
+    //  * idx_scan: score[b] = sum_h relu(q_h . kpool[b]), the DeepSeek
+    //    lightning indexer's per-head rectification (qwen4exp.cpp:576-591).
+    //    This model has ONE indexer key head (indexer.k_proj is [2560,128])
+    //    and four query heads; m3_attn.hip's scan kernel assumed four key
+    //    heads and no relu, so it is a cost model for this pass, not a port
+    //    of it -- the real pass reads a QUARTER of the pooled-key bytes §M3
+    //    charged it.
+    //  * qsa_expand: set_input_qsa's per-block bias
+    //    (llama-memory-hybrid-idx.cpp:438-447) computed IN the kernel from
+    //    the position -- the incomplete tail always visible (+1e9), a block
+    //    that could not be pooled -inf, everything else 0. It used to be
+    //    built on the host and uploaded, which put a BLOCKING hipMemcpy
+    //    inside the layer body once per QSA layer.
+    //  * the top-k: "the reference returns indexer_top_k + compress_ratio - 1:
+    //    whole blocks plus the tail" (qwen4exp.cpp:613-614). When that budget
+    //    covers the whole cache the top-k is the IDENTITY -- every visible
+    //    cell is selected -- so qsa_expand writes the selection and the radix
+    //    select is not launched at all.
+    //  * attention: the combine applies the sigmoid output gate and writes
+    //    BOTH taps, so neither the sigmoid nor the multiply costs a launch.
+    const int budget = IDX_TOP_K + r - 1;
+    for (int t0 = 0; t0 < T_; t0 += qsa_rb_) {
+        const int nr = std::min(qsa_rb_, T_ - t0);
+        Backend::QsaRows j;
+        j.pooled = st.idx_pooled;
+        j.kqs = st.kqs; j.ksc = st.ksc; j.vqs = st.vqs; j.vsc = st.vsc;
+        j.idxq      = idxq_ + (size_t) t0 * IDX_N_HEADS * IDX_DIM;
+        j.q         = qcur_ + (size_t) t0 * HEAD_DIM * N_Q_HEADS;
+        j.gsig      = gsig_ + (size_t) t0 * HEAD_DIM * N_Q_HEADS;
+        j.blk       = blkscore_;
+        j.cell      = cellscore_;
+        j.sel       = sel_;
+        j.out       = kqv_  + (size_t) t0 * HEAD_DIM * N_Q_HEADS;
+        j.out_gated = kqvg_ + (size_t) t0 * HEAD_DIM * N_Q_HEADS;
+        j.rows = nr; j.pos0 = pos_ + t0; j.ratio = r; j.budget = budget;
+        j.blk_stride = blk_stride_; j.cell_stride = cell_stride_; j.sel_stride = sel_stride_;
+        bep_->qsa_rows(j);
 
-        // score[b] = sum_h relu(q_h . kpool[b]) -- the DeepSeek lightning
-        // indexer's per-head rectification (qwen4exp.cpp:576-591). NOTE: this
-        // model has ONE indexer key head (indexer.k_proj is [2560, 128]) and
-        // four query heads; m3_attn.hip's scan kernel assumed four key heads and
-        // no relu, so it is a cost model for this pass, not a port of it -- and
-        // the real pass reads a QUARTER of the pooled-key bytes §M3 charged it.
-        bep_->idx_scan(st.idx_pooled, idxq_ + (size_t) t * IDX_N_HEADS * IDX_DIM,
-                       blkscore_, n_blocks);
-        if (last) rec.tap(*bep_, "indexer_score", il, blkscore_, n_blocks);
-
-        // set_input_qsa's per-block bias (llama-memory-hybrid-idx.cpp:438-447) is
-        // a closed form of the position, so the kernel computes it: the incomplete
-        // tail is always visible (+1e9), a block that could not be pooled is -inf,
-        // everything else 0. It used to be built on the host and uploaded here,
-        // which put a BLOCKING hipMemcpy inside the layer body once per QSA layer.
-        // "the reference returns indexer_top_k + compress_ratio - 1: whole blocks
-        // plus the tail" (qwen4exp.cpp:613-614). When that budget covers the whole
-        // cache the top-k is the IDENTITY -- every visible cell is selected -- so
-        // qsa_expand writes the selection and the radix select is not launched.
-        const int tail_start = ((p + 1) / r) * r;
-        const int width   = std::min(n_kv, IDX_TOP_K + r - 1);
-        const bool ident  = (width >= n_kv);
-        bep_->qsa_expand(blkscore_, cellscore_, sel_, n_kv, p, r, tail_start, ident ? 1 : 0);
-        if (last) rec.tap(*bep_, "indexer_score_tokens", il, cellscore_, n_kv);
-        const int n_sel = ident ? n_kv : bep_->topk_select(cellscore_, n_kv, width, sel_);
-        if (last && rec.enabled()) {
-            std::vector<int> ids(n_sel);
-            bep_->sync();
-            bep_->download(ids.data(), sel_, n_sel * sizeof(int));
-            rec.tap_ints("indexer_top_k", il, ids);
+        // The three selection taps are the LAST row of the chunk, exactly as
+        // they were when the loop taps fired on `last`. A row's slice is
+        // written only by its own row, so the values are the ones the loop
+        // produced; only the moment they are read back has moved, from
+        // between that row's stages to after its block.
+        if (t0 + nr == T_) {
+            const size_t lt    = (size_t)(nr - 1);
+            const int    p     = pos_ + T_ - 1;
+            const int    n_kv  = p + 1;              // cell j == position j
+            const int    n_blk = (n_kv + r - 1) / r;
+            const int    n_sel = std::min(n_kv, budget);
+            rec.tap(*bep_, "indexer_score", il, blkscore_ + lt * blk_stride_, n_blk);
+            rec.tap(*bep_, "indexer_score_tokens", il, cellscore_ + lt * cell_stride_, n_kv);
+            if (rec.enabled()) {
+                std::vector<int> ids(n_sel);
+                bep_->sync();
+                bep_->download(ids.data(), sel_ + lt * sel_stride_, n_sel * sizeof(int));
+                rec.tap_ints("indexer_top_k", il, ids);
+            }
         }
-
-        // ---- attention --------------------------------------------------
-        // The combine applies the sigmoid output gate and writes BOTH taps, so
-        // neither the sigmoid nor the multiply costs a launch.
-        const size_t qo = (size_t) t * HEAD_DIM * N_Q_HEADS;
-        bep_->attn_qsa(st.kqs, st.ksc, st.vqs, st.vsc, qcur_ + qo, sel_, n_sel,
-                     gsig_ + qo, kqv_ + qo, kqvg_ + qo);
     }
     rec.tap(*bep_, "kqv_out",      il, kqv_  + tl * HEAD_DIM * N_Q_HEADS, HEAD_DIM * N_Q_HEADS);
     rec.tap(*bep_, "attn_pregate", il, kqv_  + tl * HEAD_DIM * N_Q_HEADS, HEAD_DIM * N_Q_HEADS);
@@ -725,8 +765,7 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
         dn.epi = GE_SCALE_SILU; dn.arg = 1.0f / (float) HC;
         bep_->gemv_batch(&dn, 1, head_xn_, GG_HC_DOWN_INJECT);
         GemvJob up; up.W = &model_.head_up(); up.out = head_gate_; up.epi = GE_SIGMOID;
-        bep_->gemv_batch(&up, 1, head_lo_, GG_HC_UP);
-        bep_->hc_collapse(head_xn_, head_gate_, head_out_);
+        bep_->gemv_hc_gate_collapse(up, head_lo_, head_xn_, head_out_, GG_HC_UP, 1);
         rec.tap(*bep_, "result_norm", -1, head_out_, N_EMBD);
 
         GemvJob lm; lm.W = &model_.lm_head(); lm.out = logits_all_;

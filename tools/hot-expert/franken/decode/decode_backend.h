@@ -226,6 +226,25 @@ public:
     // W with expert_stride != 0, one expert chosen by `expert`.
     virtual void gemv_expert(const Mat & W, int expert, const float * x, float * y) = 0;
 
+    // build_hc_mix's gate projection and the collapse that consumes it.
+    //
+    // They are two ops and this is one call because on the GPU they can be one
+    // LAUNCH: hc_up's rows are HC streams of n_embd and the collapse wants all
+    // HC of them for one embedding index, so a workgroup that takes its rows
+    // stream-wise instead of consecutively already holds everything the
+    // collapse reads. The hc modules run 32 times a decode token, so that is
+    // 32 launches at a device floor of several microseconds each.
+    //
+    // The default below is the two ops, which is what the CPU backend runs and
+    // what any backend that has not implemented the fusion runs; `up.out` is
+    // written either way, so hc_gate stays an oracle tap.
+    virtual void gemv_hc_gate_collapse(const GemvJob & up, const float * lo,
+                                       const float * xn, float * out_mixed,
+                                       int group, int T = 1) {
+        gemv_batch(&up, 1, lo, group, GX_PLAIN, nullptr, T);
+        hc_collapse(xn, up.out, out_mixed, T);
+    }
+
     virtual void copy(float * dst, const float * src, size_t n) = 0;
     virtual void unary(int op, const float * x, float * y, size_t n) = 0;
     virtual void binary(int op, const float * a, const float * b, float * y, size_t n) = 0;
@@ -440,6 +459,96 @@ public:
                           const float * q, const int * sel, int n_sel,
                           const float * gsig, float * out, float * out_gated) = 0;
 
+    // ---- the chunk's query rows, batched (PREFILL.md section 11) ----------
+    //
+    // The four calls above used to be driven by a host loop of T rows in
+    // decode_graph.cpp: at T = 256 that is ~1 000 launches a QSA layer and
+    // ~12 000 a chunk, which the profile charged 0.19 ms a prompt token a
+    // card -- all issue cost, no work. Row t differs from row t+1 only in its
+    // POSITION, and every quantity the loop computed from it (n_kv, n_blocks,
+    // tail_start, the budget, whether the top-k is the identity) is a closed
+    // form of that position. So the rows can be a grid axis.
+    //
+    // The rows of a block are INDEPENDENT: same kernels, same per-row
+    // arithmetic, more workgroups. Nothing here changes a summation order.
+    //
+    // The default implementation below IS the loop the runner used to write.
+    // A backend that does not care -- the CPU one, which is what the
+    // chunk-vs-decode oracle runs on -- is unchanged by construction, so the
+    // oracle keeps its meaning and the GPU override is the only thing under
+    // test.
+    //
+    // A block is bounded by SCRATCH, not by T: cell_scores is O(n_kv) a row,
+    // so 256 rows of a 256k cache would be 268 MB of them and 537 MB of
+    // radix-select candidates. reserve_qsa_rows() says how many rows a
+    // backend has room for and the runner walks the chunk in blocks of that
+    // many.
+    struct QsaRows {
+        const uint16_t * pooled;                      // pooled indexer keys
+        const int8_t   * kqs;  const uint16_t * ksc;
+        const int8_t   * vqs;  const uint16_t * vsc;
+        const float    * idxq;        // [rows][IDX_N_HEADS][IDX_DIM]
+        const float    * q;           // [rows][N_Q_HEADS][HEAD_DIM]
+        const float    * gsig;        // [rows][N_Q_HEADS][HEAD_DIM]
+        float * blk;                  // [rows][blk_stride]   scratch, and the
+        float * cell;                 // [rows][cell_stride]  last row of the
+        int   * sel;                  // [rows][sel_stride]   chunk is tapped
+        float * out;                  // [rows][N_Q_HEADS][HEAD_DIM]
+        float * out_gated;
+        int    rows;                  // rows in THIS block
+        int    pos0;                  // position of row 0 of THIS block
+        int    ratio;                 // the layer's compress ratio
+        int    budget;                // IDX_TOP_K + ratio - 1
+        size_t blk_stride, cell_stride, sel_stride;
+    };
+    virtual void qsa_rows(const QsaRows & j) {
+        for (int t = 0; t < j.rows; ++t) {
+            const int p          = j.pos0 + t;
+            const int n_kv       = p + 1;
+            const int n_blocks   = (n_kv + j.ratio - 1) / j.ratio;
+            const int tail_start = ((p + 1) / j.ratio) * j.ratio;
+            const int width      = n_kv < j.budget ? n_kv : j.budget;
+            const int ident      = (width >= n_kv) ? 1 : 0;
+            float * blk  = j.blk  + (size_t) t * j.blk_stride;
+            float * cell = j.cell + (size_t) t * j.cell_stride;
+            int   * sel  = j.sel  + (size_t) t * j.sel_stride;
+            idx_scan(j.pooled, j.idxq + (size_t) t * IDX_N_HEADS * IDX_DIM, blk, n_blocks);
+            qsa_expand(blk, cell, sel, n_kv, p, j.ratio, tail_start, ident);
+            const int n_sel = ident ? n_kv : topk_select(cell, n_kv, width, sel);
+            const size_t qo = (size_t) t * HEAD_DIM * N_Q_HEADS;
+            attn_qsa(j.kqs, j.ksc, j.vqs, j.vsc, j.q + qo, sel, n_sel,
+                     j.gsig + qo, j.out + qo, j.out_gated + qo);
+        }
+    }
+    // How many rows of a chunk this backend has scratch for. Called ONCE from
+    // the runner's constructor with the widest chunk and the context, and it
+    // is where a backend allocates whatever it has to size by the row count
+    // (the attention split's partials, the radix select's candidate lists).
+    // May return anything in [1, rows_max]; the runner walks the chunk in
+    // blocks of the answer, so a backend that returns 1 gets today's loop.
+    virtual int reserve_qsa_rows(int rows_max, int ctx) {
+        // The default runs the loop above, so only the runner's own per-row
+        // scratch has to fit: cell scores, block scores, the selection. At
+        // the oracle's ctx that is ~11 KB a row and the whole chunk batches,
+        // which is what makes the chunk-vs-decode gate cover this code at
+        // all; at 256k it is 1.3 MB a row and the block is ~48.
+        const size_t per_row = (size_t) ctx * sizeof(float)
+                             + (size_t) ((ctx + QSA_RATIO - 1) / QSA_RATIO) * sizeof(float)
+                             + (size_t) MAX_SEL * sizeof(int);
+        const size_t budget = (size_t) qsa_row_mb_ * 1024u * 1024u;
+        int rows = per_row ? (int)(budget / per_row) : rows_max;
+        if (rows < 1)        rows = 1;
+        if (rows > rows_max) rows = rows_max;
+        return rows;
+    }
+    // --qsa-row-mb N / FRANKEN_QSA_ROW_MB: the scratch budget, per device,
+    // for one block of query rows. It is what bounds the block, because
+    // cell_scores is O(n_kv) a row: 256 rows of a 256k cache would be 268 MB
+    // of them and 537 MB of radix candidates behind them. Raising it buys
+    // fewer launches at 256k and nothing at all below ~2k, where the whole
+    // chunk already fits.
+    virtual void set_qsa_row_mb(int mb) { if (mb > 0) qsa_row_mb_ = mb; }
+
     // -- timing (GPU only; the CPU backend returns 0) -----------------------
     // Diagnostic arm, CPU backend only (--quant-act). llama.cpp's CPU
     // mul_mat does NOT dot f32 activations against quantised weights: it
@@ -475,6 +584,22 @@ public:
     // threshold trades a reduce launch against occupancy, and the profile's
     // per-group GB/s is what should set it, so it is a runtime knob.
     virtual void set_gemv_min_rows(int) {}
+    // --gemv-fused-reduce 0|1: sum a split GEMV's partials in the GEMV kernel
+    // (one counter per output row, the last workgroup reduces) instead of in a
+    // second launch. The sum is k_reduce_splits_gemm's, in s order, so the
+    // result is bit-identical; the knob exists because the pairing of
+    // __threadfence with the counter is new here, not because a bit can move.
+    virtual void set_gemv_fused_reduce(int) {}
+    // --gemv-fuse-collapse 0|1: fold build_hc_mix's collapse into the gate
+    // GEMV (gemv_hc_gate_collapse above).
+    virtual void set_gemv_fuse_collapse(int) {}
+    // --gemv-burst 1|2|4: how many GEMV_UNROLL groups of Q8_0 blocks a decode
+    // wave loads before it multiplies any of them. The ACCUMULATOR count does
+    // not move with it -- block g stays in acc[g % GEMV_UNROLL] and the order
+    // within each accumulator stays increasing g -- so this is memory-level
+    // parallelism at constant summation order. Only the T == 1 instantiation
+    // takes it; the prompt chunk's TILE = 8 kernel is already at 135 VGPR.
+    virtual void set_gemv_burst(int) {}
     // --gemm-lds MODE: which kernel serves a T > 1 trunk GEMM.
     //   0  k_gemm_batch<GEMM_TILE> -- the wave-per-row kernel, bit-identical
     //      to the decode token's TILE = 1 instantiation per column. DEFAULT.
@@ -555,6 +680,9 @@ public:
     // which is the number that says whether a card is compute-bound or waiting
     // for the host to feed it.
     virtual long long launches_last_token() const { return 0; }
+
+protected:
+    int qsa_row_mb_ = 256;
 };
 
 Backend * make_cpu_backend(int n_threads);

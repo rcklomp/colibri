@@ -92,11 +92,24 @@ void usage(const char * p) {
         "                           both arms exist so the profile can decide\n"
         "          [--gemv-min-rows N] split K below this many output rows (default\n"
         "                           1024); sweep it against prof_gemv_*_gbs\n"
+        "          [--gemv-fused-reduce 0|1] sum a split GEMV's partials in the GEMV\n"
+        "                           kernel instead of a second launch (default 1).\n"
+        "                           Same s order, so bit-identical either way\n"
+        "          [--gemv-fuse-collapse 0|1] fold build_hc_mix's collapse into the\n"
+        "                           gate GEMV's workgroup (default 1); 32 launches\n"
+        "          [--gemv-burst N] Q8_0 block groups a decode wave has in flight\n"
+        "                           before it multiplies any of them: 1, 2 or 4\n"
+        "                           (default 4). The accumulator count does NOT\n"
+        "                           move with it, so the summation order is fixed\n"
         "          [--expert-gather M] design 9.4 item 5's device-side sort + row-gather\n"
         "                           per stage: bit 0 gate/up, bit 1 down. DEFAULT 1 --\n"
         "                           gate/up is MEASURED bit-exact, down is measured NOT\n"
         "                           to be and is off until it is (decode_backend.h).\n"
         "                           --no-expert-gather is the same as --expert-gather 0\n"
+        "          [--qsa-row-mb N]  scratch budget a device for one block of QSA\n"
+        "                           query rows (default 256). The block is what\n"
+        "                           replaced the per-row host loop; it is bounded\n"
+        "                           by this because cell_scores is O(n_kv) a row\n"
         "          [--sync-debug]   drain and check after every launch and copy;\n"
         "                           names the failing op, its class, layer and device\n"
         "          [--dump DIR]     write this run's taps in the oracle's own format,\n"
@@ -174,8 +187,12 @@ int main(int argc, char ** argv) {
     bool profile = false;
     int  gemv_lds = 1;
     int  gemv_min_rows = 1024;
+    int  gemv_fused_reduce = 1;
+    int  gemv_fuse_collapse = 1;
+    int  gemv_burst = 4;
     bool sync_debug = false;
     int expert_gather = 3;
+    int qsa_row_mb = 256;
     int prefill_pipeline = 1;
     int gemm_lds = 0;
 
@@ -194,9 +211,13 @@ int main(int argc, char ** argv) {
         else if (a == "--routing" && i + 1 < argc) routing_dir = argv[++i];
         else if (a == "--gemv-lds" && i + 1 < argc) gemv_lds = std::atoi(argv[++i]);
         else if (a == "--gemv-min-rows" && i + 1 < argc) gemv_min_rows = std::atoi(argv[++i]);
+        else if (a == "--gemv-fused-reduce" && i + 1 < argc) gemv_fused_reduce = std::atoi(argv[++i]);
+        else if (a == "--gemv-fuse-collapse" && i + 1 < argc) gemv_fuse_collapse = std::atoi(argv[++i]);
+        else if (a == "--gemv-burst" && i + 1 < argc) gemv_burst = std::atoi(argv[++i]);
         else if (a == "--sync-debug")             sync_debug = true;
         else if (a == "--no-expert-gather")       expert_gather = 0;
         else if (a == "--expert-gather" && i + 1 < argc) expert_gather = std::atoi(argv[++i]);
+        else if (a == "--qsa-row-mb" && i + 1 < argc) qsa_row_mb = std::atoi(argv[++i]);
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--jitter" && i + 1 < argc) jitter = (float) std::atof(argv[++i]);
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
@@ -255,8 +276,12 @@ int main(int argc, char ** argv) {
             if (profile)   b->set_profile(true);
             b->set_gemv_lds(gemv_lds);
             b->set_gemv_min_rows(gemv_min_rows);
+            b->set_gemv_fused_reduce(gemv_fused_reduce);
+            b->set_gemv_fuse_collapse(gemv_fuse_collapse);
+            b->set_gemv_burst(gemv_burst);
             b->set_sync_debug(sync_debug);
             b->set_expert_gather(expert_gather);
+            b->set_qsa_row_mb(qsa_row_mb);
             b->set_gemm_lds(gemm_lds);
             if (profile) b->prof_defer(prefill_pipeline != 0);
         }

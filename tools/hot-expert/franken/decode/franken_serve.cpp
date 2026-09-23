@@ -748,7 +748,11 @@ public:
         for (auto * b : devs_) {
             b->set_gemv_lds(env_int("FRANKEN_GEMV_LDS", 1));
             b->set_gemv_min_rows(env_int("FRANKEN_GEMV_MIN_ROWS", 1024));
+            b->set_gemv_fused_reduce(env_int("FRANKEN_GEMV_FUSED_REDUCE", 1));
+            b->set_gemv_fuse_collapse(env_int("FRANKEN_GEMV_FUSE_COLLAPSE", 1));
+            b->set_gemv_burst(env_int("FRANKEN_GEMV_BURST", 4));
             b->set_expert_gather(env_int("FRANKEN_EXPERT_GATHER", 3));
+            b->set_qsa_row_mb(env_int("FRANKEN_QSA_ROW_MB", 256));
             // 0 is bit-exact against the decode kernel; 1 and 2 reassociate K
             // (franken_decode.cpp's --gemm-lds). Serving defaults to 0.
             b->set_gemm_lds(env_int("FRANKEN_GEMM_LDS", 0));

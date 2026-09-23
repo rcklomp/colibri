@@ -343,6 +343,12 @@ private:
     float *kraw_, *idxraw_;
     float *idxq_, *blkscore_, *cellscore_, *pool_raw_, *pool_rope_;
     int   *sel_;
+    // QSA row batching (PREFILL.md section 11). blkscore/cellscore/sel are
+    // now [qsa_rb_][stride] rather than one row, and the chunk is walked in
+    // blocks of qsa_rb_ rows. The strides are the ROW PITCH, not the used
+    // length: a row uses n_blocks / n_kv / n_sel of its slice.
+    int    qsa_rb_ = 1;
+    size_t blk_stride_ = 0, cell_stride_ = 0, sel_stride_ = 0;
     float *logits_, *wts_, *ygate_, *yup_, *hmoe_, *eo_, *moeout_;
     float *shg_, *shu_, *shh_, *shout_, *shgated_, *shgate_, *shgsig_;
     float *plek_, *plev_, *pleq_, *plegated_, *plegate_, *plenorm_, *pleconv_, *pleemb_;

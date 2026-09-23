@@ -341,3 +341,79 @@ Small matrices (< 256 rows) and anything that is not Q8_0/BF16/F32 keep the
 old path whatever the knob says — all-or-nothing per batch, because
 `nsplit` is a function of the concatenation's row count and splitting a
 batch would change the untouched half's summation order for no reason.
+
+## 11. The query rows of a chunk are a grid axis (2026-09-23, item 3)
+
+Section 4 budgeted the QSA selection stage as "a loop of T over the existing
+kernels ... ~1 000 launches a QSA layer, ~3 ms". The three-card profile of
+2026-09-22 charged it **0.19 ms a prompt token a card** of the 1.63 total, and
+all of it is issue cost: at T = 256 and 12 QSA layers a chunk enqueues ~12 000
+launches for that stage, which at this card's ~5 us launch floor IS the 48 ms
+a chunk it costs. There is no kernel to make faster.
+
+Row t differs from row t+1 only in its POSITION, and everything the host loop
+computed from it -- `n_kv`, `n_blocks`, `tail_start`, the budget, whether the
+top-k is the identity -- is a closed form of that position. So the five
+kernels (`k_idx_scan`, `k_qsa_expand`, `k_topk_radix_select`,
+`k_attn_flash_split`, `k_attn_combine`) take a **row axis** and the host
+enqueues one launch a stage for a whole block of rows: 5 a QSA layer instead
+of ~1 000, 60 a chunk instead of ~12 000.
+
+**Nothing about the numerics moves, and the reason is structural rather than
+argued.** A row reads and writes its own slice of every buffer, no reduction
+crosses rows, and the per-row arithmetic is the code that was already there --
+only `blockIdx` and a base pointer are new. The two shapes the kernels have to
+handle are the widest row's (which sizes the grid) and everything narrower,
+and a workgroup past its own row's extent returns before any shared-memory
+barrier.
+
+**A block is bounded by SCRATCH, not by T**, which is why section 4 said the
+stage loops in the first place: `cell_scores` is O(n_kv) a row, so 256 rows of
+a 256k cache would be 268 MB of them plus 537 MB of radix-select candidates
+and 208 MB of attention partials. `Backend::reserve_qsa_rows(rows_max, ctx)`
+answers how many rows the backend has room for under `--qsa-row-mb` (default
+256 MB a device) and the runner walks the chunk in blocks of the answer. At
+ctx 8 192 a row is ~0.9 MB and the whole chunk is one block; at 262 144 it is
+~4.2 MB and the block is ~60 rows, which still cuts the launches sixtyfold.
+A backend that returns 1 gets the old loop back, exactly.
+
+`Backend::qsa_rows()` has a DEFAULT implementation which is that old loop over
+the four single-row calls, so the CPU backend is unchanged by construction and
+the chunk-vs-decode oracle keeps its meaning; the GPU override is the only
+thing under test. The GPU's own single-row entry points survive as blocks of
+one over the same kernels -- section 9's rule, applied to this stage: one
+kernel, so the decode path and the prefill path cannot disagree in the last
+bit.
+
+**The gate, run on the CPU arm** (`franken_decode_cpu`, no GPU touched),
+6 tokens, layers 0-3 (which is QSA layer 3), ctx 512, `--chunk 1 --dump`
+against `--chunk 2`, `4` (= 4+2), `5` (= 5+1) and `6` -- the row-block loop's
+partial last block is exercised at 4 and 5, and at this ctx the CPU backend
+batches the whole chunk, so the strides and the tap indices are under test:
+
+```
+compared=141  missing=0  incomparable=5  refused=0     STEP2 PASS   (x4)
+140 float taps  cos=1.000000  maxabs=0    <- bit-for-bit, not a tolerance
+indexer_top_k-3 contained=1.000000        residual l1=110.396 at every chunk
+```
+
+Separately, the five per-row closed forms the device helpers compute
+(`qsa_n_kv`, `qsa_n_blocks`, `qsa_n_sel`, `tail_start`, the identity test)
+were checked against the old host loop's values over 7 477 470 combinations of
+(ratio 2-8, pos0 0-3000, rows 1-256, t): **0 mismatches**.
+
+Resources, gfx1100, no spills anywhere: `k_idx_scan` 34 VGPR occ 16,
+`k_qsa_expand` 6 VGPR occ 16, `k_topk_radix_select` 21 VGPR 12 316 B LDS
+occ 16, `k_attn_flash_split` 49 VGPR 3 328 B LDS occ 15, `k_attn_combine`
+10 VGPR occ 16.
+
+`--profile` gained two classes for exactly the two things these items change:
+`prof_qsa_rows_us` is the batched row stage (scan, expand, select, attention)
+apart from `prof_qsa_us`, which keeps the per-chunk work that is not per query
+row (the cache writes, the pooling, `qk_post`, rope); and
+`prof_expert_gather_us` is the counting sort plus the row-gather kernels,
+apart from `prof_expert_gate_up_us` / `prof_expert_down_us`, which now hold
+only the per-assignment path. Together they say how much of the expert time
+the amortisation is carrying and how much of the QSA time was the loop.
+
+**Not measured here:** anything on a GPU by the agent that wrote this section.

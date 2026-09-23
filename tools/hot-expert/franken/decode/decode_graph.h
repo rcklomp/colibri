@@ -177,9 +177,32 @@ public:
     // Sizes at the served geometry (48 layers, 36 of them recurrent): 3.1 MB of
     // GDN state a layer dominates, 118 MB a snapshot in total. This is a HOST
     // copy: it costs one download a device per snapshot and nothing in VRAM.
-    size_t state_bytes() const;
-    void   save_state(void * dst);
-    void   load_state(const void * src, int pos);
+    size_t rec_bytes() const;
+    void   save_rec(void * dst);
+    void   load_rec(const void * src, int pos);
+
+    // ---- the POSITIONAL half of a slot, cells [0, len) ---------------------
+    //
+    // Restoring the recurrent state alone is only enough while the slot's own
+    // K/V cells still hold the tokens the snapshot was taken over. One
+    // interleaved request on the same slot ends that: it re-prefills from its
+    // own longest common prefix and overwrites the cells from there on, and a
+    // rollback afterwards would then report reuse over a cache that holds
+    // somebody else's keys. With one KV slot and a gateway that routes every
+    // conversation to it, that is the normal case, not a corner (2026-09-22:
+    // a 58-token request between two UI chats is what made the second one
+    // reuse nothing).
+    //
+    // So a checkpoint may also carry the cells. The q8_0 K/V cache and the
+    // pooled indexer keys are laid out cell-major (decode_backend.h:
+    // `qs[(cell*N_KV_HEADS + h)*HEAD_DIM + d]`, `pooled[blk*IDX_DIM + i]`), so
+    // cells [0, len) are a contiguous PREFIX of every one of those buffers and
+    // an image of `layout_len` cells can be restored to any `copy_len <=
+    // layout_len` without re-packing. ~1152 B a token a QSA layer, i.e. 13.8 kB
+    // a token over the 12 QSA layers of this model.
+    size_t kv_bytes(int len) const;
+    void   save_kv(void * dst, int len);
+    void   load_kv(const void * src, int layout_len, int copy_len, int pos);
     // A fresh sequence: every recurrent buffer zeroed and pos back to 0, which
     // is the state the constructor left (alloc_f32 zeroes). The positional
     // caches are deliberately NOT cleared -- every cell they hold is about to
@@ -221,6 +244,10 @@ private:
     // written by save_state() is read back by load_state() piece for piece.
     struct StatePiece { Backend * be; void * ptr; size_t bytes; };
     void state_pieces(std::vector<StatePiece> & out);
+    // One run of a positional cache. `off` is where it sits in a host image
+    // laid out for `layout_len` cells; `bytes` is how much of it to move.
+    struct KvPiece { Backend * be; void * ptr; size_t off; size_t bytes; };
+    void kv_plan(std::vector<KvPiece> & out, int layout_len, int copy_len);
 
     void hc_mix(const LayerWeights & L, const float * w_norm, const Mat & down,
                 const Mat & up, const Mat & inj, const float * x,

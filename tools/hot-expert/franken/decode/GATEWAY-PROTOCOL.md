@@ -747,7 +747,21 @@ context overflow `CONTEXT_EXCEEDED prompt_tokens=N requested=M capacity=C`
 (the qwen38 form `_engine_error` understands) instead of `BAD_REQUEST`, so the
 client gets a 400 that says what to do.
 
-One thing it does not do: prefix **checkpoints**. Per §5 that is allowed —
-plain per-slot reuse is what `accept_live.sh` checks 2/2b/3 need — but it is
-also the one place where a real serving run could still differ from `glm53`'s
-behaviour, and no serving run has been made.
+**§5's "a minimal new engine can skip checkpointing entirely" is WRONG for a
+one-slot engine, and the first served run (2026-09-22) is the evidence.** The
+gateway routes every conversation to a slot, and with `--kv-slots 1` that is
+the same slot: one 58-token request between two UI chats re-prefilled from its
+own zero and overwrote the cells the second chat's 4.6k-token tool block lived
+in, so its reuse was 0 and check 2 failed. Plain per-slot reuse is enough only
+while nothing else lands on the slot. This engine therefore keeps checkpoints
+that carry the positional cells too, copy-on-write (`franken_serve.cpp`,
+`struct Snapshot`); the sentence in §5 holds only for an engine with a slot
+per conversation.
+
+Also worth a line of its own, because two gates depend on it and this document
+could not have told anyone: **`reused` is read off the engine's STDERR, not off
+the DONE frame.** `accept_live.sh` check 3 and `owui_ui_turn.sh` both run
+`grep " REUSE <id> " | awk '{print $(NF-1)}'` over the gateway log, which is
+`c/glm53.c:6717`'s verbose line. An engine that gets the DONE field perfectly
+right and does not print that line reads as `reused=0` (owui_ui_turn.sh's own
+default) and as "integer expected" (accept_live.sh check 3). Print it.

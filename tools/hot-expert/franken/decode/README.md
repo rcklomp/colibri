@@ -693,3 +693,74 @@ Known gaps, all of them unmeasured rather than unknown:
    awaited, so it also costs the pipeline.
 5. **Tool calling** is parsed gateway-side out of the DATA text for this family
    as for every other; nothing about it has been exercised here.
+
+### Step 4 fix (2026-09-23): what the first served run broke, and why
+
+The engine served the owner's gateway on 2026-09-22 (commit `3ae6bdb` plus a
+docker wrapper). It answered — "I am Qwen, and 12 plus 30 is 42", 4916-token
+prefill 6.5–6.7 s, decode 22–27 tok/s, first token on screen 6.84 s through
+`accept_ui.sh`, CANCEL mid-prefill and the request-behind-an-abandoned-one both
+fine. Every failure was prefix reuse, and they had three distinct causes.
+
+**1. The number the gates read was not on the wire this engine wrote to.**
+`accept_live.sh` check 3 and `owui_ui_turn.sh` both take `reused` from
+`grep " REUSE <id> " | awk '{print $(NF-1)}'` over the gateway log — glm53's
+own stderr line (`c/glm53.c:6717`), not the DONE frame's 8th field. This
+engine's DONE was correct and the line did not exist, so check 3 read an empty
+string ("integer expected") and check 2 read `owui_ui_turn.sh`'s `'0'`
+default. It now prints `[serve] REUSE <id> <reused> <prompt_tokens>`, and the
+conformance driver checks that line against the frame for every request.
+
+**2. A checkpoint that carries only the recurrent state is worthless the
+moment another request touches the slot.** With `--kv-slots 1` the gateway
+routes *every* conversation to slot 0. A 58-token request between UI chat A
+and UI chat B re-prefilled from its own zero and overwrote the cells the
+4.6k-token tool block lived in; restoring A's recurrent state into those cells
+would have been reuse over another conversation's keys, so the engine (which
+dropped its snapshots on any reuse=0 turn) reported `reused=0` and re-prefilled
+everything. A checkpoint is now **both halves**: the recurrent state, always,
+and the positional cells [0, pos) — K/V q8_0 plus the pooled indexer keys,
+~13.8 kB a token — **copy-on-write**. Nothing is copied while the slot's own
+cells still hold that prefix (the continuation case, free); the copy happens
+once, for the deepest threatened checkpoint, at the instant something is about
+to overwrite them. Checkpoints are never dropped for belonging to another
+conversation — with one slot, the prefix they share is the whole point.
+`turn D` in the conformance suite is that exact sequence and it is now a PASS.
+
+**3. Nothing under one chunk could be reused** — answered by the end-of-request
+checkpoint, which was already taken and is now proven by phase 2 of the driver
+(chunk checkpoints switched off entirely, a 19-token follow-up still reuses
+exactly the 10 tokens the ledger predicts).
+
+Two more things came out of the env diff against `~/start_glm53.sh`:
+`COLI_PREFIX_PIN=1` (Open WebUI rebuilds its `memory_context` block every turn;
+without the pin the shared prefix changes near its head and reuse is lost
+before the engine ever sees it) and `COLI_THINK=0`, plus the one-line gateway
+change that makes the second one work: `ARCH == "qwen38"` forced xhigh thinking
+on clients that asked for nothing (`c/openai_server.py:5041`), which is why
+every UI answer arrived behind a `reasoning_content` block. The default is
+unchanged; only `COLI_THINK=0` opts out. The ledger (`accept_live.sh` check 2b)
+stays SKIP by code, not by configuration: `ledger_enabled()` is
+`ARCH == "glm53" and COLI_LEDGER != "0"`, and widening it would have
+`_ledger_record` build part-less entries, which risks `ledger=broken` — a FAIL
+where there is a SKIP today.
+
+**And the instrument the next GPU run needs.** The one thing that could not be
+answered from the served log was whether a rollback re-prefilled only the tail
+("reused=4096, prefill 6.72 s" looked like a full prefill). Every request now
+prints where it started, how many chunks it ran, and where the wall clock went:
+
+```
+[serve] req=3 slot=0 prompt=93 reused=0 from=0 chunks=12 emitted=4 limited=1 \
+  cancelled=0 prefill_s=38.64 [restore=6 protect=0 ple=1249 step=37397 snap=76 ms] \
+  decode_s=1.94 tok/s=2.06 ckpts=8 ckpt_mb=81
+```
+
+`from`/`chunks` make "only the tail" a checked fact (the driver asserts
+`chunks == ceil((prompt - reused) / chunk)` on every rollback), and `ple` is
+there because the PLE gather reads scattered rows of a 28.8 GB table: the CPU
+run above shows 1249 ms of a 38.6 s cold prefill and **90 ms for a single
+token** on a cold row against 2 ms warm. At the served scale that term, not the
+forward pass, is the first suspect for a slow tail — record §PLE-GATHER puts a
+cold row at 4.2 ms against 9.5 µs warm, and design 9.1's pinned PLE table is
+the fix if it is.

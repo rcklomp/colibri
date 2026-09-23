@@ -29,12 +29,17 @@
 //   5. "CANCEL/DONE/ERROR ordering" -- serve_one() emits DONE with the partial
 //      counts and only then ERROR <id> CANCELLED.
 //
-// WHAT THIS ENGINE DOES NOT DO, deliberately: no prefix CHECKPOINTS (a side
-// cache that restores a prefix into a fresh slot -- section 5 says plain
-// per-slot reuse passes every accept_live.sh check on its own), no TOOL/ECHO
-// frames (the gateway parses tool calls out of the DATA text for every family),
-// no IMAGE (text-only model; the frame is consumed to keep the stream in sync
-// and refused), and STOP is a no-op (section 2: it is one on glm53 too).
+// PREFIX CHECKPOINTS EXIST HERE, and they are not an optimisation. §5 says
+// plain per-slot reuse is enough for accept_live.sh, and the first served run
+// (2026-09-22) showed why that reading is wrong for THIS engine: with one KV
+// slot the gateway routes every conversation to slot 0, so a single 58-token
+// request between two UI chats re-prefilled from its own zero and overwrote
+// the cells the second chat needed -- which took its reuse to 0. A checkpoint
+// here is the recurrent state plus, copy-on-write, the cells it stands on
+// (see `struct Snapshot`). What is still NOT here: no TOOL/ECHO frames (the
+// gateway parses tool calls out of the DATA text for every family), no IMAGE
+// (text-only model; the frame is consumed to keep the stream in sync and
+// refused), and STOP is a no-op (section 2: it is one on glm53 too).
 
 #include "franken_serve.h"
 
@@ -371,7 +376,8 @@ struct LlamaApi {
         // the rocm SDK wheels under ~/venvs/rocm; loading them BY ABSOLUTE PATH
         // and RTLD_GLOBAL first satisfies the soname for the loader (it checks
         // what is already loaded before it searches), so libllama then opens
-        // with no LD_LIBRARY_PATH from the caller. LD_LIBRARY_PATH is
+        // with no LD_LIBRARY_PATH from the caller (FRANKEN_LLAMA_PRELOAD
+        // overrides the list; the literal "none" disables it). LD_LIBRARY_PATH is
         // deliberately NOT how start_franken.sh solves it: that directory also
         // holds a libamdhip64 of a different ROCm than the one this box runs,
         // and putting it in front of the system path would swap the HIP
@@ -379,13 +385,28 @@ struct LlamaApi {
         // library it never calls. A missing preload is not an error by itself
         // (the caller may have arranged the path some other way); the dlopen
         // below is what decides.
-        for (const std::string & dep : split_paths(env_str("FRANKEN_LLAMA_PRELOAD",
-                                                           FRANKEN_LLAMA_PRELOAD_DEFAULT))) {
-            if (dep.empty()) continue;
-            if (!dlopen(dep.c_str(), RTLD_LAZY | RTLD_GLOBAL))
-                logf("preload %s: %s (continuing)", dep.c_str(), dlerror());
-        }
+        //
+        // The preload is a FALLBACK, tried only after a plain dlopen has
+        // failed: inside the ROCm 7.14 image this engine is built in (which is
+        // how it is run when the host's ROCm is too old -- see
+        // ~/bench/franken_decode_docker.sh) the real libraries are on the
+        // path, and preloading the wheel's older pair in front of them would
+        // be gratuitous. Trying the plain open first means the process ends up
+        // with whichever set actually belongs there.
         void * h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            const char * first = dlerror();
+            logf("dlopen %s: %s -- trying the preload", so.c_str(), first ? first : "?");
+            for (const std::string & dep : split_paths(env_str("FRANKEN_LLAMA_PRELOAD",
+                                                               FRANKEN_LLAMA_PRELOAD_DEFAULT))) {
+                if (dep.empty() || dep == "none") continue;
+                if (!dlopen(dep.c_str(), RTLD_LAZY | RTLD_GLOBAL)) {
+                    const char * e = dlerror();
+                    logf("preload %s: %s (continuing)", dep.c_str(), e ? e : "?");
+                }
+            }
+            h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+        }
         if (!h) {
             // dlerror() CLEARS the error, so it is read exactly once. Calling
             // it twice in one expression (`dlerror() ? dlerror() : "?"`) hands
@@ -541,18 +562,58 @@ int32_t sample_token(const std::vector<float> & logits, float temp, float top_p,
 
 // ------------------------------------------------------------------ slots --
 
-// A rolled-back-to position and the recurrent state that belongs to it.
+// ------------------------------------------------------------ checkpoints --
+//
+// A checkpoint is "the slot, exactly after `seq` was fed". It has two halves
+// and they expire differently:
+//
+//   rec  the recurrent state (GDN + conv windows + the indexer's running block
+//        sum). Always copied: it cannot be reconstructed from the cache.
+//   kv   the positional cells [0, pos). NOT copied while the slot's own cells
+//        still hold this very prefix -- which is the common case and free.
+//        It is materialised the moment something is about to overwrite those
+//        cells (copy-on-write), because after that the cells belong to another
+//        conversation and a rollback into them would be reuse over the wrong
+//        keys. One image covers every checkpoint that needed it, so a
+//        divergence costs ONE download of the deepest threatened prefix.
+//
+// This is what makes UI chat B reuse chat A's tool block even though a short
+// request landed on the same slot in between -- with one KV slot and a
+// gateway that routes every conversation to it, that is the normal case.
+struct KvImage {
+    int               len = 0;      // cells the image holds, [0, len)
+    std::vector<char> data;
+};
+
 struct Snapshot {
-    int               pos = 0;
-    std::vector<char> blob;
+    std::vector<int32_t>     seq;   // pos == seq.size()
+    std::vector<char>        rec;
+    std::shared_ptr<KvImage> kv;    // null while the slot's cells still hold it
+    long long                stamp = 0;
+    int    pos()   const { return (int) seq.size(); }
+    size_t bytes() const { return rec.size() + (kv ? kv->data.size() : 0); }
 };
 
 struct Slot {
     std::unique_ptr<DecodeRunner> run;
-    // The tokens the live state corresponds to: seq.size() == run->pos(), always.
+    // What the slot's CELLS hold, which is also what the runner's position
+    // means: seq.size() == run->pos(), always.
     std::vector<int32_t>  seq;
     std::vector<Snapshot> snaps;
+    long long             stamp = 0;
 };
+
+// Is `a` a prefix of `b`? The one comparison this whole mechanism rests on,
+// and it is over TOKEN IDS: not a text diff, not a hash (GATEWAY-PROTOCOL.md
+// section 5).
+bool is_prefix(const std::vector<int32_t> & a, const std::vector<int32_t> & b) {
+    return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+double ms_since(const std::chrono::steady_clock::time_point & t0) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+}
 
 // --------------------------------------------------------------- the engine --
 
@@ -604,6 +665,12 @@ public:
         n_slots_ = std::max(1, std::min(16, env_int("KV_SLOTS", 1)));
         snap_every_ = std::max(1, env_int("FRANKEN_SNAP_EVERY", chunk_));
         snap_keep_  = std::max(1, env_int("FRANKEN_SNAP_KEEP", 8));
+        // Host memory the checkpoints of ONE slot may hold. The recurrent half
+        // is 118 MB whatever the position; the positional half is ~13.8 kB a
+        // token and only exists on a checkpoint that has had to take its cells
+        // with it. 6 GB is ~8 checkpoints of a 40k-token prefix.
+        budget_bytes_ = (size_t) std::max(256, env_int("FRANKEN_SNAP_BUDGET_MB", 6144))
+                      * (size_t) 1024 * 1024;
         n_cand_     = std::max(1, env_int("FRANKEN_TOPK_CAND", 4096));
         const int seed = env_int("FRANKEN_SEED", 0);
         rng_.seed(seed > 0 ? (uint32_t) seed
@@ -751,8 +818,9 @@ private:
             slots_[(size_t) s].run->report_cache_bytes(stderr);
             for (int d = 0; d < (int) owned_.size(); ++d)
                 owned_[d]->vram_report(stderr, "after slot");
-            logf("slot %d allocated (state snapshot = %.1f MB a copy)",
-                 s, slots_[(size_t) s].run->state_bytes() / 1e6);
+            logf("slot %d allocated (checkpoint: %.1f MB recurrent + %.2f kB a token of cells)",
+                 s, slots_[(size_t) s].run->rec_bytes() / 1e6,
+                 slots_[(size_t) s].run->kv_bytes(1024) / 1024.0 / 1024.0);
             return true;
         } catch (const std::exception & e) {
             why = e.what();
@@ -761,46 +829,116 @@ private:
         }
     }
 
-    // Section 5's rule, as arithmetic. Candidates are the snapshots plus the
-    // LIVE position (which needs no restore at all and is the continuation
-    // case: the slot already sits exactly where the next turn's prefix ends).
-    // The cap at n_prompt-1 is not cosmetic: a turn must run at least one token
-    // through the model or it has no logits to sample from.
-    int plan_reuse(Slot & sl, const std::vector<int32_t> & toks, int & snap_idx) {
-        snap_idx = -1;
-        const int live = (int) sl.seq.size();
-        int lcp = 0;
-        const int n = std::min(live, (int) toks.size());
-        while (lcp < n && sl.seq[(size_t) lcp] == toks[(size_t) lcp]) ++lcp;
-        const int cap = std::min(lcp, (int) toks.size() - 1);
-        if (cap <= 0) return 0;
-        int best = 0;
-        if (live <= cap) best = live;                 // the live state is usable as it stands
-        for (int i = 0; i < (int) sl.snaps.size(); ++i) {
-            const int p = sl.snaps[(size_t) i].pos;
-            if (p <= cap && p > best) { best = p; snap_idx = i; }
+    // Section 5's rule, as arithmetic. A candidate position is reusable when
+    // the state that belongs to it can be put back AND the tokens it stands
+    // for are a prefix of this prompt. Two sources:
+    //
+    //   the LIVE position -- no restore at all, the continuation case: the
+    //     slot already sits exactly where this prompt's shared prefix ends;
+    //   a CHECKPOINT -- rolled back into, which needs its cells to be either
+    //     still in the slot or carried in its own image.
+    //
+    // The cap at n_prompt-1 is not cosmetic: a turn must run at least one
+    // token through the model or it has no logits to sample from.
+    struct ReusePlan { int pos = 0; int snap = -1; bool live = false; };
+
+    ReusePlan plan_reuse(Slot & sl, const std::vector<int32_t> & toks) {
+        ReusePlan p;
+        const int cap = (int) toks.size() - 1;
+        if (cap <= 0) return p;
+        if (!sl.seq.empty() && (int) sl.seq.size() <= cap && is_prefix(sl.seq, toks)) {
+            p.pos = (int) sl.seq.size();
+            p.live = true;
         }
-        if (best == live) snap_idx = -1;
-        return best;
+        for (int i = 0; i < (int) sl.snaps.size(); ++i) {
+            const Snapshot & s = sl.snaps[(size_t) i];
+            const int sp = s.pos();
+            if (sp <= p.pos || sp > cap)        continue;
+            if (!is_prefix(s.seq, toks))        continue;   // another conversation
+            if (!s.kv && !is_prefix(s.seq, sl.seq)) continue; // its cells are gone
+            p.pos  = sp;
+            p.snap = i;
+            p.live = false;
+        }
+        return p;
     }
 
-    void take_snapshot(Slot & sl) {
+    // Copy-on-write: everything that is about to lose the cells it leans on
+    // gets them, in ONE image sized to the deepest of them.
+    double protect_cells(Slot & sl, int from) {
+        int need = 0;
+        for (const Snapshot & s : sl.snaps)
+            if (!s.kv && s.pos() > from && is_prefix(s.seq, sl.seq))
+                need = std::max(need, s.pos());
+        if (need <= 0) return 0.0;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto img = std::make_shared<KvImage>();
+        img->len = need;
+        img->data.resize(sl.run->kv_bytes(need));
+        sl.run->save_kv(img->data.data(), need);
+        for (Snapshot & s : sl.snaps)
+            if (!s.kv && s.pos() > from && is_prefix(s.seq, sl.seq)) s.kv = img;
+        const double ms = ms_since(t0);
+        logf("protect: %d cells, %.0f MB, %.0f ms (a request is about to overwrite from %d)",
+             need, img->data.size() / 1e6, ms, from);
+        return ms;
+    }
+
+    double take_snapshot(Slot & sl) {
+        const auto t0 = std::chrono::steady_clock::now();
         Snapshot s;
-        s.pos = sl.run->pos();
-        s.blob.resize(sl.run->state_bytes());
-        sl.run->save_state(s.blob.data());
+        s.seq.assign(sl.seq.begin(), sl.seq.begin() + sl.run->pos());
+        s.rec.resize(sl.run->rec_bytes());
+        s.stamp = ++sl.stamp;
+        sl.run->save_rec(s.rec.data());
         sl.snaps.push_back(std::move(s));
-        // Decimation rather than a FIFO: what a rollback needs is a snapshot
-        // just BELOW the shared prefix's end, and that end is anywhere. Evict
-        // the one whose removal leaves the smallest hole, keeping the oldest
-        // and the newest, so the survivors stay spread over the sequence.
-        while ((int) sl.snaps.size() > snap_keep_) {
-            size_t victim = 1;
-            int    hole = INT32_MAX;
-            for (size_t i = 1; i + 1 < sl.snaps.size(); ++i) {
-                const int h = sl.snaps[i + 1].pos - sl.snaps[i - 1].pos;
-                if (h < hole) { hole = h; victim = i; }
+        evict(sl);
+        return ms_since(t0);
+    }
+
+    // Host memory the slot's checkpoints really hold. One image is shared by
+    // every checkpoint that was protected in the same divergence, so counting
+    // it per checkpoint would read eight times its size and evict a working
+    // set that fits.
+    size_t snaps_bytes(const Slot & sl) const {
+        size_t n = 0;
+        std::vector<const KvImage *> seen;
+        for (const Snapshot & s : sl.snaps) {
+            n += s.rec.size();
+            if (!s.kv) continue;
+            const KvImage * p = s.kv.get();
+            if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+            seen.push_back(p);
+            n += p->data.size();
+        }
+        return n;
+    }
+
+    void evict(Slot & sl) {
+        // The dead first: a checkpoint with no image whose prefix the slot's
+        // cells no longer hold can never be used again.
+        sl.snaps.erase(std::remove_if(sl.snaps.begin(), sl.snaps.end(),
+                          [&](const Snapshot & s) {
+                              return !s.kv && !is_prefix(s.seq, sl.seq);
+                          }), sl.snaps.end());
+        while ((int) sl.snaps.size() > snap_keep_ ||
+               (snaps_bytes(sl) > budget_bytes_ && sl.snaps.size() > 1)) {
+            // Never the two most recent -- the end-of-turn checkpoint and the
+            // deepest chunk boundary are what the next turn most often wants.
+            // Among the rest the SHALLOWEST goes: a deeper checkpoint reuses
+            // strictly more, and `reused` is what the gate reads.
+            long long a = -1, b = -1;
+            for (const Snapshot & s : sl.snaps) {
+                if (s.stamp > a) { b = a; a = s.stamp; }
+                else if (s.stamp > b) b = s.stamp;
             }
+            int victim = -1, low = INT32_MAX;
+            for (int i = 0; i < (int) sl.snaps.size(); ++i) {
+                const Snapshot & s = sl.snaps[(size_t) i];
+                if (s.stamp == a || s.stamp == b) continue;
+                if (s.pos() < low) { low = s.pos(); victim = i; }
+            }
+            if (victim < 0) break;
             sl.snaps.erase(sl.snaps.begin() + (long) victim);
         }
     }
@@ -846,20 +984,38 @@ private:
         Slot & sl = slots_[(size_t) q.slot];
         DecodeRunner & run = *sl.run;
 
-        int snap_idx = -1;
-        const int reused = plan_reuse(sl, toks, snap_idx);
-        if (reused == 0) {
-            run.reset_state();
-            sl.snaps.clear();
-        } else if (snap_idx >= 0) {
-            run.load_state(sl.snaps[(size_t) snap_idx].blob.data(), reused);
+        const ReusePlan plan = plan_reuse(sl, toks);
+        const int reused = plan.pos;
+        // This request is about to overwrite the cells from `reused` on, so
+        // anything that still leans on them is given its own copy FIRST.
+        // Checkpoints are NEVER dropped for being another conversation's: with
+        // one KV slot every conversation shares the slot, and the one thing
+        // that must survive is exactly the prefix they share.
+        double protect_ms = protect_cells(sl, reused);
+        double restore_ms = 0.0;
+        {
+            const auto tr = std::chrono::steady_clock::now();
+            if (plan.snap >= 0) {
+                const Snapshot & s = sl.snaps[(size_t) plan.snap];
+                run.load_rec(s.rec.data(), reused);
+                // Only when its cells are not already in the slot: an image is
+                // an upload of ~13.8 kB a token, a re-prefill is a forward pass.
+                if (s.kv) run.load_kv(s.kv->data.data(), s.kv->len, reused, reused);
+            } else if (!plan.live) {
+                run.reset_state();
+            }
+            restore_ms = ms_since(tr);
         }
-        // Everything above the reuse point belonged to a sequence this prompt
-        // has just diverged from.
-        sl.snaps.erase(std::remove_if(sl.snaps.begin(), sl.snaps.end(),
-                                      [&](const Snapshot & s) { return s.pos > reused; }),
-                       sl.snaps.end());
         sl.seq.assign(toks.begin(), toks.begin() + reused);
+
+        // The line `accept_live.sh` and `owui_ui_turn.sh` actually read for
+        // `reused` -- they grep " REUSE <id> " out of the gateway log and take
+        // the SECOND-TO-LAST field (accept_live.sh:121, owui_ui_turn.sh). Both
+        // gates reported "reused=0" / "integer expected" against this engine
+        // for one reason: glm53 prints this line (c/glm53.c:6717) and it did
+        // not. It is the same number as the DONE frame's 8th field.
+        std::fprintf(stderr, "[serve] REUSE %s %d %d\n", q.id.c_str(), reused, prompt_tokens);
+        std::fflush(stderr);
 
         const auto t0 = std::chrono::steady_clock::now();
         Recorder rec;                                  // taps off: a tap is a download
@@ -869,13 +1025,27 @@ private:
         int  emitted = 0;
         bool limited = false;
         auto t_prefill = t0;
+        double ple_ms = 0.0, step_ms = 0.0, snap_ms = 0.0;
+        int    chunks = 0;
 
         try {
         // ---- prefill ------------------------------------------------------
+        // Where the wall clock of a prefill goes, per phase. It is printed on
+        // every request because the first served run could not say whether a
+        // rollback that reported reuse had actually re-prefilled only the tail
+        // (it had: `chunks` and `from` below are the direct answer), and
+        // because the PLE gather reads scattered rows of a 28.8 GB table --
+        // 9.5 us a token warm, 4.2 ms a token if a row's page comes off the
+        // NVMe (record §PLE-GATHER), which is a difference of three orders of
+        // magnitude that no aggregate number can show.
         for (int t = reused; t < prompt_tokens && !cancelled; ) {
             const int T = std::min(chunk_, prompt_tokens - t);
             sl.seq.insert(sl.seq.end(), toks.begin() + t, toks.begin() + t + T);
+            const auto tp = std::chrono::steady_clock::now();
             const std::vector<float> ple = ple_rows(sl.seq, t, T);
+            ple_ms += ms_since(tp);
+            const auto ts = std::chrono::steady_clock::now();
+            ++chunks;
             const bool is_last  = (t + T == prompt_tokens);
             const bool snap_due = (t + T - last_snap >= snap_every_);
             // A chunk that is neither the last nor about to be snapshotted is
@@ -886,7 +1056,8 @@ private:
                                    rec, is_last || snap_due);
             if (run.last_flushed()) greedy = g;
             t += T;
-            if (snap_due && !is_last) { take_snapshot(sl); last_snap = t; }
+            step_ms += ms_since(ts);
+            if (snap_due && !is_last) { snap_ms += take_snapshot(sl); last_snap = t; }
             cancelled = io_.drain(q.id);
         }
         t_prefill = std::chrono::steady_clock::now();
@@ -909,7 +1080,9 @@ private:
                 // what the gateway's ledger predicts for the next turn's
                 // `reused` (section 5, ledger_expect_reuse).
                 sl.seq.push_back(next);
+                const auto tp = std::chrono::steady_clock::now();
                 const std::vector<float> ple = ple_rows(sl.seq, run.pos(), 1);
+                ple_ms += ms_since(tp);
                 const int g = run.step(next, ple.empty() ? nullptr : ple.data(), rec);
                 next = (q.temp <= 0.0f) ? (int32_t) g
                                         : sample_token(run.logits_host(), q.temp, q.top_p,
@@ -920,7 +1093,7 @@ private:
         // The state the next turn will want to roll back to is the one this
         // turn ends in: one snapshot here is what makes a continuation reuse
         // EXACTLY prompt+completion tokens instead of the nearest chunk below.
-        if (run.pos() > last_snap) take_snapshot(sl);
+        if (run.pos() > last_snap) snap_ms += take_snapshot(sl);
         } catch (const std::exception & e) {
             // One request must not take the engine down, and a slot whose
             // state got as far as an exception is not trustworthy: it is
@@ -938,10 +1111,14 @@ private:
         const double dec_s = std::chrono::duration<double>(t1 - t_prefill).count();
         const double tps   = dec_s > 0.0 ? emitted / dec_s : 0.0;
         const double hit   = prompt_tokens > 0 ? 100.0 * reused / prompt_tokens : 0.0;
-        logf("req=%s slot=%d prompt=%d reused=%d emitted=%d limited=%d cancelled=%d "
-             "prefill_s=%.2f decode_s=%.2f tok/s=%.2f",
-             q.id.c_str(), q.slot, prompt_tokens, reused, emitted, (int) limited,
-             (int) cancelled, std::chrono::duration<double>(t_prefill - t0).count(), dec_s, tps);
+        logf("req=%s slot=%d prompt=%d reused=%d from=%d chunks=%d emitted=%d limited=%d "
+             "cancelled=%d prefill_s=%.2f [restore=%.0f protect=%.0f ple=%.0f step=%.0f "
+             "snap=%.0f ms] decode_s=%.2f tok/s=%.2f ckpts=%zu ckpt_mb=%.0f",
+             q.id.c_str(), q.slot, prompt_tokens, reused, reused, chunks, emitted,
+             (int) limited, (int) cancelled,
+             std::chrono::duration<double>(t_prefill - t0).count(),
+             restore_ms, protect_ms, ple_ms, step_ms, snap_ms, dec_s, tps,
+             sl.snaps.size(), snaps_bytes(sl) / 1e6);
 
         // DONE first, ALWAYS -- including for a cancelled turn. The gateway's
         // dispatcher pops the pending entry on ERROR, so a DONE after it would
@@ -954,6 +1131,7 @@ private:
     bool test_;
     int  ctx_ = 262144, chunk_ = 256, n_slots_ = 1;
     int  snap_every_ = 256, snap_keep_ = 8, n_cand_ = 4096;
+    size_t budget_bytes_ = (size_t) 6144 * 1024 * 1024;
     bool need_ple_ = false;
     std::vector<std::unique_ptr<Backend>> owned_;
     std::vector<Backend *>                devs_;

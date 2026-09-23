@@ -11,6 +11,18 @@ by hand: it writes the exact SUBMIT/CANCEL frames openai_server.py writes
 Engine._dispatch_stdout parses them (openai_server.py:3730-3849), including the
 DATA terminator check and the positional DONE STAT fields.
 
+It also reads the engine's STDERR, because two things the acceptance gates on
+the rig depend on live there and nowhere else:
+
+  * the `REUSE <id> <reused> <prompt_tokens>` line. `accept_live.sh` check 3
+    and `owui_ui_turn.sh` both take `reused` from `grep " REUSE <id> "` +
+    `awk '{print $(NF-1)}'` -- NOT from the DONE frame. The first served run
+    failed both for exactly this reason: the number was right on the wire and
+    the line the gates read did not exist.
+  * the `[serve] req=... from=N chunks=N` line, which is how "the rollback
+    re-prefilled only the tail" becomes a checked fact rather than a claim
+    about a wall-clock number.
+
 CPU ONLY, and that is enforced twice: the binary is franken_decode_cpu (which
 links no HIP runtime -- `make ldd-check`), and HIP_VISIBLE_DEVICES is set to
 empty in the child's environment, because the tokenizer's libllama is dlopened
@@ -24,8 +36,10 @@ Usage:
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 
 READY = b"\x01\x01READY\x01\x01\n"
@@ -169,6 +183,75 @@ def collect(wire, rid, cancel_after=None):
             raise AssertionError("unexpected frame %r" % verb)
 
 
+class Engine:
+    """The child process, its wire, and its stderr."""
+
+    def __init__(self, args, env_extra, log):
+        self.log = log
+        env = dict(os.environ)
+        env.update({
+            "FRANKEN_GGUF": args.gguf,
+            "FRANKEN_LAYERS": args.layers,
+            "FRANKEN_CHUNK": str(args.chunk),
+            "FRANKEN_CTX": str(args.ctx),
+            "FRANKEN_THREADS": str(args.threads),
+            "KV_SLOTS": "1",
+            # The gateway always sets these two; the engine must not care.
+            "SERVE_BATCH": "1",
+            "NGEN": "4096",
+            # Second guard: nothing in this process may see a card (see the
+            # module docstring). The first is the binary itself.
+            "HIP_VISIBLE_DEVICES": "",
+        })
+        env.update(env_extra)
+        env.pop("SERVE", None)          # --serve-test is the switch here
+        self.err = tempfile.NamedTemporaryFile(prefix="franken_serve_err_", suffix=".log",
+                                               delete=False)
+        # openai_server.py launches the child as [executable, str(cap)] with
+        # unbuffered pipes (bufsize=0) -- so does this.
+        self.p = subprocess.Popen([args.engine, "1", "--serve-test"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=self.err, bufsize=0, env=env)
+        self.wire = Wire(self.p, log)
+
+    def stderr_text(self):
+        self.err.flush()
+        with open(self.err.name, "r", errors="replace") as fh:
+            return fh.read()
+
+    def reuse_line(self, rid):
+        """Exactly what accept_live.sh:121 and owui_ui_turn.sh do:
+        grep " REUSE <id> " | tail -1 | awk '{print $(NF-1)}'."""
+        hit = None
+        for line in self.stderr_text().splitlines():
+            if (" REUSE %s " % rid) in line:
+                hit = line
+        if hit is None:
+            return None
+        return hit.split()[-2]
+
+    def req_line(self, rid):
+        """The engine's own accounting line for one request, as a dict."""
+        hit = None
+        for line in self.stderr_text().splitlines():
+            if ("req=%s " % rid) in line:
+                hit = line
+        if hit is None:
+            return {}
+        return {k: v for k, v in re.findall(r"(\w+)=(-?[\d.]+)", hit)}
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.p.wait(timeout=120)
+        except Exception:
+            self.p.kill()
+        self.err.close()
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
@@ -178,26 +261,9 @@ def main():
                     "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"))
     ap.add_argument("--layers", default="0-3")
     ap.add_argument("--chunk", type=int, default=8)
-    ap.add_argument("--ctx", type=int, default=512)
+    ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--threads", type=int, default=8)
     args = ap.parse_args()
-
-    env = dict(os.environ)
-    env.update({
-        "FRANKEN_GGUF": args.gguf,
-        "FRANKEN_LAYERS": args.layers,
-        "FRANKEN_CHUNK": str(args.chunk),
-        "FRANKEN_CTX": str(args.ctx),
-        "FRANKEN_THREADS": str(args.threads),
-        "KV_SLOTS": "1",
-        # The gateway always sets these two; the engine must not care.
-        "SERVE_BATCH": "1",
-        "NGEN": "4096",
-        # Second guard: nothing in this process may see a card (see the
-        # docstring). The first is the binary itself.
-        "HIP_VISIBLE_DEVICES": "",
-    })
-    env.pop("SERVE", None)          # --serve-test is the switch here
 
     failures = []
 
@@ -205,45 +271,55 @@ def main():
         print(msg, flush=True)
 
     def check(name, ok, detail=""):
-        print("%-46s %s %s" % (name, "PASS" if ok else "FAIL", detail), flush=True)
+        print("%-52s %s %s" % (name, "PASS" if ok else "FAIL", detail), flush=True)
         if not ok:
             failures.append(name)
 
-    log("== launching %s --serve-test (cap argv, as the gateway does) ==" % args.engine)
-    # openai_server.py launches the child as [executable, str(cap)] with
-    # unbuffered pipes (bufsize=0) -- so does this.
-    proc = subprocess.Popen([args.engine, "1", "--serve-test"],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            bufsize=0, env=env)
-    wire = Wire(proc, log)
+    # The engine tokenizes, so the driver never knows a prompt's token count in
+    # advance -- every expectation below is written against numbers the engine
+    # itself reported for an earlier turn, which is also how the gateway's own
+    # ledger predicts `reused` (openai_server.py:2842-2857).
+    SHARED = ("You are a careful assistant. Facts you must remember for this "
+              "conversation: the capital of France is Paris, the capital of Italy "
+              "is Rome, the capital of Japan is Tokyo, the capital of Peru is Lima, "
+              "the capital of Kenya is Nairobi, the capital of Norway is Oslo, and "
+              "the capital of Chile is Santiago. Answer only from that list, in one "
+              "word, and never explain your answer.\n")
+
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    # ---- phase 1: chunk-boundary checkpoints ------------------------------
+    log("== phase 1: %s --serve-test, chunk=%d ==" % (args.engine, args.chunk))
+    eng = Engine(args, {}, log)
+    w = eng.wire
+    turns = {}
     try:
         t0 = time.time()
-        stat = wire.wait_ready()
+        stat = w.wait_ready()
         log("== READY after %.1fs ==" % (time.time() - t0))
         check("boot: READY + STAT with >= 5 fields", len(stat) >= 5 and stat[0] == "STAT")
 
         # ---- 1. a prompt that does not fit the context ---------------------
-        wire.submit(1, 0, "hello", 10000)
-        t = collect(wire, 1)
+        w.submit(1, 0, "hello", 100000)
+        t = collect(w, 1)
         check("context overflow -> ERROR CONTEXT_EXCEEDED",
               t.error == "CONTEXT_EXCEEDED", str(t.frames))
 
         # ---- 2. an empty prompt -------------------------------------------
-        wire.submit(2, 0, "", 8)
-        t = collect(wire, 2)
+        w.submit(2, 0, "", 8)
+        t = collect(w, 2)
         check("empty prompt -> ERROR EMPTY_PROMPT", t.error == "EMPTY_PROMPT", str(t.frames))
 
         # ---- 3. a CANCEL for nothing in flight ----------------------------
-        wire.cancel(99)
-        verb, fid, rest = wire.frame()
+        w.cancel(99)
+        verb, fid, rest = w.frame()
         check("stray CANCEL -> ERROR <id> NOT_FOUND",
               verb == "ERROR" and fid == "99" and rest[0] == "NOT_FOUND")
 
         # ---- 4. one full round trip ---------------------------------------
-        p1 = ("The capital of France is Paris, and the capital of Italy is Rome.\n"
-              "Here is a list of three more capitals:\n")
-        wire.submit(3, 0, p1, 4)
-        a = collect(wire, 3)
+        w.submit(3, 0, SHARED + "Q: What is the capital of Japan?\nA:", 4)
+        a = collect(w, 3); turns[3] = a
         check("turn A: ACCEPT carries prompt_tokens",
               a.accept_prompt is not None and a.accept_prompt == a.prompt_tokens,
               "accept=%s done=%s" % (a.accept_prompt, a.prompt_tokens))
@@ -254,6 +330,10 @@ def main():
         check("turn A: budget of 4 is honoured and flagged",
               a.completion_tokens == 4 and a.limited == 1,
               "emitted=%d limited=%d" % (a.completion_tokens, a.limited))
+        ra = eng.req_line(3)
+        check("turn A: a fresh prefill runs every chunk",
+              int(ra.get("chunks", -1)) == ceil_div(a.prompt_tokens, args.chunk),
+              "chunks=%s of %d" % (ra.get("chunks"), ceil_div(a.prompt_tokens, args.chunk)))
 
         # ---- 5. a continuation: the ledger's own prediction ----------------
         # ledger_expect_reuse (openai_server.py:2842-2857) = the previous
@@ -261,51 +341,120 @@ def main():
         # its budget (the last generated token was never fed back). The engine
         # must report EXACTLY that or accept_live.sh check 2b fails on MISMATCH.
         expect = a.prompt_tokens + a.completion_tokens - a.limited
-        p2 = p1 + a.text.decode("utf-8", "replace")
-        wire.submit(4, 0, p2, 2)
-        b = collect(wire, 4)
+        p2 = SHARED + "Q: What is the capital of Japan?\nA:" + a.text.decode("utf-8", "replace")
+        w.submit(4, 0, p2, 2)
+        b = collect(w, 4); turns[4] = b
         check("turn B: reused == ledger_expect_reuse",
               b.reused == expect, "reused=%d expected=%d" % (b.reused, expect))
         check("turn B: hit%% follows reused/prompt",
               abs(float(b.stat[2]) - 100.0 * b.reused / b.prompt_tokens) < 0.1,
               "hit=%s" % b.stat[2])
+        rb = eng.req_line(4)
+        check("turn B: only the tail is re-prefilled",
+              int(rb.get("from", -1)) == b.reused and
+              int(rb.get("chunks", -1)) == ceil_div(b.prompt_tokens - b.reused, args.chunk),
+              "from=%s chunks=%s of %d" % (rb.get("from"), rb.get("chunks"),
+                                           ceil_div(b.prompt_tokens - b.reused, args.chunk)))
 
         # ---- 6. a rollback: the same prompt again --------------------------
         # The live state now sits PAST this prompt's end, so reuse has to come
-        # from a snapshot: the last chunk boundary at or below prompt_tokens-1
-        # (a turn must run at least one token to have logits to sample from).
+        # from a checkpoint: the last chunk boundary at or below prompt-1 (a
+        # turn must run at least one token to have logits to sample from).
+        pa = SHARED + "Q: What is the capital of Japan?\nA:"
         expect_roll = ((a.prompt_tokens - 1) // args.chunk) * args.chunk
-        wire.submit(5, 0, p1, 2)
-        c = collect(wire, 5)
-        check("turn C: rollback to the snapshot below the LCP",
+        w.submit(5, 0, pa, 2)
+        c = collect(w, 5); turns[5] = c
+        check("turn C: rollback to the checkpoint below the LCP",
               c.reused == expect_roll and c.prompt_tokens == a.prompt_tokens,
               "reused=%d expected=%d" % (c.reused, expect_roll))
+        rc = eng.req_line(5)
+        check("turn C: only the tail is re-prefilled",
+              int(rc.get("chunks", -1)) == ceil_div(c.prompt_tokens - c.reused, args.chunk),
+              "chunks=%s of %d" % (rc.get("chunks"),
+                                   ceil_div(c.prompt_tokens - c.reused, args.chunk)))
 
-        # ---- 7. CANCEL in flight -------------------------------------------
+        # ---- 7. THE ONE THAT FAILED IN SERVICE -----------------------------
+        # An unrelated short request lands on the same slot (with one KV slot
+        # every conversation does) and re-prefills from its own zero, so the
+        # cells the long prefix lived in are gone. A checkpoint that carried
+        # only the recurrent state would now be worthless -- which is exactly
+        # what the first served run reported: reused=0 on the next UI chat.
+        w.submit(6, 0, "Say OK.", 2)
+        x = collect(w, 6); turns[6] = x
+        check("turn X: an unrelated short request reuses nothing",
+              x.reused == 0, "reused=%d" % x.reused)
+        w.submit(7, 0, pa, 2)
+        d = collect(w, 7); turns[7] = d
+        check("turn D: the shared prefix survives an interleaved request",
+              d.reused == expect_roll,
+              "reused=%d expected=%d (this is the 2026-09-22 failure)" % (d.reused, expect_roll))
+        rd = eng.req_line(7)
+        check("turn D: only the tail is re-prefilled after the rollback",
+              int(rd.get("chunks", -1)) == ceil_div(d.prompt_tokens - d.reused, args.chunk),
+              "chunks=%s of %d" % (rd.get("chunks"),
+                                   ceil_div(d.prompt_tokens - d.reused, args.chunk)))
+
+        # ---- 8. CANCEL in flight -------------------------------------------
         # DONE (with the partial counts) and only THEN ERROR CANCELLED: the
         # gateway pops the pending entry on ERROR, so the other order loses the
         # turn's accounting (GATEWAY-PROTOCOL.md section 3).
-        wire.submit(6, 0, p1 + "one two three four\n", 64)
-        d = collect(wire, 6, cancel_after=1)
-        check("turn D: cancelled turn ends DONE then ERROR CANCELLED",
-              d.frames[-2:] == ["DONE", "ERROR"] and d.error == "CANCELLED",
-              str(d.frames))
-        check("turn D: DONE carries the partial count",
-              d.stat is not None and d.completion_tokens == d.n_data,
-              "emitted=%s data=%d" % (d.stat[0] if d.stat else "-", d.n_data))
-
-        # ---- 8. the engine still serves after a cancellation ---------------
-        wire.submit(7, 0, p1, 1)
-        e = collect(wire, 7)
-        check("turn E: the next request is served normally",
-              e.stat is not None and e.completion_tokens == 1 and e.error is None,
+        w.submit(8, 0, pa + " one two three four\n", 64)
+        e = collect(w, 8, cancel_after=1); turns[8] = e
+        check("turn E: cancelled turn ends DONE then ERROR CANCELLED",
+              e.frames[-2:] == ["DONE", "ERROR"] and e.error == "CANCELLED",
               str(e.frames))
+        check("turn E: DONE carries the partial count",
+              e.stat is not None and e.completion_tokens == e.n_data,
+              "emitted=%s data=%d" % (e.stat[0] if e.stat else "-", e.n_data))
+
+        # ---- 9. still serving ----------------------------------------------
+        w.submit(9, 0, pa, 1)
+        f = collect(w, 9); turns[9] = f
+        check("turn F: the next request is served normally",
+              f.stat is not None and f.completion_tokens == 1 and f.error is None,
+              str(f.frames))
+
+        # ---- 10. the fields and the line the GATES read --------------------
+        bad_stat = [rid for rid, t in turns.items()
+                    if t.stat is None or len(t.stat) != 7 or not t.stat[6].lstrip("-").isdigit()]
+        check("every DONE STAT has 7 fields, reused an integer",
+              not bad_stat, "offenders: %s" % bad_stat)
+        bad_reuse = []
+        for rid, t in turns.items():
+            got = eng.reuse_line(rid)
+            if got is None or not got.lstrip("-").isdigit() or int(got) != t.reused:
+                bad_reuse.append((rid, got, t.reused))
+        check("every request logs ' REUSE <id> <reused> <prompt>'",
+              not bad_reuse, "offenders: %s" % bad_reuse)
     finally:
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        proc.wait(timeout=60)
+        eng.close()
+        log("== engine stderr: %s ==" % eng.err.name)
+
+    # ---- phase 2: NO chunk checkpoints, only the end-of-request one --------
+    # "snapshots only at 256-token chunk boundaries mean nothing under 256 can
+    # be reused" -- the end-of-request checkpoint is what answers that, and
+    # this phase proves it by switching the chunk-boundary ones off entirely.
+    log("\n== phase 2: FRANKEN_SNAP_EVERY=1000000 (end-of-request checkpoint only) ==")
+    eng2 = Engine(args, {"FRANKEN_SNAP_EVERY": "1000000"}, log)
+    w2 = eng2.wire
+    try:
+        w2.wait_ready()
+        short = "Q: capital of Norway? A:"
+        w2.submit(1, 0, short, 3)
+        g = collect(w2, 1)
+        expect2 = g.prompt_tokens + g.completion_tokens - g.limited
+        w2.submit(2, 0, short + g.text.decode("utf-8", "replace") + "\nQ: and Chile? A:", 2)
+        h = collect(w2, 2)
+        check("phase 2: a follow-up far under one chunk reuses exactly",
+              h.reused == expect2 and h.reused > 0,
+              "prompt=%d reused=%d expected=%d" % (h.prompt_tokens, h.reused, expect2))
+        r = eng2.req_line(2)
+        check("phase 2: the follow-up re-prefills one chunk at most",
+              int(r.get("chunks", -1)) == ceil_div(h.prompt_tokens - h.reused, args.chunk),
+              "chunks=%s" % r.get("chunks"))
+    finally:
+        eng2.close()
+        log("== engine stderr: %s ==" % eng2.err.name)
 
     print("\n%d check(s) failed%s" % (len(failures),
           (": " + ", ".join(failures)) if failures else ""))

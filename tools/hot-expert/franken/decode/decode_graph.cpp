@@ -845,7 +845,65 @@ void DecodeRunner::state_pieces(std::vector<StatePiece> & out) {
     }
 }
 
-size_t DecodeRunner::state_bytes() const {
+// The positional pieces, in the one order save_kv and load_kv both walk: per
+// QSA layer, K then V quants, K then V scales, then the pooled indexer keys.
+// `layout_len` sets the strides of the host image, `copy_len` how many cells
+// are actually moved -- an image of 4 916 cells restores a 4 096-cell prefix
+// by copying less out of each run, never by re-packing it.
+void DecodeRunner::kv_plan(std::vector<KvPiece> & out, int layout_len, int copy_len) {
+    out.clear();
+    if (copy_len > layout_len) copy_len = layout_len;
+    if (copy_len <= 0) return;
+    auto qs = [](int n) { return (size_t) n * N_KV_HEADS * HEAD_DIM; };
+    auto sc = [](int n) { return (size_t) n * N_KV_HEADS * (HEAD_DIM / 32) * sizeof(uint16_t); };
+    auto pl = [](int n) {
+        return (size_t) ((n + QSA_RATIO - 1) / QSA_RATIO) * IDX_DIM * sizeof(uint16_t);
+    };
+    size_t off = 0;
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        if (is_recurrent_layer(il)) continue;
+        LayerState & st = lstate_[il - model_.il0()];
+        Backend * be = &model_.dev_for(il);
+        out.push_back({ be, st.kqs, off, qs(copy_len) });          off += qs(layout_len);
+        out.push_back({ be, st.vqs, off, qs(copy_len) });          off += qs(layout_len);
+        out.push_back({ be, st.ksc, off, sc(copy_len) });          off += sc(layout_len);
+        out.push_back({ be, st.vsc, off, sc(copy_len) });          off += sc(layout_len);
+        out.push_back({ be, st.idx_pooled, off, pl(copy_len) });   off += pl(layout_len);
+    }
+}
+
+size_t DecodeRunner::kv_bytes(int len) const {
+    if (len <= 0) return 0;
+    const size_t per_layer =
+          2 * ((size_t) len * N_KV_HEADS * HEAD_DIM)
+        + 2 * ((size_t) len * N_KV_HEADS * (HEAD_DIM / 32) * sizeof(uint16_t))
+        + (size_t) ((len + QSA_RATIO - 1) / QSA_RATIO) * IDX_DIM * sizeof(uint16_t);
+    size_t n = 0;
+    for (int il = model_.il0(); il <= model_.il1(); ++il)
+        if (!is_recurrent_layer(il)) n += per_layer;
+    return n;
+}
+
+void DecodeRunner::save_kv(void * dst, int len) {
+    std::vector<KvPiece> plan;
+    kv_plan(plan, len, len);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    char * base = (char *) dst;
+    for (const auto & p : plan) p.be->download(base + p.off, p.ptr, p.bytes);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+}
+
+void DecodeRunner::load_kv(const void * src, int layout_len, int copy_len, int pos) {
+    std::vector<KvPiece> plan;
+    kv_plan(plan, layout_len, copy_len);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    const char * base = (const char *) src;
+    for (const auto & p : plan) p.be->upload(p.ptr, base + p.off, p.bytes);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    pos_ = pos;
+}
+
+size_t DecodeRunner::rec_bytes() const {
     // const, so it counts rather than walks -- same order, same arithmetic.
     size_t n = 0;
     for (int il = model_.il0(); il <= model_.il1(); ++il) {
@@ -859,7 +917,7 @@ size_t DecodeRunner::state_bytes() const {
     return n;
 }
 
-void DecodeRunner::save_state(void * dst) {
+void DecodeRunner::save_rec(void * dst) {
     std::vector<StatePiece> pieces;
     state_pieces(pieces);
     // Every device first: a download that races the chunk still in flight
@@ -871,7 +929,7 @@ void DecodeRunner::save_state(void * dst) {
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
 }
 
-void DecodeRunner::load_state(const void * src, int pos) {
+void DecodeRunner::load_rec(const void * src, int pos) {
     std::vector<StatePiece> pieces;
     state_pieces(pieces);
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();

@@ -5039,7 +5039,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if reasoning_effort is None and "enable_thinking" not in body:
             # Qwen3.8's official template defaults to enabled xhigh thinking;
             # preserve the older opt-in default for the other families.
-            if ARCH == "qwen38":
+            # COLI_THINK=0 turns that default off (2026-09-23). Qwen3.8 is
+            # now also served by the Franken engine into the owner's Open
+            # WebUI, where every answer arrived with a reasoning_content block
+            # in front of it, because this branch forces xhigh thinking on a
+            # client that asked for nothing -- while the GLM path the owner is
+            # used to serves with thinking OFF. The default is unchanged ("1"):
+            # only an explicit COLI_THINK=0 opts out, and an explicit client
+            # reasoning_effort / enable_thinking still wins over both.
+            if ARCH == "qwen38" and os.environ.get("COLI_THINK", "1") != "0":
                 reasoning_effort = "xhigh"
             elif os.environ.get("COLI_THINK", "0") == "1":
                 reasoning_effort = "high"
@@ -5117,7 +5125,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None:
-            if ARCH == "qwen38":
+            # The same opt-out as the OpenAI path above, so the two cannot drift.
+            if ARCH == "qwen38" and os.environ.get("COLI_THINK", "1") != "0":
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True

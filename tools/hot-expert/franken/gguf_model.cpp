@@ -81,6 +81,34 @@ std::vector<uint64_t> get_u64_arr(const gguf_context * ctx, const std::string & 
     return out;
 }
 
+// Reads a KV that llama.cpp normally writes as one scalar per model but that
+// a hybrid-layer model may instead write as one GGUF array entry per block
+// (glm5next.attention.head_count_kv, observed 2026-09-23 -- see
+// gguf_model.h's head_count_kv comment). Absent key: arr_out left empty,
+// returns def. Scalar key: arr_out left empty, returns get_u32()'s value
+// (unchanged behaviour from before this helper existed). Array key: arr_out
+// filled one entry per element (reusing get_u64_arr's width handling,
+// narrowed to u32), returns the array's MAX as the scalar fallback.
+uint32_t get_u32_scalar_or_arr(const gguf_context * ctx, const std::string & key,
+                                std::vector<uint32_t> & arr_out, uint32_t def = 0) {
+    arr_out.clear();
+    int64_t kid = gguf_find_key(ctx, key.c_str());
+    if (kid < 0) return def;
+    if (gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
+        return get_u32(ctx, key, def);
+    }
+    std::vector<uint64_t> v = get_u64_arr(ctx, key);
+    arr_out.reserve(v.size());
+    uint32_t mx = def;
+    bool any = false;
+    for (uint64_t x : v) {
+        uint32_t x32 = (uint32_t) x;
+        arr_out.push_back(x32);
+        if (!any || x32 > mx) { mx = x32; any = true; }
+    }
+    return any ? mx : def;
+}
+
 void load_hparams(const gguf_context * ctx, HParams & hp) {
     const std::string & a = hp.arch;
     auto k = [&](const char * suf) { return a + "." + suf; };
@@ -90,7 +118,7 @@ void load_hparams(const gguf_context * ctx, HParams & hp) {
     hp.expert_count             = get_u32(ctx, k("expert_count"));
     hp.expert_used_count        = get_u32(ctx, k("expert_used_count"));
     hp.head_count                = get_u32(ctx, k("attention.head_count"));
-    hp.head_count_kv             = get_u32(ctx, k("attention.head_count_kv"));
+    hp.head_count_kv             = get_u32_scalar_or_arr(ctx, k("attention.head_count_kv"), hp.head_count_kv_layers);
     hp.full_attention_interval   = get_u32(ctx, k("full_attention_interval"), 4);
     hp.expert_ff_len             = get_u32(ctx, k("expert_feed_forward_length"));
     hp.expert_shared_ff_len      = get_u32(ctx, k("expert_shared_feed_forward_length"));

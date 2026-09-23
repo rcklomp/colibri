@@ -92,7 +92,22 @@ struct HParams {
     uint32_t expert_count            = 0;
     uint32_t expert_used_count       = 0;
     uint32_t head_count              = 0;
+    // attention.head_count_kv: llama.cpp convention is one scalar for the
+    // whole model, but a hybrid model that mixes GDN and QSA/full-attention
+    // layers with different KV head counts per layer may write it as a
+    // GGUF ARRAY instead (observed 2026-09-23 on the real GLM-5.3-Flash
+    // UD-IQ4_XS split: "gguf key 'glm5next.attention.head_count_kv' has an
+    // unexpected scalar type" -- it is GGUF_TYPE_ARRAY, one u32 per block).
+    // head_count_kv stays a plain scalar for every existing caller: when
+    // the file wrote an array, gguf_model.cpp sets it to that array's MAX
+    // (a safe upper bound for anything still sizing a single buffer from
+    // it); when the file wrote a scalar (or nothing), it is that value
+    // exactly, unchanged from before this field grew an array sibling.
+    // head_count_kv_layers is empty in the plain-scalar case and holds one
+    // entry per block when the file carried the array -- use
+    // head_count_kv_at(il) to get the layer-accurate value either way.
     uint32_t head_count_kv           = 0;
+    std::vector<uint32_t> head_count_kv_layers;
     uint32_t full_attention_interval = 4;
     uint32_t expert_ff_len           = 0;
     uint32_t expert_shared_ff_len    = 0;
@@ -130,6 +145,15 @@ struct HParams {
     std::array<uint64_t, MAX_PLE_NGRAM> ple_layer_multipliers{};
     std::array<uint32_t, MAX_PLE_HEADS> ple_head_offsets{};
     std::array<uint32_t, MAX_PLE_HEADS> ple_head_vocab_sizes{};
+
+    // The layer-accurate KV head count: head_count_kv_layers[il] when the
+    // file carried a per-layer array and il is in range, else the scalar
+    // head_count_kv (covers both "the file only ever had one scalar" and
+    // "il is out of the array's range").
+    uint32_t head_count_kv_at(int il) const {
+        if (il >= 0 && (size_t) il < head_count_kv_layers.size()) return head_count_kv_layers[(size_t) il];
+        return head_count_kv;
+    }
 
     uint32_t ple_n_heads() const {
         return ple_ngram_size >= 2 ? (ple_ngram_size - 1) * ple_heads_per_ngram : 0;

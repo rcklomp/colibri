@@ -46,6 +46,16 @@ void Recorder::tap_ints(const char * name, int il, const std::vector<int> & v,
     taps_[t.key] = std::move(t);
 }
 
+void Recorder::tap_host(const char * name, int il, const std::vector<float> & v) {
+    if (!on_) return;
+    TapValue t;
+    t.name = name;
+    t.key  = make_key(name, il, "");
+    t.il   = il;
+    t.data = v;
+    taps_[t.key] = std::move(t);
+}
+
 const TapValue * Recorder::get(const std::string & key) const {
     auto it = taps_.find(key);
     return it == taps_.end() ? nullptr : &it->second;
@@ -221,6 +231,18 @@ DecodeRunner::DecodeRunner(DecodeModel & model, const DecodeConfig & cfg)
             st.idx_pooled = (uint16_t *) AR((size_t) max_blocks * IDX_DIM * sizeof(uint16_t));
         }
     }
+
+    // --hip-graph: one device int a card for the position, and an empty
+    // graph slot per (card, residual bank). Allocated whether or not the knob
+    // is on -- 4 bytes a card -- so the knob changes nothing about placement.
+    graphs_.assign((size_t) n_dev * N_RES_BANKS, GraphSlot{});
+    dpos_.assign((size_t) n_dev, nullptr);
+    dpos_val_.assign((size_t) n_dev, -1);
+    for (int d = 0; d < n_dev; ++d) {
+        dpos_[(size_t) d] = model_.dev(d).alloc_i32(1);
+        owned_.push_back(dpos_[(size_t) d]);
+    }
+    if (cfg_.hip_graph_bucket < 1) cfg_.hip_graph_bucket = 1024;
     bind(0);
 }
 
@@ -253,6 +275,8 @@ void DecodeRunner::bind(int d) {
 }
 
 DecodeRunner::~DecodeRunner() {
+    for (size_t i = 0; i < graphs_.size(); ++i)
+        if (graphs_[i].exec) model_.dev((int)(i / N_RES_BANKS)).graph_destroy(graphs_[i].exec);
     for (void * p : owned_) bep_->free_buf(p);
 }
 
@@ -633,6 +657,59 @@ void DecodeRunner::layer_ffn(const LayerWeights & L, int il, Recorder & rec) {
     rec.tap(*bep_, "ffn_out",         il, blk_     + tl * N_EMBD, N_EMBD);
 }
 
+// ------------------------------------------------------ --hip-graph --
+//
+// What a card's graph bakes in, and why each is safe to bake:
+//   * every buffer pointer -- the runner's scratch, the layer state, the
+//     weights and the backend's scratch are allocated once; the backend's
+//     epoch catches the one exception (a later, larger prefill chunk growing
+//     a split-K or attention scratch) and forces a recapture;
+//   * the residual BANK -- res_hc[bank] is a different pointer per bank, so
+//     each bank has its own graph (two a card);
+//   * the grids of the QSA row stage -- sized for the position class's
+//     largest n_kv, with the kernels bounding themselves by the position they
+//     read; and whether the radix select is a node at all, which is the same
+//     class-level decision (the kernel returns for a row the budget covers).
+// What is NOT baked: the position. It lives in one device int a card that
+// the graph's last node advances, and the host re-uploads it only when its
+// shadow disagrees with pos_ (after an eager chunk, a rollback, a reset).
+// The embedding and PLE uploads go to fixed buffers BEFORE card 0's graph,
+// through the staging ring as before, so the graph never sees a slot.
+void DecodeRunner::seg_begin(int d) {
+    seg_capturing_ = false;
+    seg_replay_ = false;
+    if (!graph_now_) return;
+    Backend & be = model_.dev(d);
+    GraphSlot & g = graphs_[(size_t) d * N_RES_BANKS + (size_t) bank_];
+    if (dpos_val_[(size_t) d] != pos_) {
+        be.upload(dpos_[(size_t) d], &pos_, sizeof(int));   // stream-ordered, pinned
+        dpos_val_[(size_t) d] = pos_;
+    }
+    if (g.exec && g.cls == graph_cls_ && g.epoch == be.graph_epoch()) {
+        be.graph_launch(g.exec);
+        seg_replay_ = true;
+        return;
+    }
+    be.graph_capture_begin(dpos_[(size_t) d], graph_bound_);
+    seg_capturing_ = true;
+}
+
+void DecodeRunner::seg_end(int d) {
+    if (!graph_now_) return;
+    Backend & be = model_.dev(d);
+    if (seg_capturing_) {
+        GraphSlot & g = graphs_[(size_t) d * N_RES_BANKS + (size_t) bank_];
+        be.graph_capture_end(&g.exec);
+        g.cls   = graph_cls_;
+        g.epoch = be.graph_epoch();
+        be.graph_launch(g.exec);
+    }
+    // the graph's last node advanced the device copy
+    dpos_val_[(size_t) d] = pos_ + 1;
+    seg_capturing_ = false;
+    seg_replay_ = false;
+}
+
 // ------------------------------------------------------------- one token --
 //
 // Design 9.2's token: embed on device 0, the layer ranges in order, the
@@ -656,6 +733,20 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
     if (capture_now || cfg_.jitter > 0.0f || cfg_.sync_debug) flush = true;
     last_flushed_ = flush;
 
+    // The graph path is the decode token and nothing else: a tap is a
+    // download in the middle of the body, --jitter is a host round trip per
+    // layer and --sync-debug is a drain per launch, none of which a replay
+    // can do -- so any of them runs this token eagerly.
+    graph_now_ = cfg_.hip_graph > 0 && T == 1 && !capture_now &&
+                 cfg_.jitter <= 0.0f && !cfg_.sync_debug &&
+                 model_.dev(model_.dev_of(model_.il0())).graph_capable();
+    if (graph_now_) {
+        graph_cls_   = pos_ / cfg_.hip_graph_bucket;
+        graph_bound_ = std::min((graph_cls_ + 1) * cfg_.hip_graph_bucket, cfg_.ctx);
+    }
+    const bool gate = cfg_.prequeue_gate && !capture_now &&
+                      cfg_.jitter <= 0.0f && !cfg_.sync_debug;
+
     bank_ = (int) (chunks_ & (N_RES_BANKS - 1));
     ++chunks_;
 
@@ -665,6 +756,7 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
     // Nothing may overwrite this bank until the card downstream has copied
     // the PREVIOUS chunk that used it out. A stream wait, not a host one.
     bep_->boundary_wait_free(bank_);
+    if (gate) bep_->prequeue_hold();
 
     // One gather and ONE upload for the chunk: a per-token host copy in the
     // issue path is host time, and at T = 256 it would be 256 of them.
@@ -682,12 +774,19 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
     rec.tap(*bep_, "model.input_embed", -1, x_ + tl * N_EMBD, N_EMBD);
 
     // "the wide residual starts as hc identical copies of the embedding" (324)
-    bep_->hc_broadcast(x_, res_hc_, T_);
-    rec.tap(*bep_, "hc_init", -1, res_hc_ + tl * HC_DIM, HC_DIM);
+    // With --hip-graph it is the first node of card 0's graph instead, which
+    // is why it moves below the timer there; eagerly it stays exactly here.
+    if (!graph_now_) {
+        bep_->hc_broadcast(x_, res_hc_, T_);
+        rec.tap(*bep_, "hc_init", -1, res_hc_ + tl * HC_DIM, HC_DIM);
+    }
     xn_ready_ = false;
 
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).timer_start();
     const auto t_issue0 = std::chrono::steady_clock::now();
+
+    seg_begin(cur_dev_);
+    if (graph_now_ && !seg_replay_) bep_->hc_broadcast(x_, res_hc_, T_);
 
     for (int il = model_.il0(); il <= model_.il1(); ++il) {
         const LayerWeights & L = model_.layer(il);
@@ -704,6 +803,9 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
                             cur_dev_, il - 1, L.dev);
             std::fflush(stdout);
             const int src_dev = cur_dev_;
+            // the source card's share ends BEFORE boundary_recv records the
+            // event on its stream, so the event follows its graph
+            seg_end(src_dev);
             float * src = pool_[src_dev].res_hc[bank_];
             bind(L.dev);
             // This card is about to have bank_ written under it by the peer
@@ -712,7 +814,9 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
             bep_->boundary_recv(res_hc_, model_.dev(src_dev), src,
                                 (size_t) T_ * HC_DIM * sizeof(float), bank_);
             xn_ready_ = false;             // xn was computed on the other card
+            seg_begin(L.dev);
         }
+        if (seg_replay_) continue;         // this card's share was one graph launch
 
         bep_->set_debug_context(L.recurrent ? "GDN layer" : "QSA layer", il);
         if (L.is_ple) { layer_ple(L, rec); xn_ready_ = false; }
@@ -757,7 +861,7 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
     // The head reads the LAST ROW only: a prompt needs one logit vector, and
     // running lm_head (248 320 rows of Q6_K, 521 MB) over a whole chunk would
     // be the single most expensive thing in a prefill for no use at all.
-    if (model_.have_head()) {
+    if (model_.have_head() && !seg_replay_) {
         bep_->set_debug_context("head", -1);
         bep_->rms_norm_mul(res_hc_ + tl * HC_DIM, model_.head_norm(), head_xn_,
                            N_EMBD, HC, HC_DIM, eps_);
@@ -774,11 +878,13 @@ int DecodeRunner::step(const int32_t * tokens, int T, const float * ple_emb, Rec
 
         bep_->argmax(logits_all_, (int) model_.lm_head().rows, greedy_id_);
     }
+    seg_end(cur_dev_);
 
     // Everything above only ENQUEUED work; the first thing that waits is
     // below. This is the host cost of a token.
     last_issue_ms_ = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - t_issue0).count();
+    if (gate) model_.dev(model_.dev_of(model_.il0())).prequeue_release();
 
     if (cfg_.progress && pos_ == 0) { std::printf("  head done on dev%d\n", cur_dev_); std::fflush(stdout); }
     for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).prof_end_token();

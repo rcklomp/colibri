@@ -46,6 +46,8 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1850,9 +1852,13 @@ void k_qsa_qk_post(const float * __restrict__ qfull,   // [N_Q_HEADS][2*HEAD_DIM
                    float * __restrict__ qcur, float * __restrict__ gate,
                    float * __restrict__ gsig, float * __restrict__ kcur,
                    float * __restrict__ idxq,
-                   int pos0, float eps) {
+                   int pos0, float eps, const int * __restrict__ dpos) {
     __shared__ float lds[QKPOST_THREADS];
     __shared__ float sv[HEAD_DIM];
+    // --hip-graph: the position is DEVICE-RESIDENT (one int the replayed
+    // graph advances itself), so the captured launch never changes. Same
+    // integer either way, so the same arithmetic.
+    if (dpos) pos0 = *dpos;
 
     // grid.y is the chunk: a row's post-processing is independent of every
     // other row's, so this is the decode kernel with one more grid axis.
@@ -1957,8 +1963,9 @@ __global__ void k_rope_imrope(float * __restrict__ x, int head_dim, int n_rot, i
 __global__ void k_kv_store_q8_0(const float * __restrict__ k, const float * __restrict__ v,
                                 int8_t * __restrict__ kqs, __half * __restrict__ ksc,
                                 int8_t * __restrict__ vqs, __half * __restrict__ vsc,
-                                int cell0, int T) {
+                                int cell0, int T, const int * __restrict__ dpos) {
     // one workgroup per (tensor, head, token, 32-element block); 32 lanes
+    if (dpos) cell0 = *dpos;                              // --hip-graph
     const int which = blockIdx.z;                         // 0 = K, 1 = V
     const int h     = blockIdx.y;
     const int t     = blockIdx.x / (HEAD_DIM / 32);
@@ -1998,10 +2005,12 @@ void k_idx_pool_chunk(const float * __restrict__ k_new, float * __restrict__ sum
                       float * __restrict__ raw0, int pos0, int T,
                       const float * __restrict__ k_norm, float eps,
                       unsigned short * __restrict__ pooled,
-                      float * __restrict__ dbg_pooled, float * __restrict__ dbg_roped) {
+                      float * __restrict__ dbg_pooled, float * __restrict__ dbg_roped,
+                      const int * __restrict__ dpos) {
     __shared__ float s_v[IDX_DIM];
     __shared__ float s_r[IDX_DIM];
     const int i = threadIdx.x;
+    if (dpos) pos0 = *dpos;                               // --hip-graph
 
     float run  = sum[i];
     float fill = raw0[i];
@@ -2083,7 +2092,14 @@ struct QsaRowsD {
     size_t cand_stride;  // row pitch of the radix candidate lists
     size_t part_stride;  // row pitch of the attention partials
     size_t ml_stride;    // row pitch of mbuf / lbuf
+    // --hip-graph: when set, pos0 is READ from here at the top of every
+    // kernel instead of taken from the launch, so a captured launch is
+    // position-free. The grids are then sized for the position CLASS's
+    // largest n_kv and every kernel below already returns (or strides) past
+    // its own row's extent -- the same guards a row block relies on.
+    const int * dpos;
 };
+__device__ __forceinline__ void qsa_resolve(QsaRowsD & j) { if (j.dpos) j.pos0 = *j.dpos; }
 __device__ __forceinline__ int qsa_n_kv(const QsaRowsD & j, int t) { return j.pos0 + t + 1; }
 __device__ __forceinline__ int qsa_n_blocks(const QsaRowsD & j, int t) {
     return (qsa_n_kv(j, t) + j.ratio - 1) / j.ratio;
@@ -2100,6 +2116,7 @@ __device__ __forceinline__ int qsa_n_sel(const QsaRowsD & j, int t) {
 __global__ __launch_bounds__(IDXS_THREADS)
 void k_idx_scan(const unsigned short * __restrict__ pooled, const float * __restrict__ q,
                 float * __restrict__ scores, QsaRowsD j) {
+    qsa_resolve(j);
     const int row  = blockIdx.y;
     const int n_blocks = qsa_n_blocks(j, row);
     q      += (size_t) row * IDX_N_HEADS * IDX_DIM;
@@ -2149,6 +2166,7 @@ void k_idx_scan(const unsigned short * __restrict__ pooled, const float * __rest
 __global__ void k_qsa_expand(const float * __restrict__ blk_scores,
                              float * __restrict__ cell, int * __restrict__ sel,
                              QsaRowsD jr) {
+    qsa_resolve(jr);
     const int row = blockIdx.y;
     const int j   = blockIdx.x * blockDim.x + threadIdx.x;
     const int n_kv      = qsa_n_kv(jr, row);
@@ -2200,6 +2218,7 @@ void k_topk_radix_select(const float * __restrict__ scores,
     // has its selection -- k_qsa_expand wrote the identity -- and returns
     // before the first __syncthreads(), which is uniform across the workgroup
     // and therefore safe.
+    qsa_resolve(jr);
     const int row  = blockIdx.x;
     const int n    = qsa_n_kv(jr, row);
     const int kw   = qsa_n_sel(jr, row);
@@ -2337,6 +2356,7 @@ void k_attn_flash_split(const int8_t * __restrict__ Kqs, const __half * __restri
     // budget is min(n_kv, indexer_top_k + r - 1) and n_kv grows by one a row
     // -- so the grid is sized for the LAST row and a workgroup past its own
     // row's chunk count returns. The return is uniform over the workgroup.
+    qsa_resolve(jr);
     const int row   = blockIdx.z;
     const int n_sel = qsa_n_sel(jr, row);
     if (blockIdx.x * ATTN_CHUNK >= n_sel) return;
@@ -2445,6 +2465,7 @@ void k_attn_combine(const float * __restrict__ partial, const float * __restrict
                     const float * __restrict__ lbuf, const float * __restrict__ gsig,
                     float * __restrict__ out, float * __restrict__ out_gated,
                     QsaRowsD jr) {
+    qsa_resolve(jr);
     const int row       = blockIdx.y;
     const int n_chunks  = (qsa_n_sel(jr, row) + ATTN_CHUNK - 1) / ATTN_CHUNK;
     partial   += (size_t) row * jr.part_stride;
@@ -2517,6 +2538,39 @@ void k_argmax_final(const float * __restrict__ pv, const int * __restrict__ pi,
     if (t == 0) out[0] = si[0];
 }
 
+// ================================================ --hip-graph helpers =====
+//
+// The last node of every captured per-card body: the device-resident position
+// moves on by one, so the NEXT replay of the same graph reads the next
+// position without a host write. The host only uploads the position when its
+// shadow says the device copy is stale (a prefill chunk ran eagerly, a serving
+// rollback moved pos) -- see DecodeRunner::seg_begin.
+__global__ void k_pos_advance(int * __restrict__ pos) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) pos[0] += 1;
+}
+
+// --prequeue-gate: a diagnostic, not an engine path. The first card is the
+// only one whose token is NOT pre-queued (cards 1 and 2 wait on a boundary
+// event while the host enqueues their whole body), so its per-op profile
+// intervals can be the HOST's issue period rather than the kernels' time
+// (README "Step 3b"). This kernel holds the card's stream until the host has
+// enqueued the whole token, making card 0 pre-queued like the others; if its
+// small-GEMV bandwidth then reads like cards 1-2, the gap was issue-bound.
+// `flag` is host-mapped coherent memory the host bumps to `want`; the wall
+// clock bounds the wait so a full hardware queue (the host blocking on an
+// enqueue while the card waits on the host) can only cost `limit` ticks,
+// never a hang -- `timed_out` then says the number is not what it claims.
+__global__ void k_prequeue_gate(const volatile unsigned * flag, unsigned want,
+                                volatile unsigned * timed_out,
+                                unsigned long long limit) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const unsigned long long t0 = wall_clock64();
+    while (*flag < want) {
+        if (wall_clock64() - t0 > limit) { *timed_out = 1u; break; }
+        __builtin_amdgcn_s_sleep(8);
+    }
+}
+
 // ========================================================== backend ======
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -2579,6 +2633,10 @@ enum ProfClass {
     PC_COPY,        // device-to-device copies
     PC_BOUNDARY,    // the hyper-connection residual crossing to the next card
     PC_ARGMAX,      // greedy sampling on the device
+    // --hip-graph: one replayed per-card body, launch to the next event --
+    // i.e. the card's whole layer range (and the head on the last card) as
+    // ONE interval. prof_graph_replay_us is this class.
+    PC_GRAPH,
     // Only with a deferred profile (--prefill-pipeline): the interval from
     // the end of one chunk's enqueued work on this card to the first op of
     // the next. It IS this card's idle time, so `total - gap` is its busy
@@ -2603,6 +2661,7 @@ const char * prof_name(int c) {
         case PC_COPY:         return "copy";
         case PC_BOUNDARY:     return "boundary_p2p";
         case PC_ARGMAX:       return "argmax";
+        case PC_GRAPH:        return "graph_replay";
         case PC_GAP:          return "gap_idle";
         default:              return "copy";
     }
@@ -2657,6 +2716,7 @@ public:
             HIP_IGNORE(hipEventDestroy(stage_ev_[i]));
         }
         HIP_IGNORE(hipFree(amax_v_)); HIP_IGNORE(hipFree(amax_i_));
+        if (gate_host_) HIP_IGNORE(hipHostFree((void *) gate_host_));
         for (int i = 0; i < N_BANKS; ++i) HIP_IGNORE(hipEventDestroy(drained_[i]));
         HIP_IGNORE(hipEventDestroy(bnd_)); HIP_IGNORE(hipStreamDestroy(stream_));
         for (auto & e : ev_) HIP_IGNORE(hipEventDestroy(e));
@@ -3094,6 +3154,7 @@ public:
         HIP_IGNORE(hipFree(gemv_part_));
         HIP_CHECK(hipMalloc(&gemv_part_, want * sizeof(float)));
         part_floats_ = want;
+        ++epoch_;
     }
     // One counter per output row for the in-kernel split reduce. It is
     // allocated once and is ALWAYS zero between launches -- the workgroup that
@@ -3107,6 +3168,7 @@ public:
         HIP_CHECK(hipMalloc(&gemv_cnt_, want * sizeof(int)));
         HIP_CHECK(hipMemset(gemv_cnt_, 0, want * sizeof(int)));
         cnt_rows_ = want;
+        ++epoch_;
     }
     void set_gemv_lds(int on) override { gemv_lds_ = on; }
     void set_gemv_fused_reduce(int on) override { gemv_fused_reduce_ = on; }
@@ -3372,7 +3434,7 @@ public:
         mark(PC_QSA);
         last_op_ = "kv_store_q8_0";
         k_kv_store_q8_0<<<grid, WAVE, 0, stream_>>>(k, v, kqs, (__half *) ksc, vqs,
-                                                    (__half *) vsc, cell0, T);
+                                                    (__half *) vsc, cell0, T, gpos());
     }
     void idx_pool_chunk(const float * k_new, float * sum, float * raw0, int pos0,
                         int T, const float * kn, float eps, uint16_t * pooled,
@@ -3380,7 +3442,8 @@ public:
         mark(PC_QSA);
         last_op_ = "idx_pool_chunk";
         k_idx_pool_chunk<<<1, IDX_DIM, 0, stream_>>>(k_new, sum, raw0, pos0, T,
-                                         kn, eps, (unsigned short *) pooled, dbg_p, dbg_r);
+                                         kn, eps, (unsigned short *) pooled, dbg_p, dbg_r,
+                                         gpos());
     }
     void idx_scan(const uint16_t * pooled, const float * q, float * s, int n_blocks) override {
         const int nsub = IDXS_THREADS / WAVE;
@@ -3405,7 +3468,7 @@ public:
         k_qsa_qk_post<<<dim3(N_Q_HEADS + N_KV_HEADS + IDX_N_HEADS, (unsigned) T),
                         QKPOST_THREADS, 0, stream_>>>(
             qfull, kraw, idxraw, q_norm, k_norm, iq_norm,
-            qcur, gate, gsig, kcur, idxq, pos0, eps);
+            qcur, gate, gsig, kcur, idxq, pos0, eps, gpos());
     }
     void qsa_expand(const float * bs, float * c, int * sel, int n_kv, int q, int r,
                     int tail, int sel_identity) override {
@@ -3427,6 +3490,7 @@ public:
         const size_t nc = (size_t) cand_cap_ * (size_t) cand_rows_;
         HIP_CHECK(hipMalloc(&cand_key_, nc * sizeof(uint32_t)));
         HIP_CHECK(hipMalloc(&cand_idx_, nc * sizeof(int)));
+        ++epoch_;
     }
 
     // How many query rows of a chunk this card has scratch for. Everything a
@@ -3469,9 +3533,25 @@ public:
         d.cand_stride = (size_t) cand_cap_;
         d.part_stride = part_stride_;
         d.ml_stride   = ml_stride_;
+        d.dpos        = gpos();
         const int rows     = j.rows;
         const int last     = rows - 1;                      // the widest row
-        const int n_kv_max = j.pos0 + rows;                 // == n_kv of `last`
+        // Captured for --hip-graph, the launch must serve EVERY position of
+        // the class, so the grids are sized for the class's largest n_kv and
+        // the kernels bound themselves by the position they read. Whether the
+        // radix select is a node is decided on that bound too: a class that
+        // can exceed the budget carries it, and it returns for a row whose
+        // budget still covers its cache -- the device-side condition the
+        // kernel already had for a block of rows.
+        int n_kv_max = j.pos0 + rows;                       // == n_kv of `last`
+        if (gpos()) {
+            if (rows != 1 || graph_bound_ < n_kv_max) {
+                std::fprintf(stderr, "qsa_rows: captured with rows=%d bound=%d < n_kv=%d\n",
+                             rows, graph_bound_, n_kv_max);
+                std::abort();
+            }
+            n_kv_max = graph_bound_;
+        }
         const int nblk_max = (n_kv_max + j.ratio - 1) / j.ratio;
         const int nsel_max = n_kv_max < j.budget ? n_kv_max : j.budget;
         const bool ident   = nsel_max >= n_kv_max;          // uniform over a block?
@@ -3699,7 +3779,145 @@ public:
         return (double) ms;
     }
 
+    // ---- --hip-graph: the decode token's per-card body as one hipGraph ----
+    //
+    // Captured from THIS card's own stream only, so a graph never spans a
+    // device: the boundary's event record/wait and the P2P copy stay plain
+    // stream operations issued by the host BETWEEN the cards' graph launches,
+    // exactly where they were (decode_graph.cpp step()). A graph launch is
+    // stream-ordered like any other op, so the bank-drain handshake is
+    // unchanged.
+    bool graph_capable() const override { return true; }
+
+    void graph_capture_begin(const int * dpos, int n_kv_bound) override {
+        dev_ensure(dev_);
+        if (capturing_) { std::fprintf(stderr, "graph_capture_begin: already capturing on dev%d\n", dev_); std::abort(); }
+        gpos_ = dpos;
+        graph_bound_ = n_kv_bound;
+        capture_launch0_ = launches_;
+        capture_epoch_ = epoch_;
+        capture_t0_ = std::chrono::steady_clock::now();
+        // Relaxed: nothing in the body calls a stream-unsafe API (the ensure_*
+        // growths cannot fire at T = 1 after construction, and the epoch check
+        // below catches it if one ever does), and hipSetDevice from
+        // dev_ensure must stay legal while a stream captures.
+        HIP_CHECK(hipStreamBeginCapture(stream_, hipStreamCaptureModeRelaxed));
+        capturing_ = true;
+    }
+
+    void graph_capture_end(void ** exec) override {
+        dev_ensure(dev_);
+        // the last node: the device-resident position moves on by one
+        k_pos_advance<<<1, 1, 0, stream_>>>(const_cast<int *>(gpos_));
+        hipGraph_t g = nullptr;
+        HIP_CHECK(hipStreamEndCapture(stream_, &g));
+        capturing_ = false;
+        gpos_ = nullptr;
+        graph_nodes_last_ = (int)(launches_ - capture_launch0_) + 1;
+        // what the capture enqueued is not this token's launches: the replay
+        // below is ONE launch, and prof_launches_per_token must say so
+        launches_ = capture_launch0_;
+        if (epoch_ != capture_epoch_) {
+            std::fprintf(stderr, "graph_capture_end: a scratch buffer was reallocated DURING the "
+                                 "capture on dev%d; the graph would hold a freed pointer\n", dev_);
+            std::abort();
+        }
+        hipGraphExec_t ex = (hipGraphExec_t) *exec;
+        if (ex) {
+            // Same topology (a new position class of the same kind): only the
+            // kernel parameters -- the grids -- moved, so update in place,
+            // which is far cheaper than a fresh instantiate.
+            hipGraphNode_t err_node = nullptr;
+            hipGraphExecUpdateResult r = hipGraphExecUpdateError;
+            const hipError_t e = hipGraphExecUpdate(ex, g, &err_node, &r);
+            if (e == hipSuccess && r == hipGraphExecUpdateSuccess) {
+                ++graph_updates_;
+            } else {
+                (void) hipGetLastError();          // not sticky; clear it
+                HIP_IGNORE(hipGraphExecDestroy(ex));
+                ex = nullptr;
+            }
+        }
+        if (!ex) {
+            HIP_CHECK(hipGraphInstantiate(&ex, g, nullptr, nullptr, 0));
+            ++graph_instantiates_;
+        }
+        HIP_IGNORE(hipGraphDestroy(g));
+        *exec = (void *) ex;
+        ++graph_captures_;
+        graph_capture_ms_ += std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - capture_t0_).count();
+    }
+
+    void graph_launch(void * exec) override {
+        mark(PC_GRAPH);                    // ensures THIS device
+        last_op_ = "graph_launch";
+        HIP_CHECK(hipGraphLaunch((hipGraphExec_t) exec, stream_));
+        ++graph_replays_;
+    }
+
+    void graph_destroy(void * exec) override {
+        if (!exec) return;
+        dev_ensure(dev_);
+        HIP_IGNORE(hipGraphExecDestroy((hipGraphExec_t) exec));
+    }
+
+    long long graph_epoch() const override { return epoch_; }
+
+    void graph_report(FILE * out) override {
+        std::fprintf(out, "hip_graph_dev%d nodes=%d captures=%lld instantiates=%lld updates=%lld "
+                          "replays=%lld capture_ms_total=%.2f",
+                     dev_, graph_nodes_last_, graph_captures_, graph_instantiates_,
+                     graph_updates_, graph_replays_, graph_capture_ms_);
+        if (gate_host_) std::fprintf(out, " prequeue_holds=%u prequeue_timed_out=%u",
+                                     gate_seq_, gate_host_[16]);
+        std::fprintf(out, "\n");
+    }
+
+    // ---- --prequeue-gate (diagnostic): see k_prequeue_gate ----
+    void prequeue_hold() override {
+        dev_ensure(dev_);
+        if (!gate_host_) {
+            HIP_CHECK(hipHostMalloc((void **) &gate_host_, 128,
+                                    hipHostMallocMapped | hipHostMallocCoherent));
+            std::memset((void *) gate_host_, 0, 128);
+            HIP_CHECK(hipHostGetDevicePointer((void **) &gate_dev_, (void *) gate_host_, 0));
+            int khz = 0;
+            if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev_) != hipSuccess || khz <= 0)
+                khz = 100000;              // gfx11's 100 MHz constant clock
+            gate_limit_ = (unsigned long long) khz * 1000ull * 2ull;   // 2 s
+        }
+        ++gate_seq_;
+        k_prequeue_gate<<<1, 1, 0, stream_>>>(gate_dev_, gate_seq_, gate_dev_ + 16, gate_limit_);
+    }
+    void prequeue_release() override {
+        if (!gate_host_) return;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        __atomic_store_n(&gate_host_[0], gate_seq_, __ATOMIC_SEQ_CST);
+    }
+
 private:
+    // captured launches read the position from here (nullptr = eager path)
+    const int * gpos() const { return capturing_ ? gpos_ : nullptr; }
+    bool        capturing_ = false;
+    const int * gpos_ = nullptr;
+    int         graph_bound_ = 0;
+    long long   capture_launch0_ = 0;
+    long long   capture_epoch_ = 0;
+    std::chrono::steady_clock::time_point capture_t0_{};
+    // Bumped by every reallocation of a buffer a T = 1 kernel is handed
+    // (split-K partials and counters, attention partials, radix candidates):
+    // a graph captured before it holds a freed pointer, so the runner
+    // recaptures whenever this moved.
+    long long   epoch_ = 0;
+    int         graph_nodes_last_ = 0;
+    long long   graph_captures_ = 0, graph_instantiates_ = 0, graph_updates_ = 0, graph_replays_ = 0;
+    double      graph_capture_ms_ = 0.0;
+    volatile unsigned * gate_host_ = nullptr;   // [0] the flag, [16] timed-out
+    unsigned *          gate_dev_  = nullptr;
+    unsigned            gate_seq_  = 0;
+    unsigned long long  gate_limit_ = 0;
+
     // ---- profiling state ----
     // --sync-debug: validate everything enqueued since the PREVIOUS mark, so
     // the op named in the message is the one that actually faulted rather
@@ -3728,6 +3946,11 @@ private:
         debug_check("the next op's mark()");
         last_cls_ = cls;
         ++launches_;                       // one op == one launch, except where noted
+        // A capture is not a token's work: nothing it enqueues runs now, its
+        // bytes are charged by the replays' interval instead, and an event
+        // recorded into a capturing stream would become a graph node. The
+        // launch count above is kept -- it is the graph's node count.
+        if (capturing_) return;
         if (gemv_group >= 0 && gemv_group < GG_N) gemv_bytes_[gemv_group] += (double) bytes;
         // The sub-GEMV_SMALL_BYTES set, across groups: the launches that cannot
         // fill the card from their own bytes and therefore carry the launch
@@ -3804,6 +4027,7 @@ private:
         d.ratio = ratio; d.budget = budget;
         d.blk_stride = d.cell_stride = d.sel_stride = 0;
         d.cand_stride = 0; d.part_stride = 0; d.ml_stride = 0;
+        d.dpos = nullptr;
         return d;
     }
     void alloc_attn_rows(int rows) {
@@ -3820,6 +4044,7 @@ private:
         HIP_CHECK(hipMalloc(&partial_, part_stride_ * (size_t) rows * sizeof(float)));
         HIP_CHECK(hipMalloc(&mbuf_,    ml_stride_   * (size_t) rows * sizeof(float)));
         HIP_CHECK(hipMalloc(&lbuf_,    ml_stride_   * (size_t) rows * sizeof(float)));
+        ++epoch_;
     }
     int        gemv_lds_ = 1;
     int        gemv_min_rows_ = 1024;

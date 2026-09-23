@@ -1129,3 +1129,149 @@ the checkpoint covers them. It buys 2 tokens of the 42, and it would make
 `reused` come out at `prompt + completion + 2` — which is a MISMATCH against
 `ledger_expect_reuse` for any family whose ledger is on. Two tokens is not
 worth teaching this engine to disagree with the gateway's arithmetic.
+
+## Decode step 2 (2026-09-23): `--hip-graph`, the token body as one graph a card
+
+§L0-PERF-1 closed step 1 with the reading that fewer launches at the same
+~7 µs floor buy nothing, and that the lever left is the ~335 dependent
+dispatches a card a token. `--hip-graph 1` captures each card's share of a
+decode token -- its layer range, plus `output_hc_*`, `lm_head` and the argmax
+on the last card -- into a hipGraph once, and replays it. It fuses nothing and
+reorders nothing: **the same kernels in the same order with the same
+integers**, so the replay is bit-identical to the eager token by construction,
+and the gate below checks that rather than trusting it. Off by default;
+`FRANKEN_HIP_GRAPH=1` does the same for `--serve`. **Nothing here has been run
+on a GPU.**
+
+### What is parameterised, and how
+
+A graph bakes its kernel arguments, so everything that moves per token had to
+stop being an argument:
+
+| per-token quantity | how the graph gets it |
+|---|---|
+| the position (RoPE in `qsa_qk_post`, the cell `kv_store_q8_0` writes, the block `idx_pool_chunk` pools, `n_kv`/`n_blocks`/`n_sel`/the tail/the identity test of the five QSA-row kernels) | **device-resident**: one `int` a card, read at the top of those 8 kernels when the launch passes its pointer (eager launches pass nullptr and take the argument as before). The graph's LAST node is `k_pos_advance` (`*pos += 1`), so the next replay reads the next position with no host write. The host uploads it (4 bytes, staging ring, stream-ordered) only when its shadow disagrees with `pos_`: after an eager chunk, a serving rollback, a reset. |
+| the QSA-row grids (`idx_scan` ~n_blocks/8 WGs, `qsa_expand` n_kv/256, `attn_flash_split` n_sel/64) | sized for the **position class**'s largest cache: class = `pos / --hip-graph-bucket` (default 1024), bound = `min((class+1)*bucket, ctx)`. Every one of those kernels already returned or grid-strode past its own row's extent (the row-block guards of PREFILL.md section 11), so the idle workgroups do nothing; a scanned block's score is one wave's work whatever the grid, so the grid cannot move a bit. A new class re-captures and `hipGraphExecUpdate`s the existing executable in place (a fresh instantiate only when the topology changed). |
+| the top-k skip (budget covers the cache -> identity, no radix select) | a class-level decision, as the row block already made it: the radix-select node is captured iff the class bound exceeds the budget, and the kernel returns for any row whose budget still covers its cache (`qsa_expand` wrote the identity for it). So classes 0-1 carry no radix node, class 2 (n_kv 2049-3072) does and it returns for n_kv <= 2051. |
+| the residual bank (`res_hc[chunk & 1]` is a different pointer) | **two graphs a card**, one a bank. |
+| the embedding and PLE rows, and their staging slot | uploaded to the SAME fixed buffers as before, through the staging ring, BEFORE card 0's graph -- the graph never sees a slot. |
+| the routed-id log pointer (`--verbose` / `--routing`) | never in a graph: a capturing token runs eagerly. |
+
+A backend `epoch` moves whenever a buffer a T = 1 kernel is handed is
+reallocated (split-K partials and counters, attention partials, radix
+candidates -- e.g. a later, larger prefill chunk growing `gemv_part_`); a graph
+captured under another epoch would hold a freed pointer, so it is recaptured.
+A reallocation DURING a capture aborts with a message.
+
+### What the graph does not capture
+
+- **The boundaries.** A graph is one card's stream only; nothing spans a
+  device. The event record on the source, the wait and the
+  `hipMemcpyPeerAsync` on the destination, the `drained_[bank]` record and the
+  bank-free wait stay host-issued stream operations BETWEEN the cards' graph
+  launches, exactly where they were -- `seg_end(src)` runs before
+  `boundary_recv` records its event, `seg_begin(dst)` after the copy. A graph
+  launch is stream-ordered like any op, so the pipeline's handshake is
+  unchanged. Per token the host now issues ~15 calls (3 graph launches, 2
+  uploads, the boundary ops, the timer events) against ~1 004 launches.
+- **Taps, `--jitter`, `--sync-debug`, the routing capture, and every T > 1
+  chunk**: those tokens run eagerly. So `--sync-debug` cannot debug a graph;
+  for the first graph run use `AMD_SERIALIZE_KERNEL=3 AMD_SERIALIZE_COPY=3`
+  instead.
+- **The per-op profile.** Inside a graph there are no per-op events; `--profile`
+  charges a card's whole replay to one class, **`prof_graph_replay_us`**. The
+  per-class/per-projection numbers need `--hip-graph 0`.
+- **The first token of each (card, bank, class)** pays the capture (plus an
+  update or instantiate); `--time` now runs two warm-ups (one a bank) so the
+  counted tokens are all replays at short depth, and at depth the capture
+  recurs once per bucket. `hip_graph_dev<i> nodes= captures= instantiates=
+  updates= replays= capture_ms_total=` is printed after `--time`.
+
+### The oracle, and why taps alone would not have been one
+
+The recorder's taps are downloads in the middle of the body, so the recorded
+token (the prompt's last) always runs eagerly. With `--chunk 1` the prompt's
+first five tokens run through the graphs and the taps see the state they left
+(K/V cells, pooled keys, GDN state, both conv windows) -- but not a graph's own
+arithmetic. So `--greedy N` now also records **`greedy_ids`** (the continuation
+plus the final argmax, compared EXACTLY -- a cosine over ids would pass one
+wrong id in seventeen) and **`greedy_logits`** (all 248 320 logits of the last
+step). Every greedy token runs through the graphs. Both keys read MISSING
+against llama.cpp's dump, which does not carry them.
+
+**ISA:** the device-resident position is an integer load at the top of 8
+kernels. Compiled both ways (`hipcc -O3 --cuda-device-only -S`,
+`~/bench/franken/hipgraph_isa/`): 55 kernels have an identical instruction
+stream; the 8 touched ones have an identical FP-op multiset (VOPD dual ops
+split and counted) -- no multiply-add changed between fused and split, the
+thing `-ffp-contract=fast` decides by scheduling -- and an identical FP-op
+sequence in 7 of them; `k_idx_pool_chunk` issues the same ops in a different
+schedule order. The GPU gates (c) below are what settle it.
+
+**CPU:** `franken_decode_cpu --layers 0-3 --no-head --chunk 1` against a dump of
+the pre-change binary: 138 of 138 taps `cos=1.000000 maxabs=0`; with the head
+and `--greedy 3`, `--chunk 6 --hip-graph 1` against `--chunk 1`:
+`greedy_ids exact=1`, `greedy_logits maxabs=0`, STEP2 PASS (the CPU backend has
+no graphs, so this checks the runner's rewiring and the new taps only).
+
+### Card 0's slow small GEMVs (97 vs ~160 GB/s): a hypothesis and the run that decides it
+
+What card 0 does that cards 1-2 do not: (1) it receives the token's two host
+uploads (embedding + PLE, ~10 KB each, staged H2D on its stream -- BEFORE the
+body, so they cannot slow a GEMV in the middle of it); (2) it holds the PLE
+layer (one extra 20 480-row GEMV, not in the small set); (3) **its token is not
+pre-queued.** Cards 1-2 sit on a boundary wait while the host enqueues their
+whole body; card 0 starts on the first op and is then fed at the host's issue
+rate (step 3b). The per-op profile charges event-to-event intervals, so on card
+0 an op shorter than the host's per-op issue time (a launch plus, under
+`--profile`, an event record) is charged the ISSUE time. The small set is
+exactly the ops short enough for that: ~96 launches of 3-5 MB, ~20-40 µs of
+kernel each. Two runs tell it apart from a card-intrinsic cause (clocks,
+power state):
+
+- **`--prequeue-gate 1`** (new, diagnostic): card 0's stream is held by a
+  one-thread spin kernel on a host-mapped flag until the host has enqueued the
+  whole token, then released -- card 0 becomes pre-queued like 1-2 (a 2 s wall
+  clock bound means a full hardware queue cannot hang it; `prequeue_timed_out`
+  says so if it happened). **If card 0's `prof_gemv_small_gbs` rises to ~160
+  under the gate, the gap was host issue and `--hip-graph` removes it by
+  construction.** The token time under the gate includes the issue time; read
+  the per-class numbers, not the median.
+- **`HIP_VISIBLE_DEVICES=1,0,2`** swaps which physical card is logical card 0.
+  If the slowness follows the logical position it is the feed; if it follows
+  the physical card it is the card (then `amd-smi metric -c` during the run).
+
+With `--hip-graph 1 --profile`, `prof_graph_replay_us` per card is the third
+reading: equal replay times on three cards with the same layer shapes (card 0
++1 PLE GEMV) would say the same thing from the other side.
+
+### The GPU commands (NOT run here; rig lock, gateway stopped, cards empty)
+
+```
+cd ~/src/colibri-m1/tools/hot-expert/franken/decode
+M=~/models/Qwen3.8-Flash-Next/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+T="248044 785 10945 315 1495 374"
+C="--model $M --tokens $T --devices 3 --layers 0-47"
+
+# (a) eager, the reference of the pair
+./franken_decode $C --ctx 512 --chunk 1 --greedy 16 --hip-graph 0 --dump ~/bench/franken/hg_off
+# (b) the graphs against it -- every tap cos=1.000000 maxabs=0, greedy_ids exact=1,
+#     greedy_logits maxabs=0, STEP2 PASS; first time under the serialisers
+AMD_SERIALIZE_KERNEL=3 AMD_SERIALIZE_COPY=3 \
+./franken_decode $C --ctx 512 --chunk 1 --greedy 16 --hip-graph 1 --oracle ~/bench/franken/hg_off
+./franken_decode $C --ctx 512 --chunk 1 --greedy 16 --hip-graph 1 --oracle ~/bench/franken/hg_off
+# (c) and against the pre-change binary's dump (c0c6545, knobs off == defaults):
+#     every tap maxabs=0 (the two greedy keys read MISSING there)
+./franken_decode $C --ctx 512 --chunk 1 --greedy 16 --hip-graph 1 --oracle ~/bench/franken/dec1_off
+
+# (d) short depth, A,B,B,A -- layers0_47_ms_median, issue_ms, hip_graph_dev<i>
+for g in 0 1 1 0; do ./franken_decode $C --ctx 262144 --time 32 --hip-graph $g; done
+# (e) 256k depth, A,B,B,A (26.06 -> 25.82 ms is the number to beat)
+for g in 0 1 1 0; do ./franken_decode $C --ctx 262144 --chunk 256 --gemm-lds 1 \
+    --time-prefill 262000 --time 32 --hip-graph $g; done
+# (f) attribution and card 0
+./franken_decode $C --ctx 262144 --time 32 --hip-graph 1 --profile     # prof_graph_replay_us
+./franken_decode $C --ctx 262144 --time 32 --profile --prequeue-gate 0
+./franken_decode $C --ctx 262144 --time 32 --profile --prequeue-gate 1
+HIP_VISIBLE_DEVICES=1,0,2 ./franken_decode $C --ctx 262144 --time 32 --profile
+```

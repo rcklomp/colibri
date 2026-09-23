@@ -1,4 +1,4 @@
-# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 11)
+# Franken-engine: architecture for three RX 7900 XTX (design, 2026-09-22, rev 12)
 
 The owner's brief (plan rev 45): a NEW engine, assembled from the parts of
 Colibri, llama.cpp, hipFire and hipEngine that measure best on this rig, and
@@ -298,6 +298,8 @@ llama.cpp is not the reference to beat, the 5-minute target of §6 is.
    ladder at 19k and 256k (the number), the quality harness at the L0
    format (the quality number). Gate: tok/s ≥ 40 at 256k, quality within the
    measured spread of llama.cpp's IQ3_S/IQ4_NL serving (record §F11-QUALITY).
-   **The depth number is measured (§L0-256K: 38.4 tok/s at 256k, 7.8 min
-   cold prompt); the gateway, accept_live and the quality number are what
-   remain of L0.**
+   **All measured (rev 12, 2026-09-23): §L0-256K 38.4 tok/s at 256k and a
+   7.8 min cold prompt; §L0-STEP4 accept_live and accept_ui PASS, first
+   token on screen 0.80 s; §L0-QUALITY 77.1 % vs llama.cpp's 80.0 % on 70
+   MMLU-Pro items, not distinguishable, needles 8/8 to 200k. L0 is
+   complete; the 4 % on the tok/s target has named owners.**

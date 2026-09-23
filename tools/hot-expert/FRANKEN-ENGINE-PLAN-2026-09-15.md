@@ -14,6 +14,19 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 62 (2026-09-23 10:00 CEST, 08:00 UTC) -- L0 QUALITY MEASURED, GATE MET
+> (record §L0-QUALITY).** Franken engine as served vs llama.cpp's Qwen3.8,
+> same 70 MMLU-Pro items, reasoning xhigh, 16k budget: 77.1 % vs 80.0 %,
+> McNemar p = 0.69, NOT DISTINGUISHABLE (the Franken arm carried the
+> gateway's 4 096-token reply cap: 10 truncations vs 7); needles 8/8 at
+> 30k-200k on both, the engine 1.2-1.9x faster. FRANKEN_GEMM_LDS=1 stays the
+> serving default. **L0 is complete: design §9.5's four steps and both
+> gates (>= 40 tok/s at 256k: 38.4, 4 % short with named owners; quality
+> within llama.cpp's spread: yes).** GLM restored, accept_live PASS. Next:
+> the named performance items (decode's small-matrix GEMVs and launch
+> floor; prefill's experts, per-row QSA, the down gather) and the reply
+> cap; then L0b/L5 (DeepSeek, GLM streamed: M2, M4).**
+>
 > **Rev 61 (2026-09-23 03:20 CEST, 01:20 UTC) -- L0 STEP 4 GATE MET: accept_live
 > PASS, accept_ui PASS on the Franken engine (record §L0-STEP4).** Browser
 > first token 0.80 s, warm new chat reused 4 839/4 883 at 0.45 s, follow-up

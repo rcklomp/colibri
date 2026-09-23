@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 61 (2026-09-23 03:20 CEST, 01:20 UTC) -- L0 STEP 4 GATE MET: accept_live
+> PASS, accept_ui PASS on the Franken engine (record §L0-STEP4).** Browser
+> first token 0.80 s, warm new chat reused 4 839/4 883 at 0.45 s, follow-up
+> 0.4 s; check 3's tolerance made template-aware (Qwen's markers cost 38
+> tokens a turn; the engine reused every token it held -- my renderer
+> diagnosis was wrong and the agent disproved it with the bytes). GLM
+> restored. What remains of L0: the quality number at the served settings
+> (decides FRANKEN_GEMM_LDS); then the perf items and the streamed models.**
+>
 > **Rev 60 (2026-09-23 03:05 CEST, 01:05 UTC) -- THIRD SERVE: FIRST TOKEN ON
 > SCREEN 0.8 s (record §L0-STEP4).** Async turn-boundary checkpoints,
 > resident PLE table, LDS GEMM served: Open WebUI new chat first token 0.81 s

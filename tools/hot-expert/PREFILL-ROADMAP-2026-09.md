@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 45, 2026-09-22)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 46, 2026-09-23)
+
+**Rev 46 (2026-09-23): the Franken engine (design rev 11, plan rev 60) served Open WebUI: first token on screen 0.81 s against GLM's 3.6-3.8 on the same tool block, warm new chat reused 4 839 tokens at 0.45 s ttft, cold 4.9k prompt 7.9 s; prefill at 256k depth 7.8 min against llama.cpp's 17 (record §L0-STEP4, §L0-256K). The TTFT track's numbers for GLM stand; the Franken engine is the successor once its follow-up reuse (a qwen38 renderer re-render) and quality are in.**
 
 **Rev 45 (2026-09-22): the first quality run (record §F11-QUALITY-1, to be written with the second) compared configurations, not models -- GLM on Colibri with reasoning off vs the others on llama.cpp at default reasoning, a 3 500-token budget that cut off 25 of 140 answers, 70 questions. Raw: GLM 56/70, DeepSeek 53/70, Qwen3.8 51/70, all NOT DISTINGUISHABLE; needles 8/8 everywhere. Second run `f11_quality2_chain.sh`: one engine (llama.cpp, `serve_alt.sh glm-llama` added), 210 questions, 16k budget. Nothing served changed; GLM on the Colibri gateway remains the daily service between runs.**
 

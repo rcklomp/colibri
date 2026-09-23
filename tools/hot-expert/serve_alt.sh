@@ -321,6 +321,14 @@ serve_alt_lock_release() {
 
 # ---------------------------------------------------------------------- alt-server lifecycle ---
 ensure_alt_stopped() {
+  # The Franken engine's container (started by ~/bench/franken_decode_docker.sh) is not
+  # $ALT_NAME and a host pkill by name does not reach it: three swaps back on 2026-09-23
+  # found 24 GB still on the cards. Stop it here, on every path that must empty the cards.
+  if docker ps -q -f "name=^/franken_engine\$" 2>/dev/null | grep -q .; then
+    echo "--- stopping the franken_engine container"
+    docker stop -t 5 franken_engine >/dev/null 2>&1 || true
+    wait_no_container franken_engine
+  fi
   if docker ps -aq -f "name=^/${ALT_NAME}\$" 2>/dev/null | grep -q .; then
     echo "--- stopping existing '$ALT_NAME' container"
     docker stop -t 10 "$ALT_NAME" >/dev/null 2>&1 || true

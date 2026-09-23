@@ -22,7 +22,11 @@
 > reuse still re-prefilled everything) plus launcher env (ledger) and
 > thinking-off for the UI -- all with the build. The engine runs inside the
 > ROCm 7.14 image (host ROCm 6.2 lacks libllama's libhipblas). GLM restored.
-> Next session: the reuse fixes, then accept_live/accept_ui PASS, quality.**
+> Second serve (00:05 UTC): the reuse fixes landed but per-chunk
+> checkpoints serialised the pipeline (prefill 42 s for 4.9k) and cold PLE
+> rows cost 3.8 s -- both known design items (async checkpoints, pinned PLE
+> table §9.1), with the build. Next session: run them, then
+> accept_live/accept_ui PASS, quality.**
 >
 > **Rev 58 (2026-09-22 22:05 CEST, 20:05 UTC) -- THE 256K NUMBER (record
 > §L0-256K, design rev 11).** Franken engine, Qwen3.8-Flash-Next, three cards,

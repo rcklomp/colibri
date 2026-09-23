@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 66 (2026-09-23 23:40 CEST) -- M4 MEASURED (record §M4). The whole
+> measurement program M0-M5 is done.** Three cards streaming at once: 52 GB/s
+> (28 a card alone, 36 for the shared-link pair together); PCIe-aware
+> assignment gives the lone card ~44 % of the stream. GLM-5.3 on the
+> streamed path: ~19 ms a token of stream at ~1 GB missed -> ~25-30 tok/s
+> realistic. In build: L5 step 1 (DeepSeek-V4 on the engine, CPU oracle
+> first). Next: DeepSeek on the GPU; then GLM on the streamed path
+> (L0b/L1/L2).**
+>
 > **Rev 65 (2026-09-23 23:15 CEST) -- M2 MEASURED (record §M2, design rev 13).**
 > DeepSeek-V4-Flash misses 60 MB a token with 60 GB of experts resident: a
 > near-resident model, next after Qwen3.8 on the engine. GLM-5.3 misses

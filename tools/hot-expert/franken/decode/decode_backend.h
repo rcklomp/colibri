@@ -659,6 +659,46 @@ public:
     // The Q8_0 gather never needed this and still tiles: against its twin it
     // is the per-assignment body times eight op for op, every term fused.
     virtual void set_expert_gather(int) {}
+    // --moe-tile N / FRANKEN_MOE_TILE: how many assignments of one expert a
+    // wave of the row-gather takes at once. 4, 8 (the default) or 16; the
+    // gather kernels are templated on it.
+    //
+    // What it trades. At T = 256 a chunk has 2 560 assignments over at most
+    // 512 experts, so an expert averages FIVE and a tile of 8 is five-eighths
+    // full -- but its `a[TILE][4]` accumulators cost registers whether they
+    // are used or not, and k_moe_gate_up_iq3s_gather is at 213 VGPR, which is
+    // 7 waves a SIMD on a kernel that should be weight-bandwidth bound. A
+    // smaller tile reads the expert row more times (from L1/L2, not VRAM) and
+    // gets more waves in flight to hide the latency of the reads that do go
+    // to VRAM. Which way that lands is a measurement, and this is the knob
+    // that takes it.
+    //
+    // It CANNOT move a bit, whatever it is set to: an assignment's column
+    // accumulates in the same order whichever tile it lands in. That is the
+    // design of these kernels and, since 2026-09-23, something the ISA is
+    // checked for rather than asserted (PREFILL.md section 8.1).
+    virtual void set_moe_tile(int) {}
+    // --expert-gather-serial 0|1 / FRANKEN_GATHER_SERIAL: which SHAPE the
+    // gate/up row-gather takes for the assignments of a tile.
+    //
+    //   0 (default)  the tile: the w/block loop outside, TE accumulator sets
+    //                inside, so a decoded weight block is reused from
+    //                REGISTERS across the tile. Measured bit-identical on the
+    //                device, 2026-09-22, and 213 VGPR / 7 waves a SIMD for
+    //                IQ3_S -- which is the problem, on a kernel that should be
+    //                waiting for VRAM.
+    //   1            the m loop outside, four (IQ3_S) or two (IQ4_XS) scalar
+    //                accumulators inside: literally the per-assignment
+    //                kernel's body with a different activation row, so its
+    //                94 / 65 VGPR and 16 waves a SIMD. The expert row is then
+    //                re-read once a tile member, from L1 rather than VRAM.
+    //
+    // This is the same trade the down gather has no choice about (PREFILL.md
+    // section 8.1 -- there the tiled shape was not bit-identical, because the
+    // accumulate lives inside a shared primitive and the backend contracted it
+    // differently under the two register pressures). Here both shapes are
+    // exact, and which is FASTER is a measurement nobody has taken.
+    virtual void set_gather_serial(int) {}
     // --sync-debug: drain and check after every launch and copy, so the op
     // named in a fault message is the one that faulted rather than whichever
     // launch was in flight when the queue drained.

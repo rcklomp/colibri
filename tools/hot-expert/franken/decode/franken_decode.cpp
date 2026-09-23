@@ -110,6 +110,14 @@ void usage(const char * p) {
         "                           query rows (default 256). The block is what\n"
         "                           replaced the per-row host loop; it is bounded\n"
         "                           by this because cell_scores is O(n_kv) a row\n"
+        "          [--moe-tile N]    assignments of one expert a gather wave takes\n"
+        "                           at once: 4, 8 (default) or 16. Bit-identical\n"
+        "                           at any of them; it trades the expert row's\n"
+        "                           cache re-reads against occupancy\n"
+        "          [--expert-gather-serial 0|1] gate/up gather shape: 0 tiles the\n"
+        "                           assignments (registers, 213 VGPR / occ 7 on\n"
+        "                           IQ3_S), 1 walks them (94 VGPR / occ 16, the\n"
+        "                           row re-read from L1). Bit-identical either way\n"
         "          [--sync-debug]   drain and check after every launch and copy;\n"
         "                           names the failing op, its class, layer and device\n"
         "          [--dump DIR]     write this run's taps in the oracle's own format,\n"
@@ -193,6 +201,8 @@ int main(int argc, char ** argv) {
     bool sync_debug = false;
     int expert_gather = 3;
     int qsa_row_mb = 256;
+    int moe_tile = 8;
+    int gather_serial = 0;
     int prefill_pipeline = 1;
     int gemm_lds = 0;
 
@@ -218,6 +228,8 @@ int main(int argc, char ** argv) {
         else if (a == "--no-expert-gather")       expert_gather = 0;
         else if (a == "--expert-gather" && i + 1 < argc) expert_gather = std::atoi(argv[++i]);
         else if (a == "--qsa-row-mb" && i + 1 < argc) qsa_row_mb = std::atoi(argv[++i]);
+        else if (a == "--moe-tile" && i + 1 < argc) moe_tile = std::atoi(argv[++i]);
+        else if (a == "--expert-gather-serial" && i + 1 < argc) gather_serial = std::atoi(argv[++i]);
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--jitter" && i + 1 < argc) jitter = (float) std::atof(argv[++i]);
         else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
@@ -282,6 +294,8 @@ int main(int argc, char ** argv) {
             b->set_sync_debug(sync_debug);
             b->set_expert_gather(expert_gather);
             b->set_qsa_row_mb(qsa_row_mb);
+            b->set_moe_tile(moe_tile);
+            b->set_gather_serial(gather_serial);
             b->set_gemm_lds(gemm_lds);
             if (profile) b->prof_defer(prefill_pipeline != 0);
         }

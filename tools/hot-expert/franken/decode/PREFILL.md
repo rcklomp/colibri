@@ -417,3 +417,78 @@ only the per-assignment path. Together they say how much of the expert time
 the amortisation is carrying and how much of the QSA time was the loop.
 
 **Not measured here:** anything on a GPU by the agent that wrote this section.
+
+## 12. The expert gather: two shapes and three tile sizes, all exact (item 2)
+
+The experts are 0.69 ms of the 1.63 ms prompt token a card and the weight
+bytes do not explain it. With `--expert-gather 3` a chunk reads each touched
+expert's row ONCE a tile, so at T = 256 a layer reads at most 512 experts
+rather than 2 560 assignments -- and the kernel that does most of it,
+`k_moe_gate_up_iq3s_gather`, was at **213 VGPR and 7 waves a SIMD**, on a
+kernel whose whole job is to wait for VRAM.
+
+That is the tile's doing, and not in the way it looks. At T = 256 a chunk has
+2 560 assignments over at most 512 experts, so an expert averages FIVE: a tile
+of 8 is five-eighths full and its `a[TILE][4]` accumulators cost registers
+whether an assignment uses them or not. Cutting the tile alone does not fix it
+-- IQ3_S is still 189 VGPR at TILE 4 -- because most of the register set is
+the decode's, replicated across the tile by the unrolled `m` loop.
+
+So there are now two knobs, both of them bit-neutral, and the point of both is
+that the choice becomes a measurement:
+
+`--moe-tile 4|8|16` (`FRANKEN_MOE_TILE`, default 8) -- the assignments a wave
+takes at once. The gather kernels and the counting sort are templated on it.
+
+`--expert-gather-serial 0|1` (`FRANKEN_GATHER_SERIAL`, default 0) -- the SHAPE
+of the gate/up gather. 0 is the tile: block loop outside, TILE accumulator
+sets inside, a decoded block reused from registers. 1 is the shape the down
+gather has no choice about (section 8.1): the `m` loop outside, four (IQ3_S)
+or two (IQ4_XS) scalar accumulators inside, the expert row re-read once a tile
+member from L1 instead of once from registers.
+
+| kernel | VGPR | waves/SIMD |
+|---|---|---|
+| `k_moe_gate_up_iq3s` (per assignment) | 94 | 16 |
+| `iq3s_gather` tile 4 / 8 / 16, shape 0 | 189 / 213 / 215 | 8 / 7 / 7 |
+| `iq3s_gather` tile 4 / 8 / 16, shape 1 | 99 / 119 / 127 | 12 / 12 / 10 |
+| `k_moe_gate_up_iq4xs` (per assignment) | 65 | 16 |
+| `iq4xs_gather` tile 4 / 8 / 16, shape 0 | 78 / 95 / 126 | 16 / 16 / 10 |
+| `iq4xs_gather` tile 4 / 8 / 16, shape 1 | 71 / 79 / 85 | 16 / 16 / 16 |
+| `down_iq4nl_gather` tile 4 / 8 / 16 | 32 / 31 / 31 | 16 |
+| `down_q8_0_gather` tile 4 / 8 / 16 | 16 / 23 / 37 | 16 |
+
+No spills anywhere. **The sweep worth running first is `--expert-gather-serial
+1` against 0 at `--moe-tile 8`**, because that is 7 waves against 12 on the
+kernel that dominates, and the only thing it costs is L1 traffic on a 360 B to
+1 KB row.
+
+**Why none of this can move a bit, from the ISA rather than from an argument.**
+Against the per-assignment kernel's float-op multiset:
+
+| kernel | fma_mix | fma | fmac | mul | add |
+|---|---|---|---|---|---|
+| `k_moe_gate_up_iq3s` | 5 | 10 | 30 | 41 | 18 |
+| `iq3s_gather<TILE, serial>` , any TILE | 5 | 10 | 30 | 41 | 18 |
+| `iq3s_gather<4, tile>` | 15 | 40 | 120 | 121 | 72 |
+| `iq3s_gather<8, tile>` | 35 | 80 | 240 | 281 | 144 |
+| `iq3s_gather<16, tile>` | 75 | 160 | 480 | 601 | 288 |
+
+The serial shape is literally the per-assignment body -- the same instruction
+multiset, not a similar one. The tiled shape is that body TIMES the tile in
+`fma`, `fmac` and `add`, with `fma_mix` and `mul` lower because the
+subexpressions that do not depend on `m` are CSEd, which is the signature of
+"same arithmetic, one copy of the common part" and agrees with the tiled
+shape's measured bit-identity on the device (section 8). `iq4xs` has the same
+table at its own constants (3 / 6 / 18 / 25 / 12, times the tile).
+
+**Not measured here:** anything on a GPU by the agent that wrote this section.
+The two sweeps to run are
+
+```
+--time-prefill 8192 --chunk 256 --gemm-lds 1 --profile [--expert-gather-serial 1]
+--time-prefill 8192 --chunk 256 --gemm-lds 1 --profile --moe-tile 4|8|16
+```
+
+and `prof_expert_gather_us` is the number they move.
+

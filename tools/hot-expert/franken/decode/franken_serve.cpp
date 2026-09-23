@@ -753,6 +753,8 @@ public:
             b->set_gemv_burst(env_int("FRANKEN_GEMV_BURST", 4));
             b->set_expert_gather(env_int("FRANKEN_EXPERT_GATHER", 3));
             b->set_qsa_row_mb(env_int("FRANKEN_QSA_ROW_MB", 256));
+            b->set_moe_tile(env_int("FRANKEN_MOE_TILE", 8));
+            b->set_gather_serial(env_int("FRANKEN_GATHER_SERIAL", 0));
             // 0 is bit-exact against the decode kernel; 1 and 2 reassociate K
             // (franken_decode.cpp's --gemm-lds). Serving defaults to 0.
             b->set_gemm_lds(env_int("FRANKEN_GEMM_LDS", 0));

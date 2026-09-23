@@ -1020,12 +1020,28 @@ void k_moe_down_q8_0(const unsigned char * __restrict__ base, size_t expert_stri
 // L1 for the rest of the tile, and every column accumulates in exactly the
 // order the one-assignment kernel used -- which is what keeps a chunk
 // bit-identical to T decode steps.
+// The DEFAULT tile. It is a template parameter rather than a constant because
+// what it should be is a measurement, and the number that makes it one is the
+// AVERAGE ASSIGNMENTS AN EXPERT: at T = 256 a chunk has 2 560 assignments over
+// at most 512 experts, so a tile of 8 is on average five-eighths full and its
+// `a[MOE_TILE_E][4]` accumulators are paid for in registers whether they are
+// used or not. k_moe_gate_up_iq3s_gather is at 213 VGPR, which is 7 waves a
+// SIMD on a kernel that is supposed to be weight-bandwidth bound. Smaller
+// tiles trade amortisation for occupancy and the profile is what should pick,
+// so --moe-tile does (4, 8 or 16; anything else falls back to 8).
+//
+// The tile size CANNOT move a bit: an assignment's column is accumulated in
+// the same order whatever tile it lands in, which is the whole design of
+// these kernels. Checked the way PREFILL.md section 8.1 checks everything
+// now -- the ISA op multiset of each instantiation against the
+// per-assignment kernel's, times the tile.
 #define MOE_TILE_E 8
 
 // Counting sort of the assignments by expert, plus the tile table, in one
 // workgroup of N_EXPERT threads. The scatter order inside an expert is
 // whatever the atomics give, which does not matter: every assignment writes
 // its own output column.
+template <int TE>
 __global__ __launch_bounds__(N_EXPERT)
 void k_moe_sort(const int * __restrict__ ids, int n,
                 int * __restrict__ order, int * __restrict__ tile_exp,
@@ -1044,7 +1060,7 @@ void k_moe_sort(const int * __restrict__ ids, int n,
     __syncthreads();
 
     const int c  = hist[t];
-    const int tc = (c + MOE_TILE_E - 1) / MOE_TILE_E;
+    const int tc = (c + TE - 1) / TE;
     base[t]  = c;
     tbase[t] = tc;
     __syncthreads();
@@ -1066,12 +1082,12 @@ void k_moe_sort(const int * __restrict__ ids, int n,
         order[atomicAdd(&cur[e], 1)] = i;
     }
 
-    for (int k = 0; k * MOE_TILE_E < c; ++k) {
+    for (int k = 0; k * TE < c; ++k) {
         const int idx = t0 + k;
         if (idx >= n_tiles_max) break;
         tile_exp[idx] = t;
-        tile_off[idx] = start + k * MOE_TILE_E;
-        tile_cnt[idx] = min(MOE_TILE_E, c - k * MOE_TILE_E);
+        tile_off[idx] = start + k * TE;
+        tile_cnt[idx] = min(TE, c - k * TE);
     }
 }
 
@@ -1083,8 +1099,22 @@ void k_moe_sort(const int * __restrict__ ids, int n,
     if (cnt <= 0) return;                                                             \
     const int tid = threadIdx.x;                                                      \
     const int toff = tile_off[blockIdx.y];                                            \
-    int cols[MOE_TILE_E], xb[MOE_TILE_E];
+    int cols[TE], xb[TE];
 
+// SER: the m loop OUTER and four scalar accumulators, which is the shape the
+// down gather had to take to be bit-identical (section 8.1 of PREFILL.md) and
+// which here is about REGISTERS instead. The tiled shape holds TE*4 live
+// accumulators on top of the IQ3_S decode's own working set and lands at 213
+// VGPR -- 7 waves a SIMD on a kernel that is supposed to be waiting on VRAM --
+// and it stays at 189 even with TE cut to 4, because the tile is not where
+// most of them go. The serial shape is literally k_moe_gate_up_iq3s's body
+// with a different x row, so it is that kernel's 94 VGPR and 16 waves, and it
+// reads the expert row TE times from L1 instead of once from registers.
+//
+// Which of those two wins is a measurement (--expert-gather-serial), not a
+// judgement. Neither can move a bit: the four accumulators, the block order
+// and the closing (a0+a1)+(a2+a3) are the same in both.
+template <int TE, bool SER>
 __global__ __launch_bounds__(WAVE)
 void k_moe_gate_up_iq3s_gather(const unsigned char * __restrict__ gate_base,
                                const unsigned char * __restrict__ up_base,
@@ -1099,7 +1129,7 @@ void k_moe_gate_up_iq3s_gather(const unsigned char * __restrict__ gate_base,
     MOE_GATHER_PROLOGUE(0)
     if (K & (IQ3S_BLOCK_WEIGHTS - 1)) return;            // bounded-safe
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
+    for (int m = 0; m < TE; ++m) {
         cols[m] = (m < cnt) ? order[toff + m] : 0;
         xb[m]   = (cols[m] / k_top) * K;
     }
@@ -1110,16 +1140,38 @@ void k_moe_gate_up_iq3s_gather(const unsigned char * __restrict__ gate_base,
     const int sh1 = 8 - 2 * l, sh2 = 7 - 2 * l, xoff = tid << 3;
     const int nblk = K >> 8;
 
-    float a[MOE_TILE_E][4];
+    float * out = blockIdx.z ? y_up : y_gate;
+
+    if constexpr (SER) {
+#pragma clang loop unroll(disable)
+        for (int m = 0; m < cnt; ++m) {
+            const float * xm = x + xb[m] + xoff;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            int b = 0;
+            for (; b + 3 < nblk; b += 4) {
+                a0 += m1n_iq3s_block_dot(A + (size_t)(b+0)*IQ3S_BLOCK_BYTES, c_iq3s_grid, xm + ((b+0)<<8), tid, ib32, sh1, sh2);
+                a1 += m1n_iq3s_block_dot(A + (size_t)(b+1)*IQ3S_BLOCK_BYTES, c_iq3s_grid, xm + ((b+1)<<8), tid, ib32, sh1, sh2);
+                a2 += m1n_iq3s_block_dot(A + (size_t)(b+2)*IQ3S_BLOCK_BYTES, c_iq3s_grid, xm + ((b+2)<<8), tid, ib32, sh1, sh2);
+                a3 += m1n_iq3s_block_dot(A + (size_t)(b+3)*IQ3S_BLOCK_BYTES, c_iq3s_grid, xm + ((b+3)<<8), tid, ib32, sh1, sh2);
+            }
+            for (; b < nblk; ++b)
+                a0 += m1n_iq3s_block_dot(A + (size_t)b*IQ3S_BLOCK_BYTES, c_iq3s_grid, xm + (b<<8), tid, ib32, sh1, sh2);
+            const float s = wave_sum((a0 + a1) + (a2 + a3));
+            if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
+        }
+        return;
+    }
+
+    float a[TE][4];
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m)
+    for (int m = 0; m < TE; ++m)
 #pragma unroll
         for (int u = 0; u < 4; ++u) a[m][u] = 0.0f;
 
     int b = 0;
     for (; b + 3 < nblk; b += 4) {
 #pragma unroll
-        for (int m = 0; m < MOE_TILE_E; ++m) {
+        for (int m = 0; m < TE; ++m) {
             if (m >= cnt) continue;
             const float * xm = x + xb[m] + xoff;
 #pragma unroll
@@ -1130,22 +1182,22 @@ void k_moe_gate_up_iq3s_gather(const unsigned char * __restrict__ gate_base,
     }
     for (; b < nblk; ++b) {
 #pragma unroll
-        for (int m = 0; m < MOE_TILE_E; ++m) {
+        for (int m = 0; m < TE; ++m) {
             if (m >= cnt) continue;
             a[m][0] += m1n_iq3s_block_dot(A + (size_t)b*IQ3S_BLOCK_BYTES, c_iq3s_grid,
                                           x + xb[m] + xoff + (b << 8), tid, ib32, sh1, sh2);
         }
     }
 
-    float * out = blockIdx.z ? y_up : y_gate;
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
+    for (int m = 0; m < TE; ++m) {
         if (m >= cnt) continue;
         const float s = wave_sum((a[m][0] + a[m][1]) + (a[m][2] + a[m][3]));
         if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
     }
 }
 
+template <int TE, bool SER>
 __global__ __launch_bounds__(WAVE)
 void k_moe_gate_up_iq4xs_gather(const unsigned char * __restrict__ gate_base,
                                 const unsigned char * __restrict__ up_base,
@@ -1160,7 +1212,7 @@ void k_moe_gate_up_iq4xs_gather(const unsigned char * __restrict__ gate_base,
     MOE_GATHER_PROLOGUE(0)
     if (K & (FK_IQ4XS_BLOCK_WEIGHTS - 1)) return;        // bounded-safe
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
+    for (int m = 0; m < TE; ++m) {
         cols[m] = (m < cnt) ? order[toff + m] : 0;
         xb[m]   = (cols[m] / k_top) * K;
     }
@@ -1170,14 +1222,34 @@ void k_moe_gate_up_iq4xs_gather(const unsigned char * __restrict__ gate_base,
     const int nblk = K >> 8;
     const int xoff = tid << 3;
 
-    float a[MOE_TILE_E][2];
+    float * out = blockIdx.z ? y_up : y_gate;
+
+    if constexpr (SER) {
+#pragma clang loop unroll(disable)
+        for (int m = 0; m < cnt; ++m) {
+            const float * xm = x + xb[m] + xoff;
+            float a0 = 0.0f, a1 = 0.0f;
+            int b = 0;
+            for (; b + 1 < nblk; b += 2) {
+                a0 += fk_iq4xs_block_dot(A + (size_t)(b+0)*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl, xm + ((b+0)<<8), tid);
+                a1 += fk_iq4xs_block_dot(A + (size_t)(b+1)*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl, xm + ((b+1)<<8), tid);
+            }
+            for (; b < nblk; ++b)
+                a0 += fk_iq4xs_block_dot(A + (size_t)b*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl, xm + (b<<8), tid);
+            const float s = wave_sum(a0 + a1);
+            if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
+        }
+        return;
+    }
+
+    float a[TE][2];
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) { a[m][0] = 0.0f; a[m][1] = 0.0f; }
+    for (int m = 0; m < TE; ++m) { a[m][0] = 0.0f; a[m][1] = 0.0f; }
 
     int b = 0;
     for (; b + 1 < nblk; b += 2) {
 #pragma unroll
-        for (int m = 0; m < MOE_TILE_E; ++m) {
+        for (int m = 0; m < TE; ++m) {
             if (m >= cnt) continue;
             const float * xm = x + xb[m] + xoff;
             a[m][0] += fk_iq4xs_block_dot(A + (size_t)(b+0)*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
@@ -1188,22 +1260,22 @@ void k_moe_gate_up_iq4xs_gather(const unsigned char * __restrict__ gate_base,
     }
     for (; b < nblk; ++b) {
 #pragma unroll
-        for (int m = 0; m < MOE_TILE_E; ++m) {
+        for (int m = 0; m < TE; ++m) {
             if (m >= cnt) continue;
             a[m][0] += fk_iq4xs_block_dot(A + (size_t)b*FK_IQ4XS_BLOCK_BYTES, c_kvals_iq4nl,
                                           x + xb[m] + xoff + (b << 8), tid);
         }
     }
 
-    float * out = blockIdx.z ? y_up : y_gate;
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
+    for (int m = 0; m < TE; ++m) {
         if (m >= cnt) continue;
         const float s = wave_sum(a[m][0] + a[m][1]);
         if (tid == 0) out[(size_t) cols[m] * rows + row] = s;
     }
 }
 
+template <int TE>
 __global__ __launch_bounds__(WAVE)
 void k_moe_down_iq4nl_gather(const unsigned char * __restrict__ base, size_t expert_stride,
                              size_t row_bytes, const int * __restrict__ order,
@@ -1216,7 +1288,7 @@ void k_moe_down_iq4nl_gather(const unsigned char * __restrict__ base, size_t exp
     MOE_GATHER_PROLOGUE(0)
     if (K & (IQ4NL_BLOCK_WEIGHTS - 1)) return;           // bounded-safe
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
+    for (int m = 0; m < TE; ++m) {
         cols[m] = (m < cnt) ? order[toff + m] : 0;
         xb[m]   = cols[m] * K;                           // h is [col][K]
     }
@@ -1259,6 +1331,7 @@ void k_moe_down_iq4nl_gather(const unsigned char * __restrict__ base, size_t exp
     }
 }
 
+template <int TE>
 __global__ __launch_bounds__(WAVE)
 void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expert_stride,
                             size_t row_bytes, const int * __restrict__ order,
@@ -1271,7 +1344,7 @@ void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expe
     MOE_GATHER_PROLOGUE(0)
     if (K % FK_Q8_0_BLOCK_WEIGHTS) return;               // bounded-safe
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
+    for (int m = 0; m < TE; ++m) {
         cols[m] = (m < cnt) ? order[toff + m] : 0;
         xb[m]   = cols[m] * K;
     }
@@ -1279,9 +1352,9 @@ void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expe
                             + (size_t) row * row_bytes;
     const int nblk = K / FK_Q8_0_BLOCK_WEIGHTS;
 
-    float acc[MOE_TILE_E];
+    float acc[TE];
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) acc[m] = 0.0f;
+    for (int m = 0; m < TE; ++m) acc[m] = 0.0f;
 
     // The inner statement is TEXTUALLY the per-assignment kernel's, down to
     // the primitive call. It used to hoist `d * qs[tid]` out of the column
@@ -1303,13 +1376,13 @@ void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expe
     // IQ4_NL; Q8_0 is here for a container that is not.
     for (int b = 0; b < nblk; ++b) {
 #pragma unroll
-        for (int m = 0; m < MOE_TILE_E; ++m)
+        for (int m = 0; m < TE; ++m)
             if (m < cnt) acc[m] += fk_q8_0_lane_dot(A + (size_t) b * FK_Q8_0_BLOCK_BYTES,
                                                     h + xb[m] + b * FK_Q8_0_BLOCK_WEIGHTS, tid);
     }
 
 #pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
+    for (int m = 0; m < TE; ++m) {
         if (m >= cnt) continue;
         const float s = wave_sum(acc[m]);
         if (tid == 0) eo[(size_t) cols[m] * rows + row] = s;
@@ -2960,16 +3033,25 @@ public:
     // count have tile_cnt 0 and their workgroups return immediately.
     // moe_gate_up and moe_down of one layer are handed the SAME ids, so the
     // second call reuses the first's sort rather than launching again.
+    // --moe-tile: the assignments a wave takes at once. Three instantiations,
+    // and the dispatch is a switch rather than a runtime loop bound because
+    // the accumulator array has to stay in registers.
+    int moe_tile() const { return moe_tile_ == 4 || moe_tile_ == 16 ? moe_tile_ : 8; }
+
     int moe_sort(const int * ids, int T) {
+        const int te = moe_tile();
         const int n  = N_EXPERT_USED * T;
-        const int nt = (n < N_EXPERT ? n : N_EXPERT) + ceil_div(n, MOE_TILE_E);
-        if (moe_ids_ == ids && moe_n_ == n) return nt;
-        if (n > moe_cap_) {
+        const int nt = (n < N_EXPERT ? n : N_EXPERT) + ceil_div(n, te);
+        if (moe_ids_ == ids && moe_n_ == n && moe_sorted_tile_ == te) return nt;
+        if (n > moe_cap_ || te != moe_alloc_tile_) {
             dev_ensure(dev_);
             HIP_IGNORE(hipFree(moe_order_));    HIP_IGNORE(hipFree(moe_tile_exp_));
             HIP_IGNORE(hipFree(moe_tile_off_)); HIP_IGNORE(hipFree(moe_tile_cnt_));
-            moe_cap_ = n;
-            const int ntc = (moe_cap_ < N_EXPERT ? moe_cap_ : N_EXPERT) + ceil_div(moe_cap_, MOE_TILE_E);
+            if (n > moe_cap_) moe_cap_ = n;
+            moe_alloc_tile_ = te;
+            // the smallest tile gives the most tiles, so size for it and the
+            // allocation survives a knob change mid-run
+            const int ntc = (moe_cap_ < N_EXPERT ? moe_cap_ : N_EXPERT) + ceil_div(moe_cap_, 4);
             HIP_CHECK(hipMalloc(&moe_order_,    (size_t) moe_cap_ * sizeof(int)));
             HIP_CHECK(hipMalloc(&moe_tile_exp_, (size_t) ntc * sizeof(int)));
             HIP_CHECK(hipMalloc(&moe_tile_off_, (size_t) ntc * sizeof(int)));
@@ -2977,10 +3059,17 @@ public:
         }
         mark(PC_EXP_GATHER);
         last_op_ = "moe_sort";
-        k_moe_sort<<<1, N_EXPERT, 0, stream_>>>(ids, n, moe_order_, moe_tile_exp_,
-                                                moe_tile_off_, moe_tile_cnt_, nt);
+        switch (te) {
+            case 4:  k_moe_sort<4><<<1, N_EXPERT, 0, stream_>>>(ids, n, moe_order_,
+                         moe_tile_exp_, moe_tile_off_, moe_tile_cnt_, nt); break;
+            case 16: k_moe_sort<16><<<1, N_EXPERT, 0, stream_>>>(ids, n, moe_order_,
+                         moe_tile_exp_, moe_tile_off_, moe_tile_cnt_, nt); break;
+            default: k_moe_sort<8><<<1, N_EXPERT, 0, stream_>>>(ids, n, moe_order_,
+                         moe_tile_exp_, moe_tile_off_, moe_tile_cnt_, nt); break;
+        }
         moe_ids_ = ids;
         moe_n_   = n;
+        moe_sorted_tile_ = te;
         return nt;
     }
 
@@ -3032,6 +3121,11 @@ public:
     void set_gemv_min_rows(int r) override { gemv_min_rows_ = r > 0 ? r : 1; }
     void set_gemm_lds(int m) override { gemm_lds_ = m; }
     void set_expert_gather(int mask) override { expert_gather_ = mask; }
+    void set_moe_tile(int te) override {
+        if (te != moe_tile_) moe_ids_ = nullptr;     // the tile table is stale
+        moe_tile_ = te;
+    }
+    void set_gather_serial(int on) override { gather_serial_ = on; }
     void gemv_expert(const Mat & W, int e, const float * x, float * y) override {
         Mat slice = W;
         slice.base = (const unsigned char *) W.base + (size_t) e * W.expert_stride;
@@ -3173,17 +3267,32 @@ public:
             const dim3 grid((unsigned) g.rows, (unsigned) nt, 2);
             mark(PC_EXP_GATHER);
             last_op_ = "moe_gate_up_gather";
+#define FK_GU_GATHER(KER, TE, SER) KER<TE, SER><<<grid, WAVE, 0, stream_>>>(                      \
+                (const unsigned char *) g.base, (const unsigned char *) u.base,      \
+                g.expert_stride, g.row_bytes, moe_order_, moe_tile_exp_,             \
+                moe_tile_off_, moe_tile_cnt_, x, yg, yu, (int) g.rows, (int) g.K,    \
+                N_EXPERT_USED)
+            const int sel = moe_tile() * 2 + (gather_serial_ ? 1 : 0);
             if (g.type == FK_Q_IQ3_S) {
-                k_moe_gate_up_iq3s_gather<<<grid, WAVE, 0, stream_>>>(
-                    (const unsigned char *) g.base, (const unsigned char *) u.base,
-                    g.expert_stride, g.row_bytes, moe_order_, moe_tile_exp_, moe_tile_off_,
-                    moe_tile_cnt_, x, yg, yu, (int) g.rows, (int) g.K, N_EXPERT_USED);
+                switch (sel) {
+                    case  8: FK_GU_GATHER(k_moe_gate_up_iq3s_gather, 4,  false); break;
+                    case  9: FK_GU_GATHER(k_moe_gate_up_iq3s_gather, 4,  true);  break;
+                    case 32: FK_GU_GATHER(k_moe_gate_up_iq3s_gather, 16, false); break;
+                    case 33: FK_GU_GATHER(k_moe_gate_up_iq3s_gather, 16, true);  break;
+                    case 17: FK_GU_GATHER(k_moe_gate_up_iq3s_gather, 8,  true);  break;
+                    default: FK_GU_GATHER(k_moe_gate_up_iq3s_gather, 8,  false); break;
+                }
             } else {
-                k_moe_gate_up_iq4xs_gather<<<grid, WAVE, 0, stream_>>>(
-                    (const unsigned char *) g.base, (const unsigned char *) u.base,
-                    g.expert_stride, g.row_bytes, moe_order_, moe_tile_exp_, moe_tile_off_,
-                    moe_tile_cnt_, x, yg, yu, (int) g.rows, (int) g.K, N_EXPERT_USED);
+                switch (sel) {
+                    case  8: FK_GU_GATHER(k_moe_gate_up_iq4xs_gather, 4,  false); break;
+                    case  9: FK_GU_GATHER(k_moe_gate_up_iq4xs_gather, 4,  true);  break;
+                    case 32: FK_GU_GATHER(k_moe_gate_up_iq4xs_gather, 16, false); break;
+                    case 33: FK_GU_GATHER(k_moe_gate_up_iq4xs_gather, 16, true);  break;
+                    case 17: FK_GU_GATHER(k_moe_gate_up_iq4xs_gather, 8,  true);  break;
+                    default: FK_GU_GATHER(k_moe_gate_up_iq4xs_gather, 8,  false); break;
+                }
             }
+#undef FK_GU_GATHER
             return;
         }
         const dim3 grid((unsigned) g.rows, (unsigned)(N_EXPERT_USED * T), 2);
@@ -3212,17 +3321,24 @@ public:
             const dim3 grid((unsigned) d.rows, (unsigned) nt, 1);
             mark(PC_EXP_GATHER);
             last_op_ = "moe_down_gather";
+#define FK_DN_GATHER(KER, TE) KER<TE><<<grid, WAVE, 0, stream_>>>(                     \
+                (const unsigned char *) d.base, d.expert_stride, d.row_bytes,       \
+                moe_order_, moe_tile_exp_, moe_tile_off_, moe_tile_cnt_,            \
+                h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED)
             if (d.type == FK_Q_IQ4_NL) {
-                k_moe_down_iq4nl_gather<<<grid, WAVE, 0, stream_>>>(
-                    (const unsigned char *) d.base, d.expert_stride, d.row_bytes,
-                    moe_order_, moe_tile_exp_, moe_tile_off_, moe_tile_cnt_,
-                    h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+                switch (moe_tile()) {
+                    case 4:  FK_DN_GATHER(k_moe_down_iq4nl_gather, 4);  break;
+                    case 16: FK_DN_GATHER(k_moe_down_iq4nl_gather, 16); break;
+                    default: FK_DN_GATHER(k_moe_down_iq4nl_gather, 8);  break;
+                }
             } else {
-                k_moe_down_q8_0_gather<<<grid, WAVE, 0, stream_>>>(
-                    (const unsigned char *) d.base, d.expert_stride, d.row_bytes,
-                    moe_order_, moe_tile_exp_, moe_tile_off_, moe_tile_cnt_,
-                    h, eo, (int) d.rows, (int) d.K, N_EXPERT_USED);
+                switch (moe_tile()) {
+                    case 4:  FK_DN_GATHER(k_moe_down_q8_0_gather, 4);  break;
+                    case 16: FK_DN_GATHER(k_moe_down_q8_0_gather, 16); break;
+                    default: FK_DN_GATHER(k_moe_down_q8_0_gather, 8);  break;
+                }
             }
+#undef FK_DN_GATHER
             return;
         }
         const dim3 grid((unsigned) d.rows, (unsigned)(N_EXPERT_USED * T), 1);
@@ -3705,6 +3821,10 @@ private:
     // Bit 0 (gate/up) is MEASURED bit-exact on three cards; bit 1 (down) is
     // measured NOT to be and is off until it is. See decode_backend.h.
     int        expert_gather_ = 3;
+    int        moe_tile_ = MOE_TILE_E;   // --moe-tile: 4, 8 or 16
+    int        gather_serial_ = 0;       // --expert-gather-serial
+    int        moe_sorted_tile_ = 0;     // the tile the current sort was built for
+    int        moe_alloc_tile_  = 0;
     int        dev_ = 0;
     char       name_[24] = {0};
     hipStream_t stream_{};

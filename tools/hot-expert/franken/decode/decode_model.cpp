@@ -33,6 +33,12 @@ int fk_type_of(ggml_type t) {
         case GGML_TYPE_IQ4_XS: return FK_Q_IQ4_XS;
         case GGML_TYPE_IQ3_S:  return FK_Q_IQ3_S;
         case GGML_TYPE_Q6_K:   return FK_Q_Q6_K;
+        case GGML_TYPE_Q4_K:    return FK_Q_Q4_K;
+        case GGML_TYPE_Q5_K:    return FK_Q_Q5_K;
+        case GGML_TYPE_IQ2_XXS: return FK_Q_IQ2_XXS;
+        case GGML_TYPE_IQ2_S:   return FK_Q_IQ2_S;
+        case GGML_TYPE_IQ3_XXS: return FK_Q_IQ3_XXS;
+        case GGML_TYPE_MXFP4:   return FK_Q_MXFP4;
         default:
             throw std::runtime_error(std::string("unsupported tensor type for L0 step 2: ") +
                                      ggml_type_name(t));

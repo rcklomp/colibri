@@ -61,6 +61,9 @@ public:
 
     bool loaded() const { return loaded_; }
     const std::string & dir() const { return dir_; }
+    // Whether the dump carries `key` (a readable file). The DeepSeek-V4 CLI
+    // uses it for its own required-point check (ds4_graph.cpp).
+    bool has(const std::string & key) const { return entries_.count(key) != 0; }
     size_t size() const { return entries_.size(); }
 
     // Compares every tap the recorder holds against the entry of the same

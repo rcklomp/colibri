@@ -60,6 +60,7 @@
 #define M1N_HALF_TO_F32(bits) FK_HALF_TO_F32(bits)
 #endif
 #include "../../m1/m1_native_decode.h"   // m1n_iq3s_block_dot, m1n_iq4nl_chunk_dot
+#include "ds4_quant.h"                    // the DeepSeek-V4 formats (Q4_K ... MXFP4)
 
 // ---------------------------------------------------------------- Q8_0 ----
 //
@@ -250,6 +251,12 @@ FK_QUAL size_t fk_row_bytes(int type, long long K) {
         case FK_Q_IQ4_XS: return (size_t)(K / FK_IQ4XS_BLOCK_WEIGHTS)  * FK_IQ4XS_BLOCK_BYTES;
         case FK_Q_IQ3_S:  return (size_t)(K / IQ3S_BLOCK_WEIGHTS)      * IQ3S_BLOCK_BYTES;
         case FK_Q_Q6_K:   return (size_t)(K / FK_Q6K_BLOCK_WEIGHTS)   * FK_Q6K_BLOCK_BYTES;
+        case FK_Q_Q4_K:    return (size_t)(K / FK_Q4K_BLOCK_WEIGHTS)    * FK_Q4K_BLOCK_BYTES;
+        case FK_Q_Q5_K:    return (size_t)(K / FK_Q5K_BLOCK_WEIGHTS)    * FK_Q5K_BLOCK_BYTES;
+        case FK_Q_IQ2_XXS: return (size_t)(K / FK_IQ2XXS_BLOCK_WEIGHTS) * FK_IQ2XXS_BLOCK_BYTES;
+        case FK_Q_IQ2_S:   return (size_t)(K / FK_IQ2S_BLOCK_WEIGHTS)   * FK_IQ2S_BLOCK_BYTES;
+        case FK_Q_IQ3_XXS: return (size_t)(K / FK_IQ3XXS_BLOCK_WEIGHTS) * FK_IQ3XXS_BLOCK_BYTES;
+        case FK_Q_MXFP4:   return (size_t)(K / FK_MXFP4_BLOCK_WEIGHTS)  * FK_MXFP4_BLOCK_BYTES;
         default:          return 0;
     }
 }

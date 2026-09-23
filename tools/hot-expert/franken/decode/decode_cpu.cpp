@@ -65,6 +65,24 @@ static_assert(offsetof(block_q8_0,   qs)       == FK_Q8_0_OFF_QS,        "q8_0 q
 static_assert(offsetof(block_iq4_xs, scales_h) == FK_IQ4XS_OFF_SCALES_H, "iq4_xs scales_h moved");
 static_assert(offsetof(block_iq4_xs, scales_l) == FK_IQ4XS_OFF_SCALES_L, "iq4_xs scales_l moved");
 static_assert(offsetof(block_iq4_xs, qs)       == FK_IQ4XS_OFF_QS,       "iq4_xs qs moved");
+// ds4_quant.h's layouts (DeepSeek-V4-Flash)
+static_assert(sizeof(block_q4_K)    == FK_Q4K_BLOCK_BYTES,    "block_q4_K size moved");
+static_assert(offsetof(block_q4_K, scales) == FK_Q4K_OFF_SCALES, "q4_K scales moved");
+static_assert(offsetof(block_q4_K, qs)     == FK_Q4K_OFF_QS,     "q4_K qs moved");
+static_assert(sizeof(block_q5_K)    == FK_Q5K_BLOCK_BYTES,    "block_q5_K size moved");
+static_assert(offsetof(block_q5_K, scales) == FK_Q5K_OFF_SCALES, "q5_K scales moved");
+static_assert(offsetof(block_q5_K, qh)     == FK_Q5K_OFF_QH,     "q5_K qh moved");
+static_assert(offsetof(block_q5_K, qs)     == FK_Q5K_OFF_QS,     "q5_K qs moved");
+static_assert(sizeof(block_iq2_xxs) == FK_IQ2XXS_BLOCK_BYTES, "block_iq2_xxs size moved");
+static_assert(offsetof(block_iq2_xxs, qs)  == FK_IQ2XXS_OFF_QS,  "iq2_xxs qs moved");
+static_assert(sizeof(block_iq2_s)   == FK_IQ2S_BLOCK_BYTES,   "block_iq2_s size moved");
+static_assert(offsetof(block_iq2_s, qs)     == FK_IQ2S_OFF_QS,     "iq2_s qs moved");
+static_assert(offsetof(block_iq2_s, qh)     == FK_IQ2S_OFF_QH,     "iq2_s qh moved");
+static_assert(offsetof(block_iq2_s, scales) == FK_IQ2S_OFF_SCALES, "iq2_s scales moved");
+static_assert(sizeof(block_iq3_xxs) == FK_IQ3XXS_BLOCK_BYTES, "block_iq3_xxs size moved");
+static_assert(offsetof(block_iq3_xxs, qs)  == FK_IQ3XXS_OFF_QS,  "iq3_xxs qs moved");
+static_assert(sizeof(block_mxfp4)   == FK_MXFP4_BLOCK_BYTES,  "block_mxfp4 size moved");
+static_assert(offsetof(block_mxfp4, qs)    == FK_MXFP4_OFF_QS,   "mxfp4 qs moved");
 
 namespace fk {
 
@@ -194,6 +212,73 @@ float row_dot(int type, const unsigned char * row, const float * x, int64_t K) {
                                             x + b * IQ3S_BLOCK_WEIGHTS + 8 * tid,
                                             tid, ib32, 8 - 2 * l, 7 - 2 * l);
                 }
+            }
+            return (float) a;
+        }
+        // ---- the DeepSeek-V4-Flash formats (ds4_quant.h) -------------------
+        // Same shape as the cases above: walk the 32 lanes of every block,
+        // each lane's partial from the shared decoder, summed in double.
+        case FK_Q_Q4_K: {
+            const int64_t nblk = K / FK_Q4K_BLOCK_WEIGHTS;
+            double a = 0.0;
+            for (int64_t b = 0; b < nblk; ++b) {
+                const unsigned char * bp = row + b * FK_Q4K_BLOCK_BYTES;
+                for (int tid = 0; tid < 32; ++tid)
+                    a += fk_q4k_block_dot(bp, x + b * FK_Q4K_BLOCK_WEIGHTS + 8 * tid, tid);
+            }
+            return (float) a;
+        }
+        case FK_Q_Q5_K: {
+            const int64_t nblk = K / FK_Q5K_BLOCK_WEIGHTS;
+            double a = 0.0;
+            for (int64_t b = 0; b < nblk; ++b) {
+                const unsigned char * bp = row + b * FK_Q5K_BLOCK_BYTES;
+                for (int tid = 0; tid < 32; ++tid)
+                    a += fk_q5k_block_dot(bp, x + b * FK_Q5K_BLOCK_WEIGHTS + 8 * tid, tid);
+            }
+            return (float) a;
+        }
+        case FK_Q_IQ2_XXS: {
+            const int64_t nblk = K / FK_IQ2XXS_BLOCK_WEIGHTS;
+            double a = 0.0;
+            for (int64_t b = 0; b < nblk; ++b) {
+                const unsigned char * bp = row + b * FK_IQ2XXS_BLOCK_BYTES;
+                for (int tid = 0; tid < 32; ++tid)
+                    a += fk_iq2xxs_block_dot(bp, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs,
+                                             x + b * FK_IQ2XXS_BLOCK_WEIGHTS + 8 * tid, tid);
+            }
+            return (float) a;
+        }
+        case FK_Q_IQ2_S: {
+            const int64_t nblk = K / FK_IQ2S_BLOCK_WEIGHTS;
+            double a = 0.0;
+            for (int64_t b = 0; b < nblk; ++b) {
+                const unsigned char * bp = row + b * FK_IQ2S_BLOCK_BYTES;
+                for (int tid = 0; tid < 32; ++tid)
+                    a += fk_iq2s_block_dot(bp, iq2s_grid, kmask_iq2xs,
+                                           x + b * FK_IQ2S_BLOCK_WEIGHTS + 8 * tid, tid);
+            }
+            return (float) a;
+        }
+        case FK_Q_IQ3_XXS: {
+            const int64_t nblk = K / FK_IQ3XXS_BLOCK_WEIGHTS;
+            double a = 0.0;
+            for (int64_t b = 0; b < nblk; ++b) {
+                const unsigned char * bp = row + b * FK_IQ3XXS_BLOCK_BYTES;
+                for (int tid = 0; tid < 32; ++tid)
+                    a += fk_iq3xxs_block_dot(bp, iq3xxs_grid, ksigns_iq2xs, kmask_iq2xs,
+                                             x + b * FK_IQ3XXS_BLOCK_WEIGHTS + 8 * tid, tid);
+            }
+            return (float) a;
+        }
+        case FK_Q_MXFP4: {
+            const int64_t nblk = K / FK_MXFP4_BLOCK_WEIGHTS;
+            double a = 0.0;
+            for (int64_t b = 0; b < nblk; ++b) {
+                const unsigned char * bp = row + b * FK_MXFP4_BLOCK_BYTES;
+                const float * xb = x + b * FK_MXFP4_BLOCK_WEIGHTS;
+                for (int lane = 0; lane < 32; ++lane)
+                    a += fk_mxfp4_lane_dot(bp, kvalues_mxfp4, xb, lane);
             }
             return (float) a;
         }

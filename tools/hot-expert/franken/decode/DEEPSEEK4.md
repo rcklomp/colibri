@@ -1,9 +1,10 @@
-# DeepSeek-V4-Flash on the Franken engine — L5 steps 1-2 (2026-09-23/24)
+# DeepSeek-V4-Flash on the Franken engine — L5 steps 1-3 (2026-09-23/24)
 
 The model, the path Qwen3.8 took (design rev 13 §9; record §L0-STEP1..3), and
 what steps 1 and 2 built and proved. **Everything below that says "measured"
 was measured on the CPU arm or by the compiler; nothing here is a GPU
-measurement.** Step 2 (GPU kernels, placement, the gate commands) is §9.
+measurement.** Step 2 (GPU kernels, placement, the gate commands) is §9;
+step 3 (the speed work toward ~15 ms a token) is §10.
 
 Model: `~/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M/*.gguf` (3 shards,
 85 GB, arch `deepseek4`, 1 328 tensors). Reference: `~/src/llama-glm53`
@@ -370,3 +371,113 @@ prompt past 2 048 tokens: the next gate for them is
 2. The hash layers' miss prefetch.
 3. Batched prefill for this graph.
 4. Placement from the first-half counts once `moe_hist` writes them.
+
+## 10. Step 3 (2026-09-24): toward ~15 ms a token (built, not run on a GPU)
+
+**Where step 2 stood (coordinator's run of `5102cdb`, §L5-DS4-STEP2).** The
+oracle pair was correct: 214 / 220 taps, all cos ≥ 0.9999, greedy identical.
+Speed was **91.1 ms a token** at `--ctx 262144 --expert-gb 20`, depth 53.
+
+**What a token has to read at best.** The whole trunk, 6.38 GB, every token,
+plus the six routed experts of 43 layers, ~1.9 GB. That is 8.3 GB: 10.4 ms at
+800 GB/s, or ~17 ms at the ~500 GB/s the L0 GEMVs reach. **~15 ms is
+therefore the bandwidth floor, not a comfortable target.** It needs the
+GEMVs near the bound AND the launch floor and the misses off the critical
+path.
+
+**3a (`c8afc6f`): profile, miss path, wide loads.**
+- **`--profile` on the DeepSeek path.** It reports per-card device time in
+  classes appended to the backend's profiler (printed only when non-zero, so
+  a qwen4exp profile is unchanged):
+  - trunk GEMVs by kernel: `ds4_trunk_l0_kernel` (Q8_0 / Q6_K / BF16 / F32)
+    and `ds4_trunk_kquant` (Q5_K / Q4_K);
+  - experts: `ds4_expert_gate_up` / `_down`, and `ds4_expert_host_mapped`
+    (the in-place missed slots, `--miss-stage 0`);
+  - `ds4_miss_wait`;
+  - attention: `ds4_indexer_scan`, `ds4_topk`, `ds4_attention`,
+    `ds4_rope_pool_store`;
+  - `ds4_hc_mix` (plus `norm`, `elem_hc`), `ds4_moe_tail`, `router`,
+    `boundary_p2p`, `argmax`.
+
+  Per card it also prints the total, launches and host syncs a token. The
+  miss bytes are counted **on the device** from the routed ids
+  (`ds4_miss_mb_per_token_dev<i>`). Only the `--time` tokens are profiled.
+- **The miss path, off the critical path** (`--miss-stage 1`, default).
+  - After the router, a side stream copies each missed expert (gate|up|down)
+    into a per-card VRAM staging ring with coalesced 16-byte loads
+    (`k_ds4_stage`); a resident expert is only pointed at.
+  - The shared expert now runs between the router and the routed experts
+    (independent work, the same reorder on the CPU arm) and overlaps the
+    copy; the routed GEMVs then join on an event (`ds4_miss_wait`).
+  - Layers 0-2 route by token id, so their copies start at embed time.
+  - Five slots a card: ~226-295 MB of VRAM.
+- **Wide loads.** Each wave copies its row into LDS with 16-byte loads and
+  runs the same decoder on the copy (bit-identical by construction;
+  `--staged-loads 0` keeps the byte loads for the check). This matters most
+  for a row read over PCIe, where each byte load was its own transaction.
+- **Sinkhorn on 4 threads**, each owning a row or column as the single thread
+  summed it.
+
+**3b (`1fbb781`): HIP-graph replay (`--hip-graph 1`, off by default).**
+- The Qwen runner's mechanism: each card's share of a token is captured once
+  per position class (`--hip-graph-bucket`, 1024) and replayed; the
+  embedding, the hash ids, the boundaries and the one-int download stay
+  outside the graphs.
+- To make one graph right for every position of its class, every
+  position-dependent op got a position-semantic signature (`ds4_ops.h`) and
+  reads the position from a device int the graph advances. Those are:
+  raw-window slot, ring slots, ape row, compressor block end and index,
+  visible blocks, top-k (identity at ≤ 512 blocks), attention extents.
+- Grids are sized for the class's last position, and the kernels bound
+  themselves. In a graph the compress chain and the top-k are always
+  issued, and the ops decide on the device.
+- `--all-ops 1` makes the eager path issue that same op sequence. **On the
+  CPU arm, 136 tokens, `--all-ops 1` against the eager `--dump`: 172/172
+  float taps cos=1.000000 maxabs=0, lid_top_k contained**, so the graph's
+  op sequence is the eager result.
+- `hc_init` became an op, because `Backend::copy` on a card is a NULL-stream
+  memcpy that no capture may contain.
+- `--sync-debug` forces the graph off.
+
+**Checks (all CPU or compile-time):**
+- The 65 pre-L5 GPU kernels are instruction- and descriptor-identical to
+  `cbf0430`.
+- The Qwen3.8 CPU gate passes: 1604/1604, all 1592 float taps bit-identical.
+- DeepSeek CPU oracles unchanged: 6 tokens 173/173, min cos 0.999575, routing
+  24/24; 136 tokens 173/173, min cos 0.999558, routing 533/544.
+- No kernel spills. New kernels (VGPR / LDS B / waves):
+  - `k_ds4_gemv` / `k_ds4_moe`: Q5_K 54 / 22 528 / 10, Q4_K 35 / 18 432 /
+    14, IQ2_XXS 41 / 8 448 / 16, IQ2_S 40 / 10 496 / 16, IQ3_XXS 38 / 12 544 /
+    16, MXFP4 16 / 17 408 / 14;
+  - `k_ds4_stage` 8 / 0 / 16; `k_ds4_hc_split` 25 / 64 / 16;
+    `k_ds4_store_f16` 5; `k_ds4_ring_put` 4; `k_ds4_add_row` 5;
+    `k_ds4_hc_init` ≤ 10.
+
+**The GPU commands** (`ds4_gpu_gate.sh step3`, `DS4_GPU_OK=1`, rig lock held,
+gateway stopped; `$O/cpu_l042` is step 2's CPU dump):
+
+```
+cd ~/src/colibri-m1/tools/hot-expert/franken/decode
+make franken_decode_ds4 GPU_BIN=franken_decode_ds4
+DS4_GPU_OK=1 ./ds4_gpu_gate.sh step3
+#  (4) --staged-loads 0 --miss-stage 0 --dump  vs  the defaults --oracle: every tap cos=1 maxabs=0
+#      and the defaults vs the CPU dump (step 2's gate)
+#  (5) --hip-graph 1 --oracle the eager dump: every tap cos=1 maxabs=0, greedy_ids exact
+#  (6) --ctx 262144 --greedy 16 --time 32 --profile   (and --miss-stage 0): the class table a card
+#  (7) --ctx 262144 --greedy 16 --time 32, --hip-graph 0/1/1/0 (A,B,B,A)
+```
+
+(4) proves the new loads and the staging ring bit-identical to the
+in-place paths *of this build*. To tie it to `5102cdb` itself, add that
+binary's `--dump` (the kernels' arithmetic per row is unchanged by
+construction; the Sinkhorn's 4 threads each keep the single thread's order).
+
+**What the profile should decide next** (projected, to be refuted):
+- If `ds4_trunk_l0_kernel` dominates at < 500 GB/s, the lever is the L0
+  GEMV itself (shared with Qwen3.8, its own gated item).
+- If `prof_launches_per_token` × ~3 µs is a large share, batch the GEMVs
+  that share an input (the attention block's wkv + compressor + indexer
+  projections; wo_a's 8 groups as one launch). That is a summation-order
+  change (the split-K count follows the batch), so it goes behind a knob.
+- If `ds4_miss_wait` is still large, the staging ring should start earlier:
+  a router lookahead, design §3.1.

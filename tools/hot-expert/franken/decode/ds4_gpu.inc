@@ -71,72 +71,159 @@ __device__ __forceinline__ float ds4_row_lane(const unsigned char * __restrict__
 constexpr int DS4_GEMV_THREADS = 256;                 // 8 waves = 8 rows a workgroup
 constexpr int DS4_GEMV_ROWS    = DS4_GEMV_THREADS / WAVE;
 
+// WIDE LOADS THROUGH LDS (L5 step 3). The lane decoders read their block
+// with BYTE loads -- ~30 of them per block per lane, and on a row that lives
+// in pinned host memory each one is its own PCIe read. So a wave first copies
+// its whole row into LDS with 16-byte loads, 32 lanes side by side (a row of
+// every format here is a multiple of 16 bytes, and every row starts 16-byte
+// aligned: the host checks both and passes `staged`), then runs the SAME
+// decoder on the LDS copy. Same bytes, same expressions, same order: the
+// result is bit-identical to reading the row in place. The widest row is
+// Q5_K at K = 4096, 2 816 B; the LDS is sized per format.
+template <int TY> constexpr int ds4_row_max() {
+    return TY == FK_Q_Q5_K ? 2816 : TY == FK_Q_Q4_K ? 2304 : TY == FK_Q_MXFP4 ? 2176
+         : TY == FK_Q_IQ3_XXS ? 1568 : TY == FK_Q_IQ2_S ? 1312 : 1056;   // K <= 4096
+}
+template <int TY>
+__device__ __forceinline__ float ds4_row_dot(const unsigned char * __restrict__ row, size_t row_bytes,
+                                             int staged, uint4 * sl, const float * __restrict__ x,
+                                             int K, int lane) {
+    if (!staged) return ds4_row_lane<TY>(row, x, K, lane);
+    const uint4 * src = (const uint4 *) row;
+    const int n16 = (int) (row_bytes >> 4);
+    for (int i = lane; i < n16; i += WAVE) sl[i] = src[i];
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    return ds4_row_lane<TY>((const unsigned char *) sl, x, K, lane);
+}
+
 template <int TY>
 __global__ __launch_bounds__(DS4_GEMV_THREADS)
 void k_ds4_gemv(const unsigned char * __restrict__ W, size_t row_bytes, int rows, int K,
-                const float * __restrict__ x, float * __restrict__ y) {
+                const float * __restrict__ x, float * __restrict__ y, int staged) {
+    __shared__ uint4 lds[DS4_GEMV_ROWS][ds4_row_max<TY>() / 16];
     const int lane = threadIdx.x & (WAVE - 1);
-    const int r = blockIdx.x * DS4_GEMV_ROWS + (threadIdx.x / WAVE);
+    const int wv = threadIdx.x / WAVE;
+    const int r = blockIdx.x * DS4_GEMV_ROWS + wv;
     if (r >= rows) return;                                   // wave-uniform
-    float a = ds4_row_lane<TY>(W + (size_t) r * row_bytes, x, K, lane);
+    float a = ds4_row_dot<TY>(W + (size_t) r * row_bytes, row_bytes, staged, lds[wv], x, K, lane);
     a = wave_sum(a);
     if (lane == 0) y[r] = a;
 }
 
-// The routed experts: grid.y is the slot k, the expert is ids[k], and its
-// address comes from the layer's TABLE -- VRAM when resident, the
-// device-mapped pinned host copy when not. Nothing in the kernel knows which.
+// The routed experts: grid.y is the slot k. The expert's slice comes either
+// from the layer's TABLE by id (`sp` null: in VRAM when resident, the
+// device-mapped pinned host copy when not) or from the staging slot's
+// pointers `sp[k*3 + which]` that k_ds4_stage wrote (L5 step 3). `filter`
+// (profiling only): 1 = resident slots only, 2 = missed slots only, 0 = all --
+// the same per-slot work split over two launches so their times separate.
 template <int TY>
 __global__ __launch_bounds__(DS4_GEMV_THREADS)
 void k_ds4_moe(const void * const * __restrict__ tab, const int * __restrict__ ids,
-               size_t row_bytes, int rows, int K, const float * __restrict__ x, int x_per_slot,
-               float * __restrict__ y) {
+               const void * const * __restrict__ sp, int which, const int * __restrict__ miss,
+               int filter, size_t row_bytes, int rows, int K, const float * __restrict__ x,
+               int x_per_slot, float * __restrict__ y, int staged) {
+    __shared__ uint4 lds[DS4_GEMV_ROWS][ds4_row_max<TY>() / 16];
     const int slot = blockIdx.y;
     const int lane = threadIdx.x & (WAVE - 1);
-    const int r = blockIdx.x * DS4_GEMV_ROWS + (threadIdx.x / WAVE);
+    const int wv = threadIdx.x / WAVE;
+    const int r = blockIdx.x * DS4_GEMV_ROWS + wv;
     if (r >= rows) return;
-    const unsigned char * W = (const unsigned char *) tab[ids[slot]];
+    const int e = ids[slot];
+    if (filter && ((miss[e] != 0) != (filter == 2))) return;
+    const unsigned char * W = (const unsigned char *) (sp ? sp[slot * 3 + which] : tab[e]);
     const float * xs = x + (x_per_slot ? (size_t) slot * K : 0);
-    float a = ds4_row_lane<TY>(W + (size_t) r * row_bytes, xs, K, lane);
+    float a = ds4_row_dot<TY>(W + (size_t) r * row_bytes, row_bytes, staged, lds[wv], xs, K, lane);
     a = wave_sum(a);
     if (lane == 0) y[(size_t) slot * rows + r] = a;
 }
 
+// THE STAGING COPY (L5 step 3), on the side stream. grid = (chunks, 6):
+// slot k's expert e = ids[k]; a resident one is only POINTED at (sp gets its
+// three table addresses), a missed one is copied gate|up|down into
+// dst + k*slot_bytes with 16-byte loads -- coalesced, many in flight, which is
+// what a PCIe read wants and what the GEMV's byte loads were not. Block 0 of
+// the slot publishes the pointers and counts the bytes.
+constexpr int DS4_STAGE_THREADS = 256;
+constexpr int DS4_STAGE_CHUNK   = 65536;                  // bytes a workgroup
+__global__ __launch_bounds__(DS4_STAGE_THREADS)
+void k_ds4_stage(const void * const * __restrict__ tg, const void * const * __restrict__ tu,
+                 const void * const * __restrict__ td, const int * __restrict__ ids,
+                 const int * __restrict__ miss, unsigned long long sg, unsigned long long su,
+                 unsigned long long sd, unsigned char * __restrict__ dst, unsigned long long slot_bytes,
+                 const void ** __restrict__ sp, unsigned long long * __restrict__ counter) {
+    const int k = blockIdx.y;
+    const int e = ids[k];
+    const bool missed = miss[e] != 0;
+    unsigned char * d = dst + (size_t) k * slot_bytes;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        sp[k * 3 + 0] = missed ? (const void *) d             : tg[e];
+        sp[k * 3 + 1] = missed ? (const void *) (d + sg)      : tu[e];
+        sp[k * 3 + 2] = missed ? (const void *) (d + sg + su) : td[e];
+        if (missed && counter) atomicAdd(counter, sg + su + sd);
+    }
+    if (!missed) return;
+    const unsigned long long total = sg + su + sd;
+    const unsigned long long c0 = (unsigned long long) blockIdx.x * DS4_STAGE_CHUNK;
+    if (c0 >= total) return;
+    const unsigned long long c1 = c0 + DS4_STAGE_CHUNK < total ? c0 + DS4_STAGE_CHUNK : total;
+    for (unsigned long long o = c0 + 16ull * threadIdx.x; o < c1; o += 16ull * DS4_STAGE_THREADS) {
+        const unsigned char * s = o < sg      ? (const unsigned char *) tg[e] + o
+                                : o < sg + su ? (const unsigned char *) tu[e] + (o - sg)
+                                              : (const unsigned char *) td[e] + (o - sg - su);
+        *(uint4 *) (d + o) = *(const uint4 *) s;
+    }
+}
+
+// --profile: the six chosen experts' miss bytes, added on the device.
+__global__ void k_ds4_miss_count(const int * __restrict__ ids, const int * __restrict__ miss,
+                                 unsigned long long * __restrict__ counter) {
+    const int k = threadIdx.x;
+    if (k < D::N_EXPERT_USED) {
+        const int m = miss[ids[k]];
+        if (m) atomicAdd(counter, (unsigned long long) m);
+    }
+}
+
 // -------------------------------------------------------- hyper-connections --
-// One thread: 24 inputs and a 4x4 Sinkhorn loop, the CPU op verbatim.
+// 24 inputs and a 4x4 Sinkhorn loop. Four threads (L5 step 3; it was one):
+// thread o owns column o in a column pass and row o in a row pass, and sums
+// it in the same order the single thread did, so every element sees the same
+// operations -- bit-identical to the one-thread version and to the CPU op's
+// order. 39 dependent normalisations a call, 86 calls a token.
 __global__ void k_ds4_hc_split(const float * __restrict__ m, const float * __restrict__ s,
                                const float * __restrict__ b, float * __restrict__ pre,
                                float * __restrict__ post, float * __restrict__ comb,
                                float eps, int iters) {
-    if (threadIdx.x != 0) return;
     constexpr int H = D::HC;
-    for (int h = 0; h < H; ++h) {
-        pre[h]  = ds4_sigmoid(m[h] * s[0] + b[h]) * 1.0f + eps;
-        post[h] = ds4_sigmoid(m[H + h] * s[1] + b[H + h]) * 2.0f;
-    }
-    float c[H * H];
-    for (int isrc = 0; isrc < H; ++isrc) {
-        float mx = -INFINITY;
+    __shared__ float c[H * H];
+    const int o = threadIdx.x;                       // launched with H threads
+    pre[o]  = ds4_sigmoid(m[o] * s[0] + b[o]) * 1.0f + eps;
+    post[o] = ds4_sigmoid(m[H + o] * s[1] + b[H + o]) * 2.0f;
+    {   // softmax over dst for source isrc = o
+        const int isrc = o;
+        float v[H], mx = -INFINITY;
         for (int idst = 0; idst < H; ++idst) {
             const int idx = idst + H * isrc;
-            c[idx] = m[2 * H + idx] * s[2] + b[2 * H + idx];
-            mx = fmaxf(mx, c[idx]);
+            v[idst] = m[2 * H + idx] * s[2] + b[2 * H + idx];
+            mx = fmaxf(mx, v[idst]);
         }
         float sum = 0.0f;
-        for (int idst = 0; idst < H; ++idst) { const int idx = idst + H * isrc; c[idx] = expf(c[idx] - mx); sum += c[idx]; }
+        for (int idst = 0; idst < H; ++idst) { v[idst] = expf(v[idst] - mx); sum += v[idst]; }
         const float inv = 1.0f / sum;
-        for (int idst = 0; idst < H; ++idst) { const int idx = idst + H * isrc; c[idx] = c[idx] * inv + eps; }
+        for (int idst = 0; idst < H; ++idst) c[idst + H * isrc] = v[idst] * inv + eps;
     }
+    __syncthreads();
     for (int it = 0; it < 2 * iters - 1; ++it) {
-        const bool cols = (it % 2 == 0);     // cols, then (rows, cols) x (iters-1)
-        for (int o = 0; o < H; ++o) {
-            float sum = eps;
-            for (int i = 0; i < H; ++i) sum += cols ? c[o + H * i] : c[i + H * o];
-            const float inv = 1.0f / sum;
-            for (int i = 0; i < H; ++i) { if (cols) c[o + H * i] *= inv; else c[i + H * o] *= inv; }
-        }
+        const bool cols = (it % 2 == 0);             // cols, then (rows, cols) x (iters-1)
+        float sum = eps;
+        for (int i = 0; i < H; ++i) sum += cols ? c[o + H * i] : c[i + H * o];
+        const float inv = 1.0f / sum;
+        for (int i = 0; i < H; ++i) { if (cols) c[o + H * i] *= inv; else c[i + H * o] *= inv; }
+        __syncthreads();
     }
-    for (int i = 0; i < H * H; ++i) comb[i] = c[i];
+    for (int i = 0; i < H; ++i) comb[o + H * i] = c[o + H * i];
 }
 
 __global__ void k_ds4_hc_head_pre(const float * __restrict__ m, const float * __restrict__ s,
@@ -520,10 +607,16 @@ public:
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_ds4_ksigns), ksigns_iq2xs, 128));
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_ds4_kmask),  kmask_iq2xs,  8));
         HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_ds4_kvfp4),  kvalues_mxfp4, 16));
+        HIP_CHECK(hipMalloc(&miss_ctr_, sizeof(unsigned long long)));
+        HIP_CHECK(hipMemset(miss_ctr_, 0, sizeof(unsigned long long)));
     }
     ~Ds4GpuOps() override {
         dev_ensure(g_.dev_);
         HIP_IGNORE(hipFree(po_)); HIP_IGNORE(hipFree(pm_)); HIP_IGNORE(hipFree(pl_));
+        HIP_IGNORE(hipFree(stage_)); HIP_IGNORE(hipFree(sp_)); HIP_IGNORE(hipFree(miss_ctr_));
+        for (auto & e : ev_route_) HIP_IGNORE(hipEventDestroy(e));
+        for (auto & e : ev_done_)  HIP_IGNORE(hipEventDestroy(e));
+        if (side_) HIP_IGNORE(hipStreamDestroy(side_));
         for (void * h : host_) HIP_IGNORE(hipHostFree(h));
     }
 
@@ -535,26 +628,31 @@ public:
             case FK_Q_IQ2_S:   return launch_gemv<FK_Q_IQ2_S>(W, x, y);
             case FK_Q_IQ3_XXS: return launch_gemv<FK_Q_IQ3_XXS>(W, x, y);
             case FK_Q_MXFP4:   return launch_gemv<FK_Q_MXFP4>(W, x, y);
-            default:           return g_.gemv(W, x, y);   // Q8_0, Q6_K, BF16, F32: the tuned L0 kernel
+            default:
+                // Q8_0, Q6_K, BF16, F32: the tuned L0 kernel, charged to its own class
+                g_.trunk_cls_override_ = PC_DS4_TRUNK_L0;
+                g_.gemv(W, x, y);
+                g_.trunk_cls_override_ = -1;
+                return;
         }
     }
 
     void hc_split(const float * m, const float * s, const float * b, float * pre, float * post,
                   float * comb, float eps, int iters) override {
-        g_.mark(PC_ELEM); g_.last_op_ = "ds4_hc_split";
-        k_ds4_hc_split<<<1, WAVE, 0, g_.stream_>>>(m, s, b, pre, post, comb, eps, iters);
+        g_.mark(PC_DS4_HC); g_.last_op_ = "ds4_hc_split";
+        k_ds4_hc_split<<<1, D::HC, 0, g_.stream_>>>(m, s, b, pre, post, comb, eps, iters);
     }
     void hc_head_pre(const float * m, const float * s, const float * b, float * pre, float eps) override {
-        g_.mark(PC_ELEM); g_.last_op_ = "ds4_hc_head_pre";
+        g_.mark(PC_DS4_HC); g_.last_op_ = "ds4_hc_head_pre";
         k_ds4_hc_head_pre<<<1, WAVE, 0, g_.stream_>>>(m, s, b, pre, eps);
     }
     void hc_weighted_sum(const float * H, const float * w, float * out) override {
-        g_.mark(PC_ELEM); g_.last_op_ = "ds4_hc_wsum";
+        g_.mark(PC_DS4_HC); g_.last_op_ = "ds4_hc_wsum";
         k_ds4_hc_wsum<<<ceil_div(D::N_EMBD, BLK), BLK, 0, g_.stream_>>>(H, w, out);
     }
     void hc_post(const float * x, const float * H, const float * post, const float * comb,
                  float * Ho) override {
-        g_.mark(PC_ELEM); g_.last_op_ = "ds4_hc_post";
+        g_.mark(PC_DS4_HC); g_.last_op_ = "ds4_hc_post";
         k_ds4_hc_post<<<ceil_div(D::HC_DIM, BLK), BLK, 0, g_.stream_>>>(x, H, post, comb, Ho);
     }
 
@@ -569,39 +667,39 @@ public:
         const float c1 = std::min((float) (D::N_ROT - 1), ceilf(corr(rp.beta_slow)));
         float ms = rp.attn_factor;
         if (rp.ext_factor != 0.0f) ms *= 1.0f + 0.1f * logf(1.0f / rp.freq_scale);
-        g_.mark(PC_QSA); g_.last_op_ = "ds4_rope_tail";
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_rope_tail";
         k_ds4_rope_tail<<<n_rows, D::N_ROT / 2, 0, g_.stream_>>>(x, row_len, (float) pos, theta_scale,
             rp.freq_scale, rp.ext_factor, ms, c0, c1, inverse ? -1.0f : 1.0f);
     }
     void fwht(float * x, int n_rows, int n) override {
         if (n != D::IDX_DIM) { std::fprintf(stderr, "ds4 fwht: n=%d, the kernel is 128-wide\n", n); std::abort(); }
-        g_.mark(PC_QSA); g_.last_op_ = "ds4_fwht";
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_fwht";
         k_ds4_fwht<<<n_rows, D::IDX_DIM, 0, g_.stream_>>>(x, 1.0f / sqrtf((float) n));
     }
     void to_f16(const float * x, uint16_t * y, int n) override {
-        g_.mark(PC_QSA); g_.last_op_ = "ds4_to_f16";
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_to_f16";
         k_ds4_to_f16<<<ceil_div(n, BLK), BLK, 0, g_.stream_>>>(x, (unsigned short *) y, n);
     }
 
     void comp_pool(const float * rk, const float * rs, int ring, int R, int d_out, int blk,
                    float * out) override {
-        g_.mark(PC_QSA); g_.last_op_ = "ds4_comp_pool";
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_comp_pool";
         k_ds4_comp_pool<<<ceil_div(d_out, 128), 128, 0, g_.stream_>>>(rk, rs, ring, R, d_out, blk, 0, out);
     }
     void comp_pool_overlap(const float * rk, const float * rs, int ring, int R, int d_out, int blk,
                            float * out) override {
-        g_.mark(PC_QSA); g_.last_op_ = "ds4_comp_pool_overlap";
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_comp_pool_overlap";
         k_ds4_comp_pool<<<ceil_div(d_out, 128), 128, 0, g_.stream_>>>(rk, rs, ring, R, d_out, blk, 1, out);
     }
 
     void lid_scores(const float * q, const float * w, const uint16_t * keys, int n,
                     float * scores) override {
-        g_.mark(PC_QSA); g_.last_op_ = "ds4_lid_scores";
+        g_.mark(PC_DS4_LID); g_.last_op_ = "ds4_lid_scores";
         k_ds4_lid_scores<<<ceil_div(n, DS4_LID_KEYS), DS4_LID_THREADS, 0, g_.stream_>>>(
             q, w, (const unsigned short *) keys, n, scores);
     }
     void topk(const float * s, int n, int k, int * out) override {
-        g_.mark(PC_QSA); g_.last_op_ = "ds4_topk";
+        g_.mark(PC_DS4_TOPK); g_.last_op_ = "ds4_topk";
         k_ds4_topk<<<1, DS4_TOPK_THREADS, 0, g_.stream_>>>(s, n, k, out);
     }
 
@@ -609,11 +707,11 @@ public:
               const int * ids, int n_comp, const float * sinks, float scale, float * out) override {
         const int n_chunks = ceil_div(n_raw + n_comp, DS4_ATT_CHUNK);
         ensure_attn(n_chunks);
-        g_.mark(PC_QSA_ROWS); g_.last_op_ = "ds4_attn_part";
+        g_.mark(PC_DS4_ATTN); g_.last_op_ = "ds4_attn_part";
         k_ds4_attn_part<<<dim3((unsigned) n_chunks, DS4_ATT_HGROUPS), 256, 0, g_.stream_>>>(
             q, (const unsigned short *) raw, raw0, n_raw, (const unsigned short *) comp, ids, n_comp,
             scale, po_, pm_, pl_);
-        g_.mark(PC_QSA_ROWS); g_.last_op_ = "ds4_attn_combine";
+        g_.mark(PC_DS4_ATTN); g_.last_op_ = "ds4_attn_combine";
         k_ds4_attn_combine<<<D::N_HEAD, D::HEAD_DIM, 0, g_.stream_>>>(po_, pm_, pl_, n_chunks, sinks, out);
     }
 
@@ -622,22 +720,78 @@ public:
         g_.mark(PC_ROUTER); g_.last_op_ = "ds4_router";
         k_ds4_router<<<1, D::N_EXPERT, 0, g_.stream_>>>(logits, bias, hash, probs, pb, ids, wr, wn, ws);
     }
-    void moe_gate_up(const D::ExpertTable & t, const int * ids, const float * x, float * yg,
-                     float * yu) override {
-        launch_moe(t.type_gu, t.up,   ids, t.row_gu, t.rows_gu, t.K_gu, x, 0, yu, PC_EXP_GATE_UP);
-        launch_moe(t.type_gu, t.gate, ids, t.row_gu, t.rows_gu, t.K_gu, x, 0, yg, PC_EXP_GATE_UP);
+
+    // ---- the miss path --------------------------------------------------------
+    void reserve_moe(size_t max_slab, int n_slots) override {
+        dev_ensure(g_.dev_);
+        if (n_slots <= 0) return;
+        max_slab = (max_slab + 255) & ~(size_t) 255;
+        slot_bytes_ = max_slab;
+        n_slots_ = n_slots;
+        HIP_CHECK(hipMalloc(&stage_, (size_t) n_slots * D::N_EXPERT_USED * max_slab));
+        HIP_CHECK(hipMalloc(&sp_, (size_t) n_slots * D::N_EXPERT_USED * 3 * sizeof(void *)));
+        // the side stream and its events, created with THIS card current
+        HIP_CHECK(hipStreamCreateWithFlags(&side_, hipStreamNonBlocking));
+        ev_route_.resize((size_t) n_slots); ev_done_.resize((size_t) n_slots);
+        for (int i = 0; i < n_slots; ++i) {
+            HIP_CHECK(hipEventCreateWithFlags(&ev_route_[(size_t) i], hipEventDisableTiming));
+            HIP_CHECK(hipEventCreateWithFlags(&ev_done_[(size_t) i], hipEventDisableTiming));
+        }
+        staged_bytes_ = (size_t) n_slots * D::N_EXPERT_USED * max_slab;
     }
-    void moe_down(const D::ExpertTable & t, const int * ids, const float * h, float * y) override {
-        launch_moe(t.type_d, t.down, ids, t.row_d, t.rows_d, t.K_d, h, 1, y, PC_EXP_DOWN);
+    // Fork after the router (or, for a token-id-routed layer, after the ids'
+    // upload), copy on the side stream, and leave an event to join on.
+    void moe_stage(const D::ExpertTable & t, const int * ids, int slot) override {
+        if (slot < 0 || slot >= n_slots_) return;
+        const size_t need = t.sz_g + t.sz_u + t.sz_d;
+        if (need > slot_bytes_) { std::fprintf(stderr, "ds4 stage: slab %zu > slot %zu\n", need, slot_bytes_); std::abort(); }
+        g_.mark(PC_DS4_MISS_WAIT); g_.last_op_ = "ds4_stage_fork";
+        HIP_CHECK(hipEventRecord(ev_route_[(size_t) slot], g_.stream_));
+        HIP_CHECK(hipStreamWaitEvent(side_, ev_route_[(size_t) slot], 0));
+        const unsigned chunks = (unsigned) ceil_div((int) ((need + DS4_STAGE_CHUNK - 1) / DS4_STAGE_CHUNK), 1);
+        k_ds4_stage<<<dim3(chunks, D::N_EXPERT_USED), DS4_STAGE_THREADS, 0, side_>>>(
+            t.gate, t.up, t.down, ids, t.miss_bytes, t.sz_g, t.sz_u, t.sz_d,
+            stage_ + (size_t) slot * D::N_EXPERT_USED * slot_bytes_, slot_bytes_,
+            sp_ + (size_t) slot * D::N_EXPERT_USED * 3, nullptr);   // counted by count_misses
+        HIP_CHECK(hipEventRecord(ev_done_[(size_t) slot], side_));
+        pending_[slot & 7] = true;
+    }
+    void moe_gate_up(const D::ExpertTable & t, const int * ids, const float * x, float * yg,
+                     float * yu, int slot) override {
+        const void * const * sp = join(slot);
+        launch_moe(t, t.type_gu, t.up,   ids, sp, 1, t.row_gu, t.rows_gu, t.K_gu, x, 0, yu, PC_DS4_EXP_GU);
+        launch_moe(t, t.type_gu, t.gate, ids, sp, 0, t.row_gu, t.rows_gu, t.K_gu, x, 0, yg, PC_DS4_EXP_GU);
+    }
+    void moe_down(const D::ExpertTable & t, const int * ids, const float * h, float * y, int slot) override {
+        const void * const * sp = (slot >= 0 && slot < n_slots_) ? sp_ + (size_t) slot * D::N_EXPERT_USED * 3 : nullptr;
+        launch_moe(t, t.type_d, t.down, ids, sp, 2, t.row_d, t.rows_d, t.K_d, h, 1, y, PC_DS4_EXP_DOWN);
     }
     void swiglu_clamp(const float * g, const float * u, float * h, int n, float limit) override {
-        g_.mark(PC_ELEM); g_.last_op_ = "ds4_swiglu_clamp";
+        g_.mark(PC_DS4_MOE_TAIL); g_.last_op_ = "ds4_swiglu_clamp";
         k_ds4_swiglu_clamp<<<ceil_div(n, BLK), BLK, 0, g_.stream_>>>(g, u, h, n, limit);
     }
     void moe_accum(const float * y, const float * w, int n_used, int n, float * weighted,
                    float * out) override {
-        g_.mark(PC_EXP_COMBINE); g_.last_op_ = "ds4_moe_accum";
+        g_.mark(PC_DS4_MOE_TAIL); g_.last_op_ = "ds4_moe_accum";
         k_ds4_moe_accum<<<ceil_div(n, BLK), BLK, 0, g_.stream_>>>(y, w, n_used, n, weighted, out);
+    }
+
+    // ---- profiling ----------------------------------------------------------------
+    void set_profile(bool on) override { prof_ = on; }
+    void set_staged_loads(int on) override { staged_ok_ = on != 0; }
+    void count_misses(const D::ExpertTable & t, const int * ids) override {
+        if (!prof_) return;
+        g_.mark(PC_ROUTER); g_.last_op_ = "ds4_miss_count";
+        k_ds4_miss_count<<<1, WAVE, 0, g_.stream_>>>(ids, t.miss_bytes, miss_ctr_);
+    }
+    double miss_bytes_total() override {
+        unsigned long long v = 0;
+        g_.download(&v, miss_ctr_, sizeof(v));
+        return (double) v;
+    }
+    void reset_miss_count() override {
+        dev_ensure(g_.dev_);
+        HIP_CHECK(hipMemsetAsync(miss_ctr_, 0, sizeof(unsigned long long), g_.stream_));
     }
 
     // Pinned host memory, mapped into this card's address space: the miss
@@ -654,25 +808,59 @@ public:
     }
 
 private:
+    // The main stream joins the side stream's copy for `slot` (once). The
+    // interval charged to PC_DS4_MISS_WAIT is the time the card sat waiting.
+    const void * const * join(int slot) {
+        if (slot < 0 || slot >= n_slots_) return nullptr;
+        if (pending_[slot & 7]) {
+            g_.mark(PC_DS4_MISS_WAIT); g_.last_op_ = "ds4_stage_join";
+            HIP_CHECK(hipStreamWaitEvent(g_.stream_, ev_done_[(size_t) slot], 0));
+            pending_[slot & 7] = false;
+        }
+        return sp_ + (size_t) slot * D::N_EXPERT_USED * 3;
+    }
+    static bool aligned16(const void * p, size_t rb) {
+        return ((uintptr_t) p % 16 == 0) && (rb % 16 == 0);
+    }
     template <int TY>
     void launch_gemv(const Mat & W, const float * x, float * y) {
-        g_.mark(PC_TRUNK, -1, W.row_bytes * (size_t) W.rows);
+        g_.mark(PC_DS4_TRUNK_KQ, -1, W.row_bytes * (size_t) W.rows);
         g_.last_op_ = "ds4_gemv";
+        const int staged = staged_ok_ && aligned16(W.base, W.row_bytes) && W.row_bytes <= (size_t) ds4_row_max<TY>();
         k_ds4_gemv<TY><<<ceil_div((int) W.rows, DS4_GEMV_ROWS), DS4_GEMV_THREADS, 0, g_.stream_>>>(
-            (const unsigned char *) W.base, W.row_bytes, (int) W.rows, (int) W.K, x, y);
+            (const unsigned char *) W.base, W.row_bytes, (int) W.rows, (int) W.K, x, y, staged);
     }
-    void launch_moe(int type, const void * const * tab, const int * ids, size_t rb, int rows, int K,
-                    const float * x, int x_per_slot, float * y, int cls) {
-        g_.mark(cls); g_.last_op_ = "ds4_moe";
+    template <int TY>
+    void moe_launch(const D::ExpertTable & t, const void * const * tab, const int * ids,
+                    const void * const * sp, int which, int filter, size_t rb, int rows, int K,
+                    const float * x, int x_per_slot, float * y) {
+        // every table entry and staging pointer is 16-byte aligned by
+        // construction (hipMalloc / hipHostMalloc bases, slab offsets that are
+        // multiples of 16: ds4_model.cpp place_experts), so the row size decides
+        const int staged = staged_ok_ && (rb % 16 == 0) && rb <= (size_t) ds4_row_max<TY>();
         const dim3 grid((unsigned) ceil_div(rows, DS4_GEMV_ROWS), (unsigned) D::N_EXPERT_USED);
-        switch (type) {
-            case FK_Q_IQ2_XXS: k_ds4_moe<FK_Q_IQ2_XXS><<<grid, DS4_GEMV_THREADS, 0, g_.stream_>>>(tab, ids, rb, rows, K, x, x_per_slot, y); break;
-            case FK_Q_IQ2_S:   k_ds4_moe<FK_Q_IQ2_S>  <<<grid, DS4_GEMV_THREADS, 0, g_.stream_>>>(tab, ids, rb, rows, K, x, x_per_slot, y); break;
-            case FK_Q_IQ3_XXS: k_ds4_moe<FK_Q_IQ3_XXS><<<grid, DS4_GEMV_THREADS, 0, g_.stream_>>>(tab, ids, rb, rows, K, x, x_per_slot, y); break;
-            case FK_Q_MXFP4:   k_ds4_moe<FK_Q_MXFP4>  <<<grid, DS4_GEMV_THREADS, 0, g_.stream_>>>(tab, ids, rb, rows, K, x, x_per_slot, y); break;
-            default:
-                std::fprintf(stderr, "ds4 moe: expert format %d has no kernel\n", type);
-                std::abort();
+        k_ds4_moe<TY><<<grid, DS4_GEMV_THREADS, 0, g_.stream_>>>(tab, ids, sp, which, t.miss_bytes,
+            filter, rb, rows, K, x, x_per_slot, y, staged);
+    }
+    void launch_moe(const D::ExpertTable & t, int type, const void * const * tab, const int * ids,
+                    const void * const * sp, int which, size_t rb, int rows, int K,
+                    const float * x, int x_per_slot, float * y, int cls) {
+        // In place (no staging) under --profile, the resident and the missed
+        // slots go in two launches so their device times separate; the work
+        // per slot is identical either way.
+        const bool split = prof_ && !sp;
+        for (int pass = 0; pass < (split ? 2 : 1); ++pass) {
+            const int filter = split ? pass + 1 : 0;
+            g_.mark(filter == 2 ? PC_DS4_EXP_MISS : cls); g_.last_op_ = "ds4_moe";
+            switch (type) {
+                case FK_Q_IQ2_XXS: moe_launch<FK_Q_IQ2_XXS>(t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+                case FK_Q_IQ2_S:   moe_launch<FK_Q_IQ2_S>  (t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+                case FK_Q_IQ3_XXS: moe_launch<FK_Q_IQ3_XXS>(t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+                case FK_Q_MXFP4:   moe_launch<FK_Q_MXFP4>  (t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+                default:
+                    std::fprintf(stderr, "ds4 moe: expert format %d has no kernel\n", type);
+                    std::abort();
+            }
         }
     }
     // Grown, never shrunk: a hipFree synchronises the device (CLAUDE.md). The
@@ -687,10 +875,23 @@ private:
         HIP_CHECK(hipMalloc(&pm_, (size_t) want * D::N_HEAD * sizeof(float)));
         HIP_CHECK(hipMalloc(&pl_, (size_t) want * D::N_HEAD * sizeof(float)));
         cap_chunks_ = want;
+        ++g_.epoch_;              // a graph captured before this holds the freed pointers
     }
 
     GpuBackend & g_;
     float * po_ = nullptr, * pm_ = nullptr, * pl_ = nullptr;
     int cap_chunks_ = 0;
     std::vector<void *> host_;
+    // the miss path
+    hipStream_t side_ = nullptr;
+    std::vector<hipEvent_t> ev_route_, ev_done_;
+    unsigned char * stage_ = nullptr;
+    const void ** sp_ = nullptr;
+    size_t slot_bytes_ = 0, staged_bytes_ = 0;
+    int n_slots_ = 0;
+    bool pending_[8] = {false, false, false, false, false, false, false, false};
+    bool staged_ok_ = true;
+    // profiling
+    bool prof_ = false;
+    unsigned long long * miss_ctr_ = nullptr;
 };

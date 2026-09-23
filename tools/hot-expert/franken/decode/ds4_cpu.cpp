@@ -72,7 +72,7 @@ public:
 
     // One expert = a one-matrix Mat whose base is the table entry.
     void moe_gate_up(const ExpertTable & t, const int * ids, const float * x,
-                     float * yg, float * yu) override {
+                     float * yg, float * yu, int) override {
         for (int k = 0; k < N_EXPERT_USED; ++k) {
             be_.gemv(expert_mat(t.up[ids[k]],   t.type_gu, t.row_gu, t.K_gu, t.rows_gu), x,
                      yu + (size_t) k * t.rows_gu);
@@ -80,7 +80,7 @@ public:
                      yg + (size_t) k * t.rows_gu);
         }
     }
-    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y) override {
+    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y, int) override {
         for (int k = 0; k < N_EXPERT_USED; ++k)
             be_.gemv(expert_mat(t.down[ids[k]], t.type_d, t.row_d, t.K_d, t.rows_d),
                      h + (size_t) k * t.K_d, y + (size_t) k * t.rows_d);

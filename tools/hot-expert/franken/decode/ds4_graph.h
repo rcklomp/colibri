@@ -34,6 +34,11 @@ namespace ds4 {
 struct Ds4Config {
     int  ctx = 512;          // positions the compressed caches are sized for
     bool log_routing = true; // read the routed ids back every step (a sync on a card)
+    // --miss-stage 1 (default): a missed expert is copied into a VRAM staging
+    // ring on a side stream while the shared expert runs, and the token-id
+    // routed layers 0-2 are staged at embed time. 0: step 2's path, read in
+    // place over PCIe inside the GEMV. Same bytes either way.
+    int  miss_stage = 1;
 };
 
 class Ds4Runner {
@@ -48,6 +53,8 @@ public:
 
     int pos() const { return pos_; }
     void set_log_routing(bool on) { cfg_.log_routing = on; }
+    // --profile: every card closes its profile interval at the end of a step
+    void set_profile(bool on) { profile_ = on; }
     // Per-layer routed ids of the last step, [n_layers][6] (with log_routing).
     const std::vector<int> & routed_ids() const { return routed_; }
     void report_cache_bytes(FILE * out) const;
@@ -88,6 +95,8 @@ private:
     Ds4Config cfg_;
     float eps_, hc_eps_;
     int pos_ = 0;
+    bool profile_ = false;
+    int stage_slot(int il) const;
     std::vector<LayerState> st_;
     std::vector<Scratch> scr_;
     std::vector<int> routed_;

@@ -54,6 +54,12 @@ struct ExpertTable {
     size_t row_gu  = 0, row_d  = 0;          // bytes per row
     int    K_gu    = 0, rows_gu = 0;         // 4096 -> 2048
     int    K_d     = 0, rows_d  = 0;         // 2048 -> 4096
+    // The miss path (L5 step 3): per expert, the bytes a use of it has to
+    // bring over PCIe -- its slab when it lives in pinned host memory, 0 when
+    // it is resident (backend memory, 256 ints) -- and the three slice sizes,
+    // which is how a staging copy lays a slab out: gate | up | down.
+    const int * miss_bytes = nullptr;
+    size_t sz_g = 0, sz_u = 0, sz_d = 0;
 };
 
 class Ds4Ops {
@@ -102,15 +108,41 @@ public:
     virtual void router(const float * logits, const float * bias, const int32_t * hash_ids,
                         float * probs, float * probs_biased, int * ids, float * w_raw,
                         float * w_norm, float * w_scaled) = 0;
+    // THE MISS PATH (L5 step 3). moe_stage() starts bringing layer t's six
+    // chosen experts to the card for staging `slot` and returns at once: a
+    // resident expert is used where it is, a missed one is copied into a VRAM
+    // staging ring on a side stream, overlapping whatever the caller enqueues
+    // next (the shared expert; for the token-id-routed layers, everything
+    // from the embedding on). moe_gate_up / moe_down with the same `slot`
+    // wait for that copy and read the staged addresses; slot -1 reads every
+    // expert through the table in place (a miss then is a PCIe read inside
+    // the GEMV -- step 2's path, --miss-stage 0). The bytes are the same
+    // either way, so the numerics are too.
+    virtual void reserve_moe(size_t max_slab_bytes, int n_slots) { (void) max_slab_bytes; (void) n_slots; }
+    virtual void moe_stage(const ExpertTable & t, const int * ids, int slot) { (void) t; (void) ids; (void) slot; }
     // y_gate / y_up [6][rows_gu] for the six experts `ids` names.
     virtual void moe_gate_up(const ExpertTable & t, const int * ids, const float * x,
-                             float * y_gate, float * y_up) = 0;
+                             float * y_gate, float * y_up, int slot) = 0;
     // y [6][rows_d]; slot k reads h + k*K_d.
-    virtual void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y) = 0;
+    virtual void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y,
+                          int slot) = 0;
     virtual void swiglu_clamp(const float * gate, const float * up, float * h, int n,
                               float limit) = 0;
     virtual void moe_accum(const float * y, const float * w, int n_used, int n,
                            float * weighted, float * out) = 0;
+
+    // -- profiling (--profile) ------------------------------------------------
+    // Miss bytes counted ON THE DEVICE from the ids the router chose (no host
+    // round trip): count_misses() adds the six experts' miss_bytes to a
+    // device counter; miss_bytes_total() reads it (a sync -- report time only).
+    virtual void set_profile(bool on) { (void) on; }
+    // --staged-loads 0|1 (GPU): a GEMV row through LDS with 16-byte loads (1,
+    // default) or read in place with the decoders' byte loads (0). Same
+    // decoder on the same bytes: the pair is a bit-identity check.
+    virtual void set_staged_loads(int on) { (void) on; }
+    virtual void count_misses(const ExpertTable & t, const int * ids) { (void) t; (void) ids; }
+    virtual double miss_bytes_total() { return 0.0; }
+    virtual void reset_miss_count() {}
 
     // -- memory the kernels read over PCIe -------------------------------------
     // Pinned, device-mapped host memory; returns the view a kernel on THIS

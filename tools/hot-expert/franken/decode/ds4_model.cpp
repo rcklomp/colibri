@@ -276,8 +276,13 @@ void Ds4Model::place_experts(LayerWeights & L, Backend & be, Ds4Ops & ops) {
     L.et.K_gu = (int) L.exp_gate.K; L.et.rows_gu = (int) L.exp_gate.rows;
     L.et.K_d  = (int) L.exp_down.K; L.et.rows_d  = (int) L.exp_down.rows;
     if (L.exp_up.type != L.exp_gate.type) throw std::runtime_error("gate/up formats differ on layer " + std::to_string(il));
+    L.et.sz_g = sg; L.et.sz_u = su; L.et.sz_d = sd;
+    if ((sg | su | sd) % 16) throw std::runtime_error("expert slices of layer " + std::to_string(il) +
+                                                      " are not 16-byte multiples (the staged loads need it)");
     L.tab_host.assign(3 * N_EXPERT, nullptr);
+    L.miss_host.assign(N_EXPERT, 0);
     if (!be.is_gpu()) {
+        L.et.miss_bytes = L.miss_host.data();          // all resident on the CPU arm
         for (int e = 0; e < N_EXPERT; ++e) {
             L.tab_host[e]                = tg->data + (size_t) e * sg;
             L.tab_host[N_EXPERT + e]     = tu->data + (size_t) e * su;
@@ -313,12 +318,16 @@ void Ds4Model::place_experts(LayerWeights & L, Backend & be, Ds4Ops & ops) {
             L.tab_host[e] = view + j * slab;
             L.tab_host[N_EXPERT + e] = view + j * slab + sg;
             L.tab_host[2 * N_EXPERT + e] = view + j * slab + sg + su;
+            L.miss_host[e] = (int) slab;
         }
         host_expert_bytes_ += miss.size() * slab;
     }
     const void ** dtab = (const void **) be.alloc_raw(3 * N_EXPERT * sizeof(void *));
     be.upload(dtab, L.tab_host.data(), 3 * N_EXPERT * sizeof(void *));
     L.et.gate = dtab; L.et.up = dtab + N_EXPERT; L.et.down = dtab + 2 * N_EXPERT;
+    int * dmiss = (int *) be.alloc_raw(N_EXPERT * sizeof(int));
+    be.upload(dmiss, L.miss_host.data(), N_EXPERT * sizeof(int));
+    L.et.miss_bytes = dmiss;
     L.n_resident = (int) res.size();
     placed_ += res.size() * slab;
 }

@@ -115,6 +115,24 @@ Ds4Runner::Ds4Runner(Ds4Model & model, std::vector<Ds4Ops *> ops, const Ds4Confi
         }
     }
     routed_.assign((size_t) (model_.il1() - model_.il0() + 1) * N_EXPERT_USED, -1);
+
+    // The miss path's staging ring, per card: slots 0/1 alternate over the
+    // layers, 2..4 belong to the token-id-routed layers 0-2 (staged at embed).
+    if (cfg_.miss_stage) {
+        std::vector<size_t> max_slab((size_t) n_dev, 0);
+        for (int il = model_.il0(); il <= model_.il1(); ++il) {
+            const ExpertTable & t = model_.layer(il).et;
+            size_t & m = max_slab[(size_t) dev_of(il)];
+            m = std::max(m, t.sz_g + t.sz_u + t.sz_d);
+        }
+        for (int d = 0; d < n_dev; ++d)
+            if (max_slab[(size_t) d]) ops_[(size_t) d]->reserve_moe(max_slab[(size_t) d], 2 + HASH_LAYERS);
+    }
+}
+
+int Ds4Runner::stage_slot(int il) const {
+    if (!cfg_.miss_stage) return -1;
+    return (il < HASH_LAYERS) ? 2 + il : (il & 1);
 }
 
 Ds4Runner::~Ds4Runner() {
@@ -298,17 +316,13 @@ void Ds4Runner::ffn(int il, Recorder & rec) {
     rec.tap(b, "ffn_moe_weights", il, s.wraw, N_EXPERT_USED);
     rec.tap(b, "ffn_moe_weights_norm", il, s.wnorm, N_EXPERT_USED);
     rec.tap(b, "ffn_moe_weights_scaled", il, s.wsc, N_EXPERT_USED);
+    o.count_misses(L.et, s.ids);                   // --profile only: bytes over PCIe, on the device
 
-    o.moe_gate_up(L.et, s.ids, s.xn, s.yg, s.yu);
-    rec.tap(b, "ffn_moe_up",   il, s.yu, (size_t) N_EXPERT_USED * N_FF_EXP);
-    rec.tap(b, "ffn_moe_gate", il, s.yg, (size_t) N_EXPERT_USED * N_FF_EXP);
-    o.swiglu_clamp(s.yg, s.yu, s.yh, N_EXPERT_USED * N_FF_EXP, SWIGLU_CLAMP);
-    rec.tap(b, "ffn_moe_swiglu_limited", il, s.yh, (size_t) N_EXPERT_USED * N_FF_EXP);
-    o.moe_down(L.et, s.ids, s.yh, s.yd);
-    rec.tap(b, "ffn_moe_down", il, s.yd, (size_t) N_EXPERT_USED * N_EMBD);
-    o.moe_accum(s.yd, s.wsc, N_EXPERT_USED, N_EMBD, s.ywt, s.moe);
-    rec.tap(b, "ffn_moe_weighted", il, s.ywt, (size_t) N_EXPERT_USED * N_EMBD);
-    rec.tap(b, "ffn_moe_out", il, s.moe, N_EMBD);
+    // The miss path (L5 step 3): the six experts' staging starts NOW, on a
+    // side stream, and the shared expert -- which does not depend on it --
+    // runs meanwhile. A token-id-routed layer was staged at embed time.
+    const int slot = stage_slot(il);
+    if (!hash) o.moe_stage(L.et, s.ids, slot);
 
     o.gemv(L.sh_up, s.xn, s.su);
     rec.tap(b, "ffn_up", il, s.su, N_FF_EXP);
@@ -318,6 +332,18 @@ void Ds4Runner::ffn(int il, Recorder & rec) {
     rec.tap(b, "ffn_swiglu_limited", il, s.sh, N_FF_EXP);
     o.gemv(L.sh_down, s.sh, s.sd);
     rec.tap(b, "ffn_shexp", il, s.sd, N_EMBD);
+
+    o.moe_gate_up(L.et, s.ids, s.xn, s.yg, s.yu, slot);
+    rec.tap(b, "ffn_moe_up",   il, s.yu, (size_t) N_EXPERT_USED * N_FF_EXP);
+    rec.tap(b, "ffn_moe_gate", il, s.yg, (size_t) N_EXPERT_USED * N_FF_EXP);
+    o.swiglu_clamp(s.yg, s.yu, s.yh, N_EXPERT_USED * N_FF_EXP, SWIGLU_CLAMP);
+    rec.tap(b, "ffn_moe_swiglu_limited", il, s.yh, (size_t) N_EXPERT_USED * N_FF_EXP);
+    o.moe_down(L.et, s.ids, s.yh, s.yd, slot);
+    rec.tap(b, "ffn_moe_down", il, s.yd, (size_t) N_EXPERT_USED * N_EMBD);
+    o.moe_accum(s.yd, s.wsc, N_EXPERT_USED, N_EMBD, s.ywt, s.moe);
+    rec.tap(b, "ffn_moe_weighted", il, s.ywt, (size_t) N_EXPERT_USED * N_EMBD);
+    rec.tap(b, "ffn_moe_out", il, s.moe, N_EMBD);
+
     b.binary(FK_ADD, s.moe, s.sd, s.fo, N_EMBD);
     rec.tap(b, "ffn_out", il, s.fo, N_EMBD);
 }
@@ -359,9 +385,12 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
     model_.embed_row(token, e.data());
     b0.boundary_wait_free(0);     // the next card has read last token's H out of us
     b0.upload(s0.x, e.data(), N_EMBD * sizeof(float));
-    for (int il = il0; il <= std::min(il1, HASH_LAYERS - 1); ++il)
+    for (int il = il0; il <= std::min(il1, HASH_LAYERS - 1); ++il) {
         be(il).upload(S(il).hash + (size_t) il * N_EXPERT_USED, model_.hash_ids(il, token),
                       N_EXPERT_USED * sizeof(int32_t));
+        // their experts are known now: stage them before layer 0 even starts
+        op(il).moe_stage(model_.layer(il).et, S(il).hash + (size_t) il * N_EXPERT_USED, stage_slot(il));
+    }
     for (int h = 0; h < HC; ++h) b0.copy(s0.H + (size_t) h * N_EMBD, s0.x, N_EMBD);   // hc_init
     rec.tap(b0, "hc_init", -1, s0.H, HC_DIM);
 
@@ -393,6 +422,8 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
         b.argmax(logits_, N_VOCAB, greedy_);
         b.download(&id, greedy_, sizeof(int));
     }
+    if (profile_)
+        for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).prof_end_token();
     ++pos_;
     return id;
 }
@@ -438,7 +469,8 @@ int ds4_main(int argc, char ** argv) {
     std::string model_path, oracle_dir, dump_dir, routing_dir;
     std::vector<int32_t> tokens;
     int il0 = 0, il1 = N_LAYER - 1, n_devices = 3, threads = 4, ctx = 512, greedy_n = 0, time_n = 0;
-    bool with_head = true, use_cpu = false, plan_only = false, sync_debug = false;
+    bool with_head = true, use_cpu = false, plan_only = false, sync_debug = false, profile = false;
+    int miss_stage = 1, staged_loads = 1;
     double min_cos = 0.999;
     Placement pl;
     for (int i = 1; i < argc; ++i) {
@@ -452,6 +484,9 @@ int ds4_main(int argc, char ** argv) {
         else if (a == "--cpu")                    use_cpu = true;
         else if (a == "--plan-only")              plan_only = true;   // print placement, run nothing
         else if (a == "--sync-debug")             sync_debug = true;  // drain + check after every launch
+        else if (a == "--profile")                profile = true;     // per-class device time, --time tokens
+        else if (a == "--miss-stage" && i + 1 < argc) miss_stage = std::atoi(argv[++i]);
+        else if (a == "--staged-loads" && i + 1 < argc) staged_loads = std::atoi(argv[++i]);
         else if (a == "--no-head")                with_head = false;
         else if (a == "--devices"&& i + 1 < argc) n_devices = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
@@ -474,7 +509,8 @@ int ds4_main(int argc, char ** argv) {
                              "  [--layers A-B] [--no-head] [--devices N] [--ctx N] [--threads N]\n"
                              "  [--placement DIR --expert-gb X]   (GPU: M2 histogram, VRAM for experts a card)\n"
                              "  [--oracle DIR] [--routing DIR] [--dump DIR] [--min-cos X]\n"
-                             "  [--greedy N] [--time N] [--plan-only] [--sync-debug]\n");
+                             "  [--greedy N] [--time N] [--plan-only] [--sync-debug]\n"
+                             "  [--profile] [--miss-stage 0|1] [--staged-loads 0|1]\n");
         return 2;
     }
     if ((int) tokens.size() + greedy_n + time_n > ctx) { std::fprintf(stderr, "--ctx too small\n"); return 2; }
@@ -497,6 +533,7 @@ int ds4_main(int argc, char ** argv) {
         }
         for (Backend * b : devs) {
             if (sync_debug) b->set_sync_debug(true);
+            if (profile && !use_cpu) b->set_profile(true);
             owned_ops.emplace_back(use_cpu ? make_ds4_cpu_ops(*b) : make_ds4_gpu_ops(*b));
             ops.push_back(owned_ops.back().get());
         }
@@ -515,7 +552,9 @@ int ds4_main(int argc, char ** argv) {
         for (int d = 0; d < n_report; ++d) placement_ok &= devs[d]->verify_placement(stdout);
         if (!placement_ok) { std::printf("DS4 FAIL (placement)\n"); return 1; }
 
-        Ds4Config cfg; cfg.ctx = ctx; cfg.log_routing = !routing_dir.empty();
+        for (Ds4Ops * o : ops) { o->set_profile(profile && !use_cpu); o->set_staged_loads(staged_loads); }
+        Ds4Config cfg; cfg.ctx = ctx; cfg.log_routing = !routing_dir.empty(); cfg.miss_stage = miss_stage;
+        std::printf("miss_stage=%d staged_loads=%d profile=%d\n", miss_stage, staged_loads, (int) profile);
         Ds4Runner run(model, ops, cfg);
         run.report_cache_bytes(stdout);
         for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after caches+scratch");
@@ -571,6 +610,12 @@ int ds4_main(int argc, char ** argv) {
             // decode timing: one token a step, the id read back each token
             // (it feeds the next), routing capture off
             run.set_log_routing(false);
+            const bool prof = profile && !use_cpu;
+            if (prof) {
+                // the warm tokens (prompt, greedy) are not in the profile
+                for (int d = 0; d < n_report; ++d) { devs[d]->sync(); devs[d]->prof_reset(); ops[d]->reset_miss_count(); }
+                run.set_profile(true);
+            }
             std::vector<double> ms;
             for (int i = 0; i < time_n; ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
@@ -580,6 +625,22 @@ int ds4_main(int argc, char ** argv) {
             const double med = median(ms);
             std::printf("ds4_decode_ms_median=%.3f tok_s=%.2f tokens=%d depth_end=%d ctx=%d\n",
                         med, med > 0 ? 1000.0 / med : 0.0, time_n, run.pos(), ctx);
+            if (prof) {
+                // Per card: device time by class (prof_*_us), the card's total,
+                // launches and host syncs a token; then the miss bytes counted
+                // on the device. Profiled tokens pay one event sync each, so
+                // the median above is NOT the unprofiled speed.
+                run.set_profile(false);
+                double miss_all = 0.0;
+                for (int d = 0; d < n_report; ++d) {
+                    std::printf("--- device %d (per token, %d tokens) ---\n", d, time_n);
+                    devs[d]->prof_report(stdout, time_n);
+                    const double mb = ops[d]->miss_bytes_total() / time_n / 1e6;
+                    miss_all += mb;
+                    std::printf("ds4_miss_mb_per_token_dev%d=%.2f\n", d, mb);
+                }
+                std::printf("ds4_miss_mb_per_token=%.2f (counted on the device from the routed ids)\n", miss_all);
+            }
         }
 
         bool ok = true;

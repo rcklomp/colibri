@@ -256,6 +256,10 @@ stop_gateway() {
   # would leave franken_decode holding ~22 GB on each card, and the very next step
   # (assert_vram_free) would then refuse to start anything at all -- with nothing saying why.
   pkill -9 -x franken_decode 2>/dev/null || true
+  # The engine runs inside the ROCm 7.14 image (~/bench/franken_decode_docker.sh, container
+  # `franken_engine`): a host-side pkill by name did not reach it twice on 2026-09-23 and
+  # the swap back found 24 GB still on the cards. Stop the container explicitly.
+  docker stop -t 5 franken_engine >/dev/null 2>&1 || true
   wait_no_glm53 && wait_no_franken
 }
 

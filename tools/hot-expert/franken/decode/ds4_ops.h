@@ -75,33 +75,62 @@ public:
     virtual void hc_head_pre(const float * mixes4, const float * scale1, const float * base4,
                              float * pre, float eps) = 0;
     virtual void hc_weighted_sum(const float * H, const float * w, float * out) = 0;
+    // hc_init: the embedding row repeated into the four streams. An op of its
+    // own because Backend::copy on a card is a NULL-stream memcpy, which a
+    // stream capture cannot contain.
+    virtual void hc_init(const float * x, float * H) = 0;
     virtual void hc_post(const float * x, const float * H, const float * post,
                          const float * comb, float * Hout) = 0;
 
-    // -- partial RoPE on the last N_ROT dims of each row (NORM pairs) --------
-    virtual void rope_tail(float * x, int n_rows, int row_len, int pos,
+    // -- POSITION-SEMANTIC OPS (L5 step 3b) -------------------------------------
+    // Every op below takes the token's position `pos` and derives from it
+    // whatever it needs -- the raw-window slot, the compressor ring slot, the
+    // ape row, whether a block completed and which, how many blocks are
+    // visible, the attention extents. On a card, while a hipGraph is being
+    // captured, the kernels read the position from a device int instead of
+    // the argument (Ds4GpuOps: GpuBackend's gpos), so ONE captured graph is
+    // right for every position of its class; eagerly they take `pos` as is.
+    // The block-completing ops are no-ops when no block completed at `pos`,
+    // which is what lets a graph always contain them.
+
+    // Rotate at `pos`, or at the first position of the block that ends at
+    // `pos` when block_ratio > 0 (a compressed row). NORM pairs, last N_ROT
+    // dims of every row; `inverse` is ggml_rope_ext_back.
+    virtual void rope_tail(float * x, int n_rows, int row_len, int pos, int block_ratio,
                            const RopeParams & rp, bool inverse) = 0;
     virtual void fwht(float * x, int n_rows, int n) = 0;
-    virtual void to_f16(const float * x, uint16_t * y, int n) = 0;
+    // f16 into the raw window, slot pos % N_SWA
+    virtual void store_raw(const float * kv, uint16_t * raw_ring, int pos) = 0;
+    // f16 into cache row pos / ratio -- only when (pos + 1) % ratio == 0
+    virtual void store_block(const float * x, uint16_t * cache, int width, int ratio, int pos) = 0;
+    // ring[pos % ring_rows][0..width) = src
+    virtual void ring_put(float * ring, int ring_rows, int width, int pos, const float * src) = 0;
+    // x[0..width) += table[pos % ratio][0..width)   (the compressor's ape row)
+    virtual void add_row(float * x, const float * table, int width, int ratio, int pos) = 0;
 
-    // -- compressor pooling ---------------------------------------------------
+    // -- compressor pooling: the block that ends at `pos`, if one does ---------
     virtual void comp_pool(const float * ring_kv, const float * ring_sc, int ring_rows,
-                           int ratio, int d_out, int blk, float * out) = 0;
+                           int ratio, int d_out, int pos, float * out) = 0;
     virtual void comp_pool_overlap(const float * ring_kv, const float * ring_sc, int ring_rows,
-                                   int ratio, int d_out, int blk, float * out) = 0;
+                                   int ratio, int d_out, int pos, float * out) = 0;
 
-    // -- the lightning indexer -----------------------------------------------
-    virtual void lid_scores(const float * q, const float * w, const uint16_t * keys,
-                            int n_blocks, float * scores) = 0;
-    // The top min(k, n) of scores[0..n) as a SET (order unspecified, as
-    // ggml_top_k's). Called only when n > k; below that the selection is the
-    // identity and the graph passes comp_ids = nullptr.
-    virtual void topk(const float * scores, int n, int k, int * out) = 0;
+    // -- the lightning indexer: the (pos+1)/4 visible blocks ---------------------
+    virtual void lid_scores(const float * q, const float * w, const uint16_t * keys, int pos,
+                            float * scores) = 0;
+    // The top min(k, n) of the n = (pos+1)/4 scores as a SET (order unspecified,
+    // as ggml_top_k's); n <= k writes the identity 0..n-1.
+    virtual void topk(const float * scores, int pos, int k, int * out) = 0;
 
-    // -- attention: 64 query heads against one shared K=V head --------------
-    virtual void attn(const float * q, const uint16_t * raw_ring, int raw_pos0, int n_raw,
-                      const uint16_t * comp, const int * comp_ids, int n_comp,
-                      const float * sinks, float scale, float * out) = 0;
+    // -- attention: 64 query heads against one shared K=V head ------------------
+    // Keys: the raw window of `pos` (positions max(0, pos-127) .. pos) then
+    // n_comp = min((pos+1)/ratio, cap) compressed rows (ids, or 0.. when
+    // `comp_ids` is null); ratio 0 = the raw window alone.
+    virtual void attn(const float * q, const uint16_t * raw_ring, int pos, const uint16_t * comp,
+                      int ratio, int cap, const int * comp_ids, const float * sinks, float scale,
+                      float * out) = 0;
+    // Size whatever the attention needs for positions < ctx, once (a card must
+    // not allocate inside a captured graph).
+    virtual void reserve(int ctx) { (void) ctx; }
 
     // -- MoE ------------------------------------------------------------------
     // `hash_ids` (6 ids, backend memory) replaces the top-6 on hash layers.

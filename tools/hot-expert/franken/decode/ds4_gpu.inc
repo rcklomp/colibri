@@ -32,6 +32,9 @@ __device__ __forceinline__ float ds4_h2f(unsigned int u) {
     return __half2float(__ushort_as_half((unsigned short) u));
 }
 __device__ __forceinline__ float ds4_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+// The token's position: the device int a captured graph advances, or the
+// argument when the op is issued eagerly (L5 step 3b).
+__device__ __forceinline__ int ds4_pos(const int * dpos, int pos) { return dpos ? *dpos : pos; }
 
 // ------------------------------------------------------------ the GEMVs --
 //
@@ -232,6 +235,11 @@ __global__ void k_ds4_hc_head_pre(const float * __restrict__ m, const float * __
     if (h < D::HC) pre[h] = ds4_sigmoid(m[h] * s[0] + b[h]) * 1.0f + eps;
 }
 
+__global__ void k_ds4_hc_init(const float * __restrict__ x, float * __restrict__ H) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D::HC_DIM) H[i] = x[i % D::N_EMBD];
+}
+
 __global__ void k_ds4_hc_wsum(const float * __restrict__ H, const float * __restrict__ w,
                               float * __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -257,11 +265,14 @@ __global__ void k_ds4_hc_post(const float * __restrict__ x, const float * __rest
 // effective mscale come from the HOST (the CPU arm's own powf/logf), and
 // theta is built by the same repeated multiply as ggml's cache, so theta is
 // bit-identical to the CPU arm; cos/sin are the device's.
-__global__ void k_ds4_rope_tail(float * __restrict__ x, int row_len, float pos, float theta_scale,
+__global__ void k_ds4_rope_tail(float * __restrict__ x, int row_len, int pos_arg,
+                                const int * __restrict__ dpos, int block_ratio, float theta_scale,
                                 float freq_scale, float ext, float mscale, float c0, float c1,
                                 float sin_sign) {
     const int i = threadIdx.x;                  // pair, 0..N_ROT/2-1
-    float theta = pos;
+    int p = ds4_pos(dpos, pos_arg);
+    if (block_ratio > 0) p = (p / block_ratio) * block_ratio;
+    float theta = (float) p;
     for (int j = 0; j < i; ++j) theta *= theta_scale;
     const float ti = freq_scale * theta;
     float th = ti;
@@ -296,19 +307,41 @@ void k_ds4_fwht(float * __restrict__ x, float scale) {
     row[t] = v[t];
 }
 
-__global__ void k_ds4_to_f16(const float * __restrict__ x, unsigned short * __restrict__ y, int n) {
+// f16 store into a positional cache. ratio 0: the raw window, row pos % N_SWA;
+// ratio R > 0: row pos / R, and only when a block ends at pos.
+__global__ void k_ds4_store_f16(const float * __restrict__ x, unsigned short * __restrict__ cache,
+                                int width, int ratio, int pos_arg, const int * __restrict__ dpos) {
+    const int p = ds4_pos(dpos, pos_arg);
+    int row;
+    if (ratio == 0) row = p % D::N_SWA;
+    else { if ((p + 1) % ratio != 0) return; row = p / ratio; }
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __half_as_ushort(__float2half_rn(x[i]));
+    if (i < width) cache[(size_t) row * width + i] = __half_as_ushort(__float2half_rn(x[i]));
+}
+__global__ void k_ds4_ring_put(float * __restrict__ ring, int ring_rows, int width, int pos_arg,
+                               const int * __restrict__ dpos, const float * __restrict__ src) {
+    const int p = ds4_pos(dpos, pos_arg);
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width) ring[(size_t) (p % ring_rows) * width + i] = src[i];
+}
+__global__ void k_ds4_add_row(float * __restrict__ x, const float * __restrict__ table, int width,
+                              int ratio, int pos_arg, const int * __restrict__ dpos) {
+    const int p = ds4_pos(dpos, pos_arg);
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width) x[i] = x[i] + table[(size_t) (p % ratio) * width + i];
 }
 
 // ------------------------------------------------------ compressor pools --
 // One thread a dimension: softmax over the candidates, then the weighted sum
 // (the CPU arm sums in double; here in float -- a summation-order difference).
 __global__ void k_ds4_comp_pool(const float * __restrict__ rk, const float * __restrict__ rs,
-                                int ring, int R, int d_out, int blk, int overlap,
-                                float * __restrict__ out) {
+                                int ring, int R, int d_out, int pos_arg, const int * __restrict__ dpos,
+                                int overlap, float * __restrict__ out) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= d_out) return;
+    const int p = ds4_pos(dpos, pos_arg);
+    if ((p + 1) % R != 0) return;                // no block ends here: out untouched
+    const int blk = p / R;
     const int n = overlap ? 2 * R : R;
     const int width = overlap ? 2 * d_out : d_out;
     auto get = [&](int j, float & v, float & s) {
@@ -356,7 +389,9 @@ constexpr int DS4_LID_LANES   = 4;                                  // lanes a k
 constexpr int DS4_LID_KEYS    = DS4_LID_THREADS / DS4_LID_LANES;    // 64 keys a workgroup
 __global__ __launch_bounds__(DS4_LID_THREADS)
 void k_ds4_lid_scores(const float * __restrict__ q, const float * __restrict__ w,
-                      const unsigned short * __restrict__ keys, int n, float * __restrict__ scores) {
+                      const unsigned short * __restrict__ keys, int pos_arg,
+                      const int * __restrict__ dpos, float * __restrict__ scores) {
+    const int n = (ds4_pos(dpos, pos_arg) + 1) / D::CSA_RATIO;
     __shared__ float sq[D::IDX_N_HEAD * D::IDX_DIM];
     __shared__ float sw[D::IDX_N_HEAD];
     for (int i = threadIdx.x; i < D::IDX_N_HEAD * D::IDX_DIM; i += DS4_LID_THREADS) sq[i] = q[i];
@@ -397,11 +432,17 @@ __device__ __forceinline__ unsigned ds4_key(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 __global__ __launch_bounds__(DS4_TOPK_THREADS)
-void k_ds4_topk(const float * __restrict__ s, int n, int k, int * __restrict__ out) {
+void k_ds4_topk(const float * __restrict__ s, int pos_arg, const int * __restrict__ dpos, int k,
+                int * __restrict__ out) {
     __shared__ unsigned hist[256];
     __shared__ unsigned sh_prefix, sh_mask, sh_wr, sh_tie;
     __shared__ int sh_kr;
     const int t = threadIdx.x;
+    const int n = (ds4_pos(dpos, pos_arg) + 1) / D::CSA_RATIO;
+    if (n <= k) {                                // the identity, as ggml_top_k's
+        for (int i = t; i < n; i += DS4_TOPK_THREADS) out[i] = i;
+        return;
+    }
     unsigned prefix = 0, mask = 0;
     int kr = k;
     for (int pass = 0; pass < 4; ++pass) {
@@ -448,15 +489,24 @@ void k_ds4_topk(const float * __restrict__ s, int n, int k, int * __restrict__ o
 constexpr int DS4_ATT_CHUNK   = 32;
 constexpr int DS4_ATT_HGROUPS = 4;
 constexpr int DS4_ATT_STRIDE  = D::HEAD_DIM / 2 + 1;       // u32 per LDS row
+__device__ __forceinline__ void ds4_attn_extent(int p, int ratio, int cap, int & raw0, int & n_raw,
+                                                int & n_comp) {
+    raw0 = p - D::N_SWA + 1 > 0 ? p - D::N_SWA + 1 : 0;
+    n_raw = p - raw0 + 1;
+    n_comp = ratio ? min((p + 1) / ratio, cap) : 0;
+}
 __global__ __launch_bounds__(256)
 void k_ds4_attn_part(const float * __restrict__ q, const unsigned short * __restrict__ raw,
-                     int raw0, int n_raw, const unsigned short * __restrict__ comp,
-                     const int * __restrict__ ids, int n_comp, float scale,
+                     int pos_arg, const int * __restrict__ dpos, const unsigned short * __restrict__ comp,
+                     int ratio, int cap, const int * __restrict__ ids, float scale,
                      float * __restrict__ po, float * __restrict__ pm, float * __restrict__ pl) {
     __shared__ unsigned kl[DS4_ATT_CHUNK * DS4_ATT_STRIDE];
     const int chunk = blockIdx.x, hg = blockIdx.y, t = threadIdx.x;
+    int raw0, n_raw, n_comp;
+    ds4_attn_extent(ds4_pos(dpos, pos_arg), ratio, cap, raw0, n_raw, n_comp);
     const int n_keys = n_raw + n_comp;
     const int j0 = chunk * DS4_ATT_CHUNK;
+    if (j0 >= n_keys) return;                    // a graph sized for its class's last position
     const int nk = min(DS4_ATT_CHUNK, n_keys - j0);
     for (int idx = t; idx < DS4_ATT_CHUNK * (D::HEAD_DIM / 2); idx += 256) {
         const int r = idx / (D::HEAD_DIM / 2), c = idx % (D::HEAD_DIM / 2);
@@ -510,9 +560,12 @@ void k_ds4_attn_part(const float * __restrict__ q, const unsigned short * __rest
 
 __global__ __launch_bounds__(D::HEAD_DIM)
 void k_ds4_attn_combine(const float * __restrict__ po, const float * __restrict__ pm,
-                        const float * __restrict__ pl, int n_chunks,
-                        const float * __restrict__ sinks, float * __restrict__ out) {
+                        const float * __restrict__ pl, int pos_arg, const int * __restrict__ dpos,
+                        int ratio, int cap, const float * __restrict__ sinks, float * __restrict__ out) {
     const int h = blockIdx.x, d = threadIdx.x;
+    int raw0, n_raw, n_comp;
+    ds4_attn_extent(ds4_pos(dpos, pos_arg), ratio, cap, raw0, n_raw, n_comp);
+    const int n_chunks = (n_raw + n_comp + DS4_ATT_CHUNK - 1) / DS4_ATT_CHUNK;
     float M = sinks[h];
     for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, pm[c * D::N_HEAD + h]);
     float L = expf(sinks[h] - M), o = 0.0f;
@@ -646,6 +699,10 @@ public:
         g_.mark(PC_DS4_HC); g_.last_op_ = "ds4_hc_head_pre";
         k_ds4_hc_head_pre<<<1, WAVE, 0, g_.stream_>>>(m, s, b, pre, eps);
     }
+    void hc_init(const float * x, float * H) override {
+        g_.mark(PC_DS4_HC); g_.last_op_ = "ds4_hc_init";
+        k_ds4_hc_init<<<ceil_div(D::HC_DIM, BLK), BLK, 0, g_.stream_>>>(x, H);
+    }
     void hc_weighted_sum(const float * H, const float * w, float * out) override {
         g_.mark(PC_DS4_HC); g_.last_op_ = "ds4_hc_wsum";
         k_ds4_hc_wsum<<<ceil_div(D::N_EMBD, BLK), BLK, 0, g_.stream_>>>(H, w, out);
@@ -656,8 +713,8 @@ public:
         k_ds4_hc_post<<<ceil_div(D::HC_DIM, BLK), BLK, 0, g_.stream_>>>(x, H, post, comb, Ho);
     }
 
-    void rope_tail(float * x, int n_rows, int row_len, int pos, const D::RopeParams & rp,
-                   bool inverse) override {
+    void rope_tail(float * x, int n_rows, int row_len, int pos, int block_ratio,
+                   const D::RopeParams & rp, bool inverse) override {
         // the host half of ggml's rope cache, with the CPU arm's own libm
         const float theta_scale = powf(rp.freq_base, -2.0f / D::N_ROT);
         auto corr = [&](float beta) {
@@ -668,51 +725,77 @@ public:
         float ms = rp.attn_factor;
         if (rp.ext_factor != 0.0f) ms *= 1.0f + 0.1f * logf(1.0f / rp.freq_scale);
         g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_rope_tail";
-        k_ds4_rope_tail<<<n_rows, D::N_ROT / 2, 0, g_.stream_>>>(x, row_len, (float) pos, theta_scale,
-            rp.freq_scale, rp.ext_factor, ms, c0, c1, inverse ? -1.0f : 1.0f);
+        k_ds4_rope_tail<<<n_rows, D::N_ROT / 2, 0, g_.stream_>>>(x, row_len, pos, dp(), block_ratio,
+            theta_scale, rp.freq_scale, rp.ext_factor, ms, c0, c1, inverse ? -1.0f : 1.0f);
     }
     void fwht(float * x, int n_rows, int n) override {
         if (n != D::IDX_DIM) { std::fprintf(stderr, "ds4 fwht: n=%d, the kernel is 128-wide\n", n); std::abort(); }
         g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_fwht";
         k_ds4_fwht<<<n_rows, D::IDX_DIM, 0, g_.stream_>>>(x, 1.0f / sqrtf((float) n));
     }
-    void to_f16(const float * x, uint16_t * y, int n) override {
-        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_to_f16";
-        k_ds4_to_f16<<<ceil_div(n, BLK), BLK, 0, g_.stream_>>>(x, (unsigned short *) y, n);
+    void store_raw(const float * kv, uint16_t * raw, int pos) override {
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_store_raw";
+        k_ds4_store_f16<<<ceil_div(D::HEAD_DIM, BLK), BLK, 0, g_.stream_>>>(
+            kv, (unsigned short *) raw, D::HEAD_DIM, 0, pos, dp());
+    }
+    void store_block(const float * x, uint16_t * cache, int width, int ratio, int pos) override {
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_store_block";
+        k_ds4_store_f16<<<ceil_div(width, BLK), BLK, 0, g_.stream_>>>(
+            x, (unsigned short *) cache, width, ratio, pos, dp());
+    }
+    void ring_put(float * ring, int ring_rows, int width, int pos, const float * src) override {
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_ring_put";
+        k_ds4_ring_put<<<ceil_div(width, BLK), BLK, 0, g_.stream_>>>(ring, ring_rows, width, pos, dp(), src);
+    }
+    void add_row(float * x, const float * table, int width, int ratio, int pos) override {
+        g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_add_row";
+        k_ds4_add_row<<<ceil_div(width, BLK), BLK, 0, g_.stream_>>>(x, table, width, ratio, pos, dp());
     }
 
-    void comp_pool(const float * rk, const float * rs, int ring, int R, int d_out, int blk,
+    void comp_pool(const float * rk, const float * rs, int ring, int R, int d_out, int pos,
                    float * out) override {
         g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_comp_pool";
-        k_ds4_comp_pool<<<ceil_div(d_out, 128), 128, 0, g_.stream_>>>(rk, rs, ring, R, d_out, blk, 0, out);
+        k_ds4_comp_pool<<<ceil_div(d_out, 128), 128, 0, g_.stream_>>>(rk, rs, ring, R, d_out, pos, dp(), 0, out);
     }
-    void comp_pool_overlap(const float * rk, const float * rs, int ring, int R, int d_out, int blk,
+    void comp_pool_overlap(const float * rk, const float * rs, int ring, int R, int d_out, int pos,
                            float * out) override {
         g_.mark(PC_DS4_ATTN_MISC); g_.last_op_ = "ds4_comp_pool_overlap";
-        k_ds4_comp_pool<<<ceil_div(d_out, 128), 128, 0, g_.stream_>>>(rk, rs, ring, R, d_out, blk, 1, out);
+        k_ds4_comp_pool<<<ceil_div(d_out, 128), 128, 0, g_.stream_>>>(rk, rs, ring, R, d_out, pos, dp(), 1, out);
     }
 
-    void lid_scores(const float * q, const float * w, const uint16_t * keys, int n,
+    void lid_scores(const float * q, const float * w, const uint16_t * keys, int pos,
                     float * scores) override {
+        const int n = (bpos(pos) + 1) / D::CSA_RATIO;             // grid for the class's last position
+        if (n <= 0) return;
         g_.mark(PC_DS4_LID); g_.last_op_ = "ds4_lid_scores";
         k_ds4_lid_scores<<<ceil_div(n, DS4_LID_KEYS), DS4_LID_THREADS, 0, g_.stream_>>>(
-            q, w, (const unsigned short *) keys, n, scores);
+            q, w, (const unsigned short *) keys, pos, dp(), scores);
     }
-    void topk(const float * s, int n, int k, int * out) override {
+    void topk(const float * s, int pos, int k, int * out) override {
         g_.mark(PC_DS4_TOPK); g_.last_op_ = "ds4_topk";
-        k_ds4_topk<<<1, DS4_TOPK_THREADS, 0, g_.stream_>>>(s, n, k, out);
+        k_ds4_topk<<<1, DS4_TOPK_THREADS, 0, g_.stream_>>>(s, pos, dp(), k, out);
     }
 
-    void attn(const float * q, const uint16_t * raw, int raw0, int n_raw, const uint16_t * comp,
-              const int * ids, int n_comp, const float * sinks, float scale, float * out) override {
+    void attn(const float * q, const uint16_t * raw, int pos, const uint16_t * comp, int ratio,
+              int cap, const int * ids, const float * sinks, float scale, float * out) override {
+        const int bp = bpos(pos);
+        const int n_raw = bp - std::max(0, bp - D::N_SWA + 1) + 1;
+        const int n_comp = ratio ? std::min((bp + 1) / ratio, cap) : 0;
         const int n_chunks = ceil_div(n_raw + n_comp, DS4_ATT_CHUNK);
         ensure_attn(n_chunks);
         g_.mark(PC_DS4_ATTN); g_.last_op_ = "ds4_attn_part";
         k_ds4_attn_part<<<dim3((unsigned) n_chunks, DS4_ATT_HGROUPS), 256, 0, g_.stream_>>>(
-            q, (const unsigned short *) raw, raw0, n_raw, (const unsigned short *) comp, ids, n_comp,
+            q, (const unsigned short *) raw, pos, dp(), (const unsigned short *) comp, ratio, cap, ids,
             scale, po_, pm_, pl_);
         g_.mark(PC_DS4_ATTN); g_.last_op_ = "ds4_attn_combine";
-        k_ds4_attn_combine<<<D::N_HEAD, D::HEAD_DIM, 0, g_.stream_>>>(po_, pm_, pl_, n_chunks, sinks, out);
+        k_ds4_attn_combine<<<D::N_HEAD, D::HEAD_DIM, 0, g_.stream_>>>(po_, pm_, pl_, pos, dp(), ratio,
+                                                                     cap, sinks, out);
+    }
+    void reserve(int ctx) override {
+        // the widest attention: the raw window plus every HCA row, or the
+        // CSA top-512, whichever is larger at this context
+        const int max_keys = D::N_SWA + std::max(D::IDX_TOP_K, ctx / D::HCA_RATIO + 1);
+        ensure_attn(ceil_div(max_keys, DS4_ATT_CHUNK));
     }
 
     void router(const float * logits, const float * bias, const int32_t * hash, float * probs,
@@ -808,6 +891,10 @@ public:
     }
 
 private:
+    // While a graph is captured: the device position the graph reads, and the
+    // last position of the class for sizing grids. Eagerly: none, and `pos`.
+    const int * dp() const { return g_.capturing_ ? g_.gpos_ : nullptr; }
+    int bpos(int pos) const { return g_.capturing_ ? g_.graph_bound_ - 1 : pos; }
     // The main stream joins the side stream's copy for `slot` (once). The
     // interval charged to PC_DS4_MISS_WAIT is the time the card sat waiting.
     const void * const * join(int slot) {

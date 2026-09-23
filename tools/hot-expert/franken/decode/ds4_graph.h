@@ -34,6 +34,22 @@ namespace ds4 {
 struct Ds4Config {
     int  ctx = 512;          // positions the compressed caches are sized for
     bool log_routing = true; // read the routed ids back every step (a sync on a card)
+    // --miss-stage 1 (default): a missed expert is copied into a VRAM staging
+    // ring on a side stream while the shared expert runs, and the token-id
+    // routed layers 0-2 are staged at embed time. 0: step 2's path, read in
+    // place over PCIe inside the GEMV. Same bytes either way.
+    int  miss_stage = 1;
+    // --hip-graph 0|1 (L5 step 3b, default 0): each card's share of a decode
+    // token is captured once per position class as a hipGraph and replayed;
+    // the ops read the position from a device int the graph advances. The
+    // same kernels in the same order with the same arguments -- except the
+    // position, which the kernel now reads -- so a replay is the eager token.
+    int  hip_graph = 0;
+    int  hip_graph_bucket = 1024;   // positions a captured graph serves
+    // --all-ops 1 (a check, not a mode): issue every position-guarded op
+    // eagerly too, exactly as a captured graph contains them -- so the CPU arm
+    // can prove the graph's op sequence gives the eager result.
+    int  all_ops = 0;
 };
 
 class Ds4Runner {
@@ -41,6 +57,7 @@ public:
     // `ops` holds one Ds4Ops per model device, in the model's device order.
     Ds4Runner(Ds4Model & model, std::vector<Ds4Ops *> ops, const Ds4Config & cfg);
     ~Ds4Runner();
+    void graph_report(FILE * out);
 
     // One token at the next position. With the head placed, returns the
     // greedy id; otherwise -1.
@@ -48,6 +65,8 @@ public:
 
     int pos() const { return pos_; }
     void set_log_routing(bool on) { cfg_.log_routing = on; }
+    // --profile: every card closes its profile interval at the end of a step
+    void set_profile(bool on) { profile_ = on; }
     // Per-layer routed ids of the last step, [n_layers][6] (with log_routing).
     const std::vector<int> & routed_ids() const { return routed_; }
     void report_cache_bytes(FILE * out) const;
@@ -88,6 +107,17 @@ private:
     Ds4Config cfg_;
     float eps_, hc_eps_;
     int pos_ = 0;
+    bool profile_ = false;
+    // --hip-graph
+    struct GraphSlot { void * exec = nullptr; int cls = -1; long long epoch = -1; };
+    bool seg_begin(int d);             // true: issue the body (eager or capturing)
+    void seg_end(int d);
+    bool graph_now_ = false, seg_capturing_ = false;
+    int  graph_cls_ = 0, graph_bound_ = 0;
+    std::vector<GraphSlot> graphs_;    // per card
+    std::vector<int *>     dpos_;      // per card: the device-resident position
+    std::vector<int>       dpos_val_;  // what it will hold once queued work has run (-1 unknown)
+    int stage_slot(int il) const;
     std::vector<LayerState> st_;
     std::vector<Scratch> scr_;
     std::vector<int> routed_;

@@ -72,6 +72,7 @@ struct LayerWeights {
                                            // (base is null: the TABLE addresses the experts)
     ExpertTable et;                        // per-expert addresses, backend memory
     std::vector<const void *> tab_host;    // the CPU arm's table (mmap addresses)
+    std::vector<int> miss_host;            // per expert: slab bytes if host-mapped, else 0
     int n_resident = N_EXPERT;             // experts in VRAM (all, on the CPU arm)
     Mat sh_gate, sh_up, sh_down;           // the shared expert, 2048 wide
 };

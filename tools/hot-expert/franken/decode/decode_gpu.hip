@@ -2646,6 +2646,20 @@ enum ProfClass {
     // time and three cards whose busy times add up to more than the wall
     // clock are overlapping.
     PC_GAP,
+    // DeepSeek-V4 (ds4_gpu.inc). Appended, and prof_report prints them only
+    // when non-zero, so a qwen4exp profile reads exactly as it did.
+    PC_DS4_TRUNK_L0,    // Q8_0 / Q6_K / BF16 / F32 trunk GEMVs through k_gemm_batch
+    PC_DS4_TRUNK_KQ,    // Q5_K / Q4_K trunk and lm_head through k_ds4_gemv
+    PC_DS4_EXP_GU,      // routed experts, gate + up
+    PC_DS4_EXP_DOWN,    // routed experts, down
+    PC_DS4_EXP_MISS,    // (--miss-stage 0 --profile) the slots read over PCIe, split out
+    PC_DS4_MISS_WAIT,   // the main stream waiting on the side stream's miss copy
+    PC_DS4_LID,         // the lightning indexer scan
+    PC_DS4_TOPK,
+    PC_DS4_ATTN,        // attention split + combine
+    PC_DS4_ATTN_MISC,   // rope / de-rope / FWHT / f16 stores / compressor pools and rings
+    PC_DS4_HC,          // the four-stream mix: split + Sinkhorn, weighted sum, post
+    PC_DS4_MOE_TAIL,    // swiglu clamp, the weighted sum of the six
     PC_N
 };
 const char * prof_name(int c) {
@@ -2666,6 +2680,18 @@ const char * prof_name(int c) {
         case PC_ARGMAX:       return "argmax";
         case PC_GRAPH:        return "graph_replay";
         case PC_GAP:          return "gap_idle";
+        case PC_DS4_TRUNK_L0:  return "ds4_trunk_l0_kernel";
+        case PC_DS4_TRUNK_KQ:  return "ds4_trunk_kquant";
+        case PC_DS4_EXP_GU:    return "ds4_expert_gate_up";
+        case PC_DS4_EXP_DOWN:  return "ds4_expert_down";
+        case PC_DS4_EXP_MISS:  return "ds4_expert_host_mapped";
+        case PC_DS4_MISS_WAIT: return "ds4_miss_wait";
+        case PC_DS4_LID:       return "ds4_indexer_scan";
+        case PC_DS4_TOPK:      return "ds4_topk";
+        case PC_DS4_ATTN:      return "ds4_attention";
+        case PC_DS4_ATTN_MISC: return "ds4_rope_pool_store";
+        case PC_DS4_HC:        return "ds4_hc_mix";
+        case PC_DS4_MOE_TAIL:  return "ds4_moe_tail";
         default:              return "copy";
     }
 }
@@ -3728,8 +3754,10 @@ public:
         const double n = n_tokens > 0 ? (double) n_tokens : 1.0;
         double total = 0.0;
         for (int c = 0; c < PC_N; ++c) total += prof_us_[c];
-        for (int c = 0; c < PC_N; ++c)
+        for (int c = 0; c < PC_N; ++c) {
+            if (c >= PC_DS4_TRUNK_L0 && prof_us_[c] == 0.0) continue;   // a qwen4exp run
             std::fprintf(out, "prof_%s_us=%.2f\n", prof_name(c), prof_us_[c] / n);
+        }
         std::fprintf(out, "prof_total_us=%.2f\n", total / n);
         // THE OVERLAP NUMBER. `busy` is this card's own work; `total` is the
         // span it covered. Three cards each busy ~2.5 ms a token inside a
@@ -3948,6 +3976,7 @@ private:
 
     void mark(int cls, int gemv_group = -1, size_t bytes = 0) {
         dev_ensure(dev_);                  // every op runs on its OWN card
+        if (cls == PC_TRUNK && trunk_cls_override_ >= 0) cls = trunk_cls_override_;   // ds4_gpu.inc
         debug_check("the next op's mark()");
         last_cls_ = cls;
         ++launches_;                       // one op == one launch, except where noted
@@ -4002,6 +4031,7 @@ private:
     long long  launches_in_body_ = 0;
     long long  launches_last_ = 0;
     double     prof_us_[PC_N] = {0};
+    int        trunk_cls_override_ = -1;   // set around a DeepSeek-V4 call into gemv()
     double     gemv_us_[GG_N]  = {0};
     double     gemv_bytes_[GG_N] = {0};
     double     gemv_small_us_ = 0.0;

@@ -115,10 +115,84 @@ Ds4Runner::Ds4Runner(Ds4Model & model, std::vector<Ds4Ops *> ops, const Ds4Confi
         }
     }
     routed_.assign((size_t) (model_.il1() - model_.il0() + 1) * N_EXPERT_USED, -1);
+
+    // --hip-graph: a device position a card, and the attention scratch sized
+    // for the whole context now, so nothing allocates inside a capture.
+    graphs_.assign((size_t) n_dev, GraphSlot());
+    dpos_val_.assign((size_t) n_dev, -1);
+    for (int d = 0; d < n_dev; ++d) {
+        Backend & b = model_.dev(d);
+        int * p = b.alloc_i32(1);
+        owned_.emplace_back(&b, p);
+        dpos_.push_back(p);
+        ops_[(size_t) d]->reserve(cfg_.ctx);
+    }
+
+    // The miss path's staging ring, per card: slots 0/1 alternate over the
+    // layers, 2..4 belong to the token-id-routed layers 0-2 (staged at embed).
+    if (cfg_.miss_stage) {
+        std::vector<size_t> max_slab((size_t) n_dev, 0);
+        for (int il = model_.il0(); il <= model_.il1(); ++il) {
+            const ExpertTable & t = model_.layer(il).et;
+            size_t & m = max_slab[(size_t) dev_of(il)];
+            m = std::max(m, t.sz_g + t.sz_u + t.sz_d);
+        }
+        for (int d = 0; d < n_dev; ++d)
+            if (max_slab[(size_t) d]) ops_[(size_t) d]->reserve_moe(max_slab[(size_t) d], 2 + HASH_LAYERS);
+    }
+}
+
+int Ds4Runner::stage_slot(int il) const {
+    if (!cfg_.miss_stage) return -1;
+    return (il < HASH_LAYERS) ? 2 + il : (il & 1);
 }
 
 Ds4Runner::~Ds4Runner() {
+    for (size_t d = 0; d < graphs_.size(); ++d)
+        if (graphs_[d].exec) model_.dev((int) d).graph_destroy(graphs_[d].exec);
     for (auto & o : owned_) o.first->free_buf(o.second);
+}
+
+void Ds4Runner::graph_report(FILE * out) {
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).graph_report(out);
+}
+
+// --hip-graph (the qwen4exp runner's mechanism, decode_graph.cpp seg_begin):
+// a card's share of the token is captured the first time a position CLASS
+// (pos / bucket) meets it and replayed after; its grids are sized for the
+// class's last position and the kernels bound themselves by the position they
+// read. The graph's last node advances the device position; the host
+// re-uploads it only when its shadow disagrees (after an eager token).
+bool Ds4Runner::seg_begin(int d) {
+    seg_capturing_ = false;
+    if (!graph_now_) return true;
+    Backend & b = model_.dev(d);
+    GraphSlot & g = graphs_[(size_t) d];
+    if (dpos_val_[(size_t) d] != pos_) {
+        b.upload(dpos_[(size_t) d], &pos_, sizeof(int));
+        dpos_val_[(size_t) d] = pos_;
+    }
+    if (g.exec && g.cls == graph_cls_ && g.epoch == b.graph_epoch()) {
+        b.graph_launch(g.exec);
+        return false;
+    }
+    b.graph_capture_begin(dpos_[(size_t) d], graph_bound_);
+    seg_capturing_ = true;
+    return true;
+}
+
+void Ds4Runner::seg_end(int d) {
+    if (!graph_now_) return;
+    Backend & b = model_.dev(d);
+    if (seg_capturing_) {
+        GraphSlot & g = graphs_[(size_t) d];
+        b.graph_capture_end(&g.exec);
+        g.cls = graph_cls_;
+        g.epoch = b.graph_epoch();
+        b.graph_launch(g.exec);
+    }
+    dpos_val_[(size_t) d] = pos_ + 1;
+    seg_capturing_ = false;
 }
 
 void Ds4Runner::report_cache_bytes(FILE * out) const {
@@ -171,73 +245,71 @@ void Ds4Runner::attention(int il, Recorder & rec) {
     o.gemv(L.wq_b, s.qr, s.q);
     b.rms_norm_mul(s.q, nullptr, s.q, HEAD_DIM, N_HEAD, HEAD_DIM, eps_);
     rec.tap(b, "q_norm", il, s.q, (size_t) N_HEAD * HEAD_DIM);
-    o.rope_tail(s.q, N_HEAD, HEAD_DIM, p, rp, false);
+    o.rope_tail(s.q, N_HEAD, HEAD_DIM, p, 0, rp, false);
     rec.tap(b, "q", il, s.q, (size_t) N_HEAD * HEAD_DIM);
 
     // the single K=V head, into the f16 raw window (slot pos % 128)
     o.gemv(L.wkv, s.xn, s.kv);
     b.rms_norm_mul(s.kv, L.kv_norm, s.kv, HEAD_DIM, 1, HEAD_DIM, eps_);
     rec.tap(b, "kv_norm", il, s.kv, HEAD_DIM);
-    o.rope_tail(s.kv, 1, HEAD_DIM, p, rp, false);
+    o.rope_tail(s.kv, 1, HEAD_DIM, p, 0, rp, false);
     rec.tap(b, "kv", il, s.kv, HEAD_DIM);
-    o.to_f16(s.kv, st.raw + (size_t) (p % N_SWA) * HEAD_DIM, HEAD_DIM);
-    const int raw0 = std::max(0, p - N_SWA + 1);
-    const int n_raw = p - raw0 + 1;
+    o.store_raw(s.kv, st.raw, p);
 
+    // In a captured graph every position-dependent op is ISSUED whatever the
+    // position -- the ops themselves decide on the device whether a block
+    // completed (L5 step 3b) -- so the one graph fits every position of its
+    // class. Eagerly, the host skips what it knows is a no-op.
+    const bool all = graph_now_ || cfg_.all_ops;
     if (L.ratio == HCA_RATIO) {
         o.gemv(L.comp_wkv, s.xn, s.ckv);
         rec.tap(b, "hca_state_kv", il, s.ckv, HEAD_DIM);
         o.gemv(L.comp_wgate, s.xn, s.csc);
         rec.tap(b, "hca_state_score", il, s.csc, HEAD_DIM);
-        b.binary(FK_ADD, s.csc, L.comp_ape + (size_t) (p % HCA_RATIO) * HEAD_DIM, s.csc, HEAD_DIM);
+        o.add_row(s.csc, L.comp_ape, HEAD_DIM, HCA_RATIO, p);
         rec.tap(b, "hca_state_score_ape", il, s.csc, HEAD_DIM);
-        const int slot = p % st.ring;
-        b.copy(st.ck + (size_t) slot * HEAD_DIM, s.ckv, HEAD_DIM);
-        b.copy(st.cs + (size_t) slot * HEAD_DIM, s.csc, HEAD_DIM);
-        if ((p + 1) % HCA_RATIO == 0) {      // build_hca_compressed_kv_from_state
-            const int blk = p / HCA_RATIO;
-            o.comp_pool(st.ck, st.cs, st.ring, HCA_RATIO, HEAD_DIM, blk, s.cpool);
+        o.ring_put(st.ck, st.ring, HEAD_DIM, p, s.ckv);
+        o.ring_put(st.cs, st.ring, HEAD_DIM, p, s.csc);
+        if (all || (p + 1) % HCA_RATIO == 0) {      // build_hca_compressed_kv_from_state
+            o.comp_pool(st.ck, st.cs, st.ring, HCA_RATIO, HEAD_DIM, p, s.cpool);
             b.rms_norm_mul(s.cpool, L.comp_norm, s.cpool, HEAD_DIM, 1, HEAD_DIM, eps_);
-            o.rope_tail(s.cpool, 1, HEAD_DIM, blk * HCA_RATIO, rc, false);
-            o.to_f16(s.cpool, st.comp + (size_t) blk * HEAD_DIM, HEAD_DIM);
+            o.rope_tail(s.cpool, 1, HEAD_DIM, p, HCA_RATIO, rc, false);
+            o.store_block(s.cpool, st.comp, HEAD_DIM, HCA_RATIO, p);
         }
-        const int n_vis = (p + 1) / HCA_RATIO;
-        o.attn(s.q, st.raw, raw0, n_raw, st.comp, nullptr, n_vis, L.attn_sinks, kq_scale, s.att);
+        o.attn(s.q, st.raw, p, st.comp, HCA_RATIO, 1 << 30, nullptr, L.attn_sinks, kq_scale, s.att);
         rec.tap(b, "attn_hca", il, s.att, (size_t) N_HEAD * HEAD_DIM);
     } else if (L.ratio == CSA_RATIO) {
         o.gemv(L.comp_wkv, s.xn, s.ckv);
         rec.tap(b, "csa_state_kv", il, s.ckv, 2 * HEAD_DIM);
         o.gemv(L.comp_wgate, s.xn, s.csc);
         rec.tap(b, "csa_state_score", il, s.csc, 2 * HEAD_DIM);
-        b.binary(FK_ADD, s.csc, L.comp_ape + (size_t) (p % CSA_RATIO) * 2 * HEAD_DIM, s.csc, 2 * HEAD_DIM);
+        o.add_row(s.csc, L.comp_ape, 2 * HEAD_DIM, CSA_RATIO, p);
         rec.tap(b, "csa_state_score_ape", il, s.csc, 2 * HEAD_DIM);
-        const int slot = p % st.ring;
-        b.copy(st.ck + (size_t) slot * 2 * HEAD_DIM, s.ckv, 2 * HEAD_DIM);
-        b.copy(st.cs + (size_t) slot * 2 * HEAD_DIM, s.csc, 2 * HEAD_DIM);
+        o.ring_put(st.ck, st.ring, 2 * HEAD_DIM, p, s.ckv);
+        o.ring_put(st.cs, st.ring, 2 * HEAD_DIM, p, s.csc);
         o.gemv(L.idx_comp_wkv, s.xn, s.lkv);
         rec.tap(b, "lid_state_kv", il, s.lkv, 2 * IDX_DIM);
         o.gemv(L.idx_comp_wgate, s.xn, s.lsc);
         rec.tap(b, "lid_state_score", il, s.lsc, 2 * IDX_DIM);
-        b.binary(FK_ADD, s.lsc, L.idx_comp_ape + (size_t) (p % CSA_RATIO) * 2 * IDX_DIM, s.lsc, 2 * IDX_DIM);
+        o.add_row(s.lsc, L.idx_comp_ape, 2 * IDX_DIM, CSA_RATIO, p);
         rec.tap(b, "lid_state_score_ape", il, s.lsc, 2 * IDX_DIM);
-        b.copy(st.lk + (size_t) slot * 2 * IDX_DIM, s.lkv, 2 * IDX_DIM);
-        b.copy(st.ls + (size_t) slot * 2 * IDX_DIM, s.lsc, 2 * IDX_DIM);
-        if ((p + 1) % CSA_RATIO == 0) {      // build_overlap_compressed_kv_from_state, twice
-            const int blk = p / CSA_RATIO;
-            o.comp_pool_overlap(st.ck, st.cs, st.ring, CSA_RATIO, HEAD_DIM, blk, s.cpool);
+        o.ring_put(st.lk, st.ring, 2 * IDX_DIM, p, s.lkv);
+        o.ring_put(st.ls, st.ring, 2 * IDX_DIM, p, s.lsc);
+        if (all || (p + 1) % CSA_RATIO == 0) {      // build_overlap_compressed_kv_from_state, twice
+            o.comp_pool_overlap(st.ck, st.cs, st.ring, CSA_RATIO, HEAD_DIM, p, s.cpool);
             b.rms_norm_mul(s.cpool, L.comp_norm, s.cpool, HEAD_DIM, 1, HEAD_DIM, eps_);
-            o.rope_tail(s.cpool, 1, HEAD_DIM, blk * CSA_RATIO, rc, false);
-            o.to_f16(s.cpool, st.comp + (size_t) blk * HEAD_DIM, HEAD_DIM);
-            o.comp_pool_overlap(st.lk, st.ls, st.ring, CSA_RATIO, IDX_DIM, blk, s.cpool);
+            o.rope_tail(s.cpool, 1, HEAD_DIM, p, CSA_RATIO, rc, false);
+            o.store_block(s.cpool, st.comp, HEAD_DIM, CSA_RATIO, p);
+            o.comp_pool_overlap(st.lk, st.ls, st.ring, CSA_RATIO, IDX_DIM, p, s.cpool);
             b.rms_norm_mul(s.cpool, L.idx_comp_norm, s.cpool, IDX_DIM, 1, IDX_DIM, eps_);
-            o.rope_tail(s.cpool, 1, IDX_DIM, blk * CSA_RATIO, rc, false);
+            o.rope_tail(s.cpool, 1, IDX_DIM, p, CSA_RATIO, rc, false);
             o.fwht(s.cpool, 1, IDX_DIM);                     // the lid cache's k_rot
-            o.to_f16(s.cpool, st.lid + (size_t) blk * IDX_DIM, IDX_DIM);
+            o.store_block(s.cpool, st.lid, IDX_DIM, CSA_RATIO, p);
         }
         // the lightning indexer's query (build_lid_top_k)
         o.gemv(L.idx_q_b, s.qr, s.iq);
         rec.tap(b, "lid_q", il, s.iq, (size_t) IDX_N_HEAD * IDX_DIM);
-        o.rope_tail(s.iq, IDX_N_HEAD, IDX_DIM, p, rc, false);
+        o.rope_tail(s.iq, IDX_N_HEAD, IDX_DIM, p, 0, rc, false);
         rec.tap(b, "lid_q_rope", il, s.iq, (size_t) IDX_N_HEAD * IDX_DIM);
         o.fwht(s.iq, IDX_N_HEAD, IDX_DIM);
         rec.tap(b, "lid_q_rot", il, s.iq, (size_t) IDX_N_HEAD * IDX_DIM);
@@ -249,26 +321,26 @@ void Ds4Runner::attention(int il, Recorder & rec) {
         // then ggml_top_k's selection is the identity and nothing is ranked.
         const int n_sel = std::min(n_vis, IDX_TOP_K);
         const int * sel = nullptr;
-        if (n_vis > 0) {
-            o.lid_scores(s.iq, s.iw, st.lid, n_vis, s.iscore);
+        if (all || n_vis > 0) {
+            o.lid_scores(s.iq, s.iw, st.lid, p, s.iscore);
             rec.tap(b, "lid_score_masked", il, s.iscore, (size_t) n_vis);
-            if (n_vis > IDX_TOP_K) { o.topk(s.iscore, n_vis, IDX_TOP_K, s.isel); sel = s.isel; }
-            if (rec.enabled()) {
+            if (all || n_vis > IDX_TOP_K) { o.topk(s.iscore, p, IDX_TOP_K, s.isel); sel = s.isel; }
+            if (rec.enabled() && n_sel > 0) {
                 std::vector<int> v((size_t) n_sel);
                 if (sel) b.download(v.data(), sel, (size_t) n_sel * sizeof(int));
                 else std::iota(v.begin(), v.end(), 0);
                 rec.tap_ints("lid_top_k", il, v);
             }
         }
-        o.attn(s.q, st.raw, raw0, n_raw, st.comp, sel, n_sel, L.attn_sinks, kq_scale, s.att);
+        o.attn(s.q, st.raw, p, st.comp, CSA_RATIO, IDX_TOP_K, sel, L.attn_sinks, kq_scale, s.att);
         rec.tap(b, "attn_csa_lid", il, s.att, (size_t) N_HEAD * HEAD_DIM);
     } else {
-        o.attn(s.q, st.raw, raw0, n_raw, nullptr, nullptr, 0, L.attn_sinks, kq_scale, s.att);
+        o.attn(s.q, st.raw, p, nullptr, 0, 0, nullptr, L.attn_sinks, kq_scale, s.att);
         rec.tap(b, "attn_raw", il, s.att, (size_t) N_HEAD * HEAD_DIM);
     }
 
     // de-rope (ggml_rope_ext_back), the grouped output LoRA, wo_b
-    o.rope_tail(s.att, N_HEAD, HEAD_DIM, p, rp, true);
+    o.rope_tail(s.att, N_HEAD, HEAD_DIM, p, 0, rp, true);
     rec.tap(b, "attn_derope", il, s.att, (size_t) N_HEAD * HEAD_DIM);
     for (int g = 0; g < O_GROUPS; ++g)
         o.gemv(L.wo_a[g], s.att + (size_t) g * O_GROUP_DIM, s.oa + (size_t) g * O_LORA);
@@ -298,17 +370,13 @@ void Ds4Runner::ffn(int il, Recorder & rec) {
     rec.tap(b, "ffn_moe_weights", il, s.wraw, N_EXPERT_USED);
     rec.tap(b, "ffn_moe_weights_norm", il, s.wnorm, N_EXPERT_USED);
     rec.tap(b, "ffn_moe_weights_scaled", il, s.wsc, N_EXPERT_USED);
+    o.count_misses(L.et, s.ids);                   // --profile only: bytes over PCIe, on the device
 
-    o.moe_gate_up(L.et, s.ids, s.xn, s.yg, s.yu);
-    rec.tap(b, "ffn_moe_up",   il, s.yu, (size_t) N_EXPERT_USED * N_FF_EXP);
-    rec.tap(b, "ffn_moe_gate", il, s.yg, (size_t) N_EXPERT_USED * N_FF_EXP);
-    o.swiglu_clamp(s.yg, s.yu, s.yh, N_EXPERT_USED * N_FF_EXP, SWIGLU_CLAMP);
-    rec.tap(b, "ffn_moe_swiglu_limited", il, s.yh, (size_t) N_EXPERT_USED * N_FF_EXP);
-    o.moe_down(L.et, s.ids, s.yh, s.yd);
-    rec.tap(b, "ffn_moe_down", il, s.yd, (size_t) N_EXPERT_USED * N_EMBD);
-    o.moe_accum(s.yd, s.wsc, N_EXPERT_USED, N_EMBD, s.ywt, s.moe);
-    rec.tap(b, "ffn_moe_weighted", il, s.ywt, (size_t) N_EXPERT_USED * N_EMBD);
-    rec.tap(b, "ffn_moe_out", il, s.moe, N_EMBD);
+    // The miss path (L5 step 3): the six experts' staging starts NOW, on a
+    // side stream, and the shared expert -- which does not depend on it --
+    // runs meanwhile. A token-id-routed layer was staged at embed time.
+    const int slot = stage_slot(il);
+    if (!hash) o.moe_stage(L.et, s.ids, slot);
 
     o.gemv(L.sh_up, s.xn, s.su);
     rec.tap(b, "ffn_up", il, s.su, N_FF_EXP);
@@ -318,6 +386,18 @@ void Ds4Runner::ffn(int il, Recorder & rec) {
     rec.tap(b, "ffn_swiglu_limited", il, s.sh, N_FF_EXP);
     o.gemv(L.sh_down, s.sh, s.sd);
     rec.tap(b, "ffn_shexp", il, s.sd, N_EMBD);
+
+    o.moe_gate_up(L.et, s.ids, s.xn, s.yg, s.yu, slot);
+    rec.tap(b, "ffn_moe_up",   il, s.yu, (size_t) N_EXPERT_USED * N_FF_EXP);
+    rec.tap(b, "ffn_moe_gate", il, s.yg, (size_t) N_EXPERT_USED * N_FF_EXP);
+    o.swiglu_clamp(s.yg, s.yu, s.yh, N_EXPERT_USED * N_FF_EXP, SWIGLU_CLAMP);
+    rec.tap(b, "ffn_moe_swiglu_limited", il, s.yh, (size_t) N_EXPERT_USED * N_FF_EXP);
+    o.moe_down(L.et, s.ids, s.yh, s.yd, slot);
+    rec.tap(b, "ffn_moe_down", il, s.yd, (size_t) N_EXPERT_USED * N_EMBD);
+    o.moe_accum(s.yd, s.wsc, N_EXPERT_USED, N_EMBD, s.ywt, s.moe);
+    rec.tap(b, "ffn_moe_weighted", il, s.ywt, (size_t) N_EXPERT_USED * N_EMBD);
+    rec.tap(b, "ffn_moe_out", il, s.moe, N_EMBD);
+
     b.binary(FK_ADD, s.moe, s.sd, s.fo, N_EMBD);
     rec.tap(b, "ffn_out", il, s.fo, N_EMBD);
 }
@@ -353,8 +433,16 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
     Backend & b0 = be(il0);
     Scratch & s0 = S(il0);
     if (pos_ >= cfg_.ctx) throw std::runtime_error("context full");
+    // A graph only for a token nobody inspects: a tap or a routing read-back
+    // is a download, which a capture cannot hold.
+    graph_now_ = cfg_.hip_graph && !rec.enabled() && !cfg_.log_routing && b0.graph_capable();
+    if (graph_now_) {
+        const int bucket = std::max(1, cfg_.hip_graph_bucket);
+        graph_cls_   = pos_ / bucket;
+        graph_bound_ = std::min(cfg_.ctx, (graph_cls_ + 1) * bucket);   // positions < bound
+    }
     // host work of the token: the embedding row and the hash layers' ids,
-    // uploaded with it (design 9.1's gather tables)
+    // uploaded (stream-ordered, pinned staging) BEFORE any card's segment
     std::vector<float> e(N_EMBD);
     model_.embed_row(token, e.data());
     b0.boundary_wait_free(0);     // the next card has read last token's H out of us
@@ -362,37 +450,53 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
     for (int il = il0; il <= std::min(il1, HASH_LAYERS - 1); ++il)
         be(il).upload(S(il).hash + (size_t) il * N_EXPERT_USED, model_.hash_ids(il, token),
                       N_EXPERT_USED * sizeof(int32_t));
-    for (int h = 0; h < HC; ++h) b0.copy(s0.H + (size_t) h * N_EMBD, s0.x, N_EMBD);   // hc_init
-    rec.tap(b0, "hc_init", -1, s0.H, HC_DIM);
 
-    for (int il = il0; il <= il1; ++il) {
-        if (il > il0 && dev_of(il) != dev_of(il - 1)) {
-            // the only per-token traffic between cards: H, 64 KB
+    const bool head = model_.have_head() && il1 == N_LAYER - 1;
+    int il = il0;
+    while (il <= il1) {
+        const int d = dev_of(il);
+        int last = il;
+        while (last + 1 <= il1 && dev_of(last + 1) == d) ++last;
+        if (il > il0) {
+            // the only per-token traffic between cards: H, 64 KB (outside the graphs)
             be(il).boundary_recv(S(il).H, be(il - 1), S(il - 1).H, HC_DIM * sizeof(float), 0);
         }
-        layer(il, rec);
+        if (seg_begin(d)) {
+            if (il == il0) {
+                // the token-id-routed layers' experts are known: stage them now
+                for (int h = il0; h <= std::min(il1, HASH_LAYERS - 1); ++h)
+                    op(h).moe_stage(model_.layer(h).et, S(h).hash + (size_t) h * N_EXPERT_USED, stage_slot(h));
+                op(il0).hc_init(s0.x, s0.H);                                  // hc_init
+                rec.tap(b0, "hc_init", -1, s0.H, HC_DIM);
+            }
+            for (int l = il; l <= last; ++l) layer(l, rec);
+            if (head && last == il1) {
+                Backend & b = model_.dev(model_.n_devices() - 1);
+                Ds4Ops & o = *ops_.back();
+                Scratch & s = scr_.back();
+                // build_hc_head: flat norm, 4-row mix, sigmoid+eps, the weighted sum
+                b.rms_norm_mul(s.H, nullptr, s.Hn, HC_DIM, 1, HC_DIM, eps_);
+                o.gemv(model_.head_fn(), s.Hn, hmix_);
+                rec.tap(b, "hc_head_mixes", -1, hmix_, HC);
+                o.hc_head_pre(hmix_, model_.head_scale(), model_.head_base(), hpre_, hc_eps_);
+                rec.tap(b, "hc_head_pre", -1, hpre_, HC);
+                o.hc_weighted_sum(s.H, hpre_, hx_);
+                rec.tap(b, "hc_head", -1, hx_, N_EMBD);
+                b.rms_norm_mul(hx_, model_.output_norm(), hxn_, N_EMBD, 1, N_EMBD, eps_);
+                rec.tap(b, "result_norm", -1, hxn_, N_EMBD);
+                o.gemv(model_.output(), hxn_, logits_);
+                rec.tap(b, "result_output", -1, logits_, N_VOCAB);
+                b.argmax(logits_, N_VOCAB, greedy_);
+            }
+        }
+        seg_end(d);
+        il = last + 1;
     }
 
     int id = -1;
-    if (model_.have_head() && il1 == N_LAYER - 1) {
-        Backend & b = model_.dev(model_.n_devices() - 1);
-        Ds4Ops & o = *ops_.back();
-        Scratch & s = scr_.back();
-        // build_hc_head: flat norm, 4-row mix, sigmoid+eps, the weighted sum
-        b.rms_norm_mul(s.H, nullptr, s.Hn, HC_DIM, 1, HC_DIM, eps_);
-        o.gemv(model_.head_fn(), s.Hn, hmix_);
-        rec.tap(b, "hc_head_mixes", -1, hmix_, HC);
-        o.hc_head_pre(hmix_, model_.head_scale(), model_.head_base(), hpre_, hc_eps_);
-        rec.tap(b, "hc_head_pre", -1, hpre_, HC);
-        o.hc_weighted_sum(s.H, hpre_, hx_);
-        rec.tap(b, "hc_head", -1, hx_, N_EMBD);
-        b.rms_norm_mul(hx_, model_.output_norm(), hxn_, N_EMBD, 1, N_EMBD, eps_);
-        rec.tap(b, "result_norm", -1, hxn_, N_EMBD);
-        o.gemv(model_.output(), hxn_, logits_);
-        rec.tap(b, "result_output", -1, logits_, N_VOCAB);
-        b.argmax(logits_, N_VOCAB, greedy_);
-        b.download(&id, greedy_, sizeof(int));
-    }
+    if (head) model_.dev(model_.n_devices() - 1).download(&id, greedy_, sizeof(int));
+    if (profile_)
+        for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).prof_end_token();
     ++pos_;
     return id;
 }
@@ -438,7 +542,8 @@ int ds4_main(int argc, char ** argv) {
     std::string model_path, oracle_dir, dump_dir, routing_dir;
     std::vector<int32_t> tokens;
     int il0 = 0, il1 = N_LAYER - 1, n_devices = 3, threads = 4, ctx = 512, greedy_n = 0, time_n = 0;
-    bool with_head = true, use_cpu = false, plan_only = false, sync_debug = false;
+    bool with_head = true, use_cpu = false, plan_only = false, sync_debug = false, profile = false;
+    int miss_stage = 1, staged_loads = 1, hip_graph = 0, hip_graph_bucket = 1024, all_ops = 0;
     double min_cos = 0.999;
     Placement pl;
     for (int i = 1; i < argc; ++i) {
@@ -452,6 +557,12 @@ int ds4_main(int argc, char ** argv) {
         else if (a == "--cpu")                    use_cpu = true;
         else if (a == "--plan-only")              plan_only = true;   // print placement, run nothing
         else if (a == "--sync-debug")             sync_debug = true;  // drain + check after every launch
+        else if (a == "--profile")                profile = true;     // per-class device time, --time tokens
+        else if (a == "--miss-stage" && i + 1 < argc) miss_stage = std::atoi(argv[++i]);
+        else if (a == "--staged-loads" && i + 1 < argc) staged_loads = std::atoi(argv[++i]);
+        else if (a == "--hip-graph" && i + 1 < argc) hip_graph = std::atoi(argv[++i]);
+        else if (a == "--hip-graph-bucket" && i + 1 < argc) hip_graph_bucket = std::atoi(argv[++i]);
+        else if (a == "--all-ops" && i + 1 < argc) all_ops = std::atoi(argv[++i]);
         else if (a == "--no-head")                with_head = false;
         else if (a == "--devices"&& i + 1 < argc) n_devices = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
@@ -474,7 +585,8 @@ int ds4_main(int argc, char ** argv) {
                              "  [--layers A-B] [--no-head] [--devices N] [--ctx N] [--threads N]\n"
                              "  [--placement DIR --expert-gb X]   (GPU: M2 histogram, VRAM for experts a card)\n"
                              "  [--oracle DIR] [--routing DIR] [--dump DIR] [--min-cos X]\n"
-                             "  [--greedy N] [--time N] [--plan-only] [--sync-debug]\n");
+                             "  [--greedy N] [--time N] [--plan-only] [--sync-debug]\n"
+                             "  [--profile] [--miss-stage 0|1] [--staged-loads 0|1] [--hip-graph 0|1 [--hip-graph-bucket N]] [--all-ops 0|1]\n");
         return 2;
     }
     if ((int) tokens.size() + greedy_n + time_n > ctx) { std::fprintf(stderr, "--ctx too small\n"); return 2; }
@@ -497,6 +609,7 @@ int ds4_main(int argc, char ** argv) {
         }
         for (Backend * b : devs) {
             if (sync_debug) b->set_sync_debug(true);
+            if (profile && !use_cpu) b->set_profile(true);
             owned_ops.emplace_back(use_cpu ? make_ds4_cpu_ops(*b) : make_ds4_gpu_ops(*b));
             ops.push_back(owned_ops.back().get());
         }
@@ -515,7 +628,15 @@ int ds4_main(int argc, char ** argv) {
         for (int d = 0; d < n_report; ++d) placement_ok &= devs[d]->verify_placement(stdout);
         if (!placement_ok) { std::printf("DS4 FAIL (placement)\n"); return 1; }
 
-        Ds4Config cfg; cfg.ctx = ctx; cfg.log_routing = !routing_dir.empty();
+        for (Ds4Ops * o : ops) { o->set_profile(profile && !use_cpu); o->set_staged_loads(staged_loads); }
+        Ds4Config cfg; cfg.ctx = ctx; cfg.log_routing = !routing_dir.empty(); cfg.miss_stage = miss_stage;
+        // --sync-debug synchronises after every launch, which a capture cannot hold
+        cfg.hip_graph = (use_cpu || sync_debug) ? 0 : hip_graph; cfg.hip_graph_bucket = hip_graph_bucket;
+        cfg.all_ops = all_ops;
+        std::printf("miss_stage=%d staged_loads=%d profile=%d hip_graph=%d hip_graph_bucket=%d%s\n",
+                    miss_stage, staged_loads, (int) profile, cfg.hip_graph, hip_graph_bucket,
+                    (use_cpu && hip_graph) ? " (ignored: the CPU backend has no graphs)"
+                    : (sync_debug && hip_graph) ? " (off: --sync-debug)" : "");
         Ds4Runner run(model, ops, cfg);
         run.report_cache_bytes(stdout);
         for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after caches+scratch");
@@ -571,6 +692,12 @@ int ds4_main(int argc, char ** argv) {
             // decode timing: one token a step, the id read back each token
             // (it feeds the next), routing capture off
             run.set_log_routing(false);
+            const bool prof = profile && !use_cpu;
+            if (prof) {
+                // the warm tokens (prompt, greedy) are not in the profile
+                for (int d = 0; d < n_report; ++d) { devs[d]->sync(); devs[d]->prof_reset(); ops[d]->reset_miss_count(); }
+                run.set_profile(true);
+            }
             std::vector<double> ms;
             for (int i = 0; i < time_n; ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
@@ -578,8 +705,25 @@ int ds4_main(int argc, char ** argv) {
                 ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             }
             const double med = median(ms);
-            std::printf("ds4_decode_ms_median=%.3f tok_s=%.2f tokens=%d depth_end=%d ctx=%d\n",
-                        med, med > 0 ? 1000.0 / med : 0.0, time_n, run.pos(), ctx);
+            std::printf("ds4_decode_ms_median=%.3f tok_s=%.2f tokens=%d depth_end=%d ctx=%d hip_graph=%d\n",
+                        med, med > 0 ? 1000.0 / med : 0.0, time_n, run.pos(), ctx, cfg.hip_graph);
+            if (cfg.hip_graph) run.graph_report(stdout);
+            if (prof) {
+                // Per card: device time by class (prof_*_us), the card's total,
+                // launches and host syncs a token; then the miss bytes counted
+                // on the device. Profiled tokens pay one event sync each, so
+                // the median above is NOT the unprofiled speed.
+                run.set_profile(false);
+                double miss_all = 0.0;
+                for (int d = 0; d < n_report; ++d) {
+                    std::printf("--- device %d (per token, %d tokens) ---\n", d, time_n);
+                    devs[d]->prof_report(stdout, time_n);
+                    const double mb = ops[d]->miss_bytes_total() / time_n / 1e6;
+                    miss_all += mb;
+                    std::printf("ds4_miss_mb_per_token_dev%d=%.2f\n", d, mb);
+                }
+                std::printf("ds4_miss_mb_per_token=%.2f (counted on the device from the routed ids)\n", miss_all);
+            }
         }
 
         bool ok = true;

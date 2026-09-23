@@ -72,7 +72,7 @@ public:
 
     // One expert = a one-matrix Mat whose base is the table entry.
     void moe_gate_up(const ExpertTable & t, const int * ids, const float * x,
-                     float * yg, float * yu) override {
+                     float * yg, float * yu, int) override {
         for (int k = 0; k < N_EXPERT_USED; ++k) {
             be_.gemv(expert_mat(t.up[ids[k]],   t.type_gu, t.row_gu, t.K_gu, t.rows_gu), x,
                      yu + (size_t) k * t.rows_gu);
@@ -80,7 +80,7 @@ public:
                      yg + (size_t) k * t.rows_gu);
         }
     }
-    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y) override {
+    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y, int) override {
         for (int k = 0; k < N_EXPERT_USED; ++k)
             be_.gemv(expert_mat(t.down[ids[k]], t.type_d, t.row_d, t.K_d, t.rows_d),
                      h + (size_t) k * t.K_d, y + (size_t) k * t.rows_d);
@@ -146,6 +146,9 @@ public:
         for (int h = 0; h < HC; ++h) pre[h] = sigmoidf_(m[h] * s[0] + b[h]) * 1.0f + eps;
     }
 
+    void hc_init(const float * x, float * H) override {
+        for (int h = 0; h < HC; ++h) std::memcpy(H + (size_t) h * N_EMBD, x, N_EMBD * sizeof(float));
+    }
     void hc_weighted_sum(const float * H, const float * w, float * out) override {
         for (int i = 0; i < N_EMBD; ++i) {
             float sum = 0.0f;
@@ -165,8 +168,11 @@ public:
         }
     }
 
-    void rope_tail(float * x, int n_rows, int row_len, int pos, const RopeParams & rp,
-                   bool inverse) override {
+    void rope_tail(float * x, int n_rows, int row_len, int pos, int block_ratio,
+                   const RopeParams & rp, bool inverse) override {
+        rope_at(x, n_rows, row_len, block_ratio > 0 ? (pos / block_ratio) * block_ratio : pos, rp, inverse);
+    }
+    void rope_at(float * x, int n_rows, int row_len, int pos, const RopeParams & rp, bool inverse) {
         const int n_dims = N_ROT;
         const int offs   = row_len - N_ROT;
         const float theta_scale = powf(rp.freq_base, -2.0f / n_dims);
@@ -207,7 +213,21 @@ public:
         }
     }
 
-    void to_f16(const float * x, uint16_t * y, int n) override {
+    void store_raw(const float * kv, uint16_t * raw, int pos) override {
+        to_f16(kv, raw + (size_t) (pos % N_SWA) * HEAD_DIM, HEAD_DIM);
+    }
+    void store_block(const float * x, uint16_t * cache, int width, int ratio, int pos) override {
+        if ((pos + 1) % ratio != 0) return;
+        to_f16(x, cache + (size_t) (pos / ratio) * width, width);
+    }
+    void ring_put(float * ring, int ring_rows, int width, int pos, const float * src) override {
+        std::memcpy(ring + (size_t) (pos % ring_rows) * width, src, (size_t) width * sizeof(float));
+    }
+    void add_row(float * x, const float * table, int width, int ratio, int pos) override {
+        const float * t = table + (size_t) (pos % ratio) * width;
+        for (int i = 0; i < width; ++i) x[i] = x[i] + t[i];     // ggml_add(state_score, ape_rows)
+    }
+    void to_f16(const float * x, uint16_t * y, int n) {
         for (int i = 0; i < n; ++i) {
             const ggml_fp16_t h = ggml_fp32_to_fp16(x[i]);
             std::memcpy(&y[i], &h, 2);
@@ -230,7 +250,9 @@ public:
     }
 
     void comp_pool(const float * rk, const float * rs, int ring_rows, int ratio, int d_out,
-                   int blk, float * out) override {
+                   int pos, float * out) override {
+        if ((pos + 1) % ratio != 0) return;
+        const int blk = pos / ratio;
         std::vector<float> v((size_t) ratio), sc((size_t) ratio);
         for (int d = 0; d < d_out; ++d) {
             for (int j = 0; j < ratio; ++j) {
@@ -243,7 +265,9 @@ public:
     }
 
     void comp_pool_overlap(const float * rk, const float * rs, int ring_rows, int ratio,
-                           int d_out, int blk, float * out) override {
+                           int d_out, int pos, float * out) override {
+        if ((pos + 1) % ratio != 0) return;
+        const int blk = pos / ratio;
         const int width = 2 * d_out;
         std::vector<float> v((size_t) 2 * ratio), sc((size_t) 2 * ratio);
         for (int d = 0; d < d_out; ++d) {
@@ -263,8 +287,9 @@ public:
         }
     }
 
-    void lid_scores(const float * q, const float * w, const uint16_t * keys, int n_blocks,
+    void lid_scores(const float * q, const float * w, const uint16_t * keys, int pos,
                     float * scores) override {
+        const int n_blocks = (pos + 1) / CSA_RATIO;
         float k[IDX_DIM];
         for (int b = 0; b < n_blocks; ++b) {
             for (int i = 0; i < IDX_DIM; ++i) k[i] = h2f(keys[(size_t) b * IDX_DIM + i]);
@@ -279,7 +304,11 @@ public:
         }
     }
 
-    void topk(const float * scores, int n, int k, int * out) override { topk_n(scores, n, k, out); }
+    void topk(const float * scores, int pos, int k, int * out) override {
+        const int n = (pos + 1) / CSA_RATIO;
+        if (n <= k) { for (int i = 0; i < n; ++i) out[i] = i; return; }   // ggml_top_k's identity
+        topk_n(scores, n, k, out);
+    }
     static int topk_n(const float * scores, int n, int k, int * out) {
         std::vector<int> idx((size_t) n);
         std::iota(idx.begin(), idx.end(), 0);
@@ -290,9 +319,12 @@ public:
         return m;
     }
 
-    void attn(const float * q, const uint16_t * raw_ring, int raw_pos0, int n_raw,
-              const uint16_t * comp, const int * comp_ids, int n_comp,
-              const float * sinks, float scale, float * out) override {
+    void attn(const float * q, const uint16_t * raw_ring, int pos, const uint16_t * comp,
+              int ratio, int cap, const int * comp_ids, const float * sinks, float scale,
+              float * out) override {
+        const int raw_pos0 = std::max(0, pos - N_SWA + 1);
+        const int n_raw = pos - raw_pos0 + 1;
+        const int n_comp = ratio ? std::min((pos + 1) / ratio, cap) : 0;
         const int n_keys = n_raw + n_comp;
         // K as f32 once for all 64 heads (it is shared: MQA)
         std::vector<float> K((size_t) n_keys * HEAD_DIM);

@@ -748,7 +748,7 @@ public:
         for (auto * b : devs_) {
             b->set_gemv_lds(env_int("FRANKEN_GEMV_LDS", 1));
             b->set_gemv_min_rows(env_int("FRANKEN_GEMV_MIN_ROWS", 1024));
-            b->set_expert_gather(env_int("FRANKEN_EXPERT_GATHER", 1));
+            b->set_expert_gather(env_int("FRANKEN_EXPERT_GATHER", 3));
             // 0 is bit-exact against the decode kernel; 1 and 2 reassociate K
             // (franken_decode.cpp's --gemm-lds). Serving defaults to 0.
             b->set_gemm_lds(env_int("FRANKEN_GEMM_LDS", 0));

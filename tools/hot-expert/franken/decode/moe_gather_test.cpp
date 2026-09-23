@@ -154,18 +154,23 @@ static float down_iq4nl_ref(const unsigned char * A, const float * h_row, int K)
     return wave_sum(part);
 }
 
-// k_moe_down_iq4nl_gather, one tile.
+// k_moe_down_iq4nl_gather, one tile. Since the ISA finding of 2026-09-23 the
+// m loop is OUTER and the accumulators are scalars, so this body is literally
+// the body of down_iq4nl_ref with a different h row -- which is what makes the
+// device emit the same float ops for both. This transcription tracks that
+// shape, not the old tiled one.
 static void down_iq4nl_gather(const unsigned char * A, const float * h, const int * xb,
                               int cnt, int K, float * out) {
     const int nchunk = (K >> 5) << 2;
     float part[MOE_TILE_E][WAVE];
-    for (int tid = 0; tid < WAVE; ++tid) {
-        float lo[MOE_TILE_E], hi[MOE_TILE_E];
-        for (int m = 0; m < MOE_TILE_E; ++m) { lo[m] = 0.0f; hi[m] = 0.0f; }
-        for (int w = tid; w < nchunk; w += WAVE)
-            for (int m = 0; m < MOE_TILE_E; ++m)
-                if (m < cnt) m1n_iq4nl_chunk_dot(A, kvalues_iq4nl, h + xb[m], w, &lo[m], &hi[m]);
-        for (int m = 0; m < cnt; ++m) part[m][tid] = lo[m] + hi[m];
+    for (int m = 0; m < cnt; ++m) {
+        const float * hr = h + xb[m];
+        for (int tid = 0; tid < WAVE; ++tid) {
+            float lo = 0.0f, hi = 0.0f;
+            for (int w = tid; w < nchunk; w += WAVE)
+                m1n_iq4nl_chunk_dot(A, kvalues_iq4nl, hr, w, &lo, &hi);
+            part[m][tid] = lo + hi;
+        }
     }
     for (int m = 0; m < cnt; ++m) out[m] = wave_sum(part[m]);
 }

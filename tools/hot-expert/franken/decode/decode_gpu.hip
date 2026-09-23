@@ -1081,20 +1081,37 @@ void k_moe_down_iq4nl_gather(const unsigned char * __restrict__ base, size_t exp
                             + (size_t) row * row_bytes;
     const int nchunk = (K >> 5) << 2;
 
-    float lo[MOE_TILE_E], hi[MOE_TILE_E];
-#pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) { lo[m] = 0.0f; hi[m] = 0.0f; }
+    // THE M LOOP IS OUTER AND THE ACCUMULATORS ARE SCALARS, and that shape is
+    // the answer to PREFILL.md section 8. With the w loop outside and eight
+    // independent accumulator pairs inside, the backend has ILP to spare and
+    // keeps every `lo += (d*kv)*hb` of m1n_iq4nl_chunk_dot contracted into an
+    // FMA; with ONE pair the dependency chain is the critical path, so it
+    // breaks all but one of them into v_mul_f32 + v_add_f32 to shorten it.
+    // Same source, same algebra, one rounding apart -- which is exactly the
+    // divergence that survived the sort, the indexing, the accumulator
+    // structure and the reduction being cleared on the host.
+    //
+    // Measured on the ISA (gfx1100, ROCm 7.14, -O3, hipcc --offload-device-only
+    // -S): this body and k_moe_down_iq4nl now emit the SAME multiset of float
+    // ops -- 8 v_fma_mix_f32, 1 v_fmac_f32, 7 v_mul_f32, 13 v_add_f32 -- where
+    // the tiled form emitted 8 v_fma_mix_f32, 16 v_fma_f32, 48 v_fmac_f32 and
+    // 48 v_add_f32, i.e. every term fused. VGPRs 43 -> 31, occupancy 16 either
+    // way, no spills.
+    //
+    // The amortisation survives, which is the point: the expert row is
+    // row_bytes = 360 B at K = 640, so the second and later passes over it are
+    // L1 hits and the VRAM read is still ONCE A TILE rather than once an
+    // assignment. Only the order of the reads changes, not their count.
+    //
+    // unroll(disable) is load-bearing: an unrolled m loop is a different
+    // scheduling problem and the backend starts contracting again.
+#pragma clang loop unroll(disable)
+    for (int m = 0; m < cnt; ++m) {
+        const float * hr = h + xb[m];
+        float lo = 0.0f, hi = 0.0f;
+        for (int w = tid; w < nchunk; w += WAVE) m1n_iq4nl_chunk_dot(A, c_kvals_iq4nl, hr, w, &lo, &hi);
 
-    for (int w = tid; w < nchunk; w += WAVE) {
-#pragma unroll
-        for (int m = 0; m < MOE_TILE_E; ++m)
-            if (m < cnt) m1n_iq4nl_chunk_dot(A, c_kvals_iq4nl, h + xb[m], w, &lo[m], &hi[m]);
-    }
-
-#pragma unroll
-    for (int m = 0; m < MOE_TILE_E; ++m) {
-        if (m >= cnt) continue;
-        const float s = wave_sum(lo[m] + hi[m]);
+        const float s = wave_sum(lo + hi);
         if (tid == 0) eo[(size_t) cols[m] * rows + row] = s;
     }
 }
@@ -1130,6 +1147,17 @@ void k_moe_down_q8_0_gather(const unsigned char * __restrict__ base, size_t expe
     // must produce the same bits, the cheapest guarantee is that they are
     // the same source. The decode is then recomputed per column, which for
     // Q8_0 is one f16 widen and one multiply off L1.
+    //
+    // THIS ONE KEEPS ITS TILE, and the ISA says why it may. Against
+    // k_moe_down_q8_0 it is the per-assignment body times eight, op for op:
+    // 8 v_fma_f32 against 1 v_fmac_f32, 40 v_add_f32 against 5 (the wave
+    // reduction), and ONE v_fma_mix_f32 either way because `d * qs[lane]`
+    // does not depend on m and is common-subexpression-eliminated. Every
+    // term stays FUSED here, so there is no rounding to disagree about --
+    // unlike IQ4_NL above, whose accumulate lives inside the shared
+    // primitive and which the backend de-contracts when it has only one
+    // accumulator chain to schedule. This model's down projection is
+    // IQ4_NL; Q8_0 is here for a container that is not.
     for (int b = 0; b < nblk; ++b) {
 #pragma unroll
         for (int m = 0; m < MOE_TILE_E; ++m)
@@ -3209,7 +3237,7 @@ private:
     int        gemm_lds_ = 0;
     // Bit 0 (gate/up) is MEASURED bit-exact on three cards; bit 1 (down) is
     // measured NOT to be and is off until it is. See decode_backend.h.
-    int        expert_gather_ = 1;
+    int        expert_gather_ = 3;
     int        dev_ = 0;
     char       name_[24] = {0};
     hipStream_t stream_{};

@@ -497,35 +497,42 @@ public:
     // down. A stage that is off runs every assignment on its own, exactly as
     // a decode token does.
     //
-    // THE DEFAULT IS 1, AND EVERY BIT OF THAT IS A MEASUREMENT, not a
-    // judgement. On three cards, 2026-09-22, --chunk 6 against --chunk 1:
+    // THE DEFAULT IS 3 SINCE 2026-09-23, AND EVERY BIT OF THAT IS A
+    // MEASUREMENT, not a judgement. On three cards, 2026-09-22, --chunk 6
+    // against --chunk 1:
     //
     //   mask 0  bit-identical, greedy 12/16 as decode
-    //   mask 1  bit-identical            <- gate/up is exact, so it is on
-    //   mask 2  diverges from layer 1 on (Kcur-11 1.7e-6 ... Kcur-27 1.0e-3)
-    //   mask 3  diverges the same way
+    //   mask 1  bit-identical            <- gate/up is exact
+    //   mask 2  diverged from layer 1 on (Kcur-11 1.7e-6 ... Kcur-27 1.0e-3)
+    //   mask 3  diverged the same way
     //
-    // so the DOWN gather alone is at fault and stays off until it is not.
-    // Everything else was cleared by the same bisection: --chunk 1 against
-    // its own dump is identical (the engine is deterministic) and
-    // --gemv-lds 0 on both arms changes nothing (the LDS staging flip is not
-    // it).
+    // so the DOWN gather alone was at fault, and the mask is per STAGE
+    // because that is what turned "the gather is wrong" into "the down
+    // gather is wrong" in two runs. Everything else was cleared by the same
+    // bisection: --chunk 1 against its own dump is identical (the engine is
+    // deterministic) and --gemv-lds 0 on both arms changes nothing.
     //
-    // WHY THE DOWN GATHER IS WRONG IS STILL NOT KNOWN, and the interesting
-    // part is what that now rules out. moe_gather_test.cpp transcribes both
-    // down paths on the host over the SAME shared primitives, emulating a
-    // 32-lane wave, and they agree BIT FOR BIT -- as do the counting sort's
-    // invariants. The sort is independently proved on the device by the mask
-    // 1 arm, which shares it. So the fault is not the algorithm, not the
-    // indexing, not the accumulator structure and not the reduction: it is
-    // something the device's code generation does to one of the two kernels
-    // and not the other. The Q8_0 gather's one textual difference (a hoisted
-    // `d * qs[tid]`) has since been removed, which leaves IQ4_NL's
-    // array-of-accumulators against the per-assignment kernel's two scalars
-    // as the last one standing.
+    // WHY THE DOWN GATHER WAS WRONG, found 2026-09-23 in the ISA rather than
+    // on a card. moe_gather_test.cpp had already cleared the algorithm, the
+    // indexing, the accumulator structure and the reduction by transcribing
+    // both paths on the host over the SAME shared primitives and getting bit
+    // equality; the sort is independently proved on the device by the mask-1
+    // arm, which shares it. What was left was code generation, and it is:
+    // `lo += (d * kv) * hb[c]` inside m1n_iq4nl_chunk_dot is CONTRACTED into
+    // an FMA in one kernel and split into v_mul_f32 + v_add_f32 in the other.
+    // Both are legal under -ffp-contract=fast and they round differently. The
+    // backend contracts when it has ILP to spare (the tiled gather had eight
+    // independent accumulator pairs) and de-contracts to shorten the
+    // dependency chain when it has one (the per-assignment kernel). Giving
+    // the gather ONE accumulator pair -- its m loop outer, its w loop inner,
+    // scalars -- makes the two emit the same multiset of float ops:
+    // 8 v_fma_mix_f32, 1 v_fmac_f32, 7 v_mul_f32, 13 v_add_f32, against the
+    // tiled form's 8 / 16 v_fma_f32 / 48 v_fmac_f32 / 48 v_add_f32. The VRAM
+    // read is still once a tile (the row is 360 B and the re-reads are L1),
+    // so the amortisation is kept.
     //
-    // The mask is per STAGE because that is what turned "the gather is
-    // wrong" into "the down gather is wrong" in two runs.
+    // The Q8_0 gather never needed this and still tiles: against its twin it
+    // is the per-assignment body times eight op for op, every term fused.
     virtual void set_expert_gather(int) {}
     // --sync-debug: drain and check after every launch and copy, so the op
     // named in a fault message is the one that faulted rather than whichever

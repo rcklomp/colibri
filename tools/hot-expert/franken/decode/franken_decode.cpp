@@ -175,7 +175,7 @@ int main(int argc, char ** argv) {
     int  gemv_lds = 1;
     int  gemv_min_rows = 1024;
     bool sync_debug = false;
-    int expert_gather = 1;
+    int expert_gather = 3;
     int prefill_pipeline = 1;
     int gemm_lds = 0;
 

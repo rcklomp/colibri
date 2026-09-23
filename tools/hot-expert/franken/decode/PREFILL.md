@@ -167,38 +167,88 @@ A second pass with the mask per stage narrowed it further:
 | `--expert-gather 1` (gate/up only) | **bit-identical** — so gate/up is exact and is ON by default |
 | `--expert-gather 2` (down only) | diverges from layer 1 on, `Kcur-11` 1.7e-6 … `Kcur-27` 1.0e-3 |
 
-So **the default mask is 1**: the gate/up gather is measured exact and runs,
-the down gather is measured wrong and does not. That is most of the
-amortisation — gate and up are two `K = 2 560` tensors an assignment against
-down's one `K = 640`, about 60 % of the expert bytes.
+That put the default mask at 1 for a day: the gate/up gather was measured
+exact and ran, the down gather was measured wrong and did not. That is most of
+the amortisation — gate and up are two `K = 2 560` tensors an assignment
+against down's one `K = 640`, about 60 % of the expert bytes.
 
-**Why the down gather is wrong is still not known, and what that now rules
-out is the interesting part.** `moe_gather_test.cpp` transcribes both down
-paths on the host — emulating a 32-lane wave, over the SAME shared primitives
-from `decode_quant.h` / `m1_native_decode.h` that the kernels call, so the
-decode is not re-derived and a disagreement could only be the loop, the
-indexing, the accumulators or the reduction. They agree **bit for bit**, as
-do the counting sort's invariants (every column covered exactly once, by a
-tile whose `tile_exp` is its expert). The sort is independently proved on the
-device by the mask-1 arm, which shares it. And `moe_finish` sums a token's ten
-contributions in rank order either way, because the column index is
-`t*K_TOP + k` in both paths.
+### 8.1 What the down gather was doing wrong (2026-09-23, found in the ISA)
 
-So the fault is not the algorithm, not the indexing, not the accumulator
-structure and not the reduction: it is something the device's code generation
-does to one of these two kernels and not to its per-assignment twin. The
-Q8_0 gather's one textual difference — a hoisted `d * qs[tid]`, algebraically
-identical and bit-identical on the host — has been removed, so its inner
-statement is now literally the per-assignment kernel's. That leaves IQ4_NL's
-array-of-accumulators against the per-assignment kernel's two scalars as the
-last textual difference standing, and the next device run is the one that
-says whether removing the hoist was enough.
+`moe_gather_test.cpp` had already cleared everything a reader would suspect.
+It transcribes both down paths on the host — emulating a 32-lane wave, over
+the SAME shared primitives from `decode_quant.h` / `m1_native_decode.h` that
+the kernels call, so the decode is not re-derived and a disagreement could
+only be the loop, the indexing, the accumulators or the reduction. They agree
+**bit for bit**, as do the counting sort's invariants (every column covered
+exactly once, by a tile whose `tile_exp` is its expert). The sort is
+independently proved on the device by the mask-1 arm, which shares it. And
+`moe_finish` sums a token's ten contributions in rank order either way,
+because the column index is `t*K_TOP + k` in both paths.
 
-**What the down stage being off costs:** it reads a chosen expert's row once
-per assignment rather than once per group — at `T = 256`, 2 560 reads a layer
-instead of ~512, for ~40 % of the expert bytes. The 7.48 ms/token first
-prefill number was measured with the whole gather ON, so it needs re-taking
-either way.
+So the fault had to be code generation, and it is. Compile the file for the
+device alone and read the two kernels — no GPU, no `--device` flags, four
+seconds:
+
+```
+hipcc --offload-arch=gfx1100 -O3 -std=c++17 --offload-device-only -S \
+      decode_gpu.hip -o /tmp/decode_gpu.s
+```
+
+| kernel | `v_fma_mix_f32` | `v_fma_f32` | `v_fmac_f32` | `v_mul_f32` | `v_add_f32` |
+|---|---|---|---|---|---|
+| `k_moe_down_iq4nl` (per assignment) | 8 | 0 | 1 | 7 | 13 |
+| `k_moe_down_iq4nl_gather` (tiled, WRONG) | 8 | 16 | 48 | 0 | 48 |
+| `k_moe_down_iq4nl_gather` (m-outer, now) | 8 | 0 | 1 | 7 | 13 |
+
+The accumulate that matters lives inside `m1n_iq4nl_chunk_dot`:
+
+```c
+lo += (d * (float)kvals[q & 0xf]) * hb[c];
+```
+
+Under `-ffp-contract=fast` — hipcc's default — the backend MAY fuse that into
+an FMA and MAY leave it as a multiply and an add. Both are legal, they round
+differently, and it chooses per kernel on scheduling grounds: with the `w`
+loop outside and eight independent accumulator pairs inside, the tiled gather
+had ILP to spare and every term stayed fused; the per-assignment kernel has
+ONE accumulator pair, so the fused chain IS its critical path and the machine
+combiner splits all but one term into `v_mul_f32` + `v_add_f32` to shorten it.
+One rounding apart, which is 1.7e-6 at `Kcur-11` growing to 1.0e-3 by
+`Kcur-27` and greedy id 7 flipping — exactly the reported divergence.
+
+**The fix is to give the gather one accumulator pair too**: its `m` loop
+outer, its `w` loop inner, `lo`/`hi` as scalars, and `#pragma clang loop
+unroll(disable)` on the `m` loop so the backend does not rebuild the
+scheduling problem it has just lost. The body is then literally
+`k_moe_down_iq4nl`'s, and the table above is the device agreeing. Note that a
+`#pragma clang fp contract(off)` around the kernel would NOT have worked: FP
+options are lexical at the point the expression is WRITTEN, which is inside
+the shared primitive in `m1_native_decode.h`, and setting it there would
+change the CPU backend and the decode path with it.
+
+**The amortisation survives**, which is the point of the whole item. The
+expert row is `row_bytes` = 360 B at `K = 640`; the second and later passes
+over it are L1 hits, so the VRAM read is still once a TILE rather than once an
+assignment — only the order of the reads changes, not their count. VGPRs
+43 → 31, occupancy 16 either way, no spills.
+
+`k_moe_down_q8_0_gather` keeps its tile and needs none of this: against its
+twin it is the per-assignment body times eight, op for op (8 `v_fma_f32`
+against 1 `v_fmac_f32`, 40 `v_add_f32` against the wave reduction's 5, and one
+`v_fma_mix_f32` either way, because `d * qs[lane]` does not depend on `m` and
+is CSEd). Every term stays fused there, so there is no rounding to disagree
+about. This model's down projection is IQ4_NL; Q8_0 is for a container that is
+not.
+
+**So the default mask is 3.** `make moe-gather-test` passes on the new shape
+(`compared=60 iq4nl_mismatch=0 q8_0_mismatch=0`) and the ISA table is the
+other half of the claim. The device gate that closes it is the usual one, and
+it has NOT been run by the agent that wrote this section:
+
+```
+franken_decode --tokens <6 ids> --chunk 1 --dump A
+franken_decode --tokens <6 ids> --chunk 6 --oracle A     # must be cos 1.0
+```
 
 **Not measured here:** anything on a GPU by the agent that wrote this.
 

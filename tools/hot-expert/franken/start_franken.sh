@@ -79,7 +79,27 @@ export FRANKEN_GGUF="$GGUF"
 export FRANKEN_CTX=${FRANKEN_CTX:-262144}
 export FRANKEN_CHUNK=${FRANKEN_CHUNK:-256}
 export FRANKEN_DEVICES=${FRANKEN_DEVICES:-3}
-export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-0}
+# --gemm-lds 1 IN SERVICE (2026-09-23). 0 is the wave-per-row trunk GEMM, which
+# is bit-identical to the decode kernel; 1 is the LDS-tiled one, which decodes a
+# weight block once per 64 token columns instead of per 8 and reassociates K.
+# It is the difference between llama.cpp's prefill rate and half of it (record
+# §L0-PREFILL-2: 3.0 -> 1.63 ms a token), it applies to T > 1 only -- decode is
+# untouched and stays bit-identical either way -- and its divergence has not yet
+# been measured against the CPU reference. That is the open item: if the quality
+# harness ever says this arm is not acceptable, this is the one line to change.
+export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-1}
+
+# Design 9.1's PLE table, resident. The gather reads 16 rows a token scattered
+# over 28.8 GB; through the GGUF's mmap a row that is not page-cached costs
+# 4.2 ms against 9.5 us (record §PLE-GATHER), and the first served run spent
+# 3.8 s of a 42 s prefill there. Read once at start into memory this process
+# owns, after which no gather can fault. ~29 GB of host RAM, reported with its
+# load time at boot. FRANKEN_PLE_PINNED=1 uses hipHostMalloc instead of malloc;
+# it is not the default because nothing DMAs from this table (the gather
+# dequantises on the CPU), so pinning costs registration time for a transfer
+# that never happens.
+export FRANKEN_PLE_RESIDENT=${FRANKEN_PLE_RESIDENT:-1}
+export FRANKEN_PLE_PINNED=${FRANKEN_PLE_PINNED:-0}
 # Prefix reuse. A checkpoint is taken at every prefill chunk boundary and once
 # at the end of every request (the point a follow-up turn resumes from), eight
 # kept per slot inside a host-memory budget. Each costs ~118 MB of recurrent
@@ -90,9 +110,10 @@ export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-0}
 # reused >= prompt_tokens - 256, which is why the interval is the chunk.
 # Halving FRANKEN_SNAP_EVERY is the lever if a real prompt's shared prefix ends
 # just above a boundary; it costs one more 118 MB download per interval.
-export FRANKEN_SNAP_EVERY=${FRANKEN_SNAP_EVERY:-256}
+export FRANKEN_SNAP_EVERY=${FRANKEN_SNAP_EVERY:-512}
 export FRANKEN_SNAP_KEEP=${FRANKEN_SNAP_KEEP:-8}
 export FRANKEN_SNAP_BUDGET_MB=${FRANKEN_SNAP_BUDGET_MB:-6144}
+export FRANKEN_SNAP_TURNS=${FRANKEN_SNAP_TURNS:-3}
 # --- THE ENV DIFF AGAINST ~/start_glm53.sh ----------------------------------
 # Everything that file exports falls into three groups. The engine-specific
 # ones (COLI_VULKAN, COLI_VK_DEV*/EXPERTS*/SHADERS, COLI_USAGE_PATH,
@@ -153,6 +174,11 @@ echo "[start] engine   : $BIN"
 echo "[start] model    : $GGUF"
 echo "[start] family   : qwen38 (from $FAMILY_DIR/config.json), advertised as 'glm-5.3-flash'"
 echo "[start] ctx=$FRANKEN_CTX chunk=$FRANKEN_CHUNK devices=$FRANKEN_DEVICES gemm_lds=$FRANKEN_GEMM_LDS"
+# The log this gateway writes to, printed in a form `serve_alt.sh status` and
+# accept_live.sh's caller can both pick up: accept_live.sh reads $GLM53_LOG (it
+# defaults to ~/glm53_server.log, which is GLM's and is NOT this one -- its
+# check 1 polled that file for 18 minutes on 2026-09-23 because nobody told it).
+echo "[start] gateway log ${FRANKEN_LOG:-$HOME/bench/serve_alt_franken.log}"
 echo "[start] launching gateway on 0.0.0.0:8081"
 # NB (inherited from start_glm53.sh, and it cost a night there): do NOT put a
 # comment line BETWEEN the backslash-continued arguments below. bash joins the

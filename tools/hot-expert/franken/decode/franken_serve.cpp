@@ -580,18 +580,47 @@ int32_t sample_token(const std::vector<float> & logits, float temp, float top_p,
 // This is what makes UI chat B reuse chat A's tool block even though a short
 // request landed on the same slot in between -- with one KV slot and a
 // gateway that routes every conversation to it, that is the normal case.
+// Host memory a checkpoint copy can land in without the host waiting for it.
+// PINNED if the backend could (a pageable destination turns hipMemcpyAsync
+// into a synchronous copy, which is the whole thing being fixed here); plain
+// malloc otherwise, and then the copy blocks -- correct either way.
+struct HostBuf {
+    Backend * be = nullptr;
+    void *    p = nullptr;
+    size_t    bytes = 0;
+    bool      pinned = false;
+};
+
+HostBuf host_alloc(Backend * be, size_t bytes) {
+    HostBuf b;
+    b.be = be;
+    b.bytes = bytes;
+    b.p = be->alloc_pinned(bytes);
+    b.pinned = (b.p != nullptr);
+    if (!b.p) b.p = std::malloc(bytes);
+    if (!b.p) throw std::runtime_error("out of host memory for a checkpoint");
+    return b;
+}
+
+void host_free(HostBuf & b) {
+    if (!b.p) return;
+    if (b.pinned) b.be->free_pinned(b.p);
+    else          std::free(b.p);
+    b.p = nullptr;
+}
+
 struct KvImage {
-    int               len = 0;      // cells the image holds, [0, len)
-    std::vector<char> data;
+    int     len = 0;                // cells the image holds, [0, len)
+    HostBuf buf;
+    ~KvImage() { host_free(buf); }
 };
 
 struct Snapshot {
     std::vector<int32_t>     seq;   // pos == seq.size()
-    std::vector<char>        rec;
+    void *                   rec = nullptr;   // a buffer of the slot's pool
     std::shared_ptr<KvImage> kv;    // null while the slot's cells still hold it
     long long                stamp = 0;
-    int    pos()   const { return (int) seq.size(); }
-    size_t bytes() const { return rec.size() + (kv ? kv->data.size() : 0); }
+    int    pos() const { return (int) seq.size(); }
 };
 
 struct Slot {
@@ -601,6 +630,12 @@ struct Slot {
     std::vector<int32_t>  seq;
     std::vector<Snapshot> snaps;
     long long             stamp = 0;
+    // The recurrent blobs are all the same size, so they are POOLED: pinning
+    // 118 MB costs real time and a checkpoint taken mid-prefill must not pay
+    // it. Buffers go back to `rec_free` on eviction and are reused.
+    std::vector<HostBuf>  rec_all;
+    std::vector<void *>   rec_free;
+    size_t                rec_bytes = 0;
 };
 
 // Is `a` a prefix of `b`? The one comparison this whole mechanism rests on,
@@ -663,7 +698,11 @@ public:
         if (ctx <= 0) ctx = test_ ? 512 : 262144;
         ctx_ = ctx;
         n_slots_ = std::max(1, std::min(16, env_int("KV_SLOTS", 1)));
-        snap_every_ = std::max(1, env_int("FRANKEN_SNAP_EVERY", chunk_));
+        // A FLOOR under the boundary-aligned schedule (snap_points), not the
+        // schedule itself: what makes reuse precise is the template's own turn
+        // boundaries, so this can be coarse and every copy is asynchronous.
+        snap_every_ = std::max(1, env_int("FRANKEN_SNAP_EVERY", test_ ? chunk_ : 512));
+        snap_turns_ = std::max(1, env_int("FRANKEN_SNAP_TURNS", 3));
         snap_keep_  = std::max(1, env_int("FRANKEN_SNAP_KEEP", 8));
         // Host memory the checkpoints of ONE slot may hold. The recurrent half
         // is 118 MB whatever the position; the positional half is ~13.8 kB a
@@ -736,6 +775,25 @@ public:
             for (int d = 0; d < (int) owned_.size(); ++d)
                 owned_[d]->vram_report(stderr, "after tokenizer");
         }
+
+        // The template's turn boundaries, as TOKEN IDS: where a checkpoint is
+        // worth having (snap_points explains why). Tokenized with the same
+        // parse_special=true the prompt is, so "<|im_start|>" is the one token
+        // it is and not five pieces of text.
+        for (const std::string & tok :
+                 split_csv(env_str("FRANKEN_BOUNDARY_TOKENS", "<|im_start|>"))) {
+            const std::vector<int32_t> ids = vocab_->encode(tok);
+            if (ids.size() == 1) boundary_ids_.push_back(ids[0]);
+            else logf("boundary token %s is %zu tokens, ignored", tok.c_str(), ids.size());
+        }
+        {
+            std::string b;
+            for (int32_t id : boundary_ids_) b += " " + std::to_string(id);
+            logf("checkpoint boundaries:%s (interval floor %d tokens, last %d turns)",
+                 b.empty() ? " none" : b.c_str(), snap_every_, snap_turns_);
+        }
+
+        load_ple_table();
     }
 
     void run() {
@@ -787,18 +845,65 @@ private:
         if (!need_ple_) return {};
         const int back = std::min(start, PLE_NGRAM - 1);
         std::vector<int32_t> win(seq.begin() + (start - back), seq.begin() + (start + T));
-        const auto r = franken::ple_gather(model_->gguf(), win);
+        const auto r = franken::ple_gather(model_->gguf(), win, ple_table_);
         std::vector<float> out((size_t) T * N_EMBD);
         std::copy(r.emb.begin() + (size_t) back * N_EMBD,
                   r.emb.begin() + (size_t)(back + T) * N_EMBD, out.begin());
         if (env_int("FRANKEN_PLE_SELFCHECK", test_ ? 1 : 0) == 1) {
             const auto full = franken::ple_gather(model_->gguf(),
-                                  std::vector<int32_t>(seq.begin(), seq.begin() + (start + T)));
+                                  std::vector<int32_t>(seq.begin(), seq.begin() + (start + T)),
+                                  ple_table_);
             const bool same = std::equal(out.begin(), out.end(),
                                          full.emb.begin() + (size_t) start * N_EMBD);
             logf("ple_selfcheck start=%d T=%d window=%s", start, T, same ? "IDENTICAL" : "DIFFERENT");
         }
         return out;
+    }
+
+    // Design 9.1: "the per-layer n-gram embedding table stays in host RAM".
+    // It says nothing about WHICH host RAM, and the difference is three orders
+    // of magnitude: a gather row read through the GGUF's mmap costs 9.5 us
+    // when its page is cached and 4.2 ms when it is not (record §PLE-GATHER),
+    // and a served prompt's rows are scattered over 28.8 GB. The first served
+    // run spent 3.8 s of a 42 s prefill in the gather for exactly that reason.
+    // So the table is read ONCE, in full, into memory this process owns --
+    // after which no gather can fault. Anonymous memory is enough: nothing
+    // DMAs from this table, the gather dequantises on the CPU and uploads the
+    // result, so FRANKEN_PLE_PINNED=1 (hipHostMalloc) is offered and is NOT
+    // the default -- pinning 28.8 GB costs registration time for a transfer
+    // that never happens.
+    void load_ple_table() {
+        if (!need_ple_) return;
+        if (env_int("FRANKEN_PLE_RESIDENT", test_ ? 0 : 1) != 1) {
+            logf("PLE table: NOT resident (FRANKEN_PLE_RESIDENT=0) -- gathers read the mmap");
+            return;
+        }
+        const TensorInfo * t = model_->gguf().find("per_layer_token_embd.weight");
+        if (!t || !t->data) { logf("PLE table: not found, gathers read the mmap"); return; }
+        const size_t n = t->nbytes;
+        const bool pinned = env_int("FRANKEN_PLE_PINNED", 0) == 1;
+        const auto t0 = std::chrono::steady_clock::now();
+        ple_buf_.be = devs_.front();
+        ple_buf_.bytes = n;
+        ple_buf_.p = pinned ? devs_.front()->alloc_pinned(n) : nullptr;
+        ple_buf_.pinned = (ple_buf_.p != nullptr);
+        if (!ple_buf_.p) ple_buf_.p = std::malloc(n);
+        if (!ple_buf_.p) {
+            logf("PLE table: %.1f GB would not allocate -- gathers read the mmap", n / 1e9);
+            return;
+        }
+        // In pieces, so the log shows progress on a 28.8 GB read rather than
+        // looking hung for half a minute.
+        const size_t step = (size_t) 2 * 1024 * 1024 * 1024;
+        for (size_t off = 0; off < n; off += step) {
+            const size_t m = std::min(step, n - off);
+            std::memcpy((char *) ple_buf_.p + off, t->data + off, m);
+        }
+        ple_table_ = (const uint8_t *) ple_buf_.p;
+        const double sec = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t0).count();
+        logf("PLE table resident: %.2f GB in %.1f s (%.2f GB/s), %s",
+             n / 1e9, sec, n / 1e9 / (sec > 0 ? sec : 1), ple_buf_.pinned ? "pinned" : "pageable");
     }
 
     // Lazily, because a slot is 1.21 GB a card at 256k and the cards have
@@ -815,6 +920,7 @@ private:
             cfg.log_routing= false;
             cfg.progress   = false;         // stdout is the wire
             slots_[(size_t) s].run = std::make_unique<DecodeRunner>(*model_, cfg);
+            slots_[(size_t) s].rec_bytes = slots_[(size_t) s].run->rec_bytes();
             slots_[(size_t) s].run->report_cache_bytes(stderr);
             for (int d = 0; d < (int) owned_.size(); ++d)
                 owned_[d]->vram_report(stderr, "after slot");
@@ -864,35 +970,94 @@ private:
     }
 
     // Copy-on-write: everything that is about to lose the cells it leans on
-    // gets them, in ONE image sized to the deepest of them.
+    // gets them, in ONE image sized to the deepest of them -- and the copy is
+    // stream-ordered, not waited on, like every other checkpoint copy here.
+    // Bounded by the same host budget: if the deepest threatened checkpoint
+    // does not fit, the ones that do are protected and the rest are dropped
+    // rather than stalling a request behind a multi-GB copy.
     double protect_cells(Slot & sl, int from) {
-        int need = 0;
+        std::vector<int> want;
         for (const Snapshot & s : sl.snaps)
-            if (!s.kv && s.pos() > from && is_prefix(s.seq, sl.seq))
-                need = std::max(need, s.pos());
-        if (need <= 0) return 0.0;
+            if (!s.kv && s.pos() > from && is_prefix(s.seq, sl.seq)) want.push_back(s.pos());
+        if (want.empty()) return 0.0;
+        std::sort(want.begin(), want.end());
+        int need = want.back();
+        while (need > 0 && sl.run->kv_bytes(need) > budget_bytes_) {
+            while (!want.empty() && want.back() >= need) want.pop_back();
+            need = want.empty() ? 0 : want.back();
+        }
+        if (need <= 0) {
+            logf("protect: %zu checkpoint(s) dropped -- their cells do not fit "
+                 "FRANKEN_SNAP_BUDGET_MB", sl.snaps.size());
+            sl.snaps.erase(std::remove_if(sl.snaps.begin(), sl.snaps.end(),
+                              [&](const Snapshot & s) {
+                                  return !s.kv && s.pos() > from;
+                              }), sl.snaps.end());
+            return 0.0;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         auto img = std::make_shared<KvImage>();
         img->len = need;
-        img->data.resize(sl.run->kv_bytes(need));
-        sl.run->save_kv(img->data.data(), need);
-        for (Snapshot & s : sl.snaps)
-            if (!s.kv && s.pos() > from && is_prefix(s.seq, sl.seq)) s.kv = img;
+        img->buf = host_alloc(devs_.front(), sl.run->kv_bytes(need));
+        if (img->buf.pinned) sl.run->save_kv_async(img->buf.p, need);
+        else                 sl.run->save_kv(img->buf.p, need);
+        for (Snapshot & sn : sl.snaps) {
+            if (sn.kv || sn.pos() <= from || !is_prefix(sn.seq, sl.seq)) continue;
+            if (sn.pos() <= need) sn.kv = img;
+        }
+        // Anything deeper than the image is beyond saving.
+        sl.snaps.erase(std::remove_if(sl.snaps.begin(), sl.snaps.end(),
+                          [&](const Snapshot & s) { return !s.kv && s.pos() > need; }),
+                       sl.snaps.end());
         const double ms = ms_since(t0);
-        logf("protect: %d cells, %.0f MB, %.0f ms (a request is about to overwrite from %d)",
-             need, img->data.size() / 1e6, ms, from);
+        logf("protect: %d cells, %.0f MB, %.0f ms issue (%s) -- a request is about to "
+             "overwrite from %d", need, img->buf.bytes / 1e6, ms,
+             img->buf.pinned ? "async" : "blocking", from);
         return ms;
     }
 
+    // ---- the pinned pool -------------------------------------------------
+    void * rec_take(Slot & sl) {
+        if (sl.rec_free.empty()) {
+            // A hard cap, because a pathological prompt must not pin the box:
+            // sync once, evict what the budget allows, and only then grow.
+            if ((int) sl.rec_all.size() >= snap_keep_ + 8) {
+                sl.run->sync_devices();
+                evict(sl);
+            }
+            if (sl.rec_free.empty()) {
+                sl.rec_all.push_back(host_alloc(devs_.front(), sl.rec_bytes));
+                sl.rec_free.push_back(sl.rec_all.back().p);
+                if (sl.rec_all.size() == 1)
+                    logf("checkpoint buffers are %s (%.0f MB each)",
+                         !devs_.front()->is_gpu() ? "host memory -- copies are memcpy"
+                         : sl.rec_all.back().pinned ? "PINNED -- copies are async"
+                                                    : "pageable -- copies BLOCK",
+                         sl.rec_bytes / 1e6);
+            }
+        }
+        void * p = sl.rec_free.back();
+        sl.rec_free.pop_back();
+        return p;
+    }
+
+    bool rec_pinned(const Slot & sl) const {
+        return !sl.rec_all.empty() && sl.rec_all.front().pinned;
+    }
+
+    // Nothing here waits: the copy is ordered behind the chunk that has just
+    // run and in front of the next one, and the blob is read only after a
+    // sync_devices() -- which every restore does and which the end of every
+    // request does.
     double take_snapshot(Slot & sl) {
         const auto t0 = std::chrono::steady_clock::now();
         Snapshot s;
         s.seq.assign(sl.seq.begin(), sl.seq.begin() + sl.run->pos());
-        s.rec.resize(sl.run->rec_bytes());
+        s.rec = rec_take(sl);
         s.stamp = ++sl.stamp;
-        sl.run->save_rec(s.rec.data());
+        if (rec_pinned(sl)) sl.run->save_rec_async(s.rec);
+        else                sl.run->save_rec(s.rec);
         sl.snaps.push_back(std::move(s));
-        evict(sl);
         return ms_since(t0);
     }
 
@@ -904,28 +1069,31 @@ private:
         size_t n = 0;
         std::vector<const KvImage *> seen;
         for (const Snapshot & s : sl.snaps) {
-            n += s.rec.size();
+            n += sl.rec_bytes;
             if (!s.kv) continue;
             const KvImage * p = s.kv.get();
             if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
             seen.push_back(p);
-            n += p->data.size();
+            n += p->buf.bytes;
         }
         return n;
     }
 
+    // ONLY ever called after a sync_devices(): a buffer whose copy is still in
+    // flight must not go back on the free list.
     void evict(Slot & sl) {
+        auto drop = [&](Snapshot & s) { if (s.rec) sl.rec_free.push_back(s.rec); s.rec = nullptr; };
         // The dead first: a checkpoint with no image whose prefix the slot's
         // cells no longer hold can never be used again.
+        for (Snapshot & s : sl.snaps)
+            if (!s.kv && !is_prefix(s.seq, sl.seq)) drop(s);
         sl.snaps.erase(std::remove_if(sl.snaps.begin(), sl.snaps.end(),
-                          [&](const Snapshot & s) {
-                              return !s.kv && !is_prefix(s.seq, sl.seq);
-                          }), sl.snaps.end());
+                          [&](const Snapshot & s) { return s.rec == nullptr; }), sl.snaps.end());
         while ((int) sl.snaps.size() > snap_keep_ ||
                (snaps_bytes(sl) > budget_bytes_ && sl.snaps.size() > 1)) {
             // Never the two most recent -- the end-of-turn checkpoint and the
-            // deepest chunk boundary are what the next turn most often wants.
-            // Among the rest the SHALLOWEST goes: a deeper checkpoint reuses
+            // deepest boundary are what the next turn most often wants. Among
+            // the rest the SHALLOWEST goes: a deeper checkpoint reuses
             // strictly more, and `reused` is what the gate reads.
             long long a = -1, b = -1;
             for (const Snapshot & s : sl.snaps) {
@@ -939,8 +1107,53 @@ private:
                 if (s.pos() < low) { low = s.pos(); victim = i; }
             }
             if (victim < 0) break;
+            drop(sl.snaps[(size_t) victim]);
             sl.snaps.erase(sl.snaps.begin() + (long) victim);
         }
+    }
+
+    // WHERE a checkpoint is worth taking, in ascending order.
+    //
+    // The interval alone cannot do this job. accept_live.sh check 2 wants
+    // `reused >= prompt_tokens - 256` for a second UI chat that shares the
+    // first one's system+tool block, i.e. a checkpoint within 256 tokens of
+    // where the two prompts DIVERGE -- and that point is not a multiple of
+    // anything. It is, however, structural: the two chats are identical up to
+    // the last user turn, and a chat template starts every turn with the same
+    // special token. So the boundary tokens of the template are the schedule,
+    // and the interval is only a floor under it. (This is what glm53 gets from
+    // the gateway's `prefix_bytes` hint, which the gateway computes for glm53
+    // alone -- GATEWAY-PROTOCOL.md section 2. Finding it in the token stream
+    // needs no hint and no gateway change.)
+    std::vector<int> snap_points(const std::vector<int32_t> & toks, int from, int n) {
+        std::vector<int> pts;
+        if (!boundary_ids_.empty()) {
+            std::vector<int> structural;
+            for (int i = from + 1; i < n; ++i)
+                if (std::find(boundary_ids_.begin(), boundary_ids_.end(), toks[(size_t) i])
+                        != boundary_ids_.end())
+                    structural.push_back(i);
+            // The last few turns only: a long conversation has one of these per
+            // message and the old ones are below every plausible divergence.
+            const int keep = std::max(1, snap_turns_);
+            if ((int) structural.size() > keep)
+                structural.erase(structural.begin(), structural.end() - keep);
+            pts.insert(pts.end(), structural.begin(), structural.end());
+        }
+        for (int p = ((from / snap_every_) + 1) * snap_every_; p < n; p += snap_every_)
+            pts.push_back(p);
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        // Nothing closer together than a chunk: two checkpoints inside one
+        // chunk would split it for no reuse the other does not already give.
+        std::vector<int> out;
+        int last = from;
+        for (int p : pts) {
+            if (p - last < chunk_ / 2 || p <= from || p >= n) continue;
+            out.push_back(p);
+            last = p;
+        }
+        return out;
     }
 
     void serve_one(Req & q) {
@@ -997,10 +1210,10 @@ private:
             const auto tr = std::chrono::steady_clock::now();
             if (plan.snap >= 0) {
                 const Snapshot & s = sl.snaps[(size_t) plan.snap];
-                run.load_rec(s.rec.data(), reused);
+                run.load_rec(s.rec, reused);
                 // Only when its cells are not already in the slot: an image is
                 // an upload of ~13.8 kB a token, a re-prefill is a forward pass.
-                if (s.kv) run.load_kv(s.kv->data.data(), s.kv->len, reused, reused);
+                if (s.kv) run.load_kv(s.kv->buf.p, s.kv->len, reused, reused);
             } else if (!plan.live) {
                 run.reset_state();
             }
@@ -1038,26 +1251,37 @@ private:
         // 9.5 us a token warm, 4.2 ms a token if a row's page comes off the
         // NVMe (record §PLE-GATHER), which is a difference of three orders of
         // magnitude that no aggregate number can show.
+        const std::vector<int> points = snap_points(toks, reused, prompt_tokens);
+        size_t next_pt = 0;
         for (int t = reused; t < prompt_tokens && !cancelled; ) {
-            const int T = std::min(chunk_, prompt_tokens - t);
+            int limit = prompt_tokens;
+            while (next_pt < points.size() && points[next_pt] <= t) ++next_pt;
+            if (next_pt < points.size()) limit = std::min(limit, points[next_pt]);
+            const int T = std::min(chunk_, limit - t);
             sl.seq.insert(sl.seq.end(), toks.begin() + t, toks.begin() + t + T);
             const auto tp = std::chrono::steady_clock::now();
             const std::vector<float> ple = ple_rows(sl.seq, t, T);
             ple_ms += ms_since(tp);
             const auto ts = std::chrono::steady_clock::now();
             ++chunks;
-            const bool is_last  = (t + T == prompt_tokens);
-            const bool snap_due = (t + T - last_snap >= snap_every_);
-            // A chunk that is neither the last nor about to be snapshotted is
-            // ENQUEUED: the pipeline is what makes the prompt 1.63 ms a token,
-            // and the only thing that forces a wait is a host read of the
-            // state (record §L0-PREFILL-2).
+            const bool is_last = (t + T == prompt_tokens);
+            // ONLY the last chunk is awaited. A checkpoint no longer forces a
+            // flush: its copy is stream-ordered behind this chunk and in front
+            // of the next one, so the host runs ahead and the three cards stay
+            // overlapped. Taking one per chunk with a BLOCKING copy is what
+            // put the first served prefill at 7.4 ms a token -- the
+            // unpipelined rate, record §L0-PREFILL-2 -- with 2.3 s of copy on
+            // top.
             const int g = run.step(toks.data() + t, T, ple.empty() ? nullptr : ple.data(),
-                                   rec, is_last || snap_due);
+                                   rec, is_last);
             if (run.last_flushed()) greedy = g;
             t += T;
             step_ms += ms_since(ts);
-            if (snap_due && !is_last) { snap_ms += take_snapshot(sl); last_snap = t; }
+            if (next_pt < points.size() && t == points[next_pt] && !is_last) {
+                snap_ms += take_snapshot(sl);
+                last_snap = t;
+                ++next_pt;
+            }
             cancelled = io_.drain(q.id);
         }
         t_prefill = std::chrono::steady_clock::now();
@@ -1093,7 +1317,16 @@ private:
         // The state the next turn will want to roll back to is the one this
         // turn ends in: one snapshot here is what makes a continuation reuse
         // EXACTLY prompt+completion tokens instead of the nearest chunk below.
+        // The state the next turn will want to roll back to is the one this
+        // turn ends in: one checkpoint here is what makes a continuation reuse
+        // EXACTLY prompt+completion tokens instead of the nearest point below.
         if (run.pos() > last_snap) snap_ms += take_snapshot(sl);
+        // The ONE wait this request owes its checkpoints: after it, every
+        // async copy has landed, so a buffer may be recycled and a blob read.
+        // It costs nothing here -- the turn is over and the host is about to
+        // write DONE.
+        run.sync_devices();
+        evict(sl);
         } catch (const std::exception & e) {
             // One request must not take the engine down, and a slot whose
             // state got as far as an exception is not trustworthy: it is
@@ -1130,7 +1363,10 @@ private:
 
     bool test_;
     int  ctx_ = 262144, chunk_ = 256, n_slots_ = 1;
-    int  snap_every_ = 256, snap_keep_ = 8, n_cand_ = 4096;
+    int  snap_every_ = 512, snap_keep_ = 8, n_cand_ = 4096, snap_turns_ = 3;
+    std::vector<int32_t> boundary_ids_;
+    const uint8_t * ple_table_ = nullptr;   // design 9.1's resident PLE table
+    HostBuf ple_buf_;
     size_t budget_bytes_ = (size_t) 6144 * 1024 * 1024;
     bool need_ple_ = false;
     std::vector<std::unique_ptr<Backend>> owned_;

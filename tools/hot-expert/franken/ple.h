@@ -83,7 +83,13 @@ struct PleGatherResult {
 // per_layer_token_embd.weight out of the model's mmap -- CPU only, touches
 // only the pages those rows live on. Throws if the model has no PLE layer
 // or the table isn't the expected IQ4_NL.
-PleGatherResult ple_gather(const GgufModel & model, const std::vector<int32_t> & tokens);
+// `table_base`, when given, replaces the mmap as the table's base address:
+// design 9.1's resident PLE table (franken_serve.cpp loads the whole 28.8 GB
+// once at engine start). The row arithmetic is identical -- the only thing
+// that changes is whether a row that has not been read for a while costs
+// 9.5 us or a 4.2 ms page fault off the NVMe (record §PLE-GATHER).
+PleGatherResult ple_gather(const GgufModel & model, const std::vector<int32_t> & tokens,
+                           const uint8_t * table_base = nullptr);
 
 // franken_load --ple-check's output: per position, the chosen row index per
 // head, then the first 8 dequantised values of the concatenated per-layer

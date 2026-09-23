@@ -2461,6 +2461,24 @@ public:
         HIP_CHECK(hipStreamSynchronize(stream_));
         HIP_CHECK(hipMemcpy(d, s, b, hipMemcpyDeviceToHost));
     }
+    // A serving checkpoint's copy: stream-ordered, never waited on (see
+    // decode_backend.h). It is NOT counted in `blocking_` because it does not
+    // block -- prof_host_syncs_per_token must stay the number it measures.
+    void download_async(void * d, const void * s, size_t b) override {
+        dev_ensure(dev_);
+        debug_check("download_async()");
+        HIP_CHECK(hipMemcpyAsync(d, s, b, hipMemcpyDeviceToHost, stream_));
+    }
+    // Pinned, or the copy above silently becomes a synchronous one. A failure
+    // is not fatal: the caller falls back to pageable memory and pays the
+    // blocking copy, which is what this engine did before there was a choice.
+    void * alloc_pinned(size_t bytes) override {
+        dev_ensure(dev_);
+        void * p = nullptr;
+        if (hipHostMalloc(&p, bytes, hipHostMallocDefault) != hipSuccess) return nullptr;
+        return p;
+    }
+    void free_pinned(void * p) override { if (p) HIP_IGNORE(hipHostFree(p)); }
     void sync() override {
         dev_ensure(dev_);
         debug_check("sync()");

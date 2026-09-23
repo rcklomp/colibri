@@ -58,7 +58,8 @@ std::vector<int32_t> compute_ple_indices(const HParams & hp, const std::vector<i
     return idx;
 }
 
-PleGatherResult ple_gather(const GgufModel & model, const std::vector<int32_t> & tokens) {
+PleGatherResult ple_gather(const GgufModel & model, const std::vector<int32_t> & tokens,
+                           const uint8_t * table_base) {
     const HParams & hp = model.hparams();
     if (hp.ple_layers.empty()) {
         throw std::runtime_error("ple_gather: model has no ple.layers entry");
@@ -91,7 +92,10 @@ PleGatherResult ple_gather(const GgufModel & model, const std::vector<int32_t> &
             if (row < 0 || (int64_t) row >= table->ne1()) {
                 throw std::runtime_error("ple_gather: row index " + std::to_string(row) + " out of range");
             }
-            const uint8_t * row_ptr = table->data + (size_t) row * row_bytes; // the only bytes of the 28.8 GB table this touches
+            // table_base is the resident copy when the engine has one; the
+            // mmap otherwise. Same rows either way.
+            const uint8_t * base = table_base ? table_base : table->data;
+            const uint8_t * row_ptr = base + (size_t) row * row_bytes;
             float * out = &r.emb[(i * (size_t) n_heads + (size_t) h) * (size_t) head_dim];
             tt->to_float(row_ptr, out, head_dim);
         }

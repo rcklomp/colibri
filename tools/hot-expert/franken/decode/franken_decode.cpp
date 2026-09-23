@@ -71,6 +71,13 @@ void usage(const char * p) {
         "                           activation tile quantised to int8 and RDNA3's\n"
         "                           v_dot4_i32_iu8. 1 and 2 reassociate K, so they are\n"
         "                           a knob and their divergence is measured.\n"
+        "          [--snap-every N] with --time-prefill: take a SERVING CHECKPOINT of\n"
+        "                           the recurrent state every N tokens, exactly as\n"
+        "                           franken_serve.cpp does -- stream-ordered into pinned\n"
+        "                           host memory, never awaited. This is the measurement\n"
+        "                           that says whether checkpoints cost the pipeline:\n"
+        "                           run --time-prefill twice, with 0 and with 512, and\n"
+        "                           compare prefill_ms_per_token.\n"
         "          [--ctx N]        cells the QSA caches are sized for (default 512)\n"
         "          [--threads N]    CPU backend threads (default 4)\n"
         "          [--min-cos X]    oracle bar (default 0.999)\n"
@@ -152,7 +159,7 @@ int main(int argc, char ** argv) {
     int n_devices = 3, greedy_n = 0;
     bool with_head = true;
     std::string expect_ids_path, routing_dir;
-    int time_n = 0, ctx = 512, threads = 4;
+    int time_n = 0, ctx = 512, threads = 4, snap_every = 0;
     int chunk = 256, time_prefill = 0;
     // franken_decode_cpu is built with -DFRANKEN_NO_HIP and has no GPU
     // backend to fall back to, so --cpu is its only mode and its default.
@@ -197,6 +204,7 @@ int main(int argc, char ** argv) {
         else if (a == "--time-prefill" && i + 1 < argc) time_prefill = std::atoi(argv[++i]);
         else if (a == "--prefill-pipeline" && i + 1 < argc) prefill_pipeline = std::atoi(argv[++i]);
         else if (a == "--gemm-lds" && i + 1 < argc) gemm_lds = std::atoi(argv[++i]);
+        else if (a == "--snap-every" && i + 1 < argc) snap_every = std::atoi(argv[++i]);
         else if (a == "--ctx"    && i + 1 < argc) ctx = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--min-cos"&& i + 1 < argc) min_cos = std::atof(argv[++i]);
@@ -320,6 +328,23 @@ int main(int argc, char ** argv) {
         // A timing run measures the ENGINE: a tap is a download and the
         // recorder would put 1 600 of them on the last chunk.
         if (time_prefill > 0) run.set_capture(false);
+        // Serving checkpoints, as the serve loop takes them: pinned host
+        // memory and Backend::download_async, so the copy is ordered inside
+        // the stream and the host never waits. A ring of four, because a fifth
+        // would only ever be needed if a copy took four chunks to land.
+        std::vector<void *> snap_bufs;
+        int snaps_taken = 0, snap_next = 0;
+        long long snap_bytes = 0;
+        if (snap_every > 0) {
+            for (int i = 0; i < 4; ++i) {
+                void * b = devs.front()->alloc_pinned(run.rec_bytes());
+                if (!b) { std::printf("snapshot buffers are NOT pinned; copies will block\n"); b = std::malloc(run.rec_bytes()); }
+                snap_bufs.push_back(b);
+            }
+            std::printf("snap_every=%d snap_bytes_each=%.1f MB\n",
+                        snap_every, run.rec_bytes() / 1e6);
+        }
+        int last_snap_pos = 0;
         std::vector<double> chunk_ms, chunk_issue;
         long long pf_launches = 0;
         int n_chunks = 0;
@@ -339,6 +364,12 @@ int main(int argc, char ** argv) {
                 if (routing.loaded()) routing.observe(run.pos() - 1, il0, run.routed_ids());
             }
             ++n_chunks;
+            if (snap_every > 0 && run.pos() - last_snap_pos >= snap_every) {
+                run.save_rec_async(snap_bufs[(size_t)(snap_next++ % (int) snap_bufs.size())]);
+                last_snap_pos = run.pos();
+                ++snaps_taken;
+                snap_bytes += (long long) run.rec_bytes();
+            }
             if (run.last_body_ms() > 0.0) chunk_ms.push_back(run.last_body_ms());
             chunk_issue.push_back(run.last_issue_ms());
             // The FIRST chunk pays every one-time allocation this run makes
@@ -363,6 +394,8 @@ int main(int argc, char ** argv) {
             for (int d = 0; d < n_report; ++d) devs[d]->sync();
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t_pf0).count();
+            std::printf("prefill_snapshots=%d snap_bytes_total=%.1f MB\n",
+                        snaps_taken, snap_bytes / 1e6);
             std::printf("prefill_tokens=%d chunk=%d chunks=%d prefill_ms=%.1f "
                         "prefill_ms_per_token=%.4f prefill_tokens_per_s=%.2f\n",
                         time_prefill, chunk, n_chunks, ms, ms / (double) time_prefill,

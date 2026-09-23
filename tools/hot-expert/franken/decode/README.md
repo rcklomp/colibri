@@ -764,3 +764,84 @@ token** on a cold row against 2 ms warm. At the served scale that term, not the
 forward pass, is the first suspect for a slow tail — record §PLE-GATHER puts a
 cold row at 4.2 ms against 9.5 µs warm, and design 9.1's pinned PLE table is
 the fix if it is.
+
+### Step 4 fix 2 (2026-09-23): the checkpoints were eating the prefill pipeline
+
+The second serve reported the reuse fixes working and a prefill that had gone
+from 6.5 s to 42.2 s for a 4 881-token UI prompt:
+
+```
+prefill_s=42.18 [restore=47 protect=2 ple=3784 step=36252 snap=2300 ms] ckpt_mb=944
+```
+
+`step` is 36.3 s for 4 881 tokens = **7.4 ms a token, which is the UNPIPELINED
+rate** (record §L0-PREFILL-2: 7.7 unpipelined, 3.0 pipelined, 1.63 with
+`--gemm-lds 1`). The instrumentation added the day before is what made that
+readable, and the cause was in this file: a checkpoint per chunk, each one a
+`sync()` of all three cards plus a blocking 118 MB `download()`. Every chunk
+therefore ended in a full device drain, and the three-card overlap — the thing
+`08fc15f` exists for — could never happen. Three changes:
+
+- **A checkpoint copy is stream-ordered and never awaited.**
+  `Backend::download_async` issues the copy on the engine's own stream, which
+  puts it behind the chunk that has just run and in front of the one that comes
+  next: exactly the ordering a checkpoint needs, with no host wait and no
+  drain. The destination must be pinned or `hipMemcpyAsync` silently becomes
+  synchronous (the same trap the upload staging ring exists for), so the blobs
+  come from a **pool** of `hipHostMalloc`'d buffers — pinning 118 MB costs real
+  time and a checkpoint taken mid-prefill must not pay it. The one wait a
+  request owes its checkpoints is a single `sync_devices()` after the last
+  token, where the host is about to write DONE anyway. The prefill loop no
+  longer forces a flush for anything but its final chunk.
+- **The schedule is the chat template's turn boundaries, not an interval.**
+  `accept_live.sh` check 2 wants reuse within 256 tokens of where two UI chats
+  diverge, and that point is not a multiple of anything — it is the start of
+  the last user turn, which begins with `<|im_start|>`. So `snap_points()`
+  takes a checkpoint at the last `FRANKEN_SNAP_TURNS` (3) boundary tokens, with
+  `FRANKEN_SNAP_EVERY` (512) as a floor under them, and the prefill chunks stop
+  on those positions. This is what glm53 gets from the gateway's `prefix_bytes`
+  hint, which the gateway computes for glm53 alone (GATEWAY-PROTOCOL.md §2);
+  finding it in the token stream needs no hint and no gateway change. A
+  4 881-token prompt now takes ~6 checkpoints instead of 19, and each costs a
+  copy the host does not see.
+- **The copy-on-write image is asynchronous and bounded too**, and if the
+  deepest threatened checkpoint's cells do not fit `FRANKEN_SNAP_BUDGET_MB`,
+  the ones that do are protected and the rest are dropped — a request is never
+  stalled behind a multi-GB copy.
+
+**The PLE gather's 3.8 s** is design 9.1's other half: the table's rows are
+scattered over 28.8 GB and a row whose page is not cached costs 4.2 ms against
+9.5 µs (record §PLE-GATHER). `FRANKEN_PLE_RESIDENT=1` (default in
+`start_franken.sh`) reads the whole table once at boot into memory this process
+owns, after which no gather can fault; the load time and rate are printed.
+`FRANKEN_PLE_PINNED=1` uses `hipHostMalloc` instead and is **not** the default:
+nothing DMAs from this table — the gather dequantises on the CPU and uploads
+the result — so pinning 28.8 GB would cost registration time for a transfer
+that never happens.
+
+Also: `FRANKEN_GEMM_LDS=1` is now the serving default (the LDS-tiled trunk
+GEMM, T > 1 only; decode is untouched and stays bit-identical), because it is
+llama.cpp's prefill rate against half of it. Its divergence from the CPU
+reference has not been measured — that is the open item, and this is the one
+line to change if the quality harness ever rules against it.
+
+### Verifying the pipeline claim (GPU, under the rig lock)
+
+`--snap-every N` makes `--time-prefill` take serving checkpoints on exactly the
+serving path (pinned host memory, `download_async`, never awaited), so the cost
+is one number against another:
+
+```
+# gateway stopped, rig lock held, cards empty
+M=~/models/Qwen3.8-Flash-Next/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+./franken_decode --model $M --time-prefill 4096 --chunk 256 --ctx 8192 \
+                 --gemm-lds 1 --snap-every 0     # the baseline
+./franken_decode --model $M --time-prefill 4096 --chunk 256 --ctx 8192 \
+                 --gemm-lds 1 --snap-every 512   # with checkpoints
+```
+
+`prefill_ms_per_token` must agree within 5 %; `prefill_snapshots` says how many
+were taken. **The CPU binary cannot answer this** — it has one backend, no
+streams and no overlap to lose, so its `snap=` is a memcpy and its
+`prefill_ms_per_token` measures nothing about the pipeline. Nothing here claims
+a GPU measurement.

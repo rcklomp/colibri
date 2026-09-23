@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "../gguf_model.h"
 #include "decode_backend.h"
+#include "ds4_ops.h"
 #include "ds4_shapes.h"
 
 namespace fk {
@@ -66,8 +68,21 @@ struct LayerWeights {
     Mat gate_inp;                          // 4096 -> 256, BF16
     const float * exp_probs_b = nullptr;   // [256], non-hash layers
     const int32_t * tid2eid = nullptr;     // HOST [n_vocab][6], hash layers
-    Mat exp_gate, exp_up, exp_down;        // 256-expert tensors
+    Mat exp_gate, exp_up, exp_down;        // 256-expert tensors: format + row stride only
+                                           // (base is null: the TABLE addresses the experts)
+    ExpertTable et;                        // per-expert addresses, backend memory
+    std::vector<const void *> tab_host;    // the CPU arm's table (mmap addresses)
+    int n_resident = N_EXPERT;             // experts in VRAM (all, on the CPU arm)
     Mat sh_gate, sh_up, sh_down;           // the shared expert, 2048 wide
+};
+
+// Expert placement (L5 step 2, DEEPSEEK4.md section 5): per card, the
+// experts of its layers with the highest usage counts in the M2 histogram
+// (`<hist_dir>/layer_<il>.csv`, expert_id,count) until `expert_gb` of VRAM is
+// spent; the rest go to pinned host memory, read through the table.
+struct Placement {
+    std::string hist_dir;
+    double      expert_gb = 20.0;
 };
 
 class Ds4Model {
@@ -77,7 +92,8 @@ public:
     // final hyper-connection mixer, output_norm, output.weight) goes on the
     // last one when `with_head`.
     Ds4Model(const std::string & any_shard_path, std::vector<Backend *> devs,
-             int il0, int il1, bool with_head);
+             std::vector<Ds4Ops *> ops, int il0, int il1, bool with_head,
+             const Placement & pl = Placement());
 
     const GgufModel & gguf() const { return *model_; }
     float rms_eps() const { return rms_eps_; }
@@ -102,15 +118,24 @@ public:
     const int32_t * hash_ids(int il, int32_t tok) const;      // tid2eid row, or nullptr
 
     size_t placed_bytes() const { return placed_; }
+    size_t host_expert_bytes() const { return host_expert_bytes_; }
 
 private:
     const TensorInfo * need(const std::string & name) const;
     Mat place_mat(Backend & be, const std::string & name, size_t n_slices);
+    Mat describe_mat(const std::string & name, size_t n_slices);
     const float * place_f32(Backend & be, const std::string & name, int64_t n_expect);
     void check_hparams();
+    void plan_placement(const Placement & pl);
+    void place_experts(LayerWeights & L, Backend & be, Ds4Ops & ops);
 
     std::unique_ptr<GgufModel> model_;
     std::vector<Backend *> devs_;
+    std::vector<Ds4Ops *>  ops_;
+    std::vector<std::vector<char>> resident_;   // [layer][expert], from plan_placement
+    std::vector<unsigned char> embd_copy_;       // token_embd in host RAM (GPU runs)
+    std::vector<std::vector<int32_t>> tid_copy_; // the hash layers' tid2eid, likewise
+    size_t host_expert_bytes_ = 0;
     std::vector<LayerWeights> layers_;
     const TensorInfo * tok_embd_ = nullptr;
     bool have_head_ = false;

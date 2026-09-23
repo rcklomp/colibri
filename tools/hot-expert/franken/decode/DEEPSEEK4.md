@@ -1,8 +1,9 @@
-# DeepSeek-V4-Flash on the Franken engine — L5 step 1 (2026-09-23)
+# DeepSeek-V4-Flash on the Franken engine — L5 steps 1-2 (2026-09-23/24)
 
 The model, the path Qwen3.8 took (design rev 13 §9; record §L0-STEP1..3), and
-what step 1 built and proved. **Everything below that says "measured" was
-measured on the CPU arm; nothing here is a GPU measurement.**
+what steps 1 and 2 built and proved. **Everything below that says "measured"
+was measured on the CPU arm or by the compiler; nothing here is a GPU
+measurement.** Step 2 (GPU kernels, placement, the gate commands) is §9.
 
 Model: `~/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M/*.gguf` (3 shards,
 85 GB, arch `deepseek4`, 1 328 tensors). Reference: `~/src/llama-glm53`
@@ -166,6 +167,7 @@ embedded and can be prefetched before layer 0 runs.
 | `../oracle_dump.cpp` | DeepSeek tap names (chosen from the model's arch), `--stop-after-layer N` (the eval callback stops the graph after `l_last-N`), `--no-extra-bufts` (no repacking reads) |
 | `../no_populate.c` | LD_PRELOAD shim: libllama maps with MAP_POPULATE / WILLNEED; this keeps the mapping lazy so a dump reads only what it computes |
 | `ds4_oracle.sh` | the oracle run: dump (bounded, with a page-cache watchdog) then compare |
+| `ds4_gpu.inc`, `ds4_gpu_gate.sh` | step 2: the GPU ops and kernels, the GPU gate commands (§9) |
 
 Scope limits of step 1: T = 1 (the prompt is fed token by token — correct,
 since every DS4 attention path is causal per token, but no batched prefill);
@@ -215,7 +217,7 @@ with a different set (one expert of six) are not taps and were not
 individually examined; that they are near-ties at the cut is the likely
 reading, not a verified one.
 
-## 8. Next steps
+## 8. Next steps (as of step 1; step 2's are at the end of §9)
 
 1. **GPU kernels** (Opus tier where noted): the six decoders as expert and
    trunk GEMVs (the lane forms exist; the IQ2_XXS/IQ3_XXS grid tables go to
@@ -234,3 +236,137 @@ reading, not a verified one.
    budget or run while GLM is not serving); a prompt past 2 048 tokens so the
    indexer's top-512 actually selects; an activation-quantisation arm to
    attribute the 0.9996 floor.
+
+## 9. Step 2 (2026-09-24): the GPU side, built and not run
+
+**What was built.** `ds4_gpu.inc` holds 25 new kernels and `Ds4GpuOps`, the
+GPU implementation of `ds4_ops.h`. It is `#include`d at the end of
+`decode_gpu.hip`'s anonymous namespace, after `GpuBackend`, so every launch
+goes through the backend's own `mark()` (device selection per the HIP
+multi-GPU rule, launch count, `--profile`, `--sync-debug`). `decode_gpu.hip`
+itself gains three include lines, one `friend class Ds4GpuOps;` and the
+factory. `ds4_graph.cpp` is now per device: one scratch set and one
+`Ds4Ops` per card, layer ranges 0-14 / 15-28 / 29-42, the head on card 2, and
+only H (64 KB) crossing a boundary (`boundary_recv`). The expert ids, the
+hash-routing ids, the top-k output and the greedy id stay on the device. The
+host uploads the embedding row and the three hash layers' 18 ids with the
+token (both are gather tables held in host RAM on a GPU run), and reads back
+one int.
+
+The ops' interface gained `gemv` (the six new formats go to `k_ds4_gemv`;
+Q8_0 / Q6_K / BF16 / F32 go to the L0 engine's own tuned GEMV, unchanged),
+`moe_gate_up` / `moe_down` over an **`ExpertTable`** (per layer, 3 × 256
+expert addresses in device memory), and `alloc_host_mapped`.
+
+**The qwen4exp GPU path, unchanged by construction and by check.** Both the
+pre-L5 tree (`cbf0430`) and this tree were compiled to device assembly
+(`hipcc --cuda-device-only -S`). All **65 of 65** pre-existing kernels are
+instruction-for-instruction identical (comments and per-TU branch-label
+numbering normalised), and their `.amdhsa` descriptors match too, so their
+VGPR, LDS and scratch are the same. The CPU gate still passes: 1604/1604, all
+1592 float taps cos=1.000000 maxabs=0.
+
+**The new kernels** (`make resources`, gfx1100, `-O3`; none spills):
+
+| kernel | VGPR | SGPR | LDS B | waves/SIMD | what |
+|---|---:|---:|---:|---:|---|
+| `k_ds4_gemv<Q4_K>` | 35 | 18 | 0 | 16 | lm_head |
+| `k_ds4_gemv<Q5_K>` | 52 | 18 | 0 | 16 | q_a, shared-expert gate/up |
+| `k_ds4_gemv<IQ2_XXS / IQ2_S / IQ3_XXS / MXFP4>` | 40 / 38 / 38 / 15 | 18 | 0 | 16 | (trunk use: none; kept for completeness) |
+| `k_ds4_moe<IQ2_XXS / IQ2_S / IQ3_XXS / MXFP4>` | 40 / 38 / 38 / 15 | 18 | 0 | 16 | routed experts through the table |
+| `k_ds4_lid_scores` | 48 | 18 | 33 024 | 6 | the 64-head indexer scan |
+| `k_ds4_topk` | 11 | 31 | 1 044 | 16 | radix top-512 |
+| `k_ds4_attn_part` / `_combine` | 43 / 11 | 25 / 21 | 32 896 / 0 | 6 / 16 | sink MQA over raw window + selected rows |
+| `k_ds4_router` | 40 | 24 | 3 096 | 16 | sqrt-softplus, bias or hash, top-6, weights |
+| `k_ds4_hc_split` / `_wsum` / `_post` / `_head_pre` | 50 / 9 / 15 / 7 | ≤54 | 0 | 16 | the four-stream mix, Sinkhorn |
+| `k_ds4_rope_tail` / `k_ds4_fwht` / `k_ds4_to_f16` | 25 / 6 / 5 | 18 | 0 / 512 / 0 | 16 | partial RoPE (+inverse), Hadamard, f16 store |
+| `k_ds4_comp_pool` / `_swiglu_clamp` / `_moe_accum` | 13 / 11 / 9 | ≤33 | 0 | 16 | compressor pools, MoE tail |
+
+How they are built:
+- **GEMV.** One wave per row; each lane runs the `ds4_quant.h` lane decoder
+  (the bit-exact ones of §7a) on every block. First cut: the block bytes are
+  byte loads spread over the lanes, not a tuned layout.
+- **Indexer scan.** Checked against compute as well as bandwidth: at 256k a
+  CSA layer scans 65 536 keys, 16.8 MB (21 µs at 800 GB/s) but 537 M MACs
+  (~27 µs at a ~20 TFMA/s dual-issue peak, ~55 µs single-issue). It is
+  **compute-bound**; 21 layers ≈ 0.6-1.2 ms a token at 256k, projected. The
+  first two shapes, one thread per key with 64 or 16 head sums in registers,
+  took 256 / 246 VGPR and spilled; the kept shape is four lanes per key with
+  a shuffle reduce, 48 VGPR, and reads the keys fully coalesced.
+- **Top-k.** Runs only past 512 visible blocks (> 2 048 tokens); below that
+  the selection is the identity, as in ggml. Its algorithm was checked on the
+  host against a sort: 300 random arrays incl. heavy ties, 0 bad.
+- **Attention.** A flash-style split over 32-key chunks held in LDS (rows
+  padded to 257 u32 against bank conflicts), 16 heads a workgroup, and a
+  combine that puts the sink in the denominator.
+- **Numerics.** Every kernel is a transcription of its CPU op. Summation
+  order differs (float against the CPU arm's double), and cos/sin are the
+  device's; theta, the yarn corr dims and the mscale are computed on the
+  host with the CPU arm's libm.
+
+**Placement** (`--placement ~/bench/m2/deepseek_b60 --expert-gb 20`, printed
+by `--plan-only` without reading a model byte):
+
+| card | layers | experts resident | VRAM | pinned host | expected misses (in-sample) |
+|---|---|---:|---:|---:|---:|
+| 0 | 0-14 | 2 653 | 19.99 GB | 8.95 GB | 18.8 MB/token |
+| 1 | 15-28 | 2 597 | 20.00 GB | 7.60 GB | 8.7 MB/token |
+| 2 | 29-42 (+ head) | 2 623 | 19.99 GB | 7.34 GB | 8.3 MB/token |
+
+The ranking is greedy by histogram count per card. Keeping a slab saves
+count × slab bytes of misses for slab bytes of VRAM, so count alone is the
+ratio. **The CSVs hold the whole 32 760-token counts, not the first half**
+(`moe_hist.cpp write_layer_csv`); the first-half ranking M2 used for its miss
+figure is not on disk. So the 35.8 MB a token above is an IN-SAMPLE
+estimate, and M2's out-of-sample 60 MB (uniform 185 experts a layer) is the
+honest upper reference. Card 0 carries half the misses: layers 0-2 route by
+token hash and are the flattest (cov25 0.44-0.46).
+
+VRAM a card at `--ctx 262144`, projected: trunk 2.1-2.4 GB + experts 20.0 GB
++ positional caches 0.60 GB (7 CSA layers × 84 MB + 6-7 HCA × 2 MB + raw
+windows) + attention partials ≤ 9 MB + the L0 backend's scratch ≈ 22.8-23.1
+GB of 25.77 GB (24 GiB).
+
+**What a miss costs (estimate, not measured).** A miss is a kernel reading a
+pinned host page over PCIe (zero-copy), on the critical path: the router
+decides, then the expert GEMV reads. There is no overlap in this cut. At
+10-20 GB/s effective per link for these scattered 66-98-byte block reads
+(below the ~25 GB/s DMA rate: small requests), the in-sample 36 MB a token
+costs **~1.8-3.6 ms a token**, and M2's 60 MB costs 3-6 ms. Two of the cards
+share one upstream link (§1), so their misses serialise on it. Card 0's 18.8
+MB is the largest share, and the cheapest to hide: its three hash layers'
+experts are known from the token id before layer 0 runs, so a prefetch into
+a VRAM ring can start at embed time (not built).
+
+**The gate** (`ds4_gpu_gate.sh`, refuses without `DS4_GPU_OK=1`; the caller
+holds the rig lock with the gateway stopped):
+
+```
+cd ~/src/colibri-m1/tools/hot-expert/franken/decode
+make franken_decode_ds4 GPU_BIN=franken_decode_ds4      # leaves the served franken_decode alone
+M=~/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf
+T="0 671 6102 294 8760 344"; P=~/bench/m2/deepseek_b60; O=~/bench/franken/ds4
+# (1) CPU reference, layers 0-42 + head, 6 tokens, greedy 16 (reads ~15-40 GB of the file)
+./franken_decode_cpu --model $M --tokens $T --cpu --ctx 512 --threads 8 --greedy 16 --dump $O/cpu_l042
+# (2) GPU against it, first under --sync-debug, then without: every tap + greedy_ids exact
+./franken_decode_ds4 --model $M --tokens $T --ctx 512 --placement $P --expert-gb 20 --greedy 16 --oracle $O/cpu_l042 --sync-debug
+./franken_decode_ds4 --model $M --tokens $T --ctx 512 --placement $P --expert-gb 20 --greedy 16 --oracle $O/cpu_l042
+# (3) 256k allocated: greedy 16, then 32 timed tokens (ds4_decode_ms_median=, tok_s=)
+./franken_decode_ds4 --model $M --tokens $T --ctx 262144 --placement $P --expert-gb 20 --greedy 16 --time 32
+```
+
+(3) times at **short depth** (6 + 16 positions) with the 256k caches
+allocated. The top-512 selection and the full-depth indexer scan need a
+prompt past 2 048 tokens: the next gate for them is
+`--layers 0-3 --no-head` on a ~2 100-token prompt, CPU `--dump` against GPU
+`--oracle` (the CPU side then reads ≤ 8 GB).
+
+**Not claimed:** any GPU number (correctness, VRAM, time); the miss cost
+(estimated above); the first-half histogram ranking (not on disk).
+
+**Next** (after the gate):
+1. The expert GEMV's block loads: coalesced 16-byte loads per lane instead of
+   byte loads. This is the kernel the resident experts' ~2 GB/token rides on.
+2. The hash layers' miss prefetch.
+3. Batched prefill for this graph.
+4. Placement from the first-half counts once `moe_hist` writes them.

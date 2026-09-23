@@ -2,8 +2,12 @@
 
 #include "ds4_model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <tuple>
 #include <cstring>
 #include <stdexcept>
 
@@ -139,6 +143,23 @@ const TensorInfo * Ds4Model::need(const std::string & name) const {
 
 // As DecodeModel::place_mat: the row stride the GEMVs will use is asserted
 // against the tensor's own byte size before anything is placed.
+// The format, row stride and slice stride of a tensor, asserted against the
+// file, WITHOUT placing it (the expert tensors are placed slab by slab).
+Mat Ds4Model::describe_mat(const std::string & name, size_t n_slices) {
+    const TensorInfo * t = need(name);
+    Mat m;
+    m.name          = strdup(name.c_str());
+    m.type          = fk_type_of(t->type);
+    m.K             = t->ne0();
+    m.rows          = t->ne1();
+    m.row_bytes     = fk_row_bytes(m.type, m.K);
+    m.expert_stride = n_slices > 1 ? t->slice_bytes((int64_t) n_slices) : 0;
+    const size_t expect = m.row_bytes * (size_t) m.rows * (n_slices ? n_slices : 1);
+    if (expect != t->nbytes || m.row_bytes != t->row_size())
+        throw std::runtime_error(name + ": row/slice arithmetic disagrees with the file");
+    return m;
+}
+
 Mat Ds4Model::place_mat(Backend & be, const std::string & name, size_t n_slices) {
     const TensorInfo * t = need(name);
     Mat m;
@@ -177,10 +198,136 @@ const float * Ds4Model::place_f32(Backend & be, const std::string & name, int64_
     return (const float *) be.place(t->data, t->nbytes, name.c_str());
 }
 
-Ds4Model::Ds4Model(const std::string & path, std::vector<Backend *> devs, int il0, int il1,
-                   bool with_head)
-    : devs_(std::move(devs)), il0_(il0), il1_(il1) {
+// Per card: every (layer, expert) of its layers ranked by the histogram
+// count, taken in order until the budget is spent. Saving a slab saves
+// count x slab bytes of misses for slab bytes of VRAM, so count alone is the
+// ratio and a single ranking across the card's layers is the greedy optimum.
+void Ds4Model::plan_placement(const Placement & pl) {
+    resident_.assign(N_LAYER, std::vector<char>(N_EXPERT, 1));
+    if (pl.hist_dir.empty()) {
+        if (devs_[0]->is_gpu())
+            throw std::runtime_error("a GPU run needs --placement <dir with layer_<il>.csv> "
+                                     "(the M2 histogram): 83.9 GB of experts do not fit");
+        return;
+    }
+    const int n_dev = (int) devs_.size();
+    const int n_layers = il1_ - il0_ + 1;
+    std::vector<std::vector<long long>> cnt(N_LAYER, std::vector<long long>(N_EXPERT, 0));
+    std::vector<long long> tot(N_LAYER, 0);
+    for (int il = il0_; il <= il1_; ++il) {
+        std::ifstream f(pl.hist_dir + "/layer_" + std::to_string(il) + ".csv");
+        if (!f) throw std::runtime_error("placement: no " + pl.hist_dir + "/layer_" + std::to_string(il) + ".csv");
+        std::string line;
+        std::getline(f, line);                      // header: expert_id,count
+        while (std::getline(f, line)) {
+            int e = -1; long long c = 0; char comma;
+            std::istringstream is(line);
+            if (is >> e >> comma >> c && e >= 0 && e < N_EXPERT) { cnt[il][e] = c; tot[il] += c; }
+        }
+    }
+    auto slab = [&](int il) {
+        const auto b = [&](const char * s) {
+            return need("blk." + std::to_string(il) + "." + s)->slice_bytes(N_EXPERT);
+        };
+        return b("ffn_gate_exps.weight") + b("ffn_up_exps.weight") + b("ffn_down_exps.weight");
+    };
+    const double budget = pl.expert_gb * 1e9;
+    for (int d = 0; d < n_dev; ++d) {
+        std::vector<std::tuple<long long, int, int>> c;   // (-count, il, e)
+        int la = -1, lb = -1;
+        for (int il = il0_; il <= il1_; ++il) {
+            if (std::min(n_dev - 1, (il - il0_) * n_dev / n_layers) != d) continue;
+            if (la < 0) la = il;
+            lb = il;
+            for (int e = 0; e < N_EXPERT; ++e) { c.emplace_back(-cnt[il][e], il, e); resident_[il][e] = 0; }
+        }
+        if (la < 0) continue;
+        std::sort(c.begin(), c.end());
+        double used = 0.0, miss = 0.0, host = 0.0;
+        int n_res = 0;
+        for (auto & t : c) {
+            const int il = std::get<1>(t), e = std::get<2>(t);
+            const double sb = (double) slab(il);
+            if (used + sb <= budget) { resident_[il][e] = 1; used += sb; ++n_res; }
+            else {
+                host += sb;
+                // expected bytes a token: P(e chosen) = count / positions,
+                // positions = total / 6 -- IN-SAMPLE, see DEEPSEEK4.md 5
+                if (tot[il] > 0) miss += sb * (double) cnt[il][e] / ((double) tot[il] / N_EXPERT_USED);
+            }
+        }
+        std::printf("placement dev=%d layers=%d-%d resident=%d experts_gb=%.2f host_gb=%.2f "
+                    "est_miss_mb_per_token=%.1f (histogram %s, in-sample)\n",
+                    d, la, lb, n_res, used / 1e9, host / 1e9, miss / 1e6, pl.hist_dir.c_str());
+    }
+}
+
+// The expert table of one layer. CPU arm: every entry is an mmap address.
+// A card: resident experts are copied into one VRAM block, the others into
+// one pinned, device-mapped host block, and the 3 x 256 addresses go to VRAM.
+void Ds4Model::place_experts(LayerWeights & L, Backend & be, Ds4Ops & ops) {
+    const int il = L.il;
+    const TensorInfo * tg = need("blk." + std::to_string(il) + ".ffn_gate_exps.weight");
+    const TensorInfo * tu = need("blk." + std::to_string(il) + ".ffn_up_exps.weight");
+    const TensorInfo * td = need("blk." + std::to_string(il) + ".ffn_down_exps.weight");
+    const size_t sg = tg->slice_bytes(N_EXPERT), su = tu->slice_bytes(N_EXPERT), sd = td->slice_bytes(N_EXPERT);
+    L.et.type_gu = L.exp_gate.type; L.et.type_d = L.exp_down.type;
+    L.et.row_gu  = L.exp_gate.row_bytes; L.et.row_d = L.exp_down.row_bytes;
+    L.et.K_gu = (int) L.exp_gate.K; L.et.rows_gu = (int) L.exp_gate.rows;
+    L.et.K_d  = (int) L.exp_down.K; L.et.rows_d  = (int) L.exp_down.rows;
+    if (L.exp_up.type != L.exp_gate.type) throw std::runtime_error("gate/up formats differ on layer " + std::to_string(il));
+    L.tab_host.assign(3 * N_EXPERT, nullptr);
+    if (!be.is_gpu()) {
+        for (int e = 0; e < N_EXPERT; ++e) {
+            L.tab_host[e]                = tg->data + (size_t) e * sg;
+            L.tab_host[N_EXPERT + e]     = tu->data + (size_t) e * su;
+            L.tab_host[2 * N_EXPERT + e] = td->data + (size_t) e * sd;
+        }
+        L.n_resident = N_EXPERT;
+        L.et.gate = L.tab_host.data();
+        L.et.up   = L.tab_host.data() + N_EXPERT;
+        L.et.down = L.tab_host.data() + 2 * N_EXPERT;
+        return;
+    }
+    const size_t slab = sg + su + sd;
+    std::vector<int> res, miss;
+    for (int e = 0; e < N_EXPERT; ++e) (resident_[il][e] ? res : miss).push_back(e);
+    unsigned char * vram = res.empty() ? nullptr : (unsigned char *) be.alloc_raw(res.size() * slab);
+    for (size_t i = 0; i < res.size(); ++i) {
+        const int e = res[i];
+        unsigned char * dst = vram + i * slab;
+        be.upload(dst,           tg->data + (size_t) e * sg, sg);
+        be.upload(dst + sg,      tu->data + (size_t) e * su, su);
+        be.upload(dst + sg + su, td->data + (size_t) e * sd, sd);
+        L.tab_host[e] = dst; L.tab_host[N_EXPERT + e] = dst + sg; L.tab_host[2 * N_EXPERT + e] = dst + sg + su;
+    }
+    if (!miss.empty()) {
+        void * host = nullptr;
+        const unsigned char * view = (const unsigned char *) ops.alloc_host_mapped(miss.size() * slab, &host);
+        unsigned char * h = (unsigned char *) host;
+        for (size_t j = 0; j < miss.size(); ++j) {
+            const int e = miss[j];
+            std::memcpy(h + j * slab,           tg->data + (size_t) e * sg, sg);
+            std::memcpy(h + j * slab + sg,      tu->data + (size_t) e * su, su);
+            std::memcpy(h + j * slab + sg + su, td->data + (size_t) e * sd, sd);
+            L.tab_host[e] = view + j * slab;
+            L.tab_host[N_EXPERT + e] = view + j * slab + sg;
+            L.tab_host[2 * N_EXPERT + e] = view + j * slab + sg + su;
+        }
+        host_expert_bytes_ += miss.size() * slab;
+    }
+    const void ** dtab = (const void **) be.alloc_raw(3 * N_EXPERT * sizeof(void *));
+    be.upload(dtab, L.tab_host.data(), 3 * N_EXPERT * sizeof(void *));
+    L.et.gate = dtab; L.et.up = dtab + N_EXPERT; L.et.down = dtab + 2 * N_EXPERT;
+    L.n_resident = (int) res.size();
+    placed_ += res.size() * slab;
+}
+
+Ds4Model::Ds4Model(const std::string & path, std::vector<Backend *> devs, std::vector<Ds4Ops *> ops,
+                   int il0, int il1, bool with_head, const Placement & pl)
+    : devs_(std::move(devs)), ops_(std::move(ops)), il0_(il0), il1_(il1) {
     if (devs_.empty()) throw std::runtime_error("Ds4Model needs at least one backend");
+    if (ops_.size() != devs_.size()) throw std::runtime_error("Ds4Model: one Ds4Ops per backend");
     if (il0 < 0 || il1 >= N_LAYER || il1 < il0) throw std::runtime_error("layer span out of range");
     model_ = GgufModel::open(path);
     if (model_->hparams().arch != "deepseek4")
@@ -190,6 +337,11 @@ Ds4Model::Ds4Model(const std::string & path, std::vector<Backend *> devs, int il
     tok_embd_ = need("token_embd.weight");
     if (tok_embd_->type != GGML_TYPE_Q5_K || tok_embd_->ne0() != N_EMBD || tok_embd_->ne1() != N_VOCAB)
         throw std::runtime_error("token_embd.weight is not Q5_K [4096, 129280]");
+    // design 9.1: a per-token gather table lives in host RAM, loaded at start
+    // (not left to the page cache) -- on a GPU run; the CPU arm reads the mmap
+    if (devs_[0]->is_gpu())
+        embd_copy_.assign(tok_embd_->data, tok_embd_->data + tok_embd_->nbytes);
+    plan_placement(pl);
 
     const int n_layers = il1 - il0 + 1;
     const int n_dev = (int) devs_.size();
@@ -263,12 +415,17 @@ Ds4Model::Ds4Model(const std::string & path, std::vector<Backend *> devs, int il
             if (t->type != GGML_TYPE_I32 || t->ne0() != N_EXPERT_USED || t->ne1() != N_VOCAB)
                 throw std::runtime_error(b("ffn_gate_tid2eid.weight") + " is not I32 [6, 129280]");
             L.tid2eid = (const int32_t *) t->data;   // HOST: a per-token row gather
+            if (devs_[0]->is_gpu()) {                 // ... loaded into RAM on a GPU run
+                tid_copy_.emplace_back((const int32_t *) t->data,
+                                       (const int32_t *) t->data + (size_t) N_EXPERT_USED * N_VOCAB);
+                L.tid2eid = tid_copy_.back().data();
+            }
         } else {
             L.exp_probs_b = place_f32(be, b("exp_probs_b.bias"), N_EXPERT);
         }
-        L.exp_gate = place_mat(be, b("ffn_gate_exps.weight"), N_EXPERT);
-        L.exp_up   = place_mat(be, b("ffn_up_exps.weight"),   N_EXPERT);
-        L.exp_down = place_mat(be, b("ffn_down_exps.weight"), N_EXPERT);
+        L.exp_gate = describe_mat(b("ffn_gate_exps.weight"), N_EXPERT);
+        L.exp_up   = describe_mat(b("ffn_up_exps.weight"),   N_EXPERT);
+        L.exp_down = describe_mat(b("ffn_down_exps.weight"), N_EXPERT);
         L.sh_gate  = place_mat(be, b("ffn_gate_shexp.weight"), 0);
         L.sh_up    = place_mat(be, b("ffn_up_shexp.weight"),   0);
         L.sh_down  = place_mat(be, b("ffn_down_shexp.weight"), 0);
@@ -276,6 +433,7 @@ Ds4Model::Ds4Model(const std::string & path, std::vector<Backend *> devs, int il
             L.exp_down.rows != N_EMBD || L.sh_up.rows != N_FF_EXP || L.sh_down.rows != N_EMBD ||
             L.gate_inp.rows != N_EXPERT)
             throw std::runtime_error("layer " + std::to_string(il) + ": MoE shapes moved");
+        place_experts(L, be, *ops_[(size_t) L.dev]);
     }
 
     if (with_head) {
@@ -294,7 +452,8 @@ Ds4Model::Ds4Model(const std::string & path, std::vector<Backend *> devs, int il
 void Ds4Model::embed_row(int32_t tok, float * out) const {
     if (tok < 0 || tok >= N_VOCAB) throw std::runtime_error("token id out of range");
     const size_t row = tok_embd_->row_size();
-    ggml_get_type_traits(GGML_TYPE_Q5_K)->to_float(tok_embd_->data + (size_t) tok * row, out, N_EMBD);
+    const uint8_t * base = embd_copy_.empty() ? tok_embd_->data : (const uint8_t *) embd_copy_.data();
+    ggml_get_type_traits(GGML_TYPE_Q5_K)->to_float(base + (size_t) tok * row, out, N_EMBD);
 }
 
 const int32_t * Ds4Model::hash_ids(int il, int32_t tok) const {

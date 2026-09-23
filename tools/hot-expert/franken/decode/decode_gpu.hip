@@ -64,6 +64,9 @@
 
 #include "decode_quant.h"
 #include "decode_backend.h"
+#include <stdexcept>
+#include "ds4_ops.h"      // DeepSeek-V4 (ds4_gpu.inc, included at the end)
+#include "ds4_shapes.h"
 
 #define HIP_CHECK(x) do {                                                      \
     hipError_t _e = (x);                                                       \
@@ -2669,6 +2672,8 @@ const char * prof_name(int c) {
 constexpr int PROF_MAX_EVENTS = 8192;
 
 class GpuBackend : public Backend {
+    // ds4_gpu.inc's ops launch on this backend's stream through mark().
+    friend class Ds4GpuOps;
 public:
     explicit GpuBackend(int dev) : dev_(dev) {
         HIP_CHECK(hipSetDevice(dev));
@@ -4094,9 +4099,20 @@ private:
     size_t placed_ = 0;
 };
 
+// DeepSeek-V4 (L5 step 2): its kernels and Ds4GpuOps. Appended AFTER every
+// qwen4exp kernel and GpuBackend, and nothing above reads anything in it.
+#include "ds4_gpu.inc"
+
 } // namespace
 
 Backend * make_gpu_backend(int device) { return new GpuBackend(device); }
+
+namespace ds4 {
+Ds4Ops * make_ds4_gpu_ops(Backend & be) {
+    if (!be.is_gpu()) throw std::runtime_error("make_ds4_gpu_ops: not a GPU backend");
+    return new Ds4GpuOps(static_cast<GpuBackend &>(be));
+}
+} // namespace ds4
 
 // P2P between every pair, once, before anything is placed. All six pairs can
 // and do on this box (M5: 16-24 GB/s, 28-32 us for a 10 KB hidden vector).

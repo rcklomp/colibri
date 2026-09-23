@@ -721,6 +721,46 @@ public:
     // for the host to feed it.
     virtual long long launches_last_token() const { return 0; }
 
+    // ---- --hip-graph: the decode token (T == 1) as one graph a card --------
+    //
+    // DecodeRunner::step() brackets each card's layer range (and the head, on
+    // the last card) with capture_begin/capture_end the first time it meets a
+    // (card, residual bank, position class) and replays the result after. The
+    // backend's part:
+    //
+    //   capture_begin(dpos, bound)  start capturing THIS card's stream. Until
+    //                               capture_end, every position-dependent
+    //                               launch (qsa_qk_post, kv_store_q8_0,
+    //                               idx_pool_chunk, qsa_rows) reads its
+    //                               position from the device int `dpos`
+    //                               instead of its argument, and sizes its
+    //                               grid for n_kv <= `bound` -- the kernels
+    //                               bound themselves by the position they read.
+    //   capture_end(&exec)          append "*dpos += 1", end the capture and
+    //                               instantiate it into *exec, or UPDATE *exec
+    //                               in place when the topology is unchanged.
+    //                               Does not launch.
+    //   launch(exec)                replay it on this card's stream.
+    //   epoch()                     moves whenever a scratch buffer that a
+    //                               T = 1 kernel is handed is reallocated; a
+    //                               graph captured under another epoch holds a
+    //                               freed pointer and must be recaptured.
+    //
+    // Same kernels, same order, same integers: a replay is bit-identical to the
+    // eager token. The CPU backend has no graphs and the runner never asks.
+    virtual bool graph_capable() const { return false; }
+    virtual void graph_capture_begin(const int * dpos, int n_kv_bound) { (void) dpos; (void) n_kv_bound; }
+    virtual void graph_capture_end(void ** exec) { (void) exec; }
+    virtual void graph_launch(void * exec) { (void) exec; }
+    virtual void graph_destroy(void * exec) { (void) exec; }
+    virtual long long graph_epoch() const { return 0; }
+    virtual void graph_report(FILE * out) { (void) out; }
+    // --prequeue-gate (diagnostic): hold this card's stream behind a device
+    // spin until release(), so the host enqueues the whole token before the
+    // card starts -- what cards 1 and 2 get from their boundary wait anyway.
+    virtual void prequeue_hold() {}
+    virtual void prequeue_release() {}
+
 protected:
     int qsa_row_mb_ = 256;
 };

@@ -118,6 +118,19 @@ void usage(const char * p) {
         "                           assignments (registers, 213 VGPR / occ 7 on\n"
         "                           IQ3_S), 1 walks them (119 VGPR / occ 12, the\n"
         "                           row re-read from L1). Bit-identical either way\n"
+        "          [--hip-graph 0|1] capture each card's decode-token body (T = 1)\n"
+        "                           into a hipGraph once per (card, residual bank,\n"
+        "                           position class) and replay it (default 0). Same\n"
+        "                           kernels in the same order: bit-identical. A token\n"
+        "                           the recorder, --jitter or --sync-debug touches runs\n"
+        "                           eagerly. FRANKEN_HIP_GRAPH=1 in --serve\n"
+        "          [--hip-graph-bucket N] positions a captured graph serves (default\n"
+        "                           1024): its QSA grids are sized for the bucket's\n"
+        "                           largest cache; a new bucket re-captures and updates\n"
+        "          [--prequeue-gate 0|1] DIAGNOSTIC: hold card 0's stream until the\n"
+        "                           host has enqueued the whole token, so its --profile\n"
+        "                           intervals are kernel time, not host issue time\n"
+        "                           (the token time then includes the issue time)\n"
         "          [--sync-debug]   drain and check after every launch and copy;\n"
         "                           names the failing op, its class, layer and device\n"
         "          [--dump DIR]     write this run's taps in the oracle's own format,\n"
@@ -205,6 +218,7 @@ int main(int argc, char ** argv) {
     int gather_serial = 0;
     int prefill_pipeline = 1;
     int gemm_lds = 0;
+    int hip_graph = 0, hip_graph_bucket = 1024, prequeue_gate = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -225,6 +239,9 @@ int main(int argc, char ** argv) {
         else if (a == "--gemv-fuse-collapse" && i + 1 < argc) gemv_fuse_collapse = std::atoi(argv[++i]);
         else if (a == "--gemv-burst" && i + 1 < argc) gemv_burst = std::atoi(argv[++i]);
         else if (a == "--sync-debug")             sync_debug = true;
+        else if (a == "--hip-graph" && i + 1 < argc) hip_graph = std::atoi(argv[++i]);
+        else if (a == "--hip-graph-bucket" && i + 1 < argc) hip_graph_bucket = std::atoi(argv[++i]);
+        else if (a == "--prequeue-gate" && i + 1 < argc) prequeue_gate = std::atoi(argv[++i]);
         else if (a == "--no-expert-gather")       expert_gather = 0;
         else if (a == "--expert-gather" && i + 1 < argc) expert_gather = std::atoi(argv[++i]);
         else if (a == "--qsa-row-mb" && i + 1 < argc) qsa_row_mb = std::atoi(argv[++i]);
@@ -262,7 +279,9 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < time_prefill; ++i) tokens.push_back((int32_t)(rng() % 100000u));
         greedy_n = 0;
     }
-    if ((int) tokens.size() + time_n > ctx) {
+    // --time runs TWO warm-up tokens (one a residual bank, so a --hip-graph run
+    // has captured both of its graphs before the first counted token)
+    if ((int) tokens.size() + time_n + (time_n > 0 ? 2 : 0) > ctx) {
         std::fprintf(stderr, "--ctx %d is too small for %zu + %d tokens\n", ctx, tokens.size(), time_n);
         return 2;
     }
@@ -308,6 +327,10 @@ int main(int argc, char ** argv) {
         std::printf("prefill_pipeline=%d gemm_lds=%d gemm_kernel=%s\n",
                     prefill_pipeline, gemm_lds,
                     gemm_lds == 2 ? "lds_i8_dot4" : (gemm_lds == 1 ? "lds_f32" : "batch_tile"));
+        // the decode-token graph knob, greppable like the two above
+        std::printf("hip_graph=%d hip_graph_bucket=%d prequeue_gate=%d%s\n",
+                    hip_graph, hip_graph_bucket, prequeue_gate,
+                    (use_cpu && hip_graph) ? " (ignored: the CPU backend has no graphs)" : "");
 
         const int n_report = use_cpu ? 1 : n_devices;
         // BEFORE the weights, so "the card was empty" is a measurement
@@ -343,6 +366,9 @@ int main(int argc, char ** argv) {
         cfg.jitter  = jitter;
         cfg.log_routing = !routing_dir.empty();
         cfg.sync_debug  = sync_debug;
+        cfg.hip_graph        = hip_graph;
+        cfg.hip_graph_bucket = hip_graph_bucket;
+        cfg.prequeue_gate    = prequeue_gate != 0;
         // weights first, then the caches and scratch, each on its owning card
         DecodeRunner run(model, cfg);
         run.report_cache_bytes(stdout);
@@ -501,6 +527,18 @@ int main(int argc, char ** argv) {
             std::printf("greedy_ids:");
             for (int id : greedy_ids) std::printf(" %d", id);
             std::printf("\n");
+            // The continuation's own oracle points. Every token above ran
+            // UNRECORDED -- so with --hip-graph, through the graphs -- and the
+            // taps of the prompt's last token cannot see that. These can: the
+            // whole id sequence (compared EXACTLY) and the logits of the last
+            // step. Not in llama.cpp's dump, so against it they read MISSING;
+            // against a --dump of this binary they are the graph-vs-eager gate.
+            if (rec.enabled()) {
+                std::vector<int> seq_ids = greedy_ids;
+                seq_ids.push_back(last_greedy);
+                rec.tap_ints("greedy_ids", -1, seq_ids);
+                rec.tap_host("greedy_logits", -1, run.logits_host());
+            }
         }
 
         // A cheap, always-printed sanity number: a zero or non-finite residual
@@ -578,7 +616,8 @@ int main(int argc, char ** argv) {
             // --routing capture either (the log costs nothing now, but its
             // read-back is a sync a token).
             run.set_capture(false);
-            run.step(filler, ple, off);         // one warm-up, not counted
+            run.step(filler, ple, off);         // two warm-ups, not counted: one
+            run.step(filler, ple, off);         // per residual bank (--hip-graph)
             for (auto * b : devs) b->prof_reset();
             std::vector<double> issue;
             for (int i = 0; i < time_n; ++i) {
@@ -602,6 +641,8 @@ int main(int argc, char ** argv) {
                     devs[d]->prof_report(stdout, time_n);
                 }
             }
+            if (hip_graph || prequeue_gate)
+                for (int d = 0; d < n_report; ++d) devs[d]->graph_report(stdout);
         }
         return rc;
     } catch (const std::exception & e) {

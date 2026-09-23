@@ -153,6 +153,19 @@ bool Oracle::compare(const Recorder & rec, const std::vector<int> & pass_layers,
             continue;
         }
 
+        // The greedy continuation's id sequence (franken_decode --greedy): a
+        // cosine over token ids is meaningless -- one differing id among 17
+        // still reads 0.999+ -- so it is equal or it FAILS.
+        if (t.name == "greedy_ids") {
+            const bool ok = t.data.size() == ref.size() &&
+                            std::equal(t.data.begin(), t.data.end(), ref.begin());
+            std::fprintf(out, "oracle %s exact=%d mine=%zu ref=%zu%s\n",
+                         t.key.c_str(), (int) ok, t.data.size(), ref.size(), ok ? "" : " FAIL");
+            if (!ok) all_ok = false;
+            ++n_cmp;
+            continue;
+        }
+
         // The dump writes ne0 floats -- the LAST ne1 column -- whenever
         // ne2 == 1, which is what the final layer looks like after llama.cpp
         // applies inp_out_ids: `l_last-47` is [2560, 4, 1] and its file holds

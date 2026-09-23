@@ -56,6 +56,8 @@ public:
              const char * suffix = "");
     void tap_ints(const char * name, int il, const std::vector<int> & v,
                   const char * suffix = "");
+    // a value that is already on the host (the greedy continuation's logits)
+    void tap_host(const char * name, int il, const std::vector<float> & v);
 
     const TapValue * get(const std::string & key) const;
     const std::map<std::string, TapValue> & all() const { return taps_; }
@@ -88,6 +90,21 @@ struct DecodeConfig {
     // print a line per layer range on the first token, so an abort says how
     // far it got (stdout is line-buffered by main for the same reason)
     bool  progress     = true;
+    // --hip-graph: capture each card's per-token body (T == 1 only) into a
+    // hipGraph once per (card, residual bank, position class) and replay it.
+    // Bit-identical by construction (same kernels, same order, same integers);
+    // off by default. A token the recorder, --jitter or --sync-debug touches
+    // always runs eagerly.
+    int   hip_graph        = 0;
+    // A position CLASS is `pos / hip_graph_bucket`: the captured grids are
+    // sized for the class's largest n_kv, so one capture serves `bucket`
+    // tokens and the idle workgroups past a row's extent are at most
+    // bucket/4 pooled blocks' worth. A new class re-captures and UPDATES the
+    // existing executable graph in place.
+    int   hip_graph_bucket = 1024;
+    // --prequeue-gate (diagnostic): hold the first card's stream until the
+    // host has enqueued the whole token (Backend::prequeue_hold).
+    bool  prequeue_gate    = false;
 };
 
 // Step 3: one runner over all the devices the model was placed on. Every
@@ -273,6 +290,22 @@ private:
     void layer_qsa(const LayerWeights & L, LayerState & st, int il, Recorder & rec);
     void layer_ffn(const LayerWeights & L, int il, Recorder & rec);
     void jitter(float * buf, size_t n);
+
+    // --hip-graph. seg_begin(d) runs where card d's share of the token starts
+    // (after its boundary copy), seg_end(d) where it ends (before the next
+    // boundary's event record). Between them the body is either CAPTURED
+    // (then launched once) or skipped because its graph was REPLAYED.
+    struct GraphSlot { void * exec = nullptr; int cls = -1; long long epoch = -1; };
+    void seg_begin(int dev);
+    void seg_end(int dev);
+    std::vector<GraphSlot> graphs_;   // [dev * N_RES_BANKS + bank]
+    std::vector<int *>     dpos_;     // per device: the device-resident position
+    std::vector<int>       dpos_val_; // what each device's copy WILL hold once
+                                      // the queued work has run; -1 = unknown
+    bool graph_now_ = false;          // this token runs through the graphs
+    bool seg_capturing_ = false;
+    bool seg_replay_ = false;
+    int  graph_cls_ = 0, graph_bound_ = 0;
 
     // One set of scratch per device; `bind()` points the active members at
     // one of them. The body code below is written against the active set and

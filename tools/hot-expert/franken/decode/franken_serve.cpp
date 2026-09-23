@@ -925,6 +925,9 @@ private:
             cfg.verbose    = false;
             cfg.log_routing= false;
             cfg.progress   = false;         // stdout is the wire
+            // --hip-graph for the served decode tokens; off unless asked
+            cfg.hip_graph        = env_int("FRANKEN_HIP_GRAPH", 0);
+            cfg.hip_graph_bucket = env_int("FRANKEN_HIP_GRAPH_BUCKET", 1024);
             slots_[(size_t) s].run = std::make_unique<DecodeRunner>(*model_, cfg);
             slots_[(size_t) s].rec_bytes = slots_[(size_t) s].run->rec_bytes();
             slots_[(size_t) s].run->report_cache_bytes(stderr);

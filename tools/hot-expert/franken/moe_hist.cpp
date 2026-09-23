@@ -494,6 +494,27 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "moe_hist: arch=%s block_count=%u expert_count=%u expert_used_count=%u\n",
                 gm->hparams().arch.c_str(), gm->hparams().block_count,
                 gm->hparams().expert_count, gm->hparams().expert_used_count);
+
+        // Metadata-only expert byte size probe (design (d)'s data dependency),
+        // independent of a real decode: the first block that has an
+        // ffn_*_exps.weight tensor, from the GGUF's own tensor shapes/nbytes
+        // (franken::GgufModel never reads tensor data, see its header
+        // comment) -- proves (d)'s inputs are readable even on a model too
+        // large to forward on the CPU (--parse-only never calls llama_decode).
+        for (uint32_t il = 0; il < gm->hparams().block_count; ++il) {
+            const franken::TensorInfo * g = gm->find_layer((int) il, "ffn_gate_exps.weight");
+            const franken::TensorInfo * u = gm->find_layer((int) il, "ffn_up_exps.weight");
+            const franken::TensorInfo * d = gm->find_layer((int) il, "ffn_down_exps.weight");
+            if (g && u && d) {
+                int64_t n_expert = g->ne2();
+                size_t total = g->nbytes + u->nbytes + d->nbytes;
+                size_t expert_bytes = n_expert > 0 ? total / (size_t) n_expert : 0;
+                fprintf(stderr, "moe_hist: layer=%u n_expert=%lld expert_bytes=%zu "
+                        "(gate=%zu up=%zu down=%zu bytes total)\n",
+                        il, (long long) n_expert, expert_bytes, g->nbytes, u->nbytes, d->nbytes);
+                break;
+            }
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "moe_hist: GgufModel::open failed (%s) -- not a split GGUF? "
                 "continuing without it: no (d) miss-bytes calc, expert counts inferred "

@@ -64,6 +64,31 @@ void rope_yarn(float theta_extrap, float freq_scale, const float cd[2], int64_t 
 
 class Ds4CpuOps : public Ds4Ops {
 public:
+    explicit Ds4CpuOps(Backend & be) : be_(be) {}
+
+    // The CPU backend's GEMV already decodes every format (decode_cpu.cpp
+    // row_dot, the six new ones through ds4_quant.h).
+    void gemv(const Mat & W, const float * x, float * y) override { be_.gemv(W, x, y); }
+
+    // One expert = a one-matrix Mat whose base is the table entry.
+    void moe_gate_up(const ExpertTable & t, const int * ids, const float * x,
+                     float * yg, float * yu) override {
+        for (int k = 0; k < N_EXPERT_USED; ++k) {
+            be_.gemv(expert_mat(t.up[ids[k]],   t.type_gu, t.row_gu, t.K_gu, t.rows_gu), x,
+                     yu + (size_t) k * t.rows_gu);
+            be_.gemv(expert_mat(t.gate[ids[k]], t.type_gu, t.row_gu, t.K_gu, t.rows_gu), x,
+                     yg + (size_t) k * t.rows_gu);
+        }
+    }
+    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y) override {
+        for (int k = 0; k < N_EXPERT_USED; ++k)
+            be_.gemv(expert_mat(t.down[ids[k]], t.type_d, t.row_d, t.K_d, t.rows_d),
+                     h + (size_t) k * t.K_d, y + (size_t) k * t.rows_d);
+    }
+    const void * alloc_host_mapped(size_t bytes, void ** host) override {
+        *host = be_.alloc_raw(bytes);
+        return *host;
+    }
     void hc_split(const float * m, const float * s, const float * b,
                   float * pre, float * post, float * comb, float eps, int iters) override {
         for (int h = 0; h < HC; ++h) {
@@ -254,7 +279,8 @@ public:
         }
     }
 
-    int topk(const float * scores, int n, int k, int * out) override {
+    void topk(const float * scores, int n, int k, int * out) override { topk_n(scores, n, k, out); }
+    static int topk_n(const float * scores, int n, int k, int * out) {
         std::vector<int> idx((size_t) n);
         std::iota(idx.begin(), idx.end(), 0);
         const int m = std::min(k, n);
@@ -313,7 +339,7 @@ public:
             if (probs_biased) std::memcpy(probs_biased, probs, sizeof(float) * N_EXPERT);
         } else {
             for (int e = 0; e < N_EXPERT; ++e) probs_biased[e] = probs[e] + bias[e];
-            topk(probs_biased, N_EXPERT, N_EXPERT_USED, ids);
+            topk_n(probs_biased, N_EXPERT, N_EXPERT_USED, ids);
         }
         double sum = 0.0;
         for (int k = 0; k < N_EXPERT_USED; ++k) { w_raw[k] = probs[ids[k]]; sum += (double) w_raw[k]; }
@@ -333,6 +359,13 @@ public:
         }
     }
 
+    static Mat expert_mat(const void * base, int type, size_t row_bytes, int K, int rows) {
+        Mat m;
+        m.base = base; m.type = type; m.row_bytes = row_bytes; m.K = K; m.rows = rows;
+        m.name = "expert";
+        return m;
+    }
+
     void moe_accum(const float * y, const float * w, int n_used, int n, float * weighted,
                    float * out) override {
         for (int e = 0; e < n_used; ++e)
@@ -344,11 +377,14 @@ public:
             out[i] = a;
         }
     }
+
+private:
+    Backend & be_;
 };
 
 } // namespace
 
-Ds4Ops * make_ds4_cpu_ops() { return new Ds4CpuOps(); }
+Ds4Ops * make_ds4_cpu_ops(Backend & be) { return new Ds4CpuOps(be); }
 
 } // namespace ds4
 } // namespace fk

@@ -19,4 +19,12 @@ Backend * make_gpu_backend(int) {
         "this binary was built without HIP (franken_decode_cpu); use franken_decode for device 0");
 }
 
+namespace ds4 {
+class Ds4Ops;
+Ds4Ops * make_ds4_gpu_ops(Backend &) {
+    throw std::runtime_error("this binary was built without HIP (franken_decode_cpu); "
+                             "the DeepSeek-V4 GPU ops are in franken_decode");
+}
+} // namespace ds4
+
 } // namespace fk

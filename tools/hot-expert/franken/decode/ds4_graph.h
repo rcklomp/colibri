@@ -6,13 +6,16 @@
 // (generic half) and Ds4Ops (ds4_ops.h, the DeepSeek-specific half). See
 // DEEPSEEK4.md for the op list per layer and what each tap is.
 //
-// L5 step 1 scope: one token a step (the prompt is fed token by token -- the
-// compressed attention is causal per token, so that is the reference's
-// ubatch result by construction), CPU backend. Taps use the reference's cb()
-// names, so ../oracle_dump.cpp's dump of llama.cpp is compared key by key by
-// decode_oracle.cpp. The reference cb's four names twice a layer
-// (build_hc_pre in the attention module, then in the FFN module): the second
-// occurrence carries the ".2" suffix, as the dump writes it.
+// One token a step (T == 1): every DS4 attention path is causal per token,
+// so feeding a prompt token by token IS the reference's ubatch result. The
+// span is split over the backends by layer range; each device has its own
+// scratch set and positional state, and the only thing that crosses a card
+// is the hyper-connection residual H (4 x 4096 f32), by Backend::boundary_recv.
+//
+// Taps use the reference's cb() names, so ../oracle_dump.cpp's dump of
+// llama.cpp -- or this binary's own --dump from another backend -- is
+// compared key by key by decode_oracle.cpp. build_hc_pre's four names occur
+// twice a layer; the FFN module's carry the ".2" suffix, as the dump writes.
 
 #pragma once
 
@@ -30,12 +33,13 @@ namespace ds4 {
 
 struct Ds4Config {
     int  ctx = 512;          // positions the compressed caches are sized for
-    bool verbose = false;
+    bool log_routing = true; // read the routed ids back every step (a sync on a card)
 };
 
 class Ds4Runner {
 public:
-    Ds4Runner(Ds4Model & model, Ds4Ops & ops, const Ds4Config & cfg);
+    // `ops` holds one Ds4Ops per model device, in the model's device order.
+    Ds4Runner(Ds4Model & model, std::vector<Ds4Ops *> ops, const Ds4Config & cfg);
     ~Ds4Runner();
 
     // One token at the next position. With the head placed, returns the
@@ -43,55 +47,54 @@ public:
     int step(int32_t token, Recorder & rec);
 
     int pos() const { return pos_; }
-    // Per-layer routed ids of the last step, [n_layers][6].
+    void set_log_routing(bool on) { cfg_.log_routing = on; }
+    // Per-layer routed ids of the last step, [n_layers][6] (with log_routing).
     const std::vector<int> & routed_ids() const { return routed_; }
-    std::vector<float> logits_host();
-    // Bytes of positional cache (raw window + compressed rows) the span holds
-    // at `ctx`, and the rate per token.
     void report_cache_bytes(FILE * out) const;
 
 private:
     struct LayerState {
         uint16_t * raw = nullptr;       // f16 [N_SWA][512], slot = pos % N_SWA
-        // compressor state rings (f32): CSA/lid 2R rows, HCA R rows
-        float * ck = nullptr, * cs = nullptr;         // [ring][coff*512]
-        float * lk = nullptr, * ls = nullptr;         // [8][256] (CSA only)
-        uint16_t * comp = nullptr;      // f16 [ctx/ratio][512] compressed K
-        uint16_t * lid  = nullptr;      // f16 [ctx/4][128] lid keys (CSA only)
+        float * ck = nullptr, * cs = nullptr;         // compressor ring [ring][coff*512]
+        float * lk = nullptr, * ls = nullptr;         // lid ring [8][256] (CSA only)
+        uint16_t * comp = nullptr;      // f16 [ctx/ratio + 1][512] compressed K
+        uint16_t * lid  = nullptr;      // f16 [ctx/4 + 1][128] lid keys (CSA only)
         int ring = 0;
     };
+    // One scratch set per device: a kernel never reads another card's memory.
+    struct Scratch {
+        float *H, *Hn, *mixes, *pre, *post, *comb;
+        float *x, *xn, *qr, *q, *kv, *att, *oa, *ao;
+        float *ckv, *csc, *lkv, *lsc, *cpool, *iq, *iw, *iscore;
+        float *rlog, *probs, *probs_b, *wraw, *wnorm, *wsc;
+        float *yg, *yu, *yh, *yd, *ywt, *moe, *sg, *su, *sh, *sd, *fo;
+        int   *isel, *ids, *hash;
+    };
 
-    void layer(int il, int32_t token, Recorder & rec);
-    void hc_pre(const Mat & fn, const float * base, const float * scale, int il,
+    void layer(int il, Recorder & rec);
+    void hc_pre(Scratch & S, const Mat & fn, const float * base, const float * scale, int il,
                 Recorder & rec, const char * sfx);
     void attention(int il, Recorder & rec);
-    void ffn(int il, int32_t token, Recorder & rec);
+    void ffn(int il, Recorder & rec);
     RopeParams rope_for(int il) const;
     RopeParams rope_compress() const;
+    int dev_of(int il) const { return model_.layer(il).dev; }
     Backend & be(int il) { return model_.dev_for(il); }
+    Ds4Ops & op(int il) { return *ops_[(size_t) dev_of(il)]; }
+    Scratch & S(int il) { return scr_[(size_t) dev_of(il)]; }
 
     Ds4Model & model_;
-    Ds4Ops & ops_;
+    std::vector<Ds4Ops *> ops_;
     Ds4Config cfg_;
     float eps_, hc_eps_;
     int pos_ = 0;
     std::vector<LayerState> st_;
+    std::vector<Scratch> scr_;
     std::vector<int> routed_;
-
-    // scratch (host for the CPU backend; one set, the CPU arm has one device)
-    float *H = nullptr, *Hn = nullptr, *mixes = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
-    float *x = nullptr, *xn = nullptr, *qr = nullptr, *q = nullptr, *kv = nullptr;
-    float *att = nullptr, *oa = nullptr, *ao = nullptr;
-    float *ckv = nullptr, *csc = nullptr, *lkv = nullptr, *lsc = nullptr, *cpool = nullptr;
-    float *iq = nullptr, *iw = nullptr, *iscore = nullptr;
-    float *rlog = nullptr, *probs = nullptr, *probs_b = nullptr;
-    float *wraw = nullptr, *wnorm = nullptr, *wsc = nullptr;
-    float *yg = nullptr, *yu = nullptr, *yh = nullptr, *yd = nullptr, *ywt = nullptr, *moe = nullptr;
-    float *sg = nullptr, *su = nullptr, *sh = nullptr, *sd = nullptr, *fo = nullptr;
-    float *hmix = nullptr, *hpre = nullptr, *hx = nullptr, *hxn = nullptr, *logits = nullptr;
-    int   *isel = nullptr;
-    std::vector<void *> owned_;
-    Backend * hb_ = nullptr;          // the backend the scratch lives on
+    // head, on the last device
+    float *hmix_ = nullptr, *hpre_ = nullptr, *hx_ = nullptr, *hxn_ = nullptr, *logits_ = nullptr;
+    int   *greedy_ = nullptr;
+    std::vector<std::pair<Backend *, void *>> owned_;
 };
 
 // The CLI of `franken_decode --model <deepseek4 gguf> ...` (dispatched from

@@ -14,6 +14,11 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 68 (2026-09-24) -- DEEPSEEK-V4 ON THE GPUS (record §L5-DS4-STEP2).**
+> Correct (220 taps >= 0.9999, greedy identical), 11.0 tok/s at a 256k
+> allocation vs llama.cpp's 8; ~6-9x off its bytes -- profile and fix next
+> (expert GEMV loads, miss path off the critical path, graph replay).**
+>
 > **Rev 67 (2026-09-24) -- L5 STEP 1: DEEPSEEK-V4 ON THE ENGINE'S CPU ARM
 > (record §L5-DS4-STEP1).** Graph model-dispatched (Qwen3.8 bit-identical);
 > deepseek4 layers 0-3 match llama.cpp (173/173 taps, cos >= 0.99956,

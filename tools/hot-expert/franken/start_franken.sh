@@ -5,7 +5,9 @@
 # This is ~/start_glm53.sh with three things changed and nothing else: the
 # engine binary, the model, and the family. Everything the owner's Open WebUI
 # depends on is kept BYTE-IDENTICAL to that file -- port 8081, the key in
-# ~/.colibri_api_key, --model-id glm-5.3-flash, --max-tokens 4096, the same
+# ~/.colibri_api_key, --model-id glm-5.3-flash, --max-tokens 16384 (FRANKEN_MAX_TOKENS;
+# GLM's launcher uses 4096 -- a thinking Qwen3.8 answer needs room: record §L0-QUALITY
+# scored 10 truncations at 4096 as wrong), the same
 # --allowed-host list -- so the UI reaches whatever is behind the port with no
 # change at all (serve_alt.sh's header documents why that works: Open WebUI's
 # connection #1 is http://host.docker.internal:8081/v1 with that key, and its
@@ -190,7 +192,7 @@ python3 -u openai_server.py \
   --arch qwen38 \
   --host 0.0.0.0 --port 8081 \
   --model-id glm-5.3-flash \
-  --max-tokens 4096 \
+  --max-tokens "${FRANKEN_MAX_TOKENS:-16384}" \
   --kv-slots 1 \
   --allowed-host 127.0.0.1 --allowed-host localhost \
   --allowed-host host.docker.internal \

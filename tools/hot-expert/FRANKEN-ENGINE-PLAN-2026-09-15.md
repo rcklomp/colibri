@@ -14,6 +14,17 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 60 (2026-09-23 03:05 CEST, 01:05 UTC) -- THIRD SERVE: FIRST TOKEN ON
+> SCREEN 0.8 s (record §L0-STEP4).** Async turn-boundary checkpoints,
+> resident PLE table, LDS GEMM served: Open WebUI new chat first token 0.81 s
+> in a real browser (GLM 3.6-3.8), warm new chat reused 4 839 of 4 883 tokens
+> at 0.45 s ttft, cold 4.9k prompt 7.9 s; 4 of 5 accept_live checks pass, the
+> fifth (follow-up reuse 161 vs >= 171) is the gateway's qwen38 renderer
+> dropping the empty think block on re-render -- fix with the build. GLM
+> restored. Next: renderer fix -> accept_live/accept_ui PASS -> quality at
+> served settings -> decide the serving default -> perf items -> streamed
+> models.**
+>
 > **Rev 59 (2026-09-23 01:45 CEST, 23:45 UTC 09-22) -- STEP 4 FIRST SERVE (record
 > §L0-STEP4).** The Franken engine served real chats behind the owner's
 > gateway and Open WebUI: first token on screen 6.8 s on the 4.9k tool

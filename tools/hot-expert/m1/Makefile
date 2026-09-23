@@ -184,3 +184,17 @@ $(M3_EMUL_BIN): $(M3_EMUL_SRC)
 
 check-m3-emul: $(M3_EMUL_BIN)
 	./$(M3_EMUL_BIN)
+
+# --- M4: streaming prefill bandwidth under real contention -----------------
+#
+# tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md section 4 row M4.
+# Single hipcc TU, no external deps (host->device copy + a plain read-reduce
+# compute kernel, both defined in the file).
+
+M4_SRC := m4_stream.hip
+M4_BIN := m4_stream
+
+.PHONY: build-m4
+build-m4: $(M4_BIN)
+$(M4_BIN): $(M4_SRC)
+	$(DOCKER_RUN) hipcc --offload-arch=$(ARCH) -O3 -std=c++17 $(M4_SRC) -o $(M4_BIN)

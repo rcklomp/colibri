@@ -76,6 +76,30 @@ static const std::set<std::string> WANTED = {
     "ffn_moe_topk",
 };
 
+// DeepSeek-V4-Flash (arch deepseek4): the cb() names of
+// src/models/deepseek4.cpp and build_moe_ffn / build_ffn that
+// decode/ds4_graph.cpp taps under the same names (decode/DEEPSEEK4.md
+// section 4). Chosen after the model loads, from general.architecture, so a
+// qwen4exp dump is byte-for-byte what it was.
+static const std::set<std::string> WANTED_DS4 = {
+    "hc_init",
+    "hc_mixes", "hc_pre", "hc_post", "hc_comb", "hc_attn_pre", "attn_norm",
+    "qr", "qr_norm", "q_norm", "q", "kv_norm", "kv",
+    "csa_state_kv", "csa_state_score", "csa_state_score_ape",
+    "lid_state_kv", "lid_state_score", "lid_state_score_ape",
+    "lid_q", "lid_q_rope", "lid_q_rot", "lid_weights", "lid_score_masked", "lid_top_k",
+    "hca_state_kv", "hca_state_score", "hca_state_score_ape",
+    "attn_raw", "attn_csa_lid", "attn_hca", "attn_derope", "attn_out",
+    "hc_attn_post", "hc_ffn_pre", "ffn_norm",
+    "ffn_moe_logits", "ffn_moe_probs", "ffn_moe_probs_biased", "ffn_moe_topk",
+    "ffn_moe_weights", "ffn_moe_weights_norm", "ffn_moe_weights_scaled",
+    "ffn_moe_up", "ffn_moe_gate", "ffn_moe_swiglu_limited", "ffn_moe_down",
+    "ffn_moe_weighted", "ffn_moe_out",
+    "ffn_up", "ffn_gate", "ffn_swiglu_limited", "ffn_shexp", "ffn_out", "l_last",
+    "hc_head_mixes", "hc_head_pre", "hc_head", "result_norm", "result_output",
+};
+static const std::set<std::string> * g_wanted = &WANTED;
+
 struct Hit {
     std::string   file_name;  // t->name + ".f32"
     std::string   base;       // name without the "-<il>" suffix
@@ -87,6 +111,7 @@ struct Hit {
 // Parse "<base>-<il>" -> (base, il); returns (name, -1) if there is no
 // "-<digits>" suffix, or the suffix is not all digits.
 static bool split_name(const std::string & name, std::string & base, int & il) {
+    const std::set<std::string> & WANTED = *g_wanted;
     if (WANTED.count(name)) {
         base = name;
         il = -1;
@@ -160,6 +185,15 @@ struct CbCtx {
     // one "<il> <pos>: <id> <id> ..." entry per (il, position); sorted by
     // (pos, il) before being written so the file reads as a timeline.
     std::vector<std::tuple<int64_t, int, std::string>> moe_lines;
+
+    // --stop-after-layer N: once "l_last-N" has been dumped, the callback
+    // returns false and ggml_backend_sched stops computing the graph
+    // (ggml-backend.cpp, the `break` after callback_eval(t, false)). The
+    // layers past N are never evaluated, so their weights are never paged
+    // in -- which is what bounds this tool's reads on a model that does not
+    // fit beside the one the box is serving.
+    std::string stop_key;
+    bool stopped = false;
 };
 
 static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -284,6 +318,11 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
             t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
             ggml_type_name(t->type), axis, occ, file_name.c_str(), out.size());
 
+    if (!ctx->stop_key.empty() && ctx->stop_key == t->name) {
+        ctx->stopped = true;
+        fprintf(stderr, "oracle_dump: %s dumped -- stopping the graph here (--stop-after-layer)\n", t->name);
+        return false;
+    }
     return true;
 }
 
@@ -309,6 +348,8 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> tokens;
     int n_threads = 8;
     int n_greedy = 0;
+    int stop_after = -1;
+    bool no_extra_bufts = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -320,6 +361,12 @@ int main(int argc, char ** argv) {
             n_threads = atoi(argv[++i]);
         } else if (a == "--greedy" && i + 1 < argc) {
             n_greedy = atoi(argv[++i]);
+        } else if (a == "--stop-after-layer" && i + 1 < argc) {
+            stop_after = atoi(argv[++i]);
+        } else if (a == "--no-extra-bufts") {
+            // no CPU weight repacking: a repacked tensor is READ IN FULL at
+            // load time, which is exactly the read --stop-after-layer avoids
+            no_extra_bufts = true;
         } else if (a == "--tokens") {
             while (i + 1 < argc && isdigit((unsigned char) argv[i + 1][0])) {
                 tokens.push_back((llama_token) atoi(argv[++i]));
@@ -331,7 +378,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s --model <first-shard.gguf> --tokens <id...> [--out <dir>] [--threads N] [--greedy N]\n", argv[0]);
+        fprintf(stderr, "usage: %s --model <first-shard.gguf> --tokens <id...> [--out <dir>] [--threads N] [--greedy N] [--stop-after-layer N] [--no-extra-bufts]\n", argv[0]);
         return 1;
     }
     if (tokens.empty()) {
@@ -353,6 +400,12 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
+    if (no_extra_bufts) mparams.use_extra_bufts = false;
+    // --stop-after-layer bounds the reads only through a LAZY mapping: pin the
+    // load mode to mmap rather than let AUTO decide (a non-mmap load reads
+    // every tensor into a buffer up front). Run it with no_populate.so
+    // preloaded, or libllama's MAP_POPULATE reads the whole file anyway.
+    if (stop_after >= 0) mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!model) {
@@ -362,6 +415,22 @@ int main(int argc, char ** argv) {
 
     CbCtx cb_ctx;
     cb_ctx.out_dir = out_dir;
+    {
+        char arch[64] = {0};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        if (std::string(arch) == "deepseek4") {
+            g_wanted = &WANTED_DS4;
+            fprintf(stderr, "oracle_dump: arch deepseek4, using the DeepSeek-V4 tap names\n");
+        }
+    }
+    if (stop_after >= 0) {
+        if (n_greedy > 0) {
+            fprintf(stderr, "oracle_dump: --stop-after-layer and --greedy exclude each other\n");
+            llama_model_free(model);
+            return 1;
+        }
+        cb_ctx.stop_key = "l_last-" + std::to_string(stop_after);
+    }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = std::max<uint32_t>(64, (uint32_t) tokens.size() + (uint32_t) n_greedy + 8);
@@ -390,7 +459,11 @@ int main(int argc, char ** argv) {
     }
     cb_ctx.position_base += (int64_t) tokens.size();
 
-    fprintf(stderr, "oracle_dump: decode done, %d tensors dumped\n", cb_ctx.n_dumped);
+    fprintf(stderr, "oracle_dump: decode done, %d tensors dumped%s\n", cb_ctx.n_dumped,
+            cb_ctx.stopped ? " (graph stopped after the requested layer)" : "");
+    if (!cb_ctx.stop_key.empty() && !cb_ctx.stopped) {
+        fprintf(stderr, "oracle_dump: --stop-after-layer: %s was never dumped\n", cb_ctx.stop_key.c_str());
+    }
 
     // --- greedy generation (argmax, temperature 0, no sampler state) ---
     std::vector<llama_token> greedy_ids;
@@ -470,7 +543,7 @@ int main(int argc, char ** argv) {
     std::set<std::string> seen_bases;
     for (auto & h : cb_ctx.hits) seen_bases.insert(h.base);
     if (!cb_ctx.moe_ids.empty()) seen_bases.insert("ffn_moe_topk"); // handled outside cb_ctx.hits
-    for (auto & w : WANTED) {
+    for (auto & w : *g_wanted) {
         if (!seen_bases.count(w)) {
             fprintf(stderr, "oracle_dump: NOT FOUND in this build's graph: %s\n", w.c_str());
         }

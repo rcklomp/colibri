@@ -33,6 +33,7 @@
 #include "decode_model.h"
 #include "decode_oracle.h"
 #include "franken_serve.h"
+#include "ds4_graph.h"
 
 using namespace fk;
 
@@ -179,6 +180,18 @@ int main(int argc, char ** argv) {
         const char * s = std::getenv("SERVE");
         if (s && !std::strcmp(s, "1")) serve = true;
         if (serve) return fk::serve_main(argc, argv, serve_test);
+    }
+
+    // ARCHITECTURE DISPATCH (L5 step 1, DEEPSEEK4.md): a deepseek4 GGUF runs
+    // its own graph (ds4_graph.cpp) behind its own CLI; everything below this
+    // block is the qwen4exp path, unchanged. Opening the split here only
+    // parses headers and maps the shards -- no tensor byte is read.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--model") != 0) continue;
+        std::string arch;
+        try { arch = franken::GgufModel::open(argv[i + 1])->hparams().arch; } catch (...) {}
+        if (arch == "deepseek4") return fk::ds4::ds4_main(argc, argv);
+        break;
     }
 
     // Line-buffered, so the progress lines survive an abort: a GPU memory

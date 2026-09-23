@@ -46,10 +46,12 @@ GGML_LIB_DIR := $(LLAMA_DIR)/build-hip/bin
 # of DecodeModel::place_mat -> Backend::place.
 COMMON_SRC := ../gguf_model.cpp ../ple.cpp \
               decode_model.cpp decode_graph.cpp decode_oracle.cpp \
-              decode_cpu.cpp franken_serve.cpp franken_decode.cpp
+              decode_cpu.cpp franken_serve.cpp franken_decode.cpp \
+              ds4_model.cpp ds4_graph.cpp ds4_cpu.cpp
 HDRS := decode_shapes.h decode_quant.h decode_backend.h decode_model.h \
         decode_graph.h decode_oracle.h franken_serve.h ../gguf_model.h ../ple.h \
-        ../../m1/m1_native_decode.h
+        ../../m1/m1_native_decode.h \
+        ds4_shapes.h ds4_quant.h ds4_ops.h ds4_model.h ds4_graph.h
 
 CPU_BIN := franken_decode_cpu
 GPU_BIN := franken_decode
@@ -68,7 +70,7 @@ INCS     := -I$(GGML_INC) -I$(GGML_SRC_INC) -I$(LLAMA_INC) -I.. \
 # dependency through the back door.
 LDLIBS   := -L$(GGML_LIB_DIR) -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(GGML_LIB_DIR) -ldl
 
-.PHONY: all clean resources cpu gpu ldd-check moe-gather-test
+.PHONY: all clean resources cpu gpu ldd-check moe-gather-test ds4-emul
 all: $(CPU_BIN) $(GPU_BIN)
 
 cpu: $(CPU_BIN)
@@ -103,5 +105,15 @@ franken_moe_gather_test: moe_gather_test.cpp $(HDRS)
 	$(DOCKER_RUN) c++ -O2 -std=c++17 -Wall $(INCS) moe_gather_test.cpp \
 		-o franken_moe_gather_test $(LDLIBS)
 
+# ds4_quant.h's six decoders against ggml's own dequantisers, bit for bit
+# (ds4_quant_emul.cpp). Host only, no HIP, seconds. DS4_MODEL=<shard> adds the
+# real-rows set (a few hundred KB read through the mmap).
+ds4-emul: franken_ds4_quant_emul
+	./franken_ds4_quant_emul $(if $(DS4_MODEL),--model $(DS4_MODEL),)
+
+franken_ds4_quant_emul: ds4_quant_emul.cpp ../gguf_model.cpp $(HDRS)
+	$(DOCKER_RUN) c++ -O2 -std=c++17 -Wall $(INCS) ds4_quant_emul.cpp ../gguf_model.cpp \
+		-o franken_ds4_quant_emul $(LDLIBS)
+
 clean:
-	rm -f $(CPU_BIN) $(GPU_BIN) franken_moe_gather_test
+	rm -f $(CPU_BIN) $(GPU_BIN) franken_moe_gather_test franken_ds4_quant_emul

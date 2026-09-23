@@ -138,7 +138,9 @@ bool Oracle::compare(const Recorder & rec, const std::vector<int> & pass_layers,
         // printed, which is an exact set match whenever the depths agree.
         // The reference's own ggml_top_k and the radix select both break ties
         // at the cut in an unspecified order, so nothing stricter is sound.
-        if (t.name == "indexer_top_k") {
+        // DeepSeek-V4's `lid_top_k` is the same kind of object (block ids, a
+        // padded reference), and gets the same test.
+        if (t.name == "indexer_top_k" || t.name == "lid_top_k") {
             std::set<int> a, b;
             for (float v : t.data) a.insert((int) v);
             for (float v : ref)    b.insert((int) v);

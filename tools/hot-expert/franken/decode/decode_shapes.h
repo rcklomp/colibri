@@ -32,6 +32,14 @@ enum FkQuantType : int {
     FK_Q_IQ4_XS = 4,
     FK_Q_IQ3_S  = 5,
     FK_Q_Q6_K   = 6,   // lm_head only
+    // DeepSeek-V4-Flash UD-IQ2_M (ds4_quant.h, DEEPSEEK4.md). Appended, so
+    // every value above is unchanged.
+    FK_Q_Q4_K    = 7,  // output.weight
+    FK_Q_Q5_K    = 8,  // attn_q_a, ffn_{gate,up}_shexp, token_embd
+    FK_Q_IQ2_XXS = 9,  // routed gate/up, 42 layers
+    FK_Q_IQ2_S   = 10, // routed gate/up, layer 26
+    FK_Q_IQ3_XXS = 11, // routed down, 41 layers
+    FK_Q_MXFP4   = 12, // routed down, layers 26 and 42
 };
 
 namespace fk {

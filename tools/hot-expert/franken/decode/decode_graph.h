@@ -60,6 +60,13 @@ public:
     void tap_host(const char * name, int il, const std::vector<float> & v);
 
     const TapValue * get(const std::string & key) const;
+    // Mutable access, for an oracle that must re-key a tap before comparing
+    // it (the DeepSeek-V4 CLI aligns per-expert-slot taps to the reference's
+    // slot order when the two routers picked the same set, ds4_graph.cpp).
+    TapValue * get_mut(const std::string & key) {
+        auto it = taps_.find(key);
+        return it == taps_.end() ? nullptr : &it->second;
+    }
     const std::map<std::string, TapValue> & all() const { return taps_; }
 
     static std::string make_key(const char * name, int il, const char * suffix);

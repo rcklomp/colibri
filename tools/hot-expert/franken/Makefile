@@ -53,7 +53,12 @@ MOE_HIST_CXXFLAGS := --offload-arch=$(ARCH) -O2 -std=c++17 -Wall -I$(LLAMA_INC) 
 MOE_HIST_LDFLAGS  := -L$(GGML_LIB_DIR) -lllama -lllama-common -lggml -lggml-base -lggml-cpu -lggml-hip -Wl,-rpath,$(GGML_LIB_DIR)
 
 .PHONY: all clean
-all: $(BIN) $(ORACLE_BIN) $(MOE_HIST_BIN)
+all: $(BIN) $(ORACLE_BIN) $(MOE_HIST_BIN) no_populate.so
+
+# LD_PRELOAD shim (no_populate.c): keeps libllama's model mapping lazy, so an
+# oracle dump with --stop-after-layer pages in only what it computes.
+no_populate.so: no_populate.c
+	$(DOCKER_RUN) gcc -shared -fPIC -O2 -Wall -o no_populate.so no_populate.c -ldl
 
 $(BIN): $(SRCS) $(HDRS)
 	$(DOCKER_RUN) hipcc $(CXXFLAGS) $(SRCS) -o $(BIN) $(LDFLAGS)
@@ -65,4 +70,4 @@ $(MOE_HIST_BIN): $(MOE_HIST_SRCS) gguf_model.h
 	$(DOCKER_RUN) hipcc $(MOE_HIST_CXXFLAGS) $(MOE_HIST_SRCS) -o $(MOE_HIST_BIN) $(MOE_HIST_LDFLAGS)
 
 clean:
-	rm -f $(BIN) $(ORACLE_BIN) $(MOE_HIST_BIN)
+	rm -f $(BIN) $(ORACLE_BIN) $(MOE_HIST_BIN) no_populate.so

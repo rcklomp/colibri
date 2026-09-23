@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 46, 2026-09-23)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 47, 2026-09-24)
+
+**Rev 47 (2026-09-24): pointer only -- the Franken track now carries DeepSeek-V4-Flash on the GPUs as well (plan rev 68, record §L5-DS4-STEP2); nothing on this roadmap's GLM/Colibri serving changed.**
 
 **Rev 46 (2026-09-23): the Franken engine (design rev 11, plan rev 60) served Open WebUI: first token on screen 0.81 s against GLM's 3.6-3.8 on the same tool block, warm new chat reused 4 839 tokens at 0.45 s ttft, cold 4.9k prompt 7.9 s; prefill at 256k depth 7.8 min against llama.cpp's 17 (record §L0-STEP4, §L0-256K). The TTFT track's numbers for GLM stand; the Franken engine is the successor once its follow-up reuse (a qwen38 renderer re-render) and quality are in.**
 

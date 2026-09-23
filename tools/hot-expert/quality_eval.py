@@ -403,12 +403,18 @@ def send_chat(url, key, model_id, prompt, max_tokens, timeout=10800, retries=2,
     attempts) only on connection errors or 5xx; never retries a request that got a real
     response (including a 4xx, which is a definitive answer -- e.g. context-length-exceeded).
     Returns a dict: ok, wall_s, and either data (parsed JSON body) or error/http_status."""
-    body = json.dumps({
+    payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "max_tokens": max_tokens,
-    }).encode()
+    }
+    # QE_REASONING_EFFORT (e.g. "xhigh"): sent explicitly so both arms of a comparison run
+    # the same thinking setting whatever the server's default is (the Franken gateway serves
+    # Qwen3.8 with COLI_THINK=0 for the UI; llama-server's default is the template's, on).
+    if os.environ.get("QE_REASONING_EFFORT"):
+        payload["reasoning_effort"] = os.environ["QE_REASONING_EFFORT"]
+    body = json.dumps(payload).encode()
     last_err = None
     for attempt in range(retries + 1):
         req = urllib.request.Request(
@@ -504,6 +510,14 @@ def verify_expect(expect, url, key):
                 f"contain {want!r}"
             )
         print(f"[identity] --expect {expect}: /props model_path={model_path!r} OK")
+    elif expect == "franken":
+        # The Franken engine serves through the Colibri gateway (no /props): the swap script's
+        # state says what is behind port 8081.
+        st = subprocess.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve_alt.sh"), "status"],
+                            capture_output=True, text=True).stdout
+        if "Franken engine" not in st:
+            raise SystemExit(f"REFUSED: --expect franken but serve_alt status says: {st.strip()[:200]!r}")
+        print("[identity] --expect franken: serve_alt status says the Franken engine serves")
     elif expect == "glm":
         gw = subprocess.run(["pgrep", "-f", "openai_[s]erver.py"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -835,7 +849,7 @@ def build_parser():
     pf.set_defaults(func=cmd_fetch)
 
     pr = sub.add_parser("run", help="evaluate one server, append to its jsonl")
-    pr.add_argument("--expect", required=True, choices=["qwen38", "deepseek", "glm", "glm-llama"])
+    pr.add_argument("--expect", required=True, choices=["qwen38", "deepseek", "glm", "glm-llama", "franken"])
     pr.add_argument("--url", required=True, help="e.g. http://127.0.0.1:8081")
     pr.add_argument("--key-file", required=True)
     pr.add_argument("--model-id", required=True, help="the `model` field to send, e.g. glm-5.3-flash")

@@ -3790,6 +3790,7 @@ private:
     float * lbuf_    = nullptr;
     size_t  part_stride_ = 0, ml_stride_ = 0;
     int     qsa_rows_ = 1;         // rows of a chunk this card has scratch for
+    int     attn_rows_ = 0;        // rows the attention split scratch is sized for
     uint32_t * cand_key_ = nullptr;
     int      * cand_idx_ = nullptr;
     int        cand_cap_ = 0;
@@ -3806,6 +3807,12 @@ private:
         return d;
     }
     void alloc_attn_rows(int rows) {
+        // Idempotent: franken_serve builds one DecodeRunner a SLOT and they
+        // all reserve the same row count from the same backend, so without
+        // this the second slot frees the first slot buffers and hands back
+        // identical ones.
+        if (rows == attn_rows_ && partial_) return;
+        attn_rows_ = rows;
         const size_t max_chunks = (size_t) ceil_div(MAX_SEL, ATTN_CHUNK);
         part_stride_ = max_chunks * N_Q_HEADS * HEAD_DIM;
         ml_stride_   = max_chunks * N_Q_HEADS;

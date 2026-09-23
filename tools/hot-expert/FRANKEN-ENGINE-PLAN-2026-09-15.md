@@ -14,6 +14,13 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 67 (2026-09-24) -- L5 STEP 1: DEEPSEEK-V4 ON THE ENGINE'S CPU ARM
+> (record §L5-DS4-STEP1).** Graph model-dispatched (Qwen3.8 bit-identical);
+> deepseek4 layers 0-3 match llama.cpp (173/173 taps, cos >= 0.99956,
+> expert selections exact on 6 tokens); six new bit-exact weight decoders;
+> KV 1.8 GB at 256k. Next: DeepSeek GPU kernels + miss path, then GLM on the
+> streamed path.**
+>
 > **Rev 66 (2026-09-23 23:40 CEST) -- M4 MEASURED (record §M4). The whole
 > measurement program M0-M5 is done.** Three cards streaming at once: 52 GB/s
 > (28 a card alone, 36 for the shared-link pair together); PCIe-aware

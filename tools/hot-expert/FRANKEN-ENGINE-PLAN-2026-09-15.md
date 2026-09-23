@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 64 (2026-09-23 -- DECODE >= 40 TOK/S AT 256K (record §L0-PERF-2).**
+> HIP-graph replay of each card's token, bit-identical (greedy exact): decode
+> 24.4 ms = 40.9 tok/s at 262k depth (25.8 before), 21.6-22.2 ms short. The
+> design's decode target is met. Open: a prefill slowdown on the same binary
+> (430 vs 354 s for 262k) to bisect before serving the graph; card 0's slow
+> small GEMVs are not host issue. Also open, the rest of the ladder: M2
+> (histograms, tool built, DeepSeek/GLM runs queued), M4, L0b/L1, L2-L4,
+> L5 (DeepSeek and GLM on the engine).**
+>
 > **Rev 63 (2026-09-23 12:15 CEST, 10:15 UTC) -- FIRST PERF PASS (record
 > §L0-PERF-1).** Prefill 1.63 -> 1.40 ms/token; cold 262k prompt 467 -> 354 s
 > (5.9 min; llama.cpp 17; target ~5). Down gather bit-identical and on (the

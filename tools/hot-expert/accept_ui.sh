@@ -42,6 +42,11 @@ if [ "$have" != "$PW_VERSION" ]; then
   mkdir -p "$HOME/.cache/colibri-ui" && (cd "$HOME/.cache/colibri-ui" && npm i -q --prefer-offline --no-audit --no-fund "playwright-core@$PW_VERSION") || { echo "npm install failed"; exit 2; }
 fi
 export COLIBRI_UI_MODULES="$MODS"
+# Refuse while a benchmark or quality run is using the engine: a browser chat queued behind a
+# long quality request measures the queue, and its prompts evict the prefix (2026-09-24: an
+# overlapping run read first token 147 s and reused=0 -- invalid, and rig time and power wasted).
+busy=$(ssh "$RIG" 'pgrep -fa "quality_[e]val.py|franken_quality_[c]hain|glm5_[g]pu_gate|ds4_[g]pu_gate|run_[c]hain.sh" | head -3' 2>/dev/null)
+if [ -n "$busy" ]; then echo "REFUSED: the rig is running a measurement -- not measuring on top of it:"; echo "$busy" | cut -c1-120; exit 3; fi
 command -v node >/dev/null || { echo "REFUSED: no node on this machine"; exit 2; }
 curl -s -o /dev/null -m 8 -w '%{http_code}' "$URL/health" | grep -q 200 || { echo "REFUSED: $URL/health is not 200 (wrong network?)"; exit 2; }
 

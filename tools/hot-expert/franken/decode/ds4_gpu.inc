@@ -149,7 +149,11 @@ void k_ds4_moe(const void * const * __restrict__ tab, const int * __restrict__ i
 // what a PCIe read wants and what the GEMV's byte loads were not. Block 0 of
 // the slot publishes the pointers and counts the bytes.
 constexpr int DS4_STAGE_THREADS = 256;
-constexpr int DS4_STAGE_CHUNK   = 65536;                  // bytes a workgroup
+// grid = (wgs, 6): workgroup x of slot k copies 16-byte words x, x + wgs*256, ...
+// of the missed expert's gate|up|down -- grid-stride, so a SMALL grid (the
+// --stage-wgs knob, 64 by default: ~11 a slot) moves the whole slab while
+// most of the card stays free for the main stream's kernels. Block 0 of the
+// slot publishes the three pointers.
 __global__ __launch_bounds__(DS4_STAGE_THREADS)
 void k_ds4_stage(const void * const * __restrict__ tg, const void * const * __restrict__ tu,
                  const void * const * __restrict__ td, const int * __restrict__ ids,
@@ -168,10 +172,9 @@ void k_ds4_stage(const void * const * __restrict__ tg, const void * const * __re
     }
     if (!missed) return;
     const unsigned long long total = sg + su + sd;
-    const unsigned long long c0 = (unsigned long long) blockIdx.x * DS4_STAGE_CHUNK;
-    if (c0 >= total) return;
-    const unsigned long long c1 = c0 + DS4_STAGE_CHUNK < total ? c0 + DS4_STAGE_CHUNK : total;
-    for (unsigned long long o = c0 + 16ull * threadIdx.x; o < c1; o += 16ull * DS4_STAGE_THREADS) {
+    const unsigned long long step = 16ull * DS4_STAGE_THREADS * gridDim.x;
+    for (unsigned long long o = 16ull * ((unsigned long long) blockIdx.x * DS4_STAGE_THREADS + threadIdx.x);
+         o < total; o += step) {
         const unsigned char * s = o < sg      ? (const unsigned char *) tg[e] + o
                                 : o < sg + su ? (const unsigned char *) tu[e] + (o - sg)
                                               : (const unsigned char *) td[e] + (o - sg - su);
@@ -669,6 +672,7 @@ public:
         HIP_IGNORE(hipFree(stage_)); HIP_IGNORE(hipFree(sp_)); HIP_IGNORE(hipFree(miss_ctr_));
         for (auto & e : ev_route_) HIP_IGNORE(hipEventDestroy(e));
         for (auto & e : ev_done_)  HIP_IGNORE(hipEventDestroy(e));
+        if (up_ev_) HIP_IGNORE(hipEventDestroy(up_ev_));
         if (side_) HIP_IGNORE(hipStreamDestroy(side_));
         for (void * h : host_) HIP_IGNORE(hipHostFree(h));
     }
@@ -831,21 +835,34 @@ public:
         g_.mark(PC_DS4_MISS_WAIT); g_.last_op_ = "ds4_stage_fork";
         HIP_CHECK(hipEventRecord(ev_route_[(size_t) slot], g_.stream_));
         HIP_CHECK(hipStreamWaitEvent(side_, ev_route_[(size_t) slot], 0));
-        const unsigned chunks = (unsigned) ceil_div((int) ((need + DS4_STAGE_CHUNK - 1) / DS4_STAGE_CHUNK), 1);
-        k_ds4_stage<<<dim3(chunks, D::N_EXPERT_USED), DS4_STAGE_THREADS, 0, side_>>>(
+        const unsigned wgs = (unsigned) std::max(1, stage_wgs_ / D::N_EXPERT_USED);
+        k_ds4_stage<<<dim3(wgs, D::N_EXPERT_USED), DS4_STAGE_THREADS, 0, side_>>>(
             t.gate, t.up, t.down, ids, t.miss_bytes, t.sz_g, t.sz_u, t.sz_d,
             stage_ + (size_t) slot * D::N_EXPERT_USED * slot_bytes_, slot_bytes_,
             sp_ + (size_t) slot * D::N_EXPERT_USED * 3, nullptr);   // counted by count_misses
         HIP_CHECK(hipEventRecord(ev_done_[(size_t) slot], side_));
         pending_[slot & 7] = true;
     }
+    // Staged: the RESIDENT slots first, straight from the table, while the
+    // side stream is still copying the missed ones (L5 step 3c); then the join
+    // and the missed slots from their staged copies. Every slot runs the same
+    // kernel body on the same bytes as before -- only which launch it is in
+    // changes -- so the result is bit-identical.
     void moe_gate_up(const D::ExpertTable & t, const int * ids, const float * x, float * yg,
                      float * yu, int slot) override {
+        if (slot < 0 || slot >= n_slots_) {
+            launch_moe(t, t.type_gu, t.up,   ids, nullptr, 1, t.row_gu, t.rows_gu, t.K_gu, x, 0, yu, PC_DS4_EXP_GU);
+            launch_moe(t, t.type_gu, t.gate, ids, nullptr, 0, t.row_gu, t.rows_gu, t.K_gu, x, 0, yg, PC_DS4_EXP_GU);
+            return;
+        }
+        launch_moe_f(t, t.type_gu, t.up,   ids, nullptr, 1, 1, t.row_gu, t.rows_gu, t.K_gu, x, 0, yu, PC_DS4_EXP_GU);
+        launch_moe_f(t, t.type_gu, t.gate, ids, nullptr, 0, 1, t.row_gu, t.rows_gu, t.K_gu, x, 0, yg, PC_DS4_EXP_GU);
         const void * const * sp = join(slot);
-        launch_moe(t, t.type_gu, t.up,   ids, sp, 1, t.row_gu, t.rows_gu, t.K_gu, x, 0, yu, PC_DS4_EXP_GU);
-        launch_moe(t, t.type_gu, t.gate, ids, sp, 0, t.row_gu, t.rows_gu, t.K_gu, x, 0, yg, PC_DS4_EXP_GU);
+        launch_moe_f(t, t.type_gu, t.up,   ids, sp, 1, 2, t.row_gu, t.rows_gu, t.K_gu, x, 0, yu, PC_DS4_EXP_GU);
+        launch_moe_f(t, t.type_gu, t.gate, ids, sp, 0, 2, t.row_gu, t.rows_gu, t.K_gu, x, 0, yg, PC_DS4_EXP_GU);
     }
     void moe_down(const D::ExpertTable & t, const int * ids, const float * h, float * y, int slot) override {
+        // the join happened in moe_gate_up: the staged pointers are all valid
         const void * const * sp = (slot >= 0 && slot < n_slots_) ? sp_ + (size_t) slot * D::N_EXPERT_USED * 3 : nullptr;
         launch_moe(t, t.type_d, t.down, ids, sp, 2, t.row_d, t.rows_d, t.K_d, h, 1, y, PC_DS4_EXP_DOWN);
     }
@@ -862,6 +879,17 @@ public:
     // ---- profiling ----------------------------------------------------------------
     void set_profile(bool on) override { prof_ = on; }
     void set_staged_loads(int on) override { staged_ok_ = on != 0; }
+    void set_stage_wgs(int n) override { if (n > 0) stage_wgs_ = n; }
+    void prof_gap() override { if (prof_) { g_.mark(PC_GAP); g_.last_op_ = "ds4_segment_end"; } }
+    void upstream_wait(D::Ds4Ops & prev) override {
+        if (!prof_) return;
+        Ds4GpuOps & p = static_cast<Ds4GpuOps &>(prev);
+        if (!up_ev_) { dev_ensure(p.g_.dev_); HIP_CHECK(hipEventCreateWithFlags(&up_ev_, hipEventDisableTiming)); }
+        dev_ensure(p.g_.dev_);                       // the event belongs to the upstream card
+        HIP_CHECK(hipEventRecord(up_ev_, p.g_.stream_));
+        g_.mark(PC_DS4_UPSTREAM); g_.last_op_ = "ds4_upstream_wait";   // ensures THIS card
+        HIP_CHECK(hipStreamWaitEvent(g_.stream_, up_ev_, 0));
+    }
     void count_misses(const D::ExpertTable & t, const int * ids) override {
         if (!prof_) return;
         g_.mark(PC_ROUTER); g_.last_op_ = "ds4_miss_count";
@@ -929,6 +957,21 @@ private:
         k_ds4_moe<TY><<<grid, DS4_GEMV_THREADS, 0, g_.stream_>>>(tab, ids, sp, which, t.miss_bytes,
             filter, rb, rows, K, x, x_per_slot, y, staged);
     }
+    // one launch with an explicit filter (1 resident slots, 2 missed slots)
+    void launch_moe_f(const D::ExpertTable & t, int type, const void * const * tab, const int * ids,
+                      const void * const * sp, int which, int filter, size_t rb, int rows, int K,
+                      const float * x, int x_per_slot, float * y, int cls) {
+        g_.mark(cls); g_.last_op_ = "ds4_moe";
+        switch (type) {
+            case FK_Q_IQ2_XXS: moe_launch<FK_Q_IQ2_XXS>(t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+            case FK_Q_IQ2_S:   moe_launch<FK_Q_IQ2_S>  (t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+            case FK_Q_IQ3_XXS: moe_launch<FK_Q_IQ3_XXS>(t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+            case FK_Q_MXFP4:   moe_launch<FK_Q_MXFP4>  (t, tab, ids, sp, which, filter, rb, rows, K, x, x_per_slot, y); break;
+            default:
+                std::fprintf(stderr, "ds4 moe: expert format %d has no kernel\n", type);
+                std::abort();
+        }
+    }
     void launch_moe(const D::ExpertTable & t, int type, const void * const * tab, const int * ids,
                     const void * const * sp, int which, size_t rb, int rows, int K,
                     const float * x, int x_per_slot, float * y, int cls) {
@@ -978,6 +1021,8 @@ private:
     int n_slots_ = 0;
     bool pending_[8] = {false, false, false, false, false, false, false, false};
     bool staged_ok_ = true;
+    int  stage_wgs_ = 64;
+    hipEvent_t up_ev_ = nullptr;                     // created on the UPSTREAM card
     // profiling
     bool prof_ = false;
     unsigned long long * miss_ctr_ = nullptr;

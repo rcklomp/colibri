@@ -364,7 +364,7 @@ public:
 
     void router(const float * logits, const float * bias, const int32_t * hash_ids,
                 float * probs, float * probs_biased, int * ids, float * w_raw,
-                float * w_norm, float * w_scaled) override {
+                float * w_norm, float * w_scaled, const int * miss, uint32_t * stats) override {
         for (int e = 0; e < N_EXPERT; ++e) probs[e] = sqrtf(softplusf_(logits[e]));
         if (hash_ids) {
             for (int k = 0; k < N_EXPERT_USED; ++k) ids[k] = hash_ids[k];
@@ -381,6 +381,41 @@ public:
             w_norm[k]   = w_raw[k] / fs;               // ggml_div
             w_scaled[k] = w_norm[k] * EXPERT_WEIGHTS_SCALE;   // ggml_scale
         }
+        if (stats)                                     // --adapt: the route counters
+            for (int k = 0; k < N_EXPERT_USED; ++k) {
+                ++stats[ids[k]];
+                stats[ADAPT_MISS] += miss[ids[k]] != 0;
+                ++stats[ADAPT_PICKS];
+            }
+    }
+
+    // --adapt on the CPU arm: the same calls, done at once (there is no
+    // second stream, so every ordering is the program order).
+    uint32_t * adapt_stats_alloc(size_t n) override {
+        uint32_t * p = (uint32_t *) be_.alloc_raw(n * sizeof(uint32_t));
+        std::memset(p, 0, n * sizeof(uint32_t));
+        return p;
+    }
+    void adapt_snapshot(const uint32_t * st, size_t n) override { snap_.assign(st, st + n); snap_ready_ = true; }
+    const uint32_t * adapt_snapshot_poll() override {
+        if (!snap_ready_) return nullptr;
+        snap_ready_ = false;
+        return snap_.data();
+    }
+    void adapt_table_edit(const ExpertTable & t, const TableEdit & ed) override {
+        for (int i = 0; i < ed.n; ++i) {
+            const int e = ed.e[i];
+            const_cast<const void **>(t.gate)[e] = ed.g[i];
+            const_cast<const void **>(t.up)[e]   = ed.u[i];
+            const_cast<const void **>(t.down)[e] = ed.d[i];
+            const_cast<int *>(t.miss_bytes)[e]   = ed.miss[i];
+        }
+    }
+    void adapt_copy(void * dst, const void * src, size_t n) override { std::memcpy(dst, src, n); }
+    long long adapt_compare(const void * a, const void * b, size_t n) override {
+        long long bad = 0;
+        for (size_t i = 0; i < n; ++i) bad += ((const unsigned char *) a)[i] != ((const unsigned char *) b)[i];
+        return bad;
     }
 
     void swiglu_clamp(const float * gate, const float * up, float * h, int n, float limit) override {
@@ -412,6 +447,8 @@ public:
 
 private:
     Backend & be_;
+    std::vector<uint32_t> snap_;
+    bool snap_ready_ = false;
 };
 
 } // namespace

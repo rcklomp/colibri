@@ -74,6 +74,13 @@ struct LayerWeights {
     std::vector<const void *> tab_host;    // the CPU arm's table (mmap addresses)
     std::vector<int> miss_host;            // per expert: slab bytes if host-mapped, else 0
     int n_resident = N_EXPERT;             // experts in VRAM (all, on the CPU arm)
+    // --adapt 1 (DEEPSEEK4.md section 12): EVERY expert of the layer also has
+    // a host copy that never changes -- a card: pinned, device-mapped; the CPU
+    // arm: the file mapping -- so an evicted expert is served from it at once.
+    // Per expert, gate/up/down: mir_view = the address a kernel reads it at,
+    // mir_src = the host address a swap copies it from. A resident expert's
+    // slot is one slab (gate|up|down) in VRAM, at tab_host[e].
+    std::vector<const void *> mir_view, mir_src;   // [3 * 256], --adapt only
     Mat sh_gate, sh_up, sh_down;           // the shared expert, 2048 wide
 };
 
@@ -84,6 +91,10 @@ struct LayerWeights {
 struct Placement {
     std::string hist_dir;
     double      expert_gb = 20.0;
+    // --adapt 1: a host mirror of every expert (see LayerWeights::mir_view);
+    // on the CPU arm the resident set is then really copied into a separate
+    // block, so its table addresses differ from the mirror's like a card's.
+    bool        adapt = false;
 };
 
 class Ds4Model {
@@ -103,6 +114,7 @@ public:
     int il0() const { return il0_; }
     int il1() const { return il1_; }
     const LayerWeights & layer(int il) const { return layers_.at(il - il0_); }
+    LayerWeights & layer_mut(int il) { return layers_.at(il - il0_); }   // ds4_adapt.cpp
     int n_devices() const { return (int) devs_.size(); }
     Backend & dev(int d) const { return *devs_.at(d); }
     Backend & dev_for(int il) const { return *devs_.at(layer(il).dev); }
@@ -127,6 +139,8 @@ public:
     bool   resident(int il, int e) const { return resident_[(size_t) il][(size_t) e] != 0; }
     int    n_resident(int il) const;
     double m2_coverage(int il) const { return m2_cov_[(size_t) il]; }
+    // --adapt: the resident set as it is now (--hit-report then measures it)
+    void   set_resident(int il, int e, bool r) { resident_[(size_t) il][(size_t) e] = r ? 1 : 0; }
 
 private:
     const TensorInfo * need(const std::string & name) const;
@@ -145,6 +159,7 @@ private:
     std::vector<std::vector<int32_t>> tid_copy_; // the hash layers' tid2eid, likewise
     size_t host_expert_bytes_ = 0;
     bool planned_ = false;
+    bool adapt_ = false;          // Placement::adapt
     std::vector<double> m2_cov_ = std::vector<double>(N_LAYER, 1.0);
     std::vector<LayerWeights> layers_;
     const TensorInfo * tok_embd_ = nullptr;

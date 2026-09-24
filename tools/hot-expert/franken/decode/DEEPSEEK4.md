@@ -578,3 +578,178 @@ faster; out-of-sample like M2).
   (themselves inflated by the profile's event syncs) leave the L0 trunk GEMV
   at ~180 GB/s, ~31 ms over three cards, as the largest term — **that GEMV,
   not DeepSeek code, is the road to ~15 ms**.
+
+## 12. Step 4 (2026-09-24): adaptive placement, design L2 (built, not run on a GPU)
+
+**Why.** Record §L5-DS4-STEP3b: the hot-expert set depends on the kind of
+text. The technical record's histogram misses 742 MB a token on prose; a
+mixed-corpus histogram 276 MB. No fixed histogram fits every conversation, so
+the engine now learns the hot set from its own routing while it runs and
+swaps experts in the background. `--adapt 1` (off by default; needs
+`--placement` for the starting set). The qwen4exp path is untouched.
+
+**What was built** (`ds4_adapt.{h,cpp}`, plus hooks in `ds4_ops.h`,
+`ds4_gpu.inc`, `ds4_cpu.cpp`, `ds4_model.cpp`, `ds4_graph.cpp`):
+
+1. **Counters in the router.** `k_ds4_router` gets the layer's counter block
+   (`ADAPT_STRIDE` = 260 uint32: per expert how often it was chosen, the
+   choices that missed, all choices). Thread 0 of the single workgroup
+   increments them after it has written the outputs. Nothing the router
+   computes reads them. No host sync; the counters sit in the graph like any
+   other kernel argument.
+2. **The average, on the host.** Every `--adapt-every` tokens (default 16) a
+   token boundary queues a device-to-host copy of each card's counters on its
+   main stream, then an event. A later boundary polls the event
+   (`hipEventQuery`, never a wait) and folds the delta into a per-expert
+   decayed average: `ema = ema * 0.5^(tokens / halflife) + delta`, with
+   `--adapt-halflife` defaulting to 2 048 tokens.
+3. **Re-placement, per card and slab size.** A slot only takes an expert of
+   its own byte layout: layers 26 and 42 carry IQ2_S / MXFP4 and have other
+   sizes. Within a class, the layers of a card share their slots, so the
+   resident count can move between layers. The hottest non-resident experts
+   are paired with the coldest resident ones while
+   `ema_in > ema_out * (1 + hyst) + margin` (`--adapt-hyst 0.25`,
+   `--adapt-margin 1.0`, against thrashing). Pairs are taken by gain until the
+   round's budget is spent: `--adapt-mb-per-token` (default 64 MB, per card)
+   × the tokens since the last round. At 50 ms a token that is 1.3 GB/s a
+   card, against M4's 28 GB/s for one card and 36 GB/s for the shared pair.
+   At most one batch per card is in flight.
+4. **The swap:**
+   - EVICT: a table-edit kernel on the main stream. The outgoing expert's
+     entry now points at its host-mirror copy, with miss bytes = slab.
+   - COPY: `hipMemcpyAsync` host to VRAM of the incoming expert's gate, up
+     and down into the freed slot. It runs on a stream created at the
+     device's lowest priority and is fenced behind an event recorded on the
+     main stream after the evictions.
+   - INSTALL: once the copy event reports complete at a later boundary, the
+     main stream waits on it (free by then) and a second table edit points
+     the incoming expert at its slot, with miss = 0.
+5. **The host mirror.** With `--adapt 1` every expert, resident or not, has a
+   pinned device-mapped host copy (all 256 a layer, slab e at offset
+   e × slab). An evicted expert is served from it at once, and it is the
+   source of every swap copy. **Cost: ~84 GB pinned host RAM, against ~24 GB
+   without adaptation**, so a GPU run with `--adapt 1` needs the gateway
+   stopped, as every DeepSeek GPU run already does.
+
+**The ordering: why no kernel reads a half-copied slot, and why every tap
+stays bit-identical.**
+
+- *Readers of the table and of a slot:*
+  - on the card's main stream: `k_ds4_router` (miss bytes), `k_ds4_moe` (the
+    table entries and the bytes behind them), `k_ds4_miss_count`;
+  - on the staging side stream: `k_ds4_stage`, which reads the table and the
+    miss bytes and publishes a resident expert's slot address for the
+    `k_ds4_moe` launches of the same layer and token.
+- *Every side-stream reader is joined within its own token.* Each
+  `moe_stage(slot)` is followed, in the same token, by that layer's
+  `moe_gate_up(slot)`, and that makes the main stream wait on `ev_done[slot]`
+  before the layer's expert GEMVs. The token-id layers staged at embed time
+  are joined by their own layers in the same token. So when the main stream
+  reaches the end of token t's work, every reader of token t on either
+  stream has finished.
+- *Every table edit sits at a token boundary on the main stream.*
+  `Adapter::tick(pos)` runs at the top of `Ds4Runner::step`, before the
+  embedding upload, the hash-layer staging and every card's segment (eager
+  or a graph launch, both on the same stream). An EVICT edit therefore
+  follows every kernel of tokens ≤ t in stream order, and so, by the join
+  above, every side-stream reader too. It precedes every kernel of tokens
+  ≥ t+1, and every side-stream stage kernel of those tokens, because they
+  fork from events recorded on the main stream after it. **No kernel runs
+  while an entry changes, and no kernel sees a mixed pair of address and
+  miss bytes.**
+- *The copy into slot S starts only after S is unreferenced.*
+  `adapt_copy_begin` records `ev_fence` on the main stream after the EVICT
+  edits, and the copy stream waits on it. Before the fence, the last entry
+  pointing at S (the outgoing expert's) has been rewritten, and every kernel
+  that could have read S through the old entry or a staged pointer has
+  finished. Between EVICT and INSTALL no entry names S. The staging pointers
+  `sp` are rewritten by every stage kernel before its join, so no stale `sp`
+  entry is ever read. **Nothing reads S while it is written.**
+- *INSTALL comes only after the copy has landed, for the device too.* The
+  host sees `ev_copied` complete. It then queues `hipStreamWaitEvent(main,
+  ev_copied)` and only after that the INSTALL edit. The edit and every later
+  reader depend on the copy through a device-side edge, not just through the
+  host's observation. Only one batch is in flight per card, and a new round
+  is planned only after the previous one was installed, so a slot is never
+  the target of two copies.
+- *The mirror never changes after load*, so a host-mapped read (the in-place
+  path, or the staging copy) sees the same bytes at any time.
+- *Bit-identity:* an expert's bytes are identical in its VRAM slot, its
+  mirror copy and a staged copy. `k_ds4_moe` runs the same decoder with the
+  same `staged` flag, which depends on the row size only, over the same
+  bytes. The only thing a swap changes is which launch a slot lands in
+  (resident first, then staged), and step 3c already made that bit-identical.
+  So the routing and every tap of `--adapt 1` equal `--adapt 0`'s, whatever
+  swaps happened.
+
+**Instrumentation.**
+- Per card, per round: `adapt dev= pos= tokens= hit= miss_mb_per_token=
+  swaps= swap_mb= resident= inflight=`. The hit fraction and miss bytes are
+  counted by the router against the table as it stood; the swaps are those
+  installed since the last line.
+- All cards together: `adapt_all pos= ...`.
+- At the end: `adapt_total`.
+- `--adapt-verify 1` checks, after the run, that each card's table equals the
+  host shadow, and it compares every resident expert's VRAM slot byte for
+  byte with its mirror copy on the card (`k_ds4_compare`). It then prints
+  `adapt_verify ... PASS|FAIL`, and a FAIL fails the run.
+- `--tokens-file F [--max-tokens N]` reads a prompt of ids from a file.
+
+**New kernels** (`make resources`, gfx1100, no spills):
+- `k_ds4_table_edit`: 15 VGPR, 0 LDS, 16 waves/SIMD, one wave a launch.
+- `k_ds4_compare`: 16 VGPR, 0 LDS, 16 waves/SIMD, `--adapt-verify` only.
+- `k_ds4_router` is still 40 VGPR / 3 096 B LDS.
+
+**Checks (CPU or compile-time; no GPU touched):**
+- **The 65 pre-L5 GPU kernels are ISA- and descriptor-identical to
+  `cbf0430`** (65/65).
+- DeepSeek CPU oracle against llama.cpp, 6 tokens, layers 0-3: 173/173 taps,
+  min cos 0.999575, routing 24/24 (unchanged).
+- Qwen3.8 CPU gate: 1604 compared, 0 not bit-exact.
+- **The adaptation itself, on the CPU arm with the real routing**
+  (`~/bench/franken/ds4/adapt/cpu_check.sh`). On the CPU arm, `--adapt 1`
+  really copies the resident set into a separate block, so a wrong slot
+  address reads other bytes. Setup: layers 0-3, 48 prose tokens, a 0.5 GB
+  "card" (66 experts), `--adapt-every 2 --adapt-mb-per-token 64`.
+  - `--adapt 0 --dump` against `--adapt 1 --oracle`: **173/173 taps
+    compared, every float tap cos=1 maxabs=0**.
+  - 74 swaps (0.56 GB), `adapt_verify ... bad_entries=0 bad_bytes=0 PASS`.
+  - Hit fraction 0.082 without adaptation, 0.168 with.
+
+**The GPU gate** (`DS4_GPU_OK=1`, rig lock held, gateway stopped; the docker
+form of `~/bench/ds4s3_chain.sh`):
+
+```
+cd ~/src/colibri-m1/tools/hot-expert/franken/decode
+make franken_decode_ds4 GPU_BIN=franken_decode_ds4         # outside docker: the target calls docker itself
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined \
+  --ipc=host -e DS4_GPU_OK=1 -e LD_LIBRARY_PATH=/opt/rocm/lib:/home/ronald/src/llama-glm53/build-hip/bin \
+  -e HOME=/home/ronald -v /home/ronald:/home/ronald -w /home/ronald/src/colibri-m1/tools/hot-expert/franken/decode \
+  rocm/dev-ubuntu-24.04:7.14.0-full bash ./ds4_gpu_gate.sh adapt 2>&1 | tee ~/bench/franken/ds4/step4.txt
+```
+
+- **(9) the oracle pair.** The gate's 6-token text, greedy 16, `--adapt 0
+  --dump` against `--adapt 1 --adapt-every 1 --adapt-mb-per-token 512
+  --adapt-verify 1 --oracle`. Expected: 2 036/2 036 taps compared,
+  `not_bitexact=0`, greedy identical, verify PASS, swaps > 0.
+  - (9b) the same with `--hip-graph 1`: swaps between graph replays.
+  - (9c) 64 prose tokens, where the hot set moves most.
+- **(10) the trajectory.** From the technical-record placement
+  (`~/bench/m2/deepseek_b60`, 20 GB a card), 8 192 prose tokens:
+  - the prompt is BOS plus the first 8 191 tokens of the MMLU-Pro half of
+    `~/bench/m2/mixed_corpus.txt`, in `~/bench/franken/ds4/adapt/mmlu_8k_ids.txt`,
+    tokenized by llama-tokenize in the ROCm image with no device;
+  - then 256 greedy tokens and 32 timed decode tokens, `--ctx 262144
+    --hip-graph 1`, `--adapt-every 64`;
+  - (10a) the control, `--adapt-mb-per-token 0`: the counters run, nothing
+    moves;
+  - (10b) adaptation at 64 MB a token a card, half-life 2 048.
+  - The `adapt_all` lines are the miss-MB-per-token trajectory. **Expected,
+    to be refuted:** (10a) stays near 740, and (10b) falls toward the
+    mixed-corpus 276 MB or below, within a few hundred tokens. Swaps needed
+    are on the order of 1 000 experts (7.5 GB) a card, i.e. ~120 tokens at
+    64 MB a token. Decode ms then drops toward step 3b's 50 ms or below.
+
+**Not claimed:** any GPU number. That includes whether the swap copy slows
+the token while it runs: the copy stream is low priority and SDMA-driven,
+and the copies share PCIe with the staging ring's misses.

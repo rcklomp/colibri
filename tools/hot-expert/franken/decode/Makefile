@@ -47,11 +47,11 @@ GGML_LIB_DIR := $(LLAMA_DIR)/build-hip/bin
 COMMON_SRC := ../gguf_model.cpp ../ple.cpp \
               decode_model.cpp decode_graph.cpp decode_oracle.cpp \
               decode_cpu.cpp franken_serve.cpp franken_decode.cpp \
-              ds4_model.cpp ds4_graph.cpp ds4_cpu.cpp
+              ds4_model.cpp ds4_graph.cpp ds4_cpu.cpp ds4_adapt.cpp
 HDRS := decode_shapes.h decode_quant.h decode_backend.h decode_model.h \
         decode_graph.h decode_oracle.h franken_serve.h ../gguf_model.h ../ple.h \
         ../../m1/m1_native_decode.h \
-        ds4_shapes.h ds4_quant.h ds4_ops.h ds4_model.h ds4_graph.h ds4_gpu.inc
+        ds4_shapes.h ds4_quant.h ds4_ops.h ds4_model.h ds4_graph.h ds4_gpu.inc ds4_adapt.h
 
 CPU_BIN := franken_decode_cpu
 GPU_BIN := franken_decode

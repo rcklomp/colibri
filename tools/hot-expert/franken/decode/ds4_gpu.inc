@@ -587,7 +587,8 @@ __global__ __launch_bounds__(D::N_EXPERT)
 void k_ds4_router(const float * __restrict__ logits, const float * __restrict__ bias,
                   const int * __restrict__ hash, float * __restrict__ probs,
                   float * __restrict__ pb, int * __restrict__ ids, float * __restrict__ wr,
-                  float * __restrict__ wn, float * __restrict__ ws) {
+                  float * __restrict__ wn, float * __restrict__ ws, const int * __restrict__ miss,
+                  unsigned * __restrict__ st) {
     __shared__ float sp[D::N_EXPERT], sv[D::N_EXPERT];
     __shared__ int   si[D::N_EXPERT], sel[D::N_EXPERT_USED];
     const int e = threadIdx.x;
@@ -626,7 +627,43 @@ void k_ds4_router(const float * __restrict__ logits, const float * __restrict__ 
             const float w = sp[sel[k]];
             ids[k] = sel[k]; wr[k] = w; wn[k] = w / sum; ws[k] = (w / sum) * D::EXPERT_WEIGHTS_SCALE;
         }
+        // --adapt: the route counters (DEEPSEEK4.md section 12). One thread
+        // of the one workgroup, in stream order with every other router of
+        // this layer, so plain increments are exact. Nothing above reads them.
+        if (st)
+            for (int k = 0; k < D::N_EXPERT_USED; ++k) {
+                const int x = sel[k];
+                st[x] += 1u;
+                st[D::ADAPT_MISS] += miss[x] != 0 ? 1u : 0u;
+                st[D::ADAPT_PICKS] += 1u;
+            }
     }
+}
+
+// --adapt: rewrite up to ADAPT_MAX_EDITS entries of one layer's table (the
+// three address arrays and the miss bytes). One tiny launch on the main
+// stream between tokens: every kernel queued before it read the old entries,
+// every kernel queued after it reads the new ones (DEEPSEEK4.md section 12).
+__global__ void k_ds4_table_edit(const void ** __restrict__ tg, const void ** __restrict__ tu,
+                                 const void ** __restrict__ td, int * __restrict__ miss,
+                                 const D::TableEdit ed) {
+    const int i = threadIdx.x;
+    if (i >= ed.n) return;
+    const int e = ed.e[i];
+    tg[e] = ed.g[i]; tu[e] = ed.u[i]; td[e] = ed.d[i]; miss[e] = ed.miss[i];
+}
+
+// --adapt-verify: 16-byte words of a (a VRAM slot) that differ from b (the
+// device view of the host mirror), counted into *bad. Grid-stride.
+__global__ void k_ds4_compare(const uint4 * __restrict__ a, const uint4 * __restrict__ b,
+                              unsigned long long n16, unsigned long long * __restrict__ bad) {
+    unsigned long long n = 0;
+    for (unsigned long long i = (unsigned long long) blockIdx.x * blockDim.x + threadIdx.x; i < n16;
+         i += (unsigned long long) gridDim.x * blockDim.x) {
+        const uint4 x = a[i], y = b[i];
+        n += (x.x != y.x) | (x.y != y.y) | (x.z != y.z) | (x.w != y.w);
+    }
+    if (n) atomicAdd(bad, n);
 }
 
 __global__ void k_ds4_swiglu_clamp(const float * __restrict__ g, const float * __restrict__ u,
@@ -674,6 +711,10 @@ public:
         for (auto & e : ev_done_)  HIP_IGNORE(hipEventDestroy(e));
         if (up_ev_) HIP_IGNORE(hipEventDestroy(up_ev_));
         if (side_) HIP_IGNORE(hipStreamDestroy(side_));
+        if (copy_) { HIP_IGNORE(hipStreamSynchronize(copy_)); HIP_IGNORE(hipStreamDestroy(copy_)); }
+        for (hipEvent_t e : {ev_snap_, ev_fence_, ev_copied_}) if (e) HIP_IGNORE(hipEventDestroy(e));
+        HIP_IGNORE(hipFree(stats_)); HIP_IGNORE(hipFree(cmp_ctr_));
+        if (snap_host_) HIP_IGNORE(hipHostFree(snap_host_));
         for (void * h : host_) HIP_IGNORE(hipHostFree(h));
     }
 
@@ -803,9 +844,96 @@ public:
     }
 
     void router(const float * logits, const float * bias, const int32_t * hash, float * probs,
-                float * pb, int * ids, float * wr, float * wn, float * ws) override {
+                float * pb, int * ids, float * wr, float * wn, float * ws, const int * miss,
+                uint32_t * stats) override {
         g_.mark(PC_ROUTER); g_.last_op_ = "ds4_router";
-        k_ds4_router<<<1, D::N_EXPERT, 0, g_.stream_>>>(logits, bias, hash, probs, pb, ids, wr, wn, ws);
+        k_ds4_router<<<1, D::N_EXPERT, 0, g_.stream_>>>(logits, bias, hash, probs, pb, ids, wr, wn, ws,
+                                                        miss, (unsigned *) stats);
+    }
+
+    // ---- adaptive placement (--adapt 1; DEEPSEEK4.md section 12) ---------------
+    // Every entry sets THIS card current first (CLAUDE.md's HIP multi-GPU
+    // rule): the streams, events and allocations below are per card.
+    uint32_t * adapt_stats_alloc(size_t n) override {
+        dev_ensure(g_.dev_);
+        uint32_t * p = nullptr;
+        HIP_CHECK(hipMalloc(&p, n * sizeof(uint32_t)));
+        HIP_CHECK(hipMemset(p, 0, n * sizeof(uint32_t)));
+        HIP_CHECK(hipHostMalloc(&snap_host_, n * sizeof(uint32_t), hipHostMallocDefault));
+        HIP_CHECK(hipEventCreateWithFlags(&ev_snap_, hipEventDisableTiming));
+        HIP_CHECK(hipEventCreateWithFlags(&ev_fence_, hipEventDisableTiming));
+        HIP_CHECK(hipEventCreateWithFlags(&ev_copied_, hipEventDisableTiming));
+        // the swap copies: their own stream, at the LOWEST priority the
+        // device offers, so the main and staging streams' work goes first
+        int least = 0, greatest = 0;
+        HIP_CHECK(hipDeviceGetStreamPriorityRange(&least, &greatest));
+        HIP_CHECK(hipStreamCreateWithPriority(&copy_, hipStreamNonBlocking, least));
+        stats_ = p;
+        return p;
+    }
+    void adapt_snapshot(const uint32_t * st, size_t n) override {
+        g_.mark(PC_DS4_ADAPT); g_.last_op_ = "ds4_adapt_snapshot";
+        HIP_CHECK(hipMemcpyAsync(snap_host_, st, n * sizeof(uint32_t), hipMemcpyDeviceToHost, g_.stream_));
+        HIP_CHECK(hipEventRecord(ev_snap_, g_.stream_));
+        snap_pending_ = true;
+    }
+    const uint32_t * adapt_snapshot_poll() override {
+        if (!snap_pending_) return nullptr;
+        dev_ensure(g_.dev_);
+        const hipError_t r = hipEventQuery(ev_snap_);
+        if (r == hipErrorNotReady) return nullptr;
+        HIP_CHECK(r);
+        snap_pending_ = false;
+        return snap_host_;
+    }
+    void adapt_table_edit(const D::ExpertTable & t, const D::TableEdit & ed) override {
+        if (ed.n <= 0) return;
+        g_.mark(PC_DS4_ADAPT); g_.last_op_ = "ds4_table_edit";
+        k_ds4_table_edit<<<1, WAVE, 0, g_.stream_>>>(const_cast<const void **>(t.gate),
+            const_cast<const void **>(t.up), const_cast<const void **>(t.down),
+            const_cast<int *>(t.miss_bytes), ed);
+    }
+    void adapt_copy_begin() override {
+        dev_ensure(g_.dev_);
+        HIP_CHECK(hipEventRecord(ev_fence_, g_.stream_));        // behind everything queued so far
+        HIP_CHECK(hipStreamWaitEvent(copy_, ev_fence_, 0));
+    }
+    void adapt_copy(void * dst, const void * src, size_t n) override {
+        dev_ensure(g_.dev_);
+        HIP_CHECK(hipMemcpyAsync(dst, src, n, hipMemcpyHostToDevice, copy_));
+    }
+    void adapt_copy_end() override {
+        dev_ensure(g_.dev_);
+        HIP_CHECK(hipEventRecord(ev_copied_, copy_));
+        copy_pending_ = true;
+    }
+    bool adapt_copy_landed() override {
+        if (!copy_pending_) return true;
+        dev_ensure(g_.dev_);
+        const hipError_t r = hipEventQuery(ev_copied_);
+        if (r == hipErrorNotReady) return false;
+        HIP_CHECK(r);
+        return true;
+    }
+    void adapt_copy_join() override {
+        if (!copy_pending_) return;
+        g_.mark(PC_DS4_ADAPT); g_.last_op_ = "ds4_adapt_join";
+        // the batch has landed (adapt_copy_landed), so this wait costs
+        // nothing; it is the edge that orders the copy before the install
+        // edit for the device, not only for the host that observed it
+        HIP_CHECK(hipStreamWaitEvent(g_.stream_, ev_copied_, 0));
+        copy_pending_ = false;
+    }
+    long long adapt_compare(const void * a, const void * b, size_t n) override {
+        if (n % 16) { std::fprintf(stderr, "ds4 adapt_compare: %zu bytes, not 16-byte words\n", n); std::abort(); }
+        if (!cmp_ctr_) { dev_ensure(g_.dev_); HIP_CHECK(hipMalloc(&cmp_ctr_, sizeof(unsigned long long))); }
+        dev_ensure(g_.dev_);
+        HIP_CHECK(hipMemsetAsync(cmp_ctr_, 0, sizeof(unsigned long long), g_.stream_));
+        g_.mark(PC_DS4_ADAPT); g_.last_op_ = "ds4_compare";
+        k_ds4_compare<<<256, 256, 0, g_.stream_>>>((const uint4 *) a, (const uint4 *) b, n / 16, cmp_ctr_);
+        unsigned long long v = 0;
+        g_.download(&v, cmp_ctr_, sizeof(v));
+        return (long long) v * 16;       // an upper bound in bytes: whole 16-byte words
     }
 
     // ---- the miss path --------------------------------------------------------
@@ -1026,4 +1154,11 @@ private:
     // profiling
     bool prof_ = false;
     unsigned long long * miss_ctr_ = nullptr;
+    // --adapt
+    uint32_t * stats_ = nullptr;
+    uint32_t * snap_host_ = nullptr;
+    hipStream_t copy_ = nullptr;
+    hipEvent_t ev_snap_ = nullptr, ev_fence_ = nullptr, ev_copied_ = nullptr;
+    bool snap_pending_ = false, copy_pending_ = false;
+    unsigned long long * cmp_ctr_ = nullptr;
 };

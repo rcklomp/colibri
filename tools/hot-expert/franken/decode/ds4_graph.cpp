@@ -141,6 +141,7 @@ Ds4Runner::Ds4Runner(Ds4Model & model, std::vector<Ds4Ops *> ops, const Ds4Confi
         for (int d = 0; d < n_dev; ++d)
             if (max_slab[(size_t) d]) ops_[(size_t) d]->reserve_moe(max_slab[(size_t) d], 2 + HASH_LAYERS);
     }
+    if (cfg_.adapt.on) adapt_.reset(new Adapter(model_, ops_, cfg_.adapt));
 }
 
 int Ds4Runner::stage_slot(int il) const {
@@ -360,7 +361,8 @@ void Ds4Runner::ffn(int il, Recorder & rec) {
     rec.tap(b, "ffn_moe_logits", il, s.rlog, N_EXPERT);
     const bool hash = L.tid2eid != nullptr;
     o.router(s.rlog, L.exp_probs_b, hash ? s.hash + (size_t) il * N_EXPERT_USED : nullptr,
-             s.probs, s.probs_b, s.ids, s.wraw, s.wnorm, s.wsc);
+             s.probs, s.probs_b, s.ids, s.wraw, s.wnorm, s.wsc, L.et.miss_bytes,
+             adapt_ ? adapt_->stats(il) : nullptr);
     rec.tap(b, "ffn_moe_probs", il, s.probs, N_EXPERT);
     if (!hash) rec.tap(b, "ffn_moe_probs_biased", il, s.probs_b, N_EXPERT);
     if (cfg_.log_routing || rec.enabled()) {
@@ -444,6 +446,10 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
     }
     // host work of the token: the embedding row and the hash layers' ids,
     // uploaded (stream-ordered, pinned staging) BEFORE any card's segment
+    // --adapt: the token boundary -- the previous token is queued on every
+    // card, nothing of this one is: install landed swaps, ingest landed
+    // counters, plan and evict, snapshot (DEEPSEEK4.md section 12)
+    if (adapt_) adapt_->tick(pos_);
     std::vector<float> e(N_EMBD);
     model_.embed_row(token, e.data());
     // --profile: a fresh per-token baseline for launches and host syncs on
@@ -557,6 +563,8 @@ int ds4_main(int argc, char ** argv) {
     int stage_wgs = 64;
     std::string hist_out;
     int miss_stage = 1, staged_loads = 1, hip_graph = 0, hip_graph_bucket = 1024, all_ops = 0;
+    AdaptConfig adapt;
+    int max_tokens = 0;
     double min_cos = 0.999;
     Placement pl;
     for (int i = 1; i < argc; ++i) {
@@ -580,6 +588,19 @@ int ds4_main(int argc, char ** argv) {
         else if (a == "--hip-graph-bucket" && i + 1 < argc) hip_graph_bucket = std::atoi(argv[++i]);
         else if (a == "--all-ops" && i + 1 < argc) all_ops = std::atoi(argv[++i]);
         else if (a == "--no-head")                with_head = false;
+        else if (a == "--adapt" && i + 1 < argc)  adapt.on = std::atoi(argv[++i]);
+        else if (a == "--adapt-every" && i + 1 < argc) adapt.every = std::atoi(argv[++i]);
+        else if (a == "--adapt-mb-per-token" && i + 1 < argc) adapt.mb_per_token = std::atof(argv[++i]);
+        else if (a == "--adapt-halflife" && i + 1 < argc) adapt.halflife = std::atof(argv[++i]);
+        else if (a == "--adapt-margin" && i + 1 < argc) adapt.margin = std::atof(argv[++i]);
+        else if (a == "--adapt-hyst" && i + 1 < argc) adapt.hyst = std::atof(argv[++i]);
+        else if (a == "--adapt-verify" && i + 1 < argc) adapt.verify = std::atoi(argv[++i]);
+        else if (a == "--tokens-file" && i + 1 < argc) {       // whitespace-separated ids
+            std::ifstream f(argv[++i]);
+            if (!f) { std::fprintf(stderr, "no --tokens-file %s\n", argv[i]); return 2; }
+            long long v;
+            while (f >> v) tokens.push_back((int32_t) v);
+        } else if (a == "--max-tokens" && i + 1 < argc) max_tokens = std::atoi(argv[++i]);
         else if (a == "--devices"&& i + 1 < argc) n_devices = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--ctx"    && i + 1 < argc) ctx = std::atoi(argv[++i]);
@@ -602,10 +623,15 @@ int ds4_main(int argc, char ** argv) {
                              "  [--placement DIR --expert-gb X]   (GPU: M2 histogram, VRAM for experts a card)\n"
                              "  [--oracle DIR] [--routing DIR] [--dump DIR] [--min-cos X]\n"
                              "  [--greedy N] [--time N] [--plan-only] [--sync-debug]\n"
-                             "  [--profile] [--hit-report] [--hist-out DIR] [--stage-wgs N] [--miss-stage 0|1] [--staged-loads 0|1] [--hip-graph 0|1 [--hip-graph-bucket N]] [--all-ops 0|1]\n");
+                             "  [--profile] [--hit-report] [--hist-out DIR] [--stage-wgs N] [--miss-stage 0|1] [--staged-loads 0|1] [--hip-graph 0|1 [--hip-graph-bucket N]] [--all-ops 0|1]\n"
+                             "  [--tokens-file F [--max-tokens N]]\n"
+                             "  [--adapt 0|1 [--adapt-every N] [--adapt-mb-per-token X] [--adapt-halflife T]\n"
+                             "   [--adapt-margin M] [--adapt-hyst H] [--adapt-verify 0|1]]   (needs --placement)\n");
         return 2;
     }
+    if (max_tokens > 0 && (int) tokens.size() > max_tokens) tokens.resize((size_t) max_tokens);
     if ((int) tokens.size() + greedy_n + time_n > ctx) { std::fprintf(stderr, "--ctx too small\n"); return 2; }
+    pl.adapt = adapt.on != 0;
     if (n_devices < 1) n_devices = 1;
 
     try {
@@ -650,6 +676,10 @@ int ds4_main(int argc, char ** argv) {
         // --sync-debug synchronises after every launch, which a capture cannot hold
         cfg.hip_graph = (use_cpu || sync_debug) ? 0 : hip_graph; cfg.hip_graph_bucket = hip_graph_bucket;
         cfg.all_ops = all_ops;
+        cfg.adapt = adapt;
+        if (adapt.on)
+            std::printf("adapt=1 every=%d mb_per_token=%.1f halflife=%.0f margin=%.2f hyst=%.2f verify=%d\n",
+                        adapt.every, adapt.mb_per_token, adapt.halflife, adapt.margin, adapt.hyst, adapt.verify);
         std::printf("miss_stage=%d staged_loads=%d profile=%d hip_graph=%d hip_graph_bucket=%d%s\n",
                     miss_stage, staged_loads, (int) profile, cfg.hip_graph, hip_graph_bucket,
                     (use_cpu && hip_graph) ? " (ignored: the CPU backend has no graphs)"
@@ -800,6 +830,10 @@ int ds4_main(int argc, char ** argv) {
             std::printf("hit-report: no --placement given, nothing planned\n");
         }
         bool ok = true;
+        if (run.adapter()) {
+            for (int d = 0; d < n_report; ++d) devs[d]->sync();
+            if (!run.adapter()->finish(run.pos(), stdout)) { std::printf("DS4 ADAPT VERIFY FAIL\n"); ok = false; }
+        }
         // SLOT ORDER (L5 step 1): align the per-expert-slot taps to the
         // reference's slot order only when the two routers picked the same
         // SET at the last prompt position; unequal sets are left to fail.

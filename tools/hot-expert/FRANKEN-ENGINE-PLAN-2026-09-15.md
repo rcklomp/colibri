@@ -14,6 +14,14 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 71 (2026-09-24 06:15 CEST) -- DEEPSEEK: NO DEPTH COST, BATCHED PREFILL
+> (record §L5-DS4-STEP5).** Decode 47.2 / 47.7 / 48.1 ms at depth 64 / 8k /
+> 33k = 21 tok/s; rev 70's "depth cost" was the wrong placement's misses
+> (104 ms at every depth) -- corrected. Prefill 5.6 ms/token (4.0 with the LDS
+> GEMM), every chunk gate bit-identical incl. the first real top-512 on the
+> GPU. Next: DeepSeek behind the gateway + quality (as L0 step 4 for Qwen);
+> then GLM-5.3 on the streamed path (L5 GLM).**
+>
 > **Rev 70 (2026-09-24 03:45 CEST) -- ADAPTIVE PLACEMENT WORKS (record
 > §L5-DS4-ADAPT).** Bit-identical with swaps; over 8.4k prose tokens from a
 > wrong placement: misses 474 -> 101 MB/token, hit 93-96 %. New finding:

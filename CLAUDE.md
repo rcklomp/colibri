@@ -236,6 +236,12 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `hipFree` synchronises the device -- never in a per-token path. First run
   of any new multi-device code: `--sync-debug` (or its equivalent), then
   the timed run.
+- **Every long GPU job starts with `tools/hot-expert/preflight.sh <the same command, cut
+  to a few tokens>` (rule since 2026-09-24).** It refuses when the lock is held, a
+  measurement or quality run is active, or VRAM is in use, then smoke-runs the exact
+  binary and flags for a minute. The rig draws real power under load: a wrong path, a
+  missing library, an OOM at load or an overlapping measurement must fail in a minute,
+  not after an hour. `accept_ui.sh` refuses by itself while a measurement runs.
 - **Port 8081 may not be GLM (since 2026-09-21).** `tools/hot-expert/serve_alt.sh
   qwen38|deepseek|glm|status` swaps the model behind Open WebUI: llama-server
   (HIP build `~/src/llama-glm53/build-hip`, docker, `--fit on`, 262144 window)

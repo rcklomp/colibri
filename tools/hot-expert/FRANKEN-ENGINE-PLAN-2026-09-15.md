@@ -14,6 +14,14 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 69 (2026-09-24 02:45 CEST) -- DEEPSEEK 19.8 TOK/S AT 256K (record
+> §L5-DS4-STEP3b).** Bit-identical throughout; placement learned on mixed
+> text cut misses 742 -> 276 MB a token; graph replay: 50.4 ms a token. The
+> hot-expert set is domain-dependent (measured), so the next item is
+> ADAPTIVE placement (online counts, background swaps: design L2), then the
+> trunk GEMV on short rows (both models). Profiler artifacts of step 3
+> corrected in the record.**
+>
 > **Rev 68 (2026-09-24) -- DEEPSEEK-V4 ON THE GPUS (record §L5-DS4-STEP2).**
 > Correct (220 taps >= 0.9999, greedy identical), 11.0 tok/s at a 256k
 > allocation vs llama.cpp's 8; ~6-9x off its bytes -- profile and fix next

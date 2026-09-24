@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "decode_graph.h"     // Recorder
+#include "ds4_adapt.h"
 #include "ds4_model.h"
 #include "ds4_ops.h"
 
@@ -50,6 +51,9 @@ struct Ds4Config {
     // eagerly too, exactly as a captured graph contains them -- so the CPU arm
     // can prove the graph's op sequence gives the eager result.
     int  all_ops = 0;
+    // --adapt 1 (design L2, DEEPSEEK4.md section 12): learn the hot experts
+    // from this run's own routing and swap them in between tokens.
+    AdaptConfig adapt;
 };
 
 class Ds4Runner {
@@ -70,6 +74,7 @@ public:
     // Per-layer routed ids of the last step, [n_layers][6] (with log_routing).
     const std::vector<int> & routed_ids() const { return routed_; }
     void report_cache_bytes(FILE * out) const;
+    Adapter * adapter() { return adapt_.get(); }
 
 private:
     struct LayerState {
@@ -125,6 +130,7 @@ private:
     float *hmix_ = nullptr, *hpre_ = nullptr, *hx_ = nullptr, *hxn_ = nullptr, *logits_ = nullptr;
     int   *greedy_ = nullptr;
     std::vector<std::pair<Backend *, void *>> owned_;
+    std::unique_ptr<Adapter> adapt_;
 };
 
 // The CLI of `franken_decode --model <deepseek4 gguf> ...` (dispatched from

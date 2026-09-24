@@ -62,6 +62,28 @@ struct ExpertTable {
     size_t sz_g = 0, sz_u = 0, sz_d = 0;
 };
 
+// -- adaptive placement (design ladder L2; DEEPSEEK4.md section 12) ------------
+// ROUTE STATISTICS, written by the router kernel itself (no host sync): per
+// layer of a card, ADAPT_STRIDE uint32 -- [e] how often expert e was chosen,
+// [ADAPT_MISS] how many choices found their expert host-mapped (a miss, by
+// the table as it stood when the router ran), [ADAPT_PICKS] every choice.
+// Cumulative from zero; the host reads them asynchronously every N tokens and
+// keeps the decayed average itself (ds4_adapt.cpp).
+constexpr int ADAPT_STRIDE = 260;
+constexpr int ADAPT_MISS   = 256;
+constexpr int ADAPT_PICKS  = 257;
+// A batch of expert-table entries to rewrite, passed BY VALUE to one tiny
+// kernel on the main stream, so no host buffer has to outlive the launch.
+constexpr int ADAPT_MAX_EDITS = 24;
+struct TableEdit {
+    int n = 0;
+    int e[ADAPT_MAX_EDITS];
+    const void * g[ADAPT_MAX_EDITS];
+    const void * u[ADAPT_MAX_EDITS];
+    const void * d[ADAPT_MAX_EDITS];
+    int miss[ADAPT_MAX_EDITS];
+};
+
 class Ds4Ops {
 public:
     virtual ~Ds4Ops() {}
@@ -134,9 +156,13 @@ public:
 
     // -- MoE ------------------------------------------------------------------
     // `hash_ids` (6 ids, backend memory) replaces the top-6 on hash layers.
+    // `stats` (--adapt 1; null otherwise): the layer's ADAPT_STRIDE route
+    // counters, which the router bumps for its six choices, reading `miss`
+    // (the table's per-expert miss bytes) to count the misses. Neither
+    // changes what the router computes.
     virtual void router(const float * logits, const float * bias, const int32_t * hash_ids,
                         float * probs, float * probs_biased, int * ids, float * w_raw,
-                        float * w_norm, float * w_scaled) = 0;
+                        float * w_norm, float * w_scaled, const int * miss, uint32_t * stats) = 0;
     // THE MISS PATH (L5 step 3). moe_stage() starts bringing layer t's six
     // chosen experts to the card for staging `slot` and returns at once: a
     // resident expert is used where it is, a missed one is copied into a VRAM
@@ -182,6 +208,35 @@ public:
     virtual void count_misses(const ExpertTable & t, const int * ids) { (void) t; (void) ids; }
     virtual double miss_bytes_total() { return 0.0; }
     virtual void reset_miss_count() {}
+
+    // -- adaptive placement (--adapt 1; DEEPSEEK4.md section 12) -----------------
+    // Every call below is made by ds4_adapt.cpp at a TOKEN BOUNDARY: after the
+    // previous token's work was queued on every card and before any of the
+    // next token's, never inside a captured graph.
+    // Zeroed backend memory for the route counters.
+    virtual uint32_t * adapt_stats_alloc(size_t n_words) { (void) n_words; return nullptr; }
+    // Queue a read-back of the counters behind everything queued on the main
+    // stream so far; adapt_snapshot_poll() returns the host copy once it has
+    // landed and nullptr until then. It never waits.
+    virtual void adapt_snapshot(const uint32_t * stats, size_t n_words) { (void) stats; (void) n_words; }
+    virtual const uint32_t * adapt_snapshot_poll() { return nullptr; }
+    // Rewrite table entries, on the main stream: in order after every kernel
+    // queued before it, before every kernel queued after it.
+    virtual void adapt_table_edit(const ExpertTable & t, const TableEdit & ed) { (void) t; (void) ed; }
+    // The swap copies, host -> card, on a low-priority copy stream:
+    // adapt_copy_begin() fences them behind everything queued on the main
+    // stream so far (including the eviction edits); adapt_copy_end() closes
+    // the batch; adapt_copy_landed() asks, without waiting, whether it has;
+    // adapt_copy_join() makes the main stream wait for it (queued work only:
+    // it is called once the batch has landed, so nothing stalls).
+    virtual void adapt_copy_begin() {}
+    virtual void adapt_copy(void * dst, const void * src_host, size_t bytes) { (void) dst; (void) src_host; (void) bytes; }
+    virtual void adapt_copy_end() {}
+    virtual bool adapt_copy_landed() { return true; }
+    virtual void adapt_copy_join() {}
+    // --adapt-verify: bytes at `a` (card) that differ from `b` (the device view
+    // of the host mirror), after everything queued. A sync: end of run only.
+    virtual long long adapt_compare(const void * a, const void * b, size_t bytes) { (void) a; (void) b; (void) bytes; return 0; }
 
     // -- memory the kernels read over PCIe -------------------------------------
     // Pinned, device-mapped host memory; returns the view a kernel on THIS

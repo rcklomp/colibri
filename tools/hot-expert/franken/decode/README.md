@@ -1275,3 +1275,21 @@ for g in 0 1 1 0; do ./franken_decode $C --ctx 262144 --chunk 256 --gemm-lds 1 \
 ./franken_decode $C --ctx 262144 --time 32 --profile --prequeue-gate 1
 HIP_VISIBLE_DEVICES=1,0,2 ./franken_decode $C --ctx 262144 --time 32 --profile
 ```
+
+## DeepSeek-V4: adaptive expert placement (2026-09-24, L5 step 4)
+
+`--adapt 1` on the DeepSeek path learns the hot experts from the engine's own
+routing (the router kernel counts them; the host keeps a decayed average) and
+swaps experts host -> VRAM on a low-priority stream between tokens. The
+qwen4exp path is unchanged: its 65 kernels are ISA-identical. **The ordering
+proof lives in `DEEPSEEK4.md` section 12.** In short:
+- evictions and installs are table-edit kernels on each card's main stream
+  at a token boundary, after every reader of the old entry (the side-stream
+  staging copies are joined within their own token);
+- a slot's copy is fenced behind the eviction;
+- an install waits on the copy's event on the device.
+
+So no kernel sees a half-copied slot or a torn table entry, and since an
+expert's bytes are identical everywhere, every tap stays bit-identical to
+`--adapt 0`. That held on the CPU arm with the real routing: 173/173, 74 swaps,
+`--adapt-verify` PASS. GPU gate: `ds4_gpu_gate.sh adapt`.

@@ -2661,6 +2661,7 @@ enum ProfClass {
     PC_DS4_HC,          // the four-stream mix: split + Sinkhorn, weighted sum, post
     PC_DS4_MOE_TAIL,    // swiglu clamp, the weighted sum of the six
     PC_DS4_UPSTREAM,    // a card waiting for the previous card's share of the token
+    PC_DS4_ADAPT,       // --adapt: counter read-back, table edits, the copy join (between tokens)
     PC_N
 };
 const char * prof_name(int c) {
@@ -2694,6 +2695,7 @@ const char * prof_name(int c) {
         case PC_DS4_HC:        return "ds4_hc_mix";
         case PC_DS4_MOE_TAIL:  return "ds4_moe_tail";
         case PC_DS4_UPSTREAM:  return "ds4_upstream_wait";
+        case PC_DS4_ADAPT:     return "ds4_adapt";
         default:              return "copy";
     }
 }

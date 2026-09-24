@@ -293,6 +293,44 @@ void Ds4Model::place_experts(LayerWeights & L, Backend & be, Ds4Ops & ops) {
                                                       " are not 16-byte multiples (the staged loads need it)");
     L.tab_host.assign(3 * N_EXPERT, nullptr);
     L.miss_host.assign(N_EXPERT, 0);
+    if (adapt_ && !be.is_gpu() && planned_) {
+        // --adapt on the CPU arm (a check of ds4_adapt.cpp's bookkeeping with
+        // the real routing): the file mapping is the mirror, and the planned
+        // resident set is COPIED into one block, as a card holds it -- so a
+        // wrong slot address or a copy into the wrong place reads other bytes
+        // and the oracle pair catches it.
+        const size_t slab = sg + su + sd;
+        L.mir_view.assign(3 * N_EXPERT, nullptr);
+        for (int e = 0; e < N_EXPERT; ++e) {
+            L.mir_view[3 * e + 0] = tg->data + (size_t) e * sg;
+            L.mir_view[3 * e + 1] = tu->data + (size_t) e * su;
+            L.mir_view[3 * e + 2] = td->data + (size_t) e * sd;
+        }
+        L.mir_src = L.mir_view;
+        std::vector<int> res;
+        for (int e = 0; e < N_EXPERT; ++e) if (resident_[il][e]) res.push_back(e);
+        unsigned char * blk = res.empty() ? nullptr : (unsigned char *) be.alloc_raw(res.size() * slab);
+        for (int e = 0; e < N_EXPERT; ++e) {
+            L.tab_host[e] = L.mir_view[3 * e]; L.tab_host[N_EXPERT + e] = L.mir_view[3 * e + 1];
+            L.tab_host[2 * N_EXPERT + e] = L.mir_view[3 * e + 2];
+            L.miss_host[e] = (int) slab;
+        }
+        for (size_t i = 0; i < res.size(); ++i) {
+            const int e = res[i];
+            unsigned char * dst = blk + i * slab;
+            std::memcpy(dst,           L.mir_view[3 * e],     sg);
+            std::memcpy(dst + sg,      L.mir_view[3 * e + 1], su);
+            std::memcpy(dst + sg + su, L.mir_view[3 * e + 2], sd);
+            L.tab_host[e] = dst; L.tab_host[N_EXPERT + e] = dst + sg; L.tab_host[2 * N_EXPERT + e] = dst + sg + su;
+            L.miss_host[e] = 0;
+        }
+        L.et.gate = L.tab_host.data();
+        L.et.up   = L.tab_host.data() + N_EXPERT;
+        L.et.down = L.tab_host.data() + 2 * N_EXPERT;
+        L.et.miss_bytes = L.miss_host.data();
+        L.n_resident = (int) res.size();
+        return;
+    }
     if (!be.is_gpu()) {
         L.et.miss_bytes = L.miss_host.data();          // all resident on the CPU arm
         for (int e = 0; e < N_EXPERT; ++e) {
@@ -318,7 +356,33 @@ void Ds4Model::place_experts(LayerWeights & L, Backend & be, Ds4Ops & ops) {
         be.upload(dst + sg + su, td->data + (size_t) e * sd, sd);
         L.tab_host[e] = dst; L.tab_host[N_EXPERT + e] = dst + sg; L.tab_host[2 * N_EXPERT + e] = dst + sg + su;
     }
-    if (!miss.empty()) {
+    if (adapt_) {
+        // --adapt: the host mirror holds all 256 experts at slab e, so an
+        // evicted expert has its copy already and a swap reads its source
+        // from it. The missed ones' table entries point at their mirror slab.
+        void * host = nullptr;
+        const unsigned char * view = (const unsigned char *) ops.alloc_host_mapped((size_t) N_EXPERT * slab, &host);
+        unsigned char * h = (unsigned char *) host;
+        L.mir_view.assign(3 * N_EXPERT, nullptr);
+        L.mir_src.assign(3 * N_EXPERT, nullptr);
+        for (int e = 0; e < N_EXPERT; ++e) {
+            std::memcpy(h + e * slab,           tg->data + (size_t) e * sg, sg);
+            std::memcpy(h + e * slab + sg,      tu->data + (size_t) e * su, su);
+            std::memcpy(h + e * slab + sg + su, td->data + (size_t) e * sd, sd);
+            for (int w = 0; w < 3; ++w) {
+                const size_t off = w == 0 ? 0 : w == 1 ? sg : sg + su;
+                L.mir_view[3 * e + w] = view + e * slab + off;
+                L.mir_src[3 * e + w]  = h + e * slab + off;
+            }
+        }
+        for (const int e : miss) {
+            L.tab_host[e] = L.mir_view[3 * e];
+            L.tab_host[N_EXPERT + e] = L.mir_view[3 * e + 1];
+            L.tab_host[2 * N_EXPERT + e] = L.mir_view[3 * e + 2];
+            L.miss_host[e] = (int) slab;
+        }
+        host_expert_bytes_ += (size_t) N_EXPERT * slab;
+    } else if (!miss.empty()) {
         void * host = nullptr;
         const unsigned char * view = (const unsigned char *) ops.alloc_host_mapped(miss.size() * slab, &host);
         unsigned char * h = (unsigned char *) host;
@@ -349,6 +413,7 @@ Ds4Model::Ds4Model(const std::string & path, std::vector<Backend *> devs, std::v
     : devs_(std::move(devs)), ops_(std::move(ops)), il0_(il0), il1_(il1) {
     if (devs_.empty()) throw std::runtime_error("Ds4Model needs at least one backend");
     if (ops_.size() != devs_.size()) throw std::runtime_error("Ds4Model: one Ds4Ops per backend");
+    adapt_ = pl.adapt;
     if (il0 < 0 || il1 >= N_LAYER || il1 < il0) throw std::runtime_error("layer span out of range");
     model_ = GgufModel::open(path);
     if (model_->hparams().arch != "deepseek4")

@@ -242,6 +242,14 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   binary and flags for a minute. The rig draws real power under load: a wrong path, a
   missing library, an OOM at load or an overlapping measurement must fail in a minute,
   not after an hour. `accept_ui.sh` refuses by itself while a measurement runs.
+- **No rig job runs unwatched, and no sequence waits only for success (rule since
+  2026-09-24, after the rig sat idle five hours).** A queued step that was refused
+  (lock held, rc 3) never printed the marker the next step waited for; nobody noticed.
+  So: (1) every chain or sequence launched gets a watcher that reports EVERY end state
+  -- success, failure, refusal -- AND silence: if no rig log has moved for 20 minutes,
+  the session is told; (2) sequences retry on rc 3 and report any other non-zero exit
+  instead of waiting on a success marker; (3) a session never ends its turn with a rig
+  job running and no such watcher armed.
 - **Port 8081 may not be GLM (since 2026-09-21).** `tools/hot-expert/serve_alt.sh
   qwen38|deepseek|glm|status` swaps the model behind Open WebUI: llama-server
   (HIP build `~/src/llama-glm53/build-hip`, docker, `--fit on`, 262144 window)

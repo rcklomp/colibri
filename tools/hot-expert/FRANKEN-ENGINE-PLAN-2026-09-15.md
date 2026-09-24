@@ -14,6 +14,16 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 73 (2026-09-24 20:10 CEST) -- GLM-5.3 ON THE GPUS (record §L5-GLM-GPU).**
+> Bit-identical to its CPU arm on every path (three-link, adaptive, both);
+> 13.6-14.9 tok/s at a 256k window against Colibri's ~5; three-link split
+> ~37 %; no depth cost. Next for GLM: batched prefill, graph replay, the
+> profiler fix, load-once gates, then serving behind the gateway + quality.
+> Process: the rig sat idle 5 h (a refused step, no watcher) -- rules added
+> (CLAUDE.md: watchers for every end state, preflight, retry on rc 3).
+> Franken engine extracted into its own repository (107 commits of history),
+> push pending the Gitea bot account.**
+>
 > **Rev 72 (2026-09-24 08:15 CEST) -- DEEPSEEK SERVED, GLM ON THE CPU ARM
 > (record §L5-DS4-SERVE, §L5-GLM-STEP1).** DeepSeek on the Franken engine
 > behind the gateway: accept_live PASS, new chat 0.9 s, cold 4.6k block 21 s;

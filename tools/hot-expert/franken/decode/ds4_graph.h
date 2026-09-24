@@ -103,7 +103,72 @@ public:
     void report_cache_bytes(FILE * out) const;
     Adapter * adapter() { return adapt_.get(); }
 
+    // ---- serving: the state a prefix-reuse rollback has to move (M4/serve) --
+    //
+    // Ported from DecodeRunner's own split (decode_graph.h), against what this
+    // architecture actually keeps rather than by name. Every attention layer
+    // keeps a RAW sliding-window ring (`LayerState::raw`, all layers, every
+    // ratio) plus, on a compressed layer (ratio != 0), two more pieces:
+    //
+    //   POSITIONAL, valid up to the LCP, and therefore truncatable to a prefix
+    //     exactly like Qwen's cell-indexed KV cache: `comp` (the pooled K of
+    //     every CLOSED block, index by block number) and, on a CSA layer only,
+    //     `lid` (the pooled lightning-indexer keys of the same closed blocks).
+    //     A block's slot is written once, when it closes (`store_block`), and
+    //     never touched again -- so an image of `layout_len` tokens' worth of
+    //     blocks is a true prefix of one for any larger length, unpacked the
+    //     same way DecodeRunner's `kv_plan` unpacks Q8_0 cells.
+    //
+    //   RECURRENT, valid only AT the exact position saved: the open block's
+    //     accumulation rings (`ck`/`cs`, and on CSA `lk`/`ls`) and the raw
+    //     window itself (`raw`) are all fixed-size ring buffers indexed by
+    //     `pos_ % rows` -- their CONTENTS mean nothing without the `pos_` they
+    //     were taken at, exactly like Qwen's GDN conv window, so they are
+    //     always copied whole and tagged with the position, never truncated.
+    //
+    // Sizes and the exact byte layout: see state_pieces()/kv_plan() below --
+    // this is the same split DEEPSEEK4.md section 12's serving note (and this
+    // header's own file comment) describes as "a serving concern"; this is
+    // that concern, implemented the same way the Qwen runner already proved.
+    size_t rec_bytes() const;
+    void   save_rec(void * dst);
+    void   save_rec_async(void * dst);
+    void   load_rec(const void * src, int pos);
+
+    size_t kv_bytes(int len) const;
+    void   save_kv(void * dst, int len);
+    void   save_kv_async(void * dst, int len);
+    void   load_kv(const void * src, int layout_len, int copy_len, int pos);
+
+    // A fresh sequence: every recurrent buffer zeroed and pos_ back to 0 (the
+    // state the constructor left it in). The positional caches (`comp`/`lid`)
+    // are deliberately NOT cleared, for the same reason DecodeRunner does not
+    // clear its KV cells: every slot they hold is bounded-read by `pos_` and
+    // gets overwritten before anything can read it again.
+    void   reset_state();
+
+    // Drains every device -- one call ends the "in flight" state of every
+    // async save issued before it (Backend::download_async).
+    void   sync_devices();
+
+    // The last step's logits, on the host (only with a head placed) -- what
+    // franken_serve.cpp's sample_token() needs for temperature > 0; the greedy
+    // id alone (step()'s return value) is all a temp == 0 turn ever downloads.
+    std::vector<float> logits_host();
+
 private:
+    // One contiguous run of recurrent state on one device, in the one order
+    // state_pieces() builds it and both save_rec/load_rec walk it.
+    struct StatePiece { Backend * be; void * ptr; size_t bytes; };
+    void state_pieces(std::vector<StatePiece> & out);
+    // One run of a positional (block-indexed) cache. `off` is where it sits in
+    // a host image laid out for `layout_len` TOKENS' worth of blocks (ceil'd
+    // per layer's own ratio, DecodeRunner::kv_plan's `pl()` convention); `bytes`
+    // is how much of it to move for `copy_len` tokens' worth.
+    struct KvPiece { Backend * be; void * ptr; size_t off; size_t bytes; };
+    void kv_plan(std::vector<KvPiece> & out, int layout_len, int copy_len);
+
+
     struct LayerState {
         uint16_t * raw = nullptr;       // f16 [raw_rows][512], slot = pos % raw_rows
         int raw_rows = N_SWA;

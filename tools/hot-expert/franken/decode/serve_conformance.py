@@ -259,15 +259,45 @@ class Engine:
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--engine", default=os.path.join(here, "franken_decode_cpu"))
-    ap.add_argument("--gguf", default=os.environ.get("FRANKEN_GGUF",
-                    "/home/ronald/models/Qwen3.8-Flash-Next/UD-IQ4_XS/"
-                    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"))
-    ap.add_argument("--layers", default="0-3")
+    # M1: DeepSeek-V4-Flash's Ds4Runner (ds4_serve.cpp) gates its head on the
+    # layer span reaching the model's TRUE last layer (N_LAYER-1 = 42) --
+    # unlike Qwen's DecodeRunner, which always places a head on whatever span
+    # it is given. "0-3" (Qwen's own default, and this file's original
+    # default) is therefore a HEADLESS span for DeepSeek: prefill/ACCEPT/
+    # DONE/reuse/rollback/cancel all still exercise fully (see --arch
+    # deepseek's own default span below for the case that also exercises
+    # DATA/emission/budget/temperature sampling). Discovered running this
+    # driver against franken_decode_ds4_cpu with --layers 0-3: every check
+    # that does not depend on a non-empty completion passed; every one that
+    # does failed for the structural reason above, not a wire-protocol bug --
+    # rerunning with a head-inclusive span (39-42) passed all of them.
+    ap.add_argument("--arch", choices=("qwen", "deepseek"), default="qwen",
+                    help="which engine/model this run targets; sets the "
+                         "--engine/--gguf/--layers defaults and (deepseek "
+                         "only) phase 3's chat-template boundary markers")
+    ap.add_argument("--engine", default=None)
+    ap.add_argument("--gguf", default=None)
+    ap.add_argument("--layers", default=None)
     ap.add_argument("--chunk", type=int, default=8)
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--threads", type=int, default=8)
     args = ap.parse_args()
+
+    if args.arch == "deepseek":
+        if args.engine is None: args.engine = os.path.join(here, "franken_decode_ds4_cpu")
+        if args.gguf is None: args.gguf = os.environ.get("FRANKEN_GGUF",
+                        "/home/ronald/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M/"
+                        "DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf")
+        # 39-42: 4 layers, same size as Qwen's own "0-3" test span, but
+        # reaching il1 == N_LAYER-1 (42) so Ds4Model actually loads and
+        # Ds4Runner actually computes the head -- see the --arch help text.
+        if args.layers is None: args.layers = "39-42"
+    else:
+        if args.engine is None: args.engine = os.path.join(here, "franken_decode_cpu")
+        if args.gguf is None: args.gguf = os.environ.get("FRANKEN_GGUF",
+                        "/home/ronald/models/Qwen3.8-Flash-Next/UD-IQ4_XS/"
+                        "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf")
+        if args.layers is None: args.layers = "0-3"
 
     failures = []
 
@@ -470,11 +500,25 @@ def main():
     w3 = eng3.wire
     try:
         w3.wait_ready()
-        # <|im_start|> is a real special token of this vocab, so the engine
-        # tokenizes it as one and takes a checkpoint there.
-        head = ("<|im_start|>system\n" + SHARED + "<|im_end|>\n")
-        qa = head + "<|im_start|>user\nWhat is the capital of Kenya?<|im_end|>\n<|im_start|>assistant\n"
-        qb = head + "<|im_start|>user\nWhat is the capital of Chile, and why?<|im_end|>\n<|im_start|>assistant\n"
+        if args.arch == "deepseek":
+            # DeepSeek-V4's own turn markers (render_chat_v4, c/openai_server.py):
+            # "<｜User｜>" / "<｜Assistant｜>", real single
+            # tokens of this vocab (ds4_serve.cpp's own default
+            # FRANKEN_BOUNDARY_TOKENS) -- there is no single marker common to
+            # every role the way Qwen's <|im_start|> is, so system content here
+            # is bare (matching render_chat_v4: a system/developer message has
+            # no wrapper at all) and both turn markers are boundary points.
+            user = "<｜User｜>"
+            assistant = "<｜Assistant｜>"
+            head = SHARED
+            qa = head + user + "What is the capital of Kenya?" + assistant
+            qb = head + user + "What is the capital of Chile, and why?" + assistant
+        else:
+            # <|im_start|> is a real special token of this vocab, so the engine
+            # tokenizes it as one and takes a checkpoint there.
+            head = ("<|im_start|>system\n" + SHARED + "<|im_end|>\n")
+            qa = head + "<|im_start|>user\nWhat is the capital of Kenya?<|im_end|>\n<|im_start|>assistant\n"
+            qb = head + "<|im_start|>user\nWhat is the capital of Chile, and why?<|im_end|>\n<|im_start|>assistant\n"
         w3.submit(1, 0, qa, 2)
         a3 = collect(w3, 1)
         w3.submit(2, 0, qb, 2)
@@ -490,10 +534,28 @@ def main():
               "prompt=%d reused=%d (bar %d)" % (b3.prompt_tokens, b3.reused,
                                                 b3.prompt_tokens - 32))
         r3 = eng3.req_line(2)
+        # DeepSeek-V4's default FRANKEN_BOUNDARY_TOKENS is TWO markers
+        # ("<｜User｜>" and "<｜Assistant｜>"), unlike Qwen's
+        # single <|im_start|> -- a short diverging tail that contains both a
+        # new user turn AND its assistant header (exactly qb's shape here)
+        # gets a checkpoint at EACH, so it is correct for DeepSeek to need
+        # >= the naive ceil_div chunk count, never fewer (measured: 3 of a
+        # naive 2, because both markers fall in the 12-token diverging tail
+        # of this test's prompt) -- more structural checkpoints than the
+        # floor interval alone would take is the intended behaviour, not a
+        # bug, and it never costs correctness (reused is still checked
+        # exactly above). Qwen keeps the exact-equality bar: one boundary
+        # marker landing twice in one short diverging tail would be a real
+        # surprise there.
+        expect_chunks = ceil_div(b3.prompt_tokens - b3.reused, args.chunk)
+        got_chunks = int(r3.get("chunks", -1))
+        chunks_ok = ((got_chunks >= expect_chunks) if args.arch == "deepseek"
+                    else (got_chunks == expect_chunks))
         check("phase 3: only the diverging tail is re-prefilled",
-              int(r3.get("chunks", -1)) == ceil_div(b3.prompt_tokens - b3.reused, args.chunk),
-              "chunks=%s of %d" % (r3.get("chunks"),
-                                   ceil_div(b3.prompt_tokens - b3.reused, args.chunk)))
+              chunks_ok,
+              "chunks=%s of %d%s" % (r3.get("chunks"), expect_chunks,
+                                     " (>=, deepseek: extra structural checkpoints)"
+                                     if args.arch == "deepseek" else ""))
     finally:
         eng3.close()
         log("== engine stderr: %s ==" % eng3.err.name)

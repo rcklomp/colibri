@@ -53,11 +53,29 @@ HDRS := decode_shapes.h decode_quant.h decode_backend.h decode_model.h \
         decode_graph.h decode_oracle.h franken_serve.h ../gguf_model.h ../ple.h \
         ../../m1/m1_native_decode.h \
         ds4_shapes.h ds4_quant.h ds4_ops.h ds4_model.h ds4_graph.h ds4_gpu.inc ds4_adapt.h \
-        glm5_shapes.h glm5_ops.h glm5_model.h glm5_graph.h
+        glm5_shapes.h glm5_ops.h glm5_model.h glm5_graph.h \
+        ds4_serve.h
 
 CPU_BIN := franken_decode_cpu
 GPU_BIN := franken_decode
 GPU_SRC := decode_gpu.hip
+
+# franken_decode_ds4 (M1): DeepSeek-V4-Flash behind the gateway
+# (GATEWAY-PROTOCOL.md), its own main() (franken_decode_ds4_main.cpp) so the
+# process is unconditionally DeepSeek-V4 with no argv --model to sniff an
+# architecture from (the gateway launches `[binary, <cap>]` with the model
+# named by SNAP/FRANKEN_GGUF in the environment, not argv -- see that file's
+# header comment). Reuses COMMON_SRC wholesale minus franken_decode.cpp (whose
+# own main() would conflict with this one) plus ds4_serve.cpp: the Qwen code
+# it drags in (DecodeModel/DecodeRunner/franken_serve.cpp) is linked but never
+# called, which costs compile time and binary size and changes no behaviour --
+# COMMON_SRC is the already-proven-working set, and trimming it to a minimal
+# DS4-only source list is a separate, lower-priority cleanup, not a
+# correctness question.
+DS4_SRC := $(filter-out franken_decode.cpp,$(COMMON_SRC)) ds4_serve.cpp franken_decode_ds4_main.cpp
+DS4_HDRS := $(HDRS) ds4_serve.h
+DS4_CPU_BIN := franken_decode_ds4_cpu
+DS4_GPU_BIN := franken_decode_ds4
 
 # llama.h is included for its TYPES only: franken_serve.cpp dlopens libllama at
 # run time rather than linking it, because `ldd libggml.so.0` lists
@@ -72,7 +90,7 @@ INCS     := -I$(GGML_INC) -I$(GGML_SRC_INC) -I$(LLAMA_INC) -I.. \
 # dependency through the back door.
 LDLIBS   := -L$(GGML_LIB_DIR) -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(GGML_LIB_DIR) -ldl
 
-.PHONY: all clean resources cpu gpu ldd-check moe-gather-test ds4-emul
+.PHONY: all clean resources cpu gpu ldd-check moe-gather-test ds4-emul ds4-cpu ds4-gpu ds4-ldd-check
 all: $(CPU_BIN) $(GPU_BIN)
 
 cpu: $(CPU_BIN)
@@ -84,6 +102,22 @@ gpu: $(GPU_BIN)
 $(GPU_BIN): $(COMMON_SRC) $(GPU_SRC) $(HDRS)
 	$(DOCKER_RUN) hipcc --offload-arch=$(ARCH) -O3 -std=c++17 -Wall -Wno-unused-function $(INCS) \
 		$(COMMON_SRC) $(GPU_SRC) -o $(GPU_BIN) $(LDLIBS) -lpthread
+
+# franken_decode_ds4[_cpu] (M1): same recipe, DS4_SRC/DS4_HDRS/DS4_*_BIN above.
+ds4-cpu: $(DS4_CPU_BIN)
+$(DS4_CPU_BIN): $(DS4_SRC) decode_nogpu.cpp $(DS4_HDRS)
+	$(DOCKER_RUN) c++ -O2 -std=c++17 -Wall -Wno-unused-function -DFRANKEN_NO_HIP $(INCS) \
+		$(DS4_SRC) decode_nogpu.cpp -o $(DS4_CPU_BIN) $(LDLIBS) -lpthread
+
+ds4-gpu: $(DS4_GPU_BIN)
+$(DS4_GPU_BIN): $(DS4_SRC) $(GPU_SRC) $(DS4_HDRS)
+	$(DOCKER_RUN) hipcc --offload-arch=$(ARCH) -O3 -std=c++17 -Wall -Wno-unused-function $(INCS) \
+		$(DS4_SRC) $(GPU_SRC) -o $(DS4_GPU_BIN) $(LDLIBS) -lpthread
+
+ds4-ldd-check: $(DS4_CPU_BIN)
+	@ldd $(DS4_CPU_BIN) | grep -qi 'amdhip\|hsa-runtime' \
+		&& { echo "FAIL: $(DS4_CPU_BIN) links a HIP runtime"; exit 1; } \
+		|| echo "OK: $(DS4_CPU_BIN) links no HIP runtime"
 
 # Per-kernel VGPR/SGPR/LDS/spill report. Compile-only (-c to /dev/null), so it
 # produces no binary and touches nothing; the remarks go to stderr.
@@ -119,4 +153,4 @@ franken_ds4_quant_emul: ds4_quant_emul.cpp ../gguf_model.cpp $(HDRS)
 		-o franken_ds4_quant_emul $(LDLIBS)
 
 clean:
-	rm -f $(CPU_BIN) $(GPU_BIN) franken_moe_gather_test franken_ds4_quant_emul
+	rm -f $(CPU_BIN) $(GPU_BIN) $(DS4_CPU_BIN) $(DS4_GPU_BIN) franken_moe_gather_test franken_ds4_quant_emul

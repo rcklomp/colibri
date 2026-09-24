@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 72 (2026-09-24 08:15 CEST) -- DEEPSEEK SERVED, GLM ON THE CPU ARM
+> (record §L5-DS4-SERVE, §L5-GLM-STEP1).** DeepSeek on the Franken engine
+> behind the gateway: accept_live PASS, new chat 0.9 s, cold 4.6k block 21 s;
+> quality run in progress. GLM-5.3 layers 0-5 match llama.cpp on the CPU arm
+> incl. the real top-512 selection; KV 3.3 GB at 256k. Next: GLM GPU kernels
+> (KDA, absorbed MLA, 8-of-288 experts, three-link stream). Two environment
+> items on the Mac need the owner: keychain (Gitea push) and Local Network
+> permission (accept_ui's browser).**
+>
 > **Rev 71 (2026-09-24 06:15 CEST) -- DEEPSEEK: NO DEPTH COST, BATCHED PREFILL
 > (record §L5-DS4-STEP5).** Decode 47.2 / 47.7 / 48.1 ms at depth 64 / 8k /
 > 33k = 21 tok/s; rev 70's "depth cost" was the wrong placement's misses

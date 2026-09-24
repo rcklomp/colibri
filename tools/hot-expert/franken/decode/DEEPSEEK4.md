@@ -1,10 +1,11 @@
-# DeepSeek-V4-Flash on the Franken engine — L5 steps 1-3c (2026-09-23/24)
+# DeepSeek-V4-Flash on the Franken engine — L5 steps 1-5 (2026-09-23/24)
 
 The model, the path Qwen3.8 took (design rev 13 §9; record §L0-STEP1..3), and
 what steps 1 and 2 built and proved. **Everything below that says "measured"
 was measured on the CPU arm or by the compiler; nothing here is a GPU
 measurement.** Step 2 (GPU kernels, placement, the gate commands) is §9;
-step 3 (the speed work toward ~15 ms a token) is §10.
+step 3 (the speed work toward ~15 ms a token) is §10; step 4 (adaptive
+placement) §12; step 5 (the depth cost, batched prefill) §13.
 
 Model: `~/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M/*.gguf` (3 shards,
 85 GB, arch `deepseek4`, 1 328 tensors). Reference: `~/src/llama-glm53`
@@ -753,3 +754,247 @@ docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security
 **Not claimed:** any GPU number. That includes whether the swap copy slows
 the token while it runs: the copy stream is low priority and SDMA-driven,
 and the copies share PCIe with the staging ring's misses.
+
+## 13. Step 5 (2026-09-24): the depth cost, and a batched prefill (built, not run on a GPU)
+
+**Why.** Record §L5-DS4-ADAPT: decode was 50.4 ms a token at depth 53
+(§L5-DS4-STEP3b) but 102.3 ms (control) and 88.8 ms (adaptive) at depth
+8 479, and the 8 192-token prompt went in token by token. For Qwen3.8 the
+whole attention path added 2.8 ms from depth 6 to 262k.
+
+### 13.1 What grows with depth, by the work it does
+
+Every term of the decode token that depends on the depth `d`, per token:
+
+| part | at d = 53 | at d = 8 479 | at d = 262 144 |
+|---|---|---|---|
+| lid scan (21 CSA layers): `d/4` keys x 256 B, 8 192 MACs a key | 13 keys | 2 120 keys: 11 MB, 0.37 G MAC | 65 536 keys: 352 MB, 11.3 G MAC |
+| top-512 (21 layers) | identity | 2 120 scores, 4 radix passes | 65 536 scores |
+| CSA attention: raw window + min(d/4, 512) rows | 67 keys | 640 keys (constant beyond 2 048) | 640 keys |
+| HCA attention (20 layers): raw window + d/128 rows | 54 keys | 194 keys | 2 176 keys |
+| everything else (pools, rings, rope, stores) | constant | constant | constant |
+
+At 8 479 all of it is ~30 MB of reads and ~1.5 G MAC a token: 0.1-0.2 ms at
+the card's bounds. The step-2 kernels are not at the bounds; estimated on
+their own shapes, the whole path is ~1.5 ms at 8.5k against ~0.9 ms at 53
+(the top-k's single-thread bin walk, 4 x 256 dependent LDS reads, is the
+largest piece at ~40 us a layer). **The attention path's work explains about
+1 ms of the +38-50 ms.** Read for anything that is not incremental, the code
+has none: the pools run only when a block completes (`(p+1) % ratio`), the
+compressed and lid caches are written once per block and never re-derived,
+the raw window is a ring, no cache is copied, `ensure_attn` stops growing
+at the reservation made at construction, and the host does nothing per
+position beyond the embedding row and the hash ids. The graph grids at depth
+are the class's (bucket 1 024): 36 indexer workgroups, 20 attention chunks.
+
+So the +40 ms is either a kernel far slower than its work, or not a function
+of depth at all. The step-4 numbers cannot tell those apart, because the deep
+token was also the 8 448th token of a 13-minute run (thermal and clock state,
+~84 GB of pinned host mirror under `--adapt 1`, six graph re-captures by
+`hipGraphExecUpdate`), and the miss traffic differed too (474-560 MB control,
+~80-100 MB adaptive, against 276 MB at depth 53: the adaptive run should have
+been FASTER than depth 53 by its misses, and was 38 ms slower).
+
+**The instrument (`--probe-at D1,D2,... --probe-n W`).** At each depth the
+prompt is prefilled in chunks (13.3), then W decode steps are timed one by
+one (a sync each), and with `--profile` each card's class table is printed
+for those W tokens. A depth below the current one rewinds to 0 and refills,
+so `--probe-at 64,8192,64` measures a shallow token before AND after a deep
+one in one process: depth against run duration. New profile classes split
+what was one attention class: `ds4_attention_csa`, `ds4_attention_hca`,
+`ds4_attention_raw`, `ds4_compressor_pool` (rings, ape rows, pools, block
+stores), `ds4_expert_sort`. Reading the GPU run:
+- a class that grows from the 64 probe to the 8 192 probe and is back at the
+  second 64 probe is depth: that kernel;
+- all classes up at 8 192 AND at the second 64 (the trunk GEMV too) is the
+  run, not the depth (clocks/thermals, pinned memory);
+- graph and eager apart only at depth, and (13c)'s single graph class fixes
+  it: the updated graphs;
+- `ds4_probe_miss_mb_per_token` a depth: the misses;
+- (13a-c) flat but (13e), the prompt token by token, slow: the 8 000 decode
+  steps before the deep token, not the depth.
+
+### 13.2 The depth kernels made to scale (numerics: bit-identical scores; the top-k order is now deterministic)
+
+- **Indexer scan (`k_ds4_lid_scores`).** Step 2's ISA: per head per lane 8
+  `ds_load_b128` of q and two `ds_bpermute` against 32 FMAs, i.e. LDS-bound
+  at about twice its FMA time, and one workgroup per 64 keys each staging the
+  32 KB q (1 024 of them at 256k: 32 MB of q against 16.8 MB of keys). Now
+  a group of four lanes carries four keys (one q read feeds four FMAs), the
+  keys stay packed f16 in registers, the in-quad exchange is DPP, and the
+  grid is persistent (<= 384 workgroups walk 256-key tiles). **Per key the
+  float operations and their order are step 2's**: 32 `fmaf` in dim order,
+  two adds, `fmaxf`, and the fused `sc = fma(relu, w_h, sc)` the step-2 ISA
+  shows as `v_fmac`. The new kernel's float-op multiset is exactly 4x step
+  2's (fma 4 / fmac 128 / add 8 / max 4 / cvt 128 against 1 / 32 / 2 / 1 /
+  32). 157 VGPR (the compiler converts the four keys once and keeps them),
+  33 024 B LDS, 6 waves/SIMD (LDS-bound as before), no spill. Projected at
+  256k: ~35-55 us a layer (compute) against ~70-140 (LDS) before.
+- **Top-512 (`k_ds4_topk`).** At 256k step 2's kernel put nearly all of a
+  pass's 65 536 LDS atomics on one bin (one query's scores share their top
+  byte), serialised on one CU, then walked 256 bins with one thread; ~2 ms a
+  token at 256k by estimate. Now each wave adds each distinct bin once
+  (ballot aggregation), the bin is found by a parallel suffix scan, and the
+  selected indices are written in **ascending index order** by a block scan.
+  Step 2 wrote them through an atomic counter, so their ORDER -- and with it
+  the attention's summation order over the selected rows -- changed from run
+  to run past 2 048 tokens. The SET is the same (same threshold; ties are
+  taken lowest index first instead of first come). This is the one
+  deliberate numerics change of step 5, and it removes a nondeterminism
+  rather than adding one: step 5 past 2 048 tokens is not bit-comparable to
+  step 4, because step 4 was not comparable to itself. 18 VGPR, 2 188 B LDS,
+  16 waves/SIMD.
+- **Attention (`k_ds4_attn_part` / `_combine`).** Unchanged arithmetic; the
+  wave index goes through `readfirstlane`, so q's head address is uniform and
+  the compiler now reads q with `s_load_b512` (16 floats a scalar load, the
+  scalar cache) where step 2 issued per-lane `global_load_b128`s of the same
+  address; a row axis for chunks (13.3). 41 / 11 VGPR, 32 896 / 0 B LDS. The HCA layers'
+  all-rows attention at 256k is 2 176 keys, 68 chunks x 4 head groups = 272
+  workgroups a layer: it was never the bottleneck by its work (~1 GMAC).
+
+### 13.3 Batched prefill (`--chunk C`, default 1; cap 512)
+
+PREFILL.md's pattern for this graph. A step is T tokens, every buffer
+token-major `[T][width]`, every positional op row t at position p + t.
+- **The causal rule.** Within a layer, every cache write of the chunk comes
+  before any row reads: raw window, compressor rings, pooled rows, lid keys;
+  then per row the indexer scan, the top-k and the attention. Row t at
+  position q attends raw positions max(0, q-127)..q, the compressed rows b
+  < (q+1)/ratio, and (CSA) the top-512 of the lid keys b < (q+1)/4. Block b
+  ends at position (b+1)*ratio - 1 <= q, so every row a query reads was
+  pooled from positions <= q and is already written; nothing later in the
+  chunk is visible. This is PREFILL.md section 2's argument with ratio 4 and
+  128, and there is no +1e9 tail term here: DS4 attends only COMPLETE blocks.
+- **The rings grow with the chunk.** A chunk writes all its rows before any
+  row reads, so a later row must not overwrite a slot an earlier row still
+  needs: the raw window is `N_SWA + C - 1` slots, a CSA ring `2*4 + C - 1`,
+  an HCA ring `128 + C - 1`. Slots are addressed by POSITION modulo the ring,
+  so the size changes no number; C = 1 gives step 4's sizes exactly.
+- **One kernel per op.** The row is a grid axis (hc, rope with
+  `rows_per_pos`, stores, rings, pools, indexer, top-k, attention, router,
+  MoE tail) or, where a weight row is reused across rows, a loop the compiler
+  must not unroll (`k_ds4_gemv`: the row staged once, the T columns in turn;
+  `k_ds4_moe`: an item's assignments in turn). The loop body is one compiled
+  sequence whatever T is, so column t is bit for bit the T = 1 result
+  (PREFILL.md 8.1's lesson). The decode token runs the same kernels at
+  T = 1. Q8_0 / Q6_K / BF16 / F32 trunk GEMVs go to the L0 engine's
+  `gemv_batch` GEMM (TILE 8; split-K from the matrix alone, PREFILL.md 9).
+- **The grouped output projection** is a strided slice of `att` in and of
+  `oa` out, so a chunk gathers each group's `[T][4096]`, runs the GEMM, and
+  scatters `[T][1024]` (`copy_rows`); T = 1 keeps step 4's direct calls.
+- **Routed experts, expert-major (`--ds4-expert-gather 1`, default).** A
+  chunk's T*6 assignments are sorted by expert on the device
+  (`k_ds4_moe_sort`: one workgroup, a thread an expert, ascending assignment
+  within an expert), and `k_ds4_moe` runs one item per EXPERT: each wave
+  stages the expert's row once (16-byte loads; over PCIe for a missed expert)
+  and loops over the expert's assignments. `0` runs one item per assignment.
+  Same loop body either way. A chunk reads missed experts in place (no
+  staging ring), which expert-major makes one PCIe read per expert row a
+  chunk. `k_ds4_moe` 48 / 53 / 50 / 23 VGPR (IQ2_XXS / IQ2_S / IQ3_XXS /
+  MXFP4), no spill; `k_ds4_moe_sort` 14 VGPR, 13 312 B LDS.
+- **Pipelined across cards (`--prefill-pipeline 1`, default).** Each card
+  but the last hands a chunk's residual on through two banks by chunk parity
+  (`hout[2]`), waiting on the next card's drain of the chunk two back
+  (`boundary_wait_free`), PREFILL.md section 10. Inner chunks skip the head
+  and are not awaited; the last is.
+- **Router counters** (`--adapt`): atomic now, since a chunk's rows are
+  workgroups running at once (integers, exact in any order).
+- `--time-prefill N`: the first N ids of `--tokens`/`--tokens-file`, cycled,
+  timed as a pipelined prefill (`prefill_ms_per_token=`); with `--profile`,
+  the class table per prompt token over chunks 2.. (the first pays the
+  one-time growths); then `--time` decodes at that depth. `--gemm-lds 1|2`
+  passes the L0 GEMM's LDS-tiled arm through (a summation-order change, off).
+- **What a chunk costs, projected (to be refuted).** A 256-token chunk
+  touches ~99.8 % of every layer's experts (1 536 assignments over 256), so
+  it reads the whole 84 GB expert set once: ~60 GB from VRAM (~0.15 s) and
+  the ~24 GB that is not resident over PCIe (~1-1.2 s at 20-25 GB/s), plus
+  the trunk once per 8 columns (205 GB, ~0.4 s; `--gemm-lds 1` once per 64)
+  and ~1.7 T MACs of expert dots. ~1.5-2 s a chunk, **~6-8 ms a prompt
+  token**, PCIe-bound by the non-resident experts; `--chunk 512` halves the
+  PCIe share. Against ~90 ms a token fed one at a time.
+
+### 13.4 Checks (CPU or compile-time; no GPU touched)
+
+- **Decode unchanged on the CPU arm:** the pre-change binary (`bc946e2`)
+  `--dump` against this one's `--oracle`, layers 0-3, 6 and 136 tokens:
+  172/172 float taps cos=1 maxabs=0 both.
+- **The chunk gate on the CPU arm**, 136 tokens (the HCA block 0 pooled
+  inside a chunk, 34 CSA blocks, the raw window wrapped), layers 0-3, three
+  "devices" (so the pipelined boundary's two banks are exercised): `--chunk 1
+  --dump`, then `--chunk 2, 5, 6, 7, 32, 128, 136 --oracle` and `--chunk 6
+  --prefill-pipeline 0`: **every run 172/172 float taps cos=1 maxabs=0**.
+  **2 200 prose tokens** (MMLU-Pro text; the lid scan over 550 blocks and
+  the top-512 SELECTING for the last ~150 positions), ctx 4 096: `--chunk 256`
+  against `--chunk 1`: 172/172 cos=1 maxabs=0, `lid_top_k` contained 1.0
+  (~29 min a run on the CPU arm).
+- `--adapt 1 --chunk 8` (swaps at chunk boundaries, 59 swaps, verify PASS)
+  against `--adapt 0 --chunk 1`: 172/172 cos=1 maxabs=0.
+- The new top-k's algorithm, transcribed on the host
+  (`~/bench/franken/ds4/pf/topk_emul.py`: radix passes, the suffix-scan bin
+  choice, the 1 024-thread index-order compaction) against a sort, 120 arrays
+  of 513-65 536 scores incl. heavy ties, negatives and near-equal floats:
+  0 bad (the set equals the sort's with ties lowest index first; the output
+  is ascending).
+- Qwen3.8 CPU gate: 1 604 compared, 0 not bit-exact.
+- The 65 pre-L5 GPU kernels: ISA- and descriptor-identical to `cbf0430`.
+- DS4 kernels against `bc946e2`, float-op multisets
+  (`~/bench/franken/ds4/pf/isa_ops.py`): unchanged except `k_ds4_gemv` /
+  `k_ds4_moe`, which are now ONE copy of the decoder (step 4 compiled two, a
+  staged and an in-place one; each had exactly the new copy's multiset), the
+  lid scan (4x, above), and one `v_mul_f32` of integer-division emulation
+  where a modulus or divisor became a runtime value (rope, stores, attention's
+  raw ring, the MoE tail). No spill anywhere.
+
+**Not claimed:** any GPU number; that the GPU decode is bit-identical to step
+4's (the multiset argument says so; (11) below proves or refutes it); the
+depth explanation beyond "not the attention path's work" (13.1: the probe
+decides); the prefill projection.
+
+### 13.5 The GPU gate (`ds4_gpu_gate.sh step5`; rig lock held, gateway stopped)
+
+```
+cd ~/src/colibri-m1/tools/hot-expert/franken/decode
+make franken_decode_ds4 GPU_BIN=franken_decode_ds4         # outside docker: the target calls docker itself
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined \
+  --ipc=host -e DS4_GPU_OK=1 -e LD_LIBRARY_PATH=/opt/rocm/lib:/home/ronald/src/llama-glm53/build-hip/bin \
+  -e HOME=/home/ronald -v /home/ronald:/home/ronald -w /home/ronald/src/colibri-m1/tools/hot-expert/franken/decode \
+  rocm/dev-ubuntu-24.04:7.14.0-full bash ./ds4_gpu_gate.sh step5 2>&1 | tee ~/bench/franken/ds4/step5.txt
+```
+
+(or one mode at a time: `s5-ident`, `s5-chunk`, `s5-long`, `s5-depth`,
+`s5-prefill`). What each checks:
+- **(11)** decode unchanged: `bc946e2`'s GPU binary (`~/bench/franken/ds4/pf/base_gpu`)
+  `--dump`, this one `--oracle`, eager and graph: expected every tap cos=1
+  maxabs=0, greedy identical.
+- **(12)** the chunk gate: `--chunk 1 --dump` against `--chunk 6` (one
+  chunk), `--chunk 6 --ds4-expert-gather 0`, and on 136 tokens `--chunk 7 /
+  32 / 128` and `--chunk 32 --prefill-pipeline 0`: expected not_bitexact=0,
+  greedy identical.
+- **(12b)** past 2 048 tokens: layers 0-3 on the GPU against the CPU arm's
+  dump of 2 200 prose tokens (`~/bench/franken/ds4/pf/c1_long`, min cos
+  0.999: the first GPU oracle of the top-512 at work), then the whole model,
+  `--chunk 256` against `--chunk 1`, eager and graph: expected bit-exact.
+- **(13)** the depth probe, 262 144 cells, `--probe-at 64,8192,64
+  --probe-n 32`: (13a) eager `--profile`, (13b) graph 0 / 1, (13c) one graph
+  class (no `hipGraphExecUpdate`), (13d) the adapt trajectory's
+  configuration, (13e) the prompt token by token.
+- **(14)** `--time-prefill 8192` and `32768 --time 32 --hip-graph 1`
+  (decode at depth 8k / 32k), (14b) the prefill's class table, (14c)
+  `--chunk 512`, `--gemm-lds 1`, `--ds4-expert-gather 0`.
+
+VRAM: a 256-row chunk adds ~0.6 GB a card at 262 144 cells (attention
+partials <= 256 MB under `--ds4-attn-mb`, the MoE intermediates 88 MB, the
+lid scores 67 MB, q and att 67 MB, the residuals and their banks 67 MB) and
+~0.04 GB of larger rings; `--chunk 512` about twice the first. If a card
+runs out: `--expert-gb 19.5`, or `--ds4-attn-mb 128`.
+
+New and changed kernels, `make resources` (gfx1100; VGPR / LDS B / waves a
+SIMD; none spills): `k_ds4_gemv` Q4_K 42 / 18 432 / 14, Q5_K 58 / 22 528 /
+10, IQ2_XXS 48 / 8 448 / 16, IQ2_S 53 / 10 496 / 16, IQ3_XXS 50 / 12 544 /
+16, MXFP4 23 / 17 408 / 14 (step 4: 35 / 54 / 41 / 40 / 38 / 16 VGPR, same
+LDS; Q5_K was already 10 waves); `k_ds4_moe` as `k_ds4_gemv` for the four
+expert formats; `k_ds4_lid_scores` 157 / 33 024 / 6; `k_ds4_topk` 18 /
+2 188 / 16; `k_ds4_attn_part` 41 / 32 896 / 6; `k_ds4_attn_combine` 11 / 0 /
+16; `k_ds4_moe_sort` 14 / 13 312 / 16; `k_ds4_copy_rows` 4 / 0 / 16;
+`k_ds4_router` 38 / 3 096 / 16; the elementwise and positional kernels
+<= 25 VGPR, 16 waves.

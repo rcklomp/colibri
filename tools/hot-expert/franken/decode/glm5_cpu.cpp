@@ -254,7 +254,8 @@ public:
 
     // ------------------------------------------------------------ MoE -------
     void router(const float * logits, const float * bias, float * probs, float * probs_b, int * ids,
-                float * w_raw, float * w_norm, float * w_scaled, int T) override {
+                float * w_raw, float * w_norm, float * w_scaled, const int * miss, uint32_t * stats,
+                int T) override {
         for (int t = 0; t < T; ++t) {
             const float * lg = logits + (size_t) t * N_EXPERT;
             float * pr = probs + (size_t) t * N_EXPERT, * pb = probs_b + (size_t) t * N_EXPERT;
@@ -273,6 +274,12 @@ public:
                 wn[k] = wr[k] / fs;                                     // ggml_div
                 ws[k] = wn[k] * EXPERT_WEIGHTS_SCALE;                   // ggml_scale
             }
+            if (stats)                                                  // --adapt: the route counters
+                for (int k = 0; k < N_EXPERT_USED; ++k) {
+                    ++stats[id[k]];
+                    stats[G_ADAPT_MISS] += miss[id[k]] != 0;
+                    ++stats[G_ADAPT_PICKS];
+                }
         }
     }
 
@@ -282,22 +289,57 @@ public:
         m.name = "expert";
         return m;
     }
-    void moe_gate_up(const ExpertTable & t, const int * ids, const float * x, float * yg, float * yu,
-                     int T) override {
-        for (int r = 0; r < T; ++r)
-            for (int k = 0; k < N_EXPERT_USED; ++k) {
-                const int a = r * N_EXPERT_USED + k;
-                const float * xr = x + (size_t) r * t.K_gu;
-                be_.gemv(expert_mat(t.up[ids[a]],   t.type_gu, t.row_gu, t.K_gu, t.rows_gu), xr,
-                         yu + (size_t) a * t.rows_gu);
-                be_.gemv(expert_mat(t.gate[ids[a]], t.type_gu, t.row_gu, t.K_gu, t.rows_gu), xr,
-                         yg + (size_t) a * t.rows_gu);
-            }
+    // ---- the routed experts, split by a LinkPlan (see glm5_ops.h) -----------
+    // On the CPU arm every "card" is this process: a helper's rows are the
+    // same GEMVs on the same bytes, written into the owner's buffers, so the
+    // three-link split is bit-identical to the owner-only path by construction.
+    struct Packet { std::vector<float> x; int ids[N_EXPERT_USED], mk[N_EXPERT_USED], assign[N_EXPERT_USED]; };
+    Packet pk_[2];
+    void moe_plan(const ExpertTable & t, const int * ids, const float * x, int me, const LinkPlan & lp,
+                  int salt, int bank) override {
+        Packet & p = pk_[bank & 1];
+        p.x.assign(x, x + t.K_gu);
+        int j = 0;
+        for (int k = 0; k < N_EXPERT_USED; ++k) {
+            p.ids[k] = ids[k];
+            p.mk[k] = t.miss_bytes[ids[k]] != 0;
+            p.assign[k] = p.mk[k] ? glm_link_card(lp, me, j++, salt) : me;
+        }
     }
-    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y, int T) override {
-        for (int a = 0; a < T * N_EXPERT_USED; ++a)
-            be_.gemv(expert_mat(t.down[ids[a]], t.type_d, t.row_d, t.K_d, t.rows_d),
-                     h + (size_t) a * t.K_d, y + (size_t) a * t.rows_d);
+    void rows_for(const ExpertTable & v, const Packet & p, int me, float * yg, float * yu, float * yh,
+                  float * yd, float limit) {
+        for (int k = 0; k < N_EXPERT_USED; ++k) {
+            if (p.assign[k] != me) continue;
+            const int e = p.ids[k];
+            float * gk = yg + (size_t) k * v.rows_gu, * uk = yu + (size_t) k * v.rows_gu;
+            float * hk = yh + (size_t) k * v.rows_gu;
+            be_.gemv(expert_mat(v.up[e],   v.type_gu, v.row_gu, v.K_gu, v.rows_gu), p.x.data(), uk);
+            be_.gemv(expert_mat(v.gate[e], v.type_gu, v.row_gu, v.K_gu, v.rows_gu), p.x.data(), gk);
+            for (int i = 0; i < v.rows_gu; ++i) {                        // ds4 swiglu_clamp, verbatim
+                const float g = std::min(gk[i], limit);
+                const float u = std::min(std::max(uk[i], -limit), limit);
+                hk[i] = g / (1.f + expf(-g)) * u;
+            }
+            be_.gemv(expert_mat(v.down[e], v.type_d, v.row_d, v.K_d, v.rows_d), hk, yd + (size_t) k * v.rows_d);
+        }
+    }
+    void moe_help(Glm5Ops & owner, const ExpertTable & view, int me, int bank, float * yg, float * yu,
+                  float * yh, float * yd, float limit) override {
+        rows_for(view, static_cast<Glm5CpuOps &>(owner).pk_[bank & 1], me, yg, yu, yh, yd, limit);
+    }
+    void moe_stage_own(const ExpertTable &, int, int) override {}
+    void moe_compute_own(const ExpertTable & t, int me, int bank, float * yg, float * yu, float * yh,
+                         float * yd, float limit) override {
+        rows_for(t, pk_[bank & 1], me, yg, yu, yh, yd, limit);
+    }
+
+    // per-head slices of one [K, rows, n_heads] tensor: the same GEMV per head
+    void head_gemv(const Mat & W, int n_heads, const float * x, int x_stride, float * y) override {
+        for (int h = 0; h < n_heads; ++h) {
+            Mat m = W;
+            m.base = (const unsigned char *) W.base + (size_t) h * W.rows * W.row_bytes;
+            be_.gemv(m, x + (size_t) h * x_stride, y + (size_t) h * W.rows);
+        }
     }
 
     // build_hc_mean: acc = H0; acc += H1; acc += H2; acc += H3; * (1/4)

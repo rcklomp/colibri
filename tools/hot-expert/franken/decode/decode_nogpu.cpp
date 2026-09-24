@@ -27,4 +27,12 @@ Ds4Ops * make_ds4_gpu_ops(Backend &) {
 }
 } // namespace ds4
 
+namespace glm5 {
+class Glm5Ops;
+Glm5Ops * make_glm5_gpu_ops(Backend &) {
+    throw std::runtime_error("this binary was built without HIP (franken_decode_cpu); "
+                             "the GLM-5.3 GPU ops are in franken_decode");
+}
+} // namespace glm5
+
 } // namespace fk

@@ -30,7 +30,8 @@
 
 #include "../gguf_model.h"
 #include "decode_backend.h"
-#include "ds4_ops.h"          // ExpertTable
+#include "ds4_ops.h"          // ExpertTable, Ds4Ops
+#include "glm5_ops.h"
 #include "glm5_shapes.h"
 
 namespace fk {
@@ -84,6 +85,18 @@ struct LayerWeights {
     ExpertTable et;                                  // per-expert addresses, backend memory
     std::vector<const void *> tab_host;              // [3 * 288]
     std::vector<int> miss_host;                      // [288]: slab bytes if host-side, else 0
+    int n_resident = N_EXPERT;
+    // THE HOST MIRROR (a GPU run): every expert of the layer in pinned,
+    // portable, device-mapped host memory, slab e at e * slab, never changed
+    // after load. A missed expert is read from it; --adapt swaps copy from it
+    // and an evicted expert is served from it at once. mir_view: the OWNER
+    // card's view (3 per expert: gate, up, down); mir_src: the host address.
+    std::vector<const void *> mir_view, mir_src;
+    // The layer's table as each card reads it (the three-link path): xt[owner]
+    // is `et`; xt[c] for another card points every expert at the mirror as
+    // mapped into card c (a helper only ever computes missed experts).
+    ExpertTable xt[3];
+    std::vector<const void *> xt_host[3];
     Mat sh_gate, sh_up, sh_down;                     // the shared expert, 2048 wide
 };
 
@@ -95,6 +108,10 @@ struct Placement {
     std::string hist_dir;
     std::vector<double> expert_gb = {17.0};
     int ctx = 262144;                 // for the per-card VRAM projection
+    // --adapt 1 on the CPU arm: the planned resident set is COPIED into a
+    // separate block, so a wrong slot address reads other bytes (a GPU run
+    // always has the mirror; its residency is a real VRAM block).
+    bool adapt = false;
 };
 
 class Glm5Model {
@@ -102,7 +119,8 @@ public:
     // One backend per layer range, in order. `split` (optional) is the first
     // layer of each card after the first; empty = the span split evenly. The
     // head (hc_mean, output_norm, output.weight) goes on the last card.
-    Glm5Model(const std::string & any_shard_path, std::vector<Backend *> devs, int il0, int il1,
+    Glm5Model(const std::string & any_shard_path, std::vector<Backend *> devs,
+              std::vector<ds4::Ds4Ops *> dops, std::vector<Glm5Ops *> gops, int il0, int il1,
               bool with_head, const std::vector<int> & split = {},
               const Placement & pl = Placement());
 
@@ -114,6 +132,7 @@ public:
     int il0() const { return il0_; }
     int il1() const { return il1_; }
     const LayerWeights & layer(int il) const { return layers_.at(il - il0_); }
+    LayerWeights & layer_mut(int il) { return layers_.at(il - il0_); }   // glm5_adapt.cpp
     int n_devices() const { return (int) devs_.size(); }
     Backend & dev(int d) const { return *devs_.at(d); }
     Backend & dev_for(int il) const { return *devs_.at(layer(il).dev); }
@@ -127,6 +146,8 @@ public:
     size_t placed_bytes() const { return placed_; }
     bool   planned() const { return planned_; }
     bool   resident(int il, int e) const { return resident_[(size_t) il][(size_t) e] != 0; }
+    void   set_resident(int il, int e, bool r) { resident_[(size_t) il][(size_t) e] = r ? 1 : 0; }
+    size_t host_expert_bytes() const { return host_expert_bytes_; }
 
 private:
     const TensorInfo * need(const std::string & name) const;
@@ -141,6 +162,10 @@ private:
 
     std::unique_ptr<GgufModel> model_;
     std::vector<Backend *> devs_;
+    std::vector<ds4::Ds4Ops *> dops_;
+    std::vector<Glm5Ops *> gops_;
+    bool adapt_cpu_ = false;
+    size_t host_expert_bytes_ = 0;
     std::vector<int> split_;
     std::vector<std::vector<char>> resident_;
     std::vector<unsigned char> embd_copy_;

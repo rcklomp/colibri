@@ -5,6 +5,7 @@
 #include "glm5_graph.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -34,8 +35,7 @@ Glm5Runner::Glm5Runner(Glm5Model & model, std::vector<ds4::Ds4Ops *> dops, std::
     const int n_dev = model_.n_devices();
     if ((int) dops_.size() != n_dev || (int) gops_.size() != n_dev)
         throw std::runtime_error("Glm5Runner: one Ds4Ops and one Glm5Ops per device");
-    for (int d = 0; d < n_dev; ++d)
-        if (model_.dev(d).is_gpu()) throw std::runtime_error("Glm5Runner: the GLM GPU path is not built (GLM5.md section 8)");
+    if (cfg_.links.n_links > 1 && n_dev != 3) cfg_.links.n_links = 1;   // three links need three cards
     const size_t n_pool = (size_t) (cfg_.ctx / KPOOL + 1);
     iscore_stride_ = n_pool;
     scr_.resize((size_t) n_dev);
@@ -66,17 +66,11 @@ Glm5Runner::Glm5Runner(Glm5Model & model, std::vector<ds4::Ds4Ops *> dops, std::
         hmean_ = F(N_EMBD); hn_ = F(N_EMBD); logits_ = F(N_VOCAB);
         greedy_ = b.alloc_i32(1); owned_.emplace_back(&b, greedy_);
     }
-    // positional state, on the layer's own card, zeroed (KDA starts from a
-    // zero conv window and a zero state, as the recurrent cache does)
     st_.resize((size_t) (model_.il1() - model_.il0() + 1));
     for (int il = model_.il0(); il <= model_.il1(); ++il) {
         LayerState & s = st_[(size_t) (il - model_.il0())];
         Backend & b = be(il);
-        auto R = [&](size_t bytes) {
-            void * p = b.alloc_raw(bytes); owned_.emplace_back(&b, p);
-            std::vector<unsigned char> z(bytes, 0); b.upload(p, z.data(), bytes);
-            return p;
-        };
+        auto R = [&](size_t bytes) { void * p = b.alloc_raw(bytes); owned_.emplace_back(&b, p); return p; };
         if (!model_.layer(il).dsa) {
             s.conv = (float *) R((size_t) (KDA_CONV - 1) * KDA_QKV * sizeof(float));
             s.ssm  = (float *) R((size_t) N_HEAD * KDA_DIM * KDA_DIM * sizeof(float));
@@ -87,11 +81,35 @@ Glm5Runner::Glm5Runner(Glm5Model & model, std::vector<ds4::Ds4Ops *> dops, std::
             s.pooled  = (uint16_t *) R(n_pool * IDX_DIM * 2);
         }
     }
+    rewind();                              // zero the recurrent state (alloc_raw zeroes too; explicit)
     routed_.assign((size_t) (model_.il1() - model_.il0() + 1) * N_EXPERT_USED, -1);
+    // attention partials and the miss path's rings, once (nothing allocates per token)
+    size_t max_slab = 0;
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        const LayerWeights & L = model_.layer(il);
+        if (L.moe) max_slab = std::max(max_slab, L.et.sz_g + L.et.sz_u + L.et.sz_d);
+    }
+    for (int d = 0; d < n_dev; ++d) {
+        gops_[(size_t) d]->reserve(cfg_.ctx);
+        if (max_slab) gops_[(size_t) d]->moe_reserve(max_slab);
+    }
+    if (cfg_.adapt.on) adapt_.reset(new Adapter(model_, dops_, cfg_.adapt));
 }
 
 Glm5Runner::~Glm5Runner() {
     for (auto & o : owned_) o.first->free_buf(o.second);
+}
+
+void Glm5Runner::rewind() {
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        LayerState & s = st_[(size_t) (il - model_.il0())];
+        Backend & b = be(il);
+        auto Z = [&](void * p, size_t bytes) { std::vector<unsigned char> z(bytes, 0); b.upload(p, z.data(), bytes); };
+        if (s.conv) Z(s.conv, (size_t) (KDA_CONV - 1) * KDA_QKV * sizeof(float));
+        if (s.ssm)  Z(s.ssm, (size_t) N_HEAD * KDA_DIM * KDA_DIM * sizeof(float));
+        if (s.kg)   Z(s.kg, (size_t) s.kg_rows * 2 * IDX_DIM * 2);
+    }
+    pos_ = 0;
 }
 
 void Glm5Runner::report_cache_bytes(FILE * out) const {
@@ -105,9 +123,11 @@ void Glm5Runner::report_cache_bytes(FILE * out) const {
         }
     }
     std::fprintf(out, "glm5_cache fixed_bytes=%zu (KDA state + conv windows, indexer rings) "
-                      "per_token_bytes=%.1f allocated_for_ctx=%.3f GB (layers %d-%d, ctx %d) scoring=%d\n",
+                      "per_token_bytes=%.1f allocated_for_ctx=%.3f GB (layers %d-%d, ctx %d) scoring=%d "
+                      "links=%d lone=%d adapt=%d\n",
                  fixed, per_tok_num / (double) KPOOL, ((per_tok_num / (double) KPOOL) * cfg_.ctx + fixed) / 1e9,
-                 model_.il0(), model_.il1(), cfg_.ctx, (int) scoring());
+                 model_.il0(), model_.il1(), cfg_.ctx, (int) scoring(), cfg_.links.n_links, cfg_.links.lone,
+                 cfg_.adapt.on);
 }
 
 // build_hc_pre (DS4): flat RMS norm (no gamma, the model's rms eps), the
@@ -228,24 +248,26 @@ void Glm5Runner::dsa(int il, Recorder & rec) {
     o.gemv(L.wkv_a, s.xn, s.kv, 1);
     b.rms_norm_mul(s.kv, L.kv_a_norm, s.kv, KV_LORA, 1, KV_LORA, eps_);
     rec.tap(b, "dsa_kv_a_norm", il, s.kv, KV_LORA);
-    for (int h = 0; h < N_HEAD; ++h)                 // q_nope through wk_b, head by head
-        o.gemv(L.wk_b[h], s.q + (size_t) h * QK_HEAD, s.qabs + (size_t) h * KV_LORA, 1);
+    g.head_gemv(L.wk_b[0], N_HEAD, s.q, QK_HEAD, s.qabs);    // q_nope through wk_b, per head
     rec.tap(b, "dsa_q_absorbed", il, s.qabs, (size_t) N_HEAD * KV_LORA);
     rec.tap(b, "dsa_kv_latent", il, s.kv, KV_LORA);
 
     g.store_f16(s.kv, KV_LORA, st.kv, KV_LORA, 0, KV_LORA, 0, p, 1);   // cpy_k, then attend
     g.mla_attn(s.qabs, st.kv, p, sel, 1.0f / sqrtf((float) QK_HEAD), s.att, 1);
-    for (int h = 0; h < N_HEAD; ++h)                 // v_mla: the latent back to 256 a head
-        o.gemv(L.wv_b[h], s.att + (size_t) h * KV_LORA, s.kqv + (size_t) h * V_HEAD, 1);
+    g.head_gemv(L.wv_b[0], N_HEAD, s.att, KV_LORA, s.kqv);   // v_mla: the latent back to 256 a head
     rec.tap(b, "kqv_out", il, s.kqv, O_WIDTH);
     o.gemv(L.wo, s.kqv, s.ao, 1);
     rec.tap(b, "dsa_out", il, s.ao, N_EMBD);
 }
 
-// build_layer_ffn (GLM): layers 0-2 a dense SwiGLU clamped at 10 (build_ffn
-// applies swiglu_clamp_shexp[il] to every PAR SiLU FFN of this arch); the
-// rest build_moe_ffn (sigmoid, exp_probs_b for the selection only, top-8,
+// build_layer_ffn (GLM): layers 0-2 a dense SwiGLU clamped at 10; the rest
+// build_moe_ffn (sigmoid, exp_probs_b for the selection only, top-8,
 // normalised, x2.5, clamped) plus the clamped, UNSCALED shared expert.
+// The routed experts go through the LinkPlan (glm5_ops.h): the owner plans,
+// the helper cards start on their share at once (their own streams and host
+// links), the owner forks its own misses' staging copy, runs the shared
+// expert and its resident experts meanwhile, then its staged misses, then
+// joins the helpers and sums the eight rows in slot order.
 void Glm5Runner::ffn(int il, Recorder & rec) {
     const LayerWeights & L = model_.layer(il);
     Scratch & s = S(il);
@@ -268,9 +290,19 @@ void Glm5Runner::ffn(int il, Recorder & rec) {
 
     o.gemv(L.gate_inp, s.xn, s.rlog, 1);
     rec.tap(b, "ffn_moe_logits", il, s.rlog, N_EXPERT);
-    g.router(s.rlog, L.exp_probs_b, s.probs, s.probs_b, s.ids, s.wraw, s.wnorm, s.wsc, 1);
+    g.router(s.rlog, L.exp_probs_b, s.probs, s.probs_b, s.ids, s.wraw, s.wnorm, s.wsc, L.et.miss_bytes,
+             adapt_ ? adapt_->stats(il) : nullptr, 1);
     rec.tap(b, "ffn_moe_probs", il, s.probs, N_EXPERT);
     rec.tap(b, "ffn_moe_probs_biased", il, s.probs_b, N_EXPERT);
+
+    const int me = L.dev, bank = il & 1, salt = (7 * il) % 11;
+    g.moe_plan(L.et, s.ids, s.xn, me, cfg_.links, salt, bank);
+    if (cfg_.links.n_links > 1)
+        for (int c = 0; c < model_.n_devices(); ++c)
+            if (c != me)
+                gops_[(size_t) c]->moe_help(g, L.xt[c], c, bank, s.yg, s.yu, s.yh, s.yd, SWIGLU_CLAMP);
+    g.moe_stage_own(L.et, me, bank);
+
     if (cfg_.log_routing || rec.enabled()) {
         std::vector<int> ids(U);
         b.download(ids.data(), s.ids, U * sizeof(int));
@@ -289,12 +321,13 @@ void Glm5Runner::ffn(int il, Recorder & rec) {
     o.gemv(L.sh_down, s.sh, s.sd, 1);
     rec.tap(b, "ffn_shexp", il, s.sd, N_EMBD);
 
-    g.moe_gate_up(L.et, s.ids, s.xn, s.yg, s.yu, 1);
+    g.moe_compute_own(L.et, me, bank, s.yg, s.yu, s.yh, s.yd, SWIGLU_CLAMP);
+    if (cfg_.links.n_links > 1)
+        for (int c = 0; c < model_.n_devices(); ++c)
+            if (c != me) g.moe_join(*gops_[(size_t) c]);
     rec.tap(b, "ffn_moe_up",   il, s.yu, U * N_FF_EXP);
     rec.tap(b, "ffn_moe_gate", il, s.yg, U * N_FF_EXP);
-    o.swiglu_clamp(s.yg, s.yu, s.yh, (int) (U * N_FF_EXP), SWIGLU_CLAMP);
     rec.tap(b, "ffn_moe_swiglu_limited", il, s.yh, U * N_FF_EXP);
-    g.moe_down(L.et, s.ids, s.yh, s.yd, 1);
     rec.tap(b, "ffn_moe_down", il, s.yd, U * N_EMBD);
     o.moe_accum(s.yd, s.wsc, N_EXPERT_USED, N_EMBD, s.ywt, s.moe, 1);
     rec.tap(b, "ffn_moe_weighted", il, s.ywt, U * N_EMBD);
@@ -333,10 +366,15 @@ void Glm5Runner::layer(int il, Recorder & rec) {
 int Glm5Runner::step(int32_t token, Recorder & rec) {
     const int il0 = model_.il0(), il1 = model_.il1();
     if (pos_ + 1 > cfg_.ctx) throw std::runtime_error("context full");
+    // --adapt: the token boundary -- the previous token is queued on every
+    // card, nothing of this one is (glm5_adapt.h, DEEPSEEK4.md section 12)
+    if (adapt_) adapt_->tick(pos_);
+    if (profile_) for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).timer_start();
     Backend & b0 = be(il0);
     Scratch & s0 = S(il0);
     std::vector<float> e(N_EMBD);
     model_.embed_row(token, e.data());
+    b0.boundary_wait_free(0);              // the next card has read last token's H out of us
     b0.upload(s0.x, e.data(), N_EMBD * sizeof(float));
     std::fill(routed_.begin(), routed_.end(), -1);
 
@@ -353,6 +391,7 @@ int Glm5Runner::step(int32_t token, Recorder & rec) {
             be(il).boundary_recv(S(il).H, be(il - 1), S(il - 1).H, (size_t) HC_DIM * sizeof(float), 0);
         }
         for (int l = il; l <= last; ++l) layer(l, rec);
+        if (profile_) dop(last).prof_gap();
         il = last + 1;
     }
     int id = -1;
@@ -368,6 +407,7 @@ int Glm5Runner::step(int32_t token, Recorder & rec) {
         b.argmax(logits_, N_VOCAB, greedy_);
         b.download(&id, greedy_, sizeof(int));
     }
+    if (profile_) for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).prof_end_token();
     ++pos_;
     return id;
 }
@@ -408,17 +448,25 @@ bool load_routing(const std::string & dir, std::map<std::pair<int, int>, std::ve
     return !ref.empty();
 }
 
+double median(std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
 } // namespace
 
 int glm5_main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string model_path, oracle_dir, dump_dir, routing_dir;
     std::vector<int32_t> tokens;
-    std::vector<int> split;
+    std::vector<int> split, probe_at;
     int il0 = 0, il1 = N_LAYER - 1, n_devices = 3, threads = 4, ctx = 512, greedy_n = 0, max_tokens = 0;
-    bool with_head = true, use_cpu = false, plan_only = false, quant_act = false;
+    int time_n = 0, probe_n = 32, three_link = -1, lone = 2, adapt_on = -1;
+    bool with_head = true, use_cpu = false, plan_only = false, quant_act = false, sync_debug = false, profile = false;
     double min_cos = 0.999;
     Placement pl;
+    AdaptConfig adapt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if      (a == "--model"  && i + 1 < argc) model_path = argv[++i];
@@ -427,19 +475,31 @@ int glm5_main(int argc, char ** argv) {
         else if (a == "--dump"   && i + 1 < argc) dump_dir = argv[++i];
         else if (a == "--placement" && i + 1 < argc) pl.hist_dir = argv[++i];
         else if (a == "--expert-gb" && i + 1 < argc) pl.expert_gb = parse_list_d(argv[++i]);
-        else if (a == "--split" && i + 1 < argc) {
-            for (double v : parse_list_d(argv[++i])) split.push_back((int) v);
-        }
+        else if (a == "--split" && i + 1 < argc) { for (double v : parse_list_d(argv[++i])) split.push_back((int) v); }
         else if (a == "--cpu")                    use_cpu = true;
         else if (a == "--plan-only")              plan_only = true;
         else if (a == "--quant-act")              quant_act = true;   // Q8_0 activations, as ggml's CPU matmul
+        else if (a == "--sync-debug")             sync_debug = true;  // drain + check after every launch
+        else if (a == "--profile")                profile = true;     // per-class device time, the --time tokens
         else if (a == "--no-head")                with_head = false;
         else if (a == "--devices"&& i + 1 < argc) n_devices = std::atoi(argv[++i]);
         else if (a == "--threads"&& i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--ctx"    && i + 1 < argc) ctx = std::atoi(argv[++i]);
         else if (a == "--greedy" && i + 1 < argc) greedy_n = std::atoi(argv[++i]);
+        else if (a == "--time"   && i + 1 < argc) time_n = std::atoi(argv[++i]);
         else if (a == "--min-cos"&& i + 1 < argc) min_cos = std::atof(argv[++i]);
         else if (a == "--max-tokens" && i + 1 < argc) max_tokens = std::atoi(argv[++i]);
+        else if (a == "--three-link" && i + 1 < argc) three_link = std::atoi(argv[++i]);
+        else if (a == "--lone-dev" && i + 1 < argc) lone = std::atoi(argv[++i]);
+        else if (a == "--adapt" && i + 1 < argc)  adapt_on = std::atoi(argv[++i]);
+        else if (a == "--adapt-every" && i + 1 < argc) adapt.every = std::atoi(argv[++i]);
+        else if (a == "--adapt-mb-per-token" && i + 1 < argc) adapt.mb_per_token = std::atof(argv[++i]);
+        else if (a == "--adapt-halflife" && i + 1 < argc) adapt.halflife = std::atof(argv[++i]);
+        else if (a == "--adapt-margin" && i + 1 < argc) adapt.margin = std::atof(argv[++i]);
+        else if (a == "--adapt-hyst" && i + 1 < argc) adapt.hyst = std::atof(argv[++i]);
+        else if (a == "--adapt-verify" && i + 1 < argc) adapt.verify = std::atoi(argv[++i]);
+        else if (a == "--probe-n" && i + 1 < argc) probe_n = std::atoi(argv[++i]);
+        else if (a == "--probe-at" && i + 1 < argc) { for (double v : parse_list_d(argv[++i])) probe_at.push_back((int) v); }
         else if (a == "--layers" && i + 1 < argc) {
             if (!parse_range(argv[++i], il0, il1)) { std::fprintf(stderr, "bad --layers\n"); return 2; }
         } else if (a == "--tokens") {
@@ -458,43 +518,86 @@ int glm5_main(int argc, char ** argv) {
     if (model_path.empty() || (tokens.empty() && !plan_only)) {
         std::fprintf(stderr, "usage: franken_decode --model <glm5next shard> --tokens <ids> [--cpu]\n"
                              "  [--layers A-B] [--no-head] [--devices N] [--split L1,L2] [--ctx N] [--threads N]\n"
-                             "  [--tokens-file F [--max-tokens N]] [--quant-act]\n"
-                             "  [--oracle DIR] [--routing DIR] [--dump DIR] [--min-cos X] [--greedy N]\n"
-                             "  [--plan-only --placement DIR --expert-gb X[,Y,Z]]   (the VRAM / miss plan; no model byte read)\n");
+                             "  [--tokens-file F [--max-tokens N]] [--quant-act] [--sync-debug] [--profile]\n"
+                             "  [--oracle DIR] [--routing DIR] [--dump DIR] [--min-cos X] [--greedy N] [--time N]\n"
+                             "  [--probe-at D1,D2,... [--probe-n W]]   (decode W tokens at each depth; a lower depth rewinds)\n"
+                             "  [--placement DIR --expert-gb X[,Y,Z]] [--plan-only]\n"
+                             "  [--three-link 0|1 [--lone-dev N]]   (default 1 with three devices; lone card HIP 2)\n"
+                             "  [--adapt 0|1 [--adapt-every N] [--adapt-mb-per-token X] [--adapt-halflife T]\n"
+                             "   [--adapt-margin M] [--adapt-hyst H] [--adapt-verify 0|1]]   (default 1 on a GPU run)\n");
         return 2;
     }
-    if (!use_cpu) {
-        std::fprintf(stderr, "glm5: the GPU path is not built yet (GLM5.md section 8); run with --cpu\n");
-        return 2;
+    if (!probe_at.empty() && !tokens.empty()) {          // the prompt, cycled, reaches the deepest probe
+        int need = 0;
+        for (int d : probe_at) need = std::max(need, d + probe_n);
+        std::vector<int32_t> src = tokens;
+        tokens.clear();
+        for (int i = 0; i < need; ++i) tokens.push_back(src[(size_t) i % src.size()]);
     }
-    if (max_tokens > 0 && (int) tokens.size() > max_tokens) tokens.resize((size_t) max_tokens);
-    if (!plan_only && (int) tokens.size() + greedy_n > ctx) { std::fprintf(stderr, "--ctx too small\n"); return 2; }
+    if (max_tokens > 0 && (int) tokens.size() > max_tokens && probe_at.empty()) tokens.resize((size_t) max_tokens);
+    if (!plan_only && probe_at.empty() && (int) tokens.size() + greedy_n + time_n > ctx) {
+        std::fprintf(stderr, "--ctx too small\n"); return 2;
+    }
     if (n_devices < 1) n_devices = 1;
+    if (three_link < 0) three_link = n_devices == 3 ? 1 : 0;
+    if (adapt_on < 0) adapt_on = use_cpu ? 0 : 1;
+    adapt.on = adapt_on;
+    if (adapt.on && pl.hist_dir.empty()) { std::fprintf(stderr, "--adapt 1 needs --placement (the starting set)\n"); return 2; }
+    pl.adapt = adapt.on != 0;
     pl.ctx = ctx;
 
     try {
-        std::unique_ptr<Backend> cpu(make_cpu_backend(threads));
-        if (quant_act) cpu->set_quant_act(true);
-        std::vector<Backend *> devs((size_t) n_devices, cpu.get());
+        std::vector<std::unique_ptr<Backend>> owned_be;
+        std::vector<Backend *> devs;
+        if (use_cpu) {
+            owned_be.emplace_back(make_cpu_backend(threads));
+            if (quant_act) owned_be[0]->set_quant_act(true);
+            for (int d = 0; d < n_devices; ++d) devs.push_back(owned_be[0].get());
+        } else {
+            enable_peer_access(n_devices);          // before anything is placed
+            for (int d = 0; d < n_devices; ++d) {
+                owned_be.emplace_back(make_gpu_backend(d));
+                devs.push_back(owned_be.back().get());
+            }
+        }
         std::vector<std::unique_ptr<ds4::Ds4Ops>> own_d;
         std::vector<std::unique_ptr<Glm5Ops>> own_g;
         std::vector<ds4::Ds4Ops *> dops;
         std::vector<Glm5Ops *> gops;
         for (Backend * b : devs) {
-            own_d.emplace_back(ds4::make_ds4_cpu_ops(*b)); dops.push_back(own_d.back().get());
-            own_g.emplace_back(make_glm5_cpu_ops(*b));     gops.push_back(own_g.back().get());
+            if (sync_debug) b->set_sync_debug(true);
+            if (profile && !use_cpu) b->set_profile(true);
+            own_d.emplace_back(use_cpu ? ds4::make_ds4_cpu_ops(*b) : ds4::make_ds4_gpu_ops(*b));
+            dops.push_back(own_d.back().get());
+            own_g.emplace_back(use_cpu ? make_glm5_cpu_ops(*b) : make_glm5_gpu_ops(*b));
+            gops.push_back(own_g.back().get());
+            gops.back()->set_profile(profile && !use_cpu);
+            dops.back()->set_profile(profile && !use_cpu);
         }
+        const int n_report = use_cpu ? 1 : n_devices;
+        for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "before placement");
         const bool head = with_head && il1 == N_LAYER - 1;
-        Glm5Model model(model_path, devs, il0, il1, head, split, pl);
+        Glm5Model model(model_path, devs, dops, gops, il0, il1, head, split, pl);
         std::printf("arch=glm5next backend=%s devices=%d layers=%d-%d head=%d ctx=%d tokens=%zu placed=%.2f GB "
-                    "rms_eps=%g ln_eps=%g hc_eps=%g quant_act=%d\n",
+                    "host_mirror=%.2f GB rms_eps=%g ln_eps=%g hc_eps=%g quant_act=%d\n",
                     devs[0]->name(), n_devices, il0, il1, (int) head, ctx, tokens.size(),
-                    model.placed_bytes() / 1e9, model.rms_eps(), model.ln_eps(), model.hc_eps(), (int) quant_act);
+                    model.placed_bytes() / 1e9, model.host_expert_bytes() / 1e9, model.rms_eps(), model.ln_eps(),
+                    model.hc_eps(), (int) quant_act);
         if (plan_only) { std::printf("plan-only: stopping before the caches\n"); return 0; }
+        for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after placement");
+        bool placement_ok = true;
+        for (int d = 0; d < n_report; ++d) placement_ok &= devs[d]->verify_placement(stdout);
+        if (!placement_ok) { std::printf("GLM5 FAIL (placement)\n"); return 1; }
 
         Glm5Config cfg; cfg.ctx = ctx; cfg.log_routing = !routing_dir.empty();
+        cfg.links.n_links = three_link ? 3 : 1; cfg.links.lone = lone;
+        cfg.adapt = adapt;
+        if (adapt.on)
+            std::printf("adapt=1 every=%d mb_per_token=%.1f halflife=%.0f margin=%.2f hyst=%.2f verify=%d\n",
+                        adapt.every, adapt.mb_per_token, adapt.halflife, adapt.margin, adapt.hyst, adapt.verify);
         Glm5Runner run(model, dops, gops, cfg);
         run.report_cache_bytes(stdout);
+        for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after caches+scratch");
 
         std::map<std::pair<int, int>, std::vector<int>> ref_routes;
         const bool have_routes = !routing_dir.empty() && load_routing(routing_dir, ref_routes);
@@ -519,12 +622,51 @@ int glm5_main(int argc, char ** argv) {
 
         Recorder rec;
         int last = -1;
+        // ---- --probe-at: decode W tokens at each depth -------------------------
+        if (!probe_at.empty()) {
+            run.set_log_routing(false);
+            for (int D : probe_at) {
+                if (D < run.pos()) run.rewind();
+                const auto f0 = std::chrono::steady_clock::now();
+                const int from = run.pos();
+                while (run.pos() < D) last = run.step(tokens[(size_t) run.pos()], rec);
+                for (int d = 0; d < n_report; ++d) devs[d]->sync();
+                const double fms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+                if (profile && !use_cpu) for (int d = 0; d < n_report; ++d) devs[d]->prof_reset();
+                run.set_profile(profile && !use_cpu);
+                std::vector<double> ms;
+                for (int i = 0; i < probe_n; ++i) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    last = run.step(tokens[(size_t) run.pos()], rec);
+                    for (int d = 0; d < n_report; ++d) devs[d]->sync();
+                    ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                }
+                run.set_profile(false);
+                const double med = median(ms);
+                std::printf("glm5_probe depth=%d tokens=%d ms_median=%.3f tok_s=%.2f ms_min=%.3f ms_max=%.3f "
+                            "links=%d adapt=%d (prefill %d->%d token by token in %.1f ms)\n",
+                            D, probe_n, med, med > 0 ? 1000.0 / med : 0.0,
+                            *std::min_element(ms.begin(), ms.end()), *std::max_element(ms.begin(), ms.end()),
+                            cfg.links.n_links, adapt.on, from, D, fms);
+                if (profile && !use_cpu)
+                    for (int d = 0; d < n_report; ++d) {
+                        std::printf("--- probe depth=%d device %d (per token, %d tokens) ---\n", D, d, probe_n);
+                        devs[d]->prof_report(stdout, probe_n);
+                    }
+            }
+            if (run.adapter()) { for (int d = 0; d < n_report; ++d) devs[d]->sync(); run.adapter()->finish(run.pos(), stdout); }
+            return 0;
+        }
+        // ---- the prompt, token by token ----------------------------------------
+        const auto tp0 = std::chrono::steady_clock::now();
         for (size_t t = 0; t < tokens.size(); ++t) {
             rec.enable(t + 1 == tokens.size());           // the taps are the LAST prompt token's
             last = run.step(tokens[t], rec);
             observe(run.pos() - 1);
             if (t == 0) std::printf("token 0 done\n");
         }
+        std::printf("prompt_tokens=%zu prompt_ms=%.1f (token by token)\n", tokens.size(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count());
         const std::vector<int> last_ids = run.routed_ids();
         rec.enable(false);
         if (greedy_n > 0 && last >= 0) {
@@ -537,8 +679,32 @@ int glm5_main(int argc, char ** argv) {
             rec.tap_host("greedy_ids", -1, std::vector<float>(greedy.begin(), greedy.end()));
             rec.enable(false);
         }
+        if (time_n > 0 && last >= 0) {
+            run.set_log_routing(false);
+            if (profile && !use_cpu) for (int d = 0; d < n_report; ++d) { devs[d]->sync(); devs[d]->prof_reset(); }
+            run.set_profile(profile && !use_cpu);
+            std::vector<double> ms;
+            for (int i = 0; i < time_n; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                last = run.step(last, rec);
+                ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+            run.set_profile(false);
+            const double med = median(ms);
+            std::printf("glm5_decode_ms_median=%.3f tok_s=%.2f tokens=%d depth_end=%d ctx=%d links=%d adapt=%d\n",
+                        med, med > 0 ? 1000.0 / med : 0.0, time_n, run.pos(), ctx, cfg.links.n_links, adapt.on);
+            if (profile && !use_cpu)
+                for (int d = 0; d < n_report; ++d) {
+                    std::printf("--- device %d (per token, %d tokens) ---\n", d, time_n);
+                    devs[d]->prof_report(stdout, time_n);
+                }
+        }
 
         bool ok = true;
+        if (run.adapter()) {
+            for (int d = 0; d < n_report; ++d) devs[d]->sync();
+            if (!run.adapter()->finish(run.pos(), stdout)) { std::printf("GLM5 ADAPT VERIFY FAIL\n"); ok = false; }
+        }
         // SLOT ORDER (the DeepSeek CLI's rule): align the per-slot taps to the
         // reference's slot order only when both routers picked the same SET at
         // the last prompt position; unequal sets are left to fail.
@@ -606,7 +772,8 @@ int glm5_main(int argc, char ** argv) {
                     }
                 }
                 ok &= cmp_ok && req_ok;
-                std::printf("GLM5 CPU ORACLE %s (min_cos=%g)\n", (cmp_ok && req_ok) ? "PASS" : "FAIL", min_cos);
+                std::printf("GLM5 %s ORACLE %s (min_cos=%g)\n", use_cpu ? "CPU" : "GPU",
+                            (cmp_ok && req_ok) ? "PASS" : "FAIL", min_cos);
             }
         }
         return ok ? 0 : 1;

@@ -1,7 +1,8 @@
-# GLM-5.3-Flash on the Franken engine — L5 GLM steps 1-3 (2026-09-24)
+# GLM-5.3-Flash on the Franken engine — L5 GLM steps 1-4 (2026-09-24)
 
 The model, the path DeepSeek-V4 took (DEEPSEEK4.md, the template), and what
-steps 1-3 built and proved. **Everything below that says "measured" was
+steps 1-3 built and proved; step 4 (the GPU side: kernels, adaptive placement,
+the three-link miss path) is section 9. **Everything below that says "measured" was
 measured on the CPU arm or by the compiler; nothing here is a GPU
 measurement.** Section 5 (placement) and section 8 (kernels) are plans and
 projections.
@@ -320,3 +321,198 @@ New or generalised (Opus tier where marked):
 selecting), then the whole model's greedy text against llama.cpp (needs a
 whole-model read: 8.8 GB trunk + the routed experts — only with GLM not
 serving).
+
+## 9. Step 4 (2026-09-24): the GPU side — kernels, adaptive placement, the three-link miss path (built, not run on a GPU)
+
+**Everything here was built and checked on the CPU arm or by the compiler.
+No GPU was touched; no GPU number is claimed.**
+
+### 9.1 What runs where
+
+`Glm5GpuOps` (`glm5_gpu.inc`, #included at the end of `decode_gpu.hip` after
+`ds4_gpu.inc`) implements `glm5_ops.h` on a card; `Ds4GpuOps` supplies what GLM
+shares with DeepSeek unchanged (the L0 GEMV for Q8_0 / Q6_K / F32, the
+hyper-connection mix, `swiglu_clamp`, `moe_accum`, the adaptive-placement I/O);
+the backend supplies `rms_norm_mul`, `l2_norm`, `gated_rms_norm`, `argmax` and
+the boundary P2P. Layers 0-14 / 15-29 / 30-44 on HIP 0 / 1 / 2, the head on
+HIP 2; only H (64 KB) crosses a boundary — plus the three-link traffic (9.3).
+The prompt is fed token by token (T = 1); no `--hip-graph` and no chunked
+prefill for GLM yet (section 10).
+
+### 9.2 The kernels (`make resources`, gfx1100, -O3; VGPR / LDS B / waves a SIMD; none spills)
+
+| kernel | VGPR / LDS / waves | what |
+|---|---|---|
+| `k_glm5_kda_conv` | 18 / 0 / 16 | a thread a q|k|v channel: 4-tap conv over the 3-row window + SiLU, the window advanced in place |
+| `k_glm5_kda_gate` | 8 / 0 / 16 | g = -5·sigmoid(-(ssm_a·(f_b·f_a·x + dt))) |
+| `k_glm5_kda_step` | 144 / 1 536 / 10 | the KDA recurrence, a workgroup a head: a thread holds half a state row (64 keys) in registers; decay by exp(g) per KEY channel, prediction, delta, rank-1 update, output; the two halves meet by a lane exchange |
+| `k_glm5_layer_norm` | 20 / 16 / 16 | the indexer's LayerNorm with bias |
+| `k_glm5_store_f16` | 5 / 0 / 16 | f16 rows: the latent K = V cache, the indexer key / gate ring |
+| `k_glm5_idx_pool` | 21 / 0 / 16 | the 4-cell softmax pool with ape, when a pool closes |
+| `k_glm5_idx_scores` | 157 / 16 512 / 9 | the pool scan: DeepSeek's `k_ds4_lid_scores` shape at 32 heads, pooled f16 keys, no FWHT |
+| `k_ds4_topk` (reused) | 18 / 2 188 / 16 | the top-512 POOLS, ascending: its visible count (p+1)/4 is exactly GLM's (KPOOL = CSA_RATIO = 4, asserted) |
+| `k_glm5_head_gemv_q8` | 13 / 0 / 16 | `attn_k_b` / `attn_v_b`: all 64 heads' slices in ONE launch (32 768 / 16 384 rows, each against its head's x) |
+| `k_glm5_attn_part` / `_combine` | 40 / 32 896 / 6 ; 11 / 0 / 16 | absorbed MLA: DeepSeek's split (32 keys a workgroup in LDS, 16 heads, V = K) over the attended cells (every cell ≤ p while ≤ 512 pools are visible; else the 2 048 cells of the selected pools + the tail), no sink; ≤ 2 051 keys at any depth |
+| `k_glm5_router` | 54 / 5 280 / 16 | sigmoid, + exp_probs_b for the selection, top-8 of 288 (eight block argmax passes, lower index on a tie), weights / sum × 2.5, the `--adapt` counters |
+| `k_glm5_moe<IQ3_S / IQ4_XS / Q6_K>` | 38 / 14 080 / 16 ; 43 / 17 408 / 14 ; 42 / 13 440 / 16 | routed-expert GEMVs through the table or the staged pointers, row staged into LDS by 16-byte loads, the bit-exact lane decoders (section 7a) |
+| `k_glm5_plan` | 7 / 0 / 16 | the per-layer packet: x, ids, missed flags, the card for each slot |
+| `k_glm5_stage` | 8 / 0 / 16 | a card's missed slabs host → its VRAM ring over its own link, grid-stride 16-byte loads |
+| `k_glm5_swiglu_rows` | 11 / 0 / 16 | swiglu_clamp on the slots a card computes |
+| `k_glm5_scatter` | 12 / 0 / 16 | a helper's finished rows (gate, up, swiglu, down) into the owner's buffers, peer stores |
+| `k_glm5_hc_mean` | 9 / 0 / 16 | the head's unweighted stream mean |
+
+**The pre-existing kernels are unchanged**: device assembly of
+`decode_gpu.hip` at `f786a5f` against this tree (comments and label numbering
+normalised): **99 of 99** (65 qwen4exp + 34 DeepSeek) instruction-identical,
+every `.amdhsa` descriptor identical, 19 new. `decode_gpu.hip` itself gains an
+include, five appended profile classes (`glm5_kda`, `glm5_indexer`,
+`glm5_mla_attention`, `glm5_expert_own`, `glm5_miss_path_wait`), a friend
+declaration and the factory.
+
+### 9.3 The three-link miss path, and why the missed experts are COMPUTED WHERE THEY LAND
+
+A decode token runs the cards one after another, so the owner-card path
+(DeepSeek step 3's staging ring) streams each layer's misses over ONE link
+at a time: ~28 GB/s, ~40 ms a token at 1.1 GB missed (section 5). To use the
+three links at once, every layer's missed slabs must be fetched by all three
+cards together — 27.5 / 27.5 / 45 %, the lone card `48:00.0` (HIP 2) the
+largest share (§M4: 17.2 + 17.2 + 28 GB/s).
+
+**Two ways to use a helper card, and why only one works.**
+- *Copy peer-to-peer*: a helper DMAs its share host → its VRAM, then P2P to
+  the owner, which computes everything. But the P2P leg enters the OWNER
+  through the owner's own x16 link — the same ingress its own host reads use.
+  Every missed byte still crosses the owner's link, so the owner's link stays
+  the bottleneck (28 GB/s, the lone card no better); only the host side is
+  parallelised. It buys nothing for decode.
+- **Compute where it lands** (built): a helper fetches its slabs over its own
+  link into its own VRAM ring, runs gate/up/swiglu/down there, and sends back
+  only the finished rows. Per missed slab (11.7 MB) the owner's link carries
+  x once a layer (16 KB, P2P to each helper) and 40 KB of rows back. The
+  three links then each carry only their own share: **~18 ms a token of
+  stream projected** (section 5), overlapped with the owner's shared expert
+  and resident experts.
+
+**The protocol, per MoE layer (T = 1).** Owner (main stream): router →
+`k_glm5_plan` writes the packet (x, the 8 ids, missed flags from the table as
+it stands, and each slot's card: resident → owner; the j-th missed slot →
+the 11-long pattern {lone ×5, A ×3, B ×3} at (j + 7·il) mod 11, so the share
+holds over a token, not only over a layer) → event. Each helper (its own
+`help_` stream): waits the event, copies the packet P2P (16.5 KB), stages its
+missed slabs over its link (`k_glm5_stage`, grid-stride 16-byte loads), runs
+`k_glm5_moe` gate/up (pass 2 = missed), `k_glm5_swiglu_rows`, down, and
+`k_glm5_scatter` writes its rows into the owner's `yg/yu/yh/yd` by peer
+stores → event. Owner: forks a side stream that stages its OWN missed slabs,
+runs the shared expert, then its resident slots straight from the table
+(pass 1), joins its copy, its missed slots from the ring (pass 2), swiglu and
+down on its slots; then waits on each helper's event and sums the eight rows
+in slot order (`moe_accum`). Two banks (layer parity) for packets, rings and
+staged pointers; every reuse is ordered by a stream or by the owner's join
+before its next plan.
+
+**Bit-identity by construction.** Every slot runs the same compiled
+`k_glm5_moe` body on the same bytes (the same gfx1100 ISA on every card),
+the same swiglu expression, and the owner sums the rows in slot order as
+before — so `--three-link 1` equals `--three-link 0` bit for bit; the gate
+checks it on the GPU (9.6 (3)). On the CPU arm it is checked already: the
+three "cards" are one process, a helper's rows are the same GEMVs written into
+the owner's buffers.
+
+`--three-link 0|1` (default 1 with three cards), `--lone-dev N` (default 2).
+The helpers' work is on their own streams and is not in `--profile`'s class
+table; `--sync-debug` checks the main streams after every launch and the
+helper streams at the next sync.
+
+### 9.4 Placement with adaptive placement ON from the start
+
+A GPU run always builds the **host mirror**: every expert of every MoE layer
+in pinned, portable, device-mapped host memory (**143.7 GB pinned**), the
+planned resident set (`--placement`, `--expert-gb`, 17 GB a card by default
+in the gate) also in one VRAM block per layer. The owner's table points a
+resident expert at its VRAM slot and a missed one at the mirror; every other
+card gets its own view table of the mirror (`hipHostGetDevicePointer` on that
+card) for the three-link path. `--adapt` defaults to **1** on a GPU run:
+`glm5_adapt.{h,cpp}` is DeepSeek's `ds4_adapt` (section 12 of DEEPSEEK4.md)
+at 288 experts (counter stride 292), the dense layers 0-2 skipped: the
+router's counters, a decayed average read back every `--adapt-every` tokens,
+the hottest non-resident experts swapped for the coldest resident ones per
+card and slab size, copied on a low-priority stream, the table edited between
+tokens. The helpers' view tables never change (the mirror does not move), so
+adaptation and the three-link split compose: the plan reads the missed flags
+from the table as it stands at the router.
+
+The starting histogram is the technical record's (M2); on prose it is
+expected to be wrong at first (DeepSeek: 742 → 101 MB a token over 8 k
+tokens with adaptation), which is why adaptation is on by default.
+
+### 9.5 Checks (CPU or compile-time; no GPU touched)
+
+- The runner, refactored for the GPU and the three-link interface, is
+  **bit-identical** to step 2's CPU dumps: 6 tokens layers 0-3, 124/124 float
+  taps cos=1 maxabs=0; layers 0-5, 204/204.
+- **Three-link and adaptive placement on the CPU arm**, 24 prose tokens,
+  layers 0-5, `--devices 3 --three-link 1 --adapt 1 --expert-gb 0.3
+  --adapt-every 2 --adapt-mb-per-token 64 --adapt-verify 1` against
+  `--devices 1 --adapt 0`: **201/201 taps cos=1 maxabs=0**, 47 swaps (0.55 GB)
+  on the two MoE cards, `adapt_verify ... bad_entries=0 bad_bytes=0 PASS` on
+  both; `--three-link 0 --adapt 1` likewise.
+- The 99 pre-existing GPU kernels ISA- and descriptor-identical (9.2).
+- No kernel spills (9.2).
+- DeepSeek-V4 CPU arm with this binary, layers 0-3 against the pre-change
+  dumps: 6 and 136 tokens, 172/172 taps cos=1 maxabs=0. The Qwen3.8 gate was
+  not re-run (it reads ~10 GB of the Qwen file): no qwen4exp source changed in
+  this step (the CPU binary gains only glm5 files and a stub), and its 65 GPU
+  kernels are ISA-identical (9.2).
+
+### 9.6 The GPU gate (`glm5_gpu_gate.sh`; rig lock held, gateway STOPPED — GLM is the served model)
+
+```
+cd ~/src/colibri-m1/tools/hot-expert/franken/decode
+make cpu CPU_BIN=franken_decode_glm_cpu && make gpu GPU_BIN=franken_decode_glm   # outside docker: the targets call docker
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined \
+  --ipc=host --ulimit memlock=-1 -e GLM5_GPU_OK=1 \
+  -e LD_LIBRARY_PATH=/opt/rocm/lib:/home/ronald/src/llama-glm53/build-hip/bin \
+  -e HOME=/home/ronald -v /home/ronald:/home/ronald -w /home/ronald/src/colibri-m1/tools/hot-expert/franken/decode \
+  rocm/dev-ubuntu-24.04:7.14.0-full bash ./glm5_gpu_gate.sh all 2>&1 | tee ~/bench/franken/glm5/gpu/gate.txt
+```
+
+(or one mode at a time: `cpu`, `gpu6`, `ident`, `long`, `time`, `probe`). What
+each does:
+- **(1) `cpu`** — the CPU references: the whole model + head, 6 tokens
+  (`[gMASK] "The capital of France is"`), `--greedy 16`, `--ctx 4096`
+  (`--dump gpu/cpu6`; reads ~20-60 GB of the file); layers 0-3 on the 2 200
+  prose tokens (`--dump gpu/cpu2200`, ~60 min; skipped if present — step 2's
+  `mine_oracle2200` is the same taps and serves if it is absent).
+- **(2) `gpu6`** — the GPU against `cpu6`, 6 tokens, greedy 16, first under
+  `--sync-debug`, then without. Expected: every tap cos ≥ 0.999 (DeepSeek's
+  GPU arm met 0.9999), greedy_ids exact.
+- **(3) `ident`** — on the GPU, `--three-link 0 --adapt 0 --dump`, then
+  `--three-link 1`, `--adapt 1 --adapt-every 1 --adapt-mb-per-token 512
+  --adapt-verify 1`, and both, each `--oracle` it: expected
+  `not_bitexact=0`, greedy exact, `adapt_verify PASS`.
+- **(4) `long`** — layers 0-3 on the GPU against the CPU arm, 2 200 tokens:
+  the pool scan, the top-512 and the sparse attention at work (expected
+  `indexer_top_k` contained 1.0, min cos ≥ 0.999).
+- **(5) `time`** — `--ctx 262144 --greedy 16 --time 32`,
+  `--three-link 1 / 0 / 0 / 1` (A,B,B,A): `glm5_decode_ms_median`, VRAM per
+  card; then `--profile`'s class table.
+- **(6) `probe`** — `--ctx 262144 --probe-at 64,8192 --probe-n 32` on 8 400
+  prose tokens (`~/bench/franken/glm5/prose8400.txt`, GLM ids), the prefill
+  token by token (~8 k decode steps), with the `adapt_all` trajectory.
+
+Every GPU step re-reads the 149 GB file into the pinned mirror (the file and
+the mirror do not fit in the page cache together): budget minutes a step.
+
+**Not claimed:** any GPU number — correctness, VRAM, time, the stream rates
+of 9.3 and section 5, whether peer stores from a helper's kernel and the
+helpers' streams overlap as designed.
+
+## 10. Next (after the gate)
+
+1. Chunked prefill for this graph (DeepSeek section 13's pattern: the KDA
+   recurrence walks a chunk in order; the indexer store / pool before any
+   row scores; the rings sized N + C - 1).
+2. `--hip-graph` (position-semantic ops as DeepSeek step 3b).
+3. A mixed-corpus or chat histogram as the starting placement (`--hist-out`).
+4. The KDA recurrence's layout for coalesced state loads, if the profile puts
+   it high (285 MB a token of state traffic).

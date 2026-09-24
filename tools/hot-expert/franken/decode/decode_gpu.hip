@@ -67,6 +67,8 @@
 #include <stdexcept>
 #include "ds4_ops.h"      // DeepSeek-V4 (ds4_gpu.inc, included at the end)
 #include "ds4_shapes.h"
+#include "glm5_ops.h"     // GLM-5.3 (glm5_gpu.inc, included at the end)
+#include "glm5_shapes.h"
 
 #define HIP_CHECK(x) do {                                                      \
     hipError_t _e = (x);                                                       \
@@ -2666,6 +2668,12 @@ enum ProfClass {
     PC_DS4_ATTN_HCA,    //   HCA layers (raw window + every 128-token row); PC_DS4_ATTN: raw-only
     PC_DS4_POOL,        // compressor rings, ape rows, pools, compressed-row stores
     PC_DS4_EXP_SORT,    // a chunk's expert sort (expert-major routed GEMVs)
+    // GLM-5.3 (glm5_gpu.inc). Appended, printed only when non-zero.
+    PC_GLM_KDA,         // KDA conv, gate, recurrence
+    PC_GLM_IDX,         // the pooled indexer: LayerNorm, stores, pool, scan, top-512
+    PC_GLM_ATTN,        // absorbed MLA: per-head wk_b / wv_b, attention split + combine
+    PC_GLM_EXP,         // the owner card's routed-expert GEMVs and swiglu (resident + its own misses)
+    PC_GLM_XLINK,       // the miss path: plan, staging fork, joins (own copy, helper cards)
     PC_N
 };
 const char * prof_name(int c) {
@@ -2704,6 +2712,11 @@ const char * prof_name(int c) {
         case PC_DS4_ATTN_HCA:  return "ds4_attention_hca";
         case PC_DS4_POOL:      return "ds4_compressor_pool";
         case PC_DS4_EXP_SORT:  return "ds4_expert_sort";
+        case PC_GLM_KDA:       return "glm5_kda";
+        case PC_GLM_IDX:       return "glm5_indexer";
+        case PC_GLM_ATTN:      return "glm5_mla_attention";
+        case PC_GLM_EXP:       return "glm5_expert_own";
+        case PC_GLM_XLINK:     return "glm5_miss_path_wait";
         default:              return "copy";
     }
 }
@@ -2712,6 +2725,7 @@ constexpr int PROF_MAX_EVENTS = 8192;
 class GpuBackend : public Backend {
     // ds4_gpu.inc's ops launch on this backend's stream through mark().
     friend class Ds4GpuOps;
+    friend class Glm5GpuOps;
 public:
     explicit GpuBackend(int dev) : dev_(dev) {
         HIP_CHECK(hipSetDevice(dev));
@@ -4145,6 +4159,10 @@ private:
 // qwen4exp kernel and GpuBackend, and nothing above reads anything in it.
 #include "ds4_gpu.inc"
 
+// GLM-5.3 (L5 GLM step 4): its kernels and Glm5GpuOps, appended after the
+// DeepSeek ones (it launches k_ds4_topk); nothing above reads anything in it.
+#include "glm5_gpu.inc"
+
 } // namespace
 
 Backend * make_gpu_backend(int device) { return new GpuBackend(device); }
@@ -4155,6 +4173,13 @@ Ds4Ops * make_ds4_gpu_ops(Backend & be) {
     return new Ds4GpuOps(static_cast<GpuBackend &>(be));
 }
 } // namespace ds4
+
+namespace glm5 {
+Glm5Ops * make_glm5_gpu_ops(Backend & be) {
+    if (!be.is_gpu()) throw std::runtime_error("make_glm5_gpu_ops: not a GPU backend");
+    return new Glm5GpuOps(static_cast<GpuBackend &>(be));
+}
+} // namespace glm5
 
 // P2P between every pair, once, before anything is placed. All six pairs can
 // and do on this box (M5: 16-24 GB/s, 28-32 us for a 10 KB hidden vector).

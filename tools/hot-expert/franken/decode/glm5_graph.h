@@ -6,16 +6,19 @@
 // DeepSeek-V4 hyper-connection builders it inherits (build_hc_pre,
 // build_hc_post, build_hc_mean), written against Backend (generic half),
 // Ds4Ops (what GLM shares with DeepSeek-V4: the HC mix, GEMV, swiglu_clamp,
-// the weighted expert sum) and Glm5Ops (glm5_ops.h, the GLM-specific half).
-// GLM5.md has the op list per layer and what each tap is.
+// the weighted expert sum, the adaptive-placement I/O) and Glm5Ops
+// (glm5_ops.h, the GLM-specific half). GLM5.md has the op list per layer.
 //
-// Step 2 (L5 GLM): T = 1 -- the prompt is fed token by token, which is exact
-// because a KDA layer is a recurrence and a DSA layer attends causally; the
-// CPU arm only (the runner refuses a GPU backend).
+// T = 1: the prompt is fed token by token (exact: KDA is a recurrence and
+// DSA attends causally). The span is split over the backends by layer range;
+// each card has its own scratch and positional state, and only the
+// hyper-connection residual H (64 KB) crosses a boundary -- plus, with the
+// three-link miss path, x out to the helper cards and their finished expert
+// rows back (glm5_ops.h LinkPlan).
 //
 // Taps use the reference's cb() names, so ../oracle_dump.cpp's dump of
-// llama.cpp is compared key by key by decode_oracle.cpp. build_hc_pre's
-// four names occur twice a layer; the FFN module's carry the ".2" suffix.
+// llama.cpp -- or this binary's own --dump from another backend -- is
+// compared key by key by decode_oracle.cpp.
 
 #pragma once
 
@@ -25,6 +28,7 @@
 
 #include "decode_graph.h"     // Recorder
 #include "ds4_ops.h"
+#include "glm5_adapt.h"
 #include "glm5_model.h"
 #include "glm5_ops.h"
 
@@ -33,7 +37,9 @@ namespace glm5 {
 
 struct Glm5Config {
     int  ctx = 512;           // positions the DSA caches are sized for
-    bool log_routing = true;  // read the routed ids back every step
+    bool log_routing = true;  // read the routed ids back every step (a sync on a card)
+    LinkPlan links;           // the three-link miss path (n_links 1 = owner card only)
+    AdaptConfig adapt;        // --adapt (GLM5.md section 9)
 };
 
 class Glm5Runner {
@@ -46,21 +52,23 @@ public:
     // One token at the next position. With the head placed, returns the
     // greedy id; otherwise -1.
     int step(int32_t token, Recorder & rec);
+    // Back to position 0 for --probe-at: the recurrent state (KDA state and
+    // conv windows, the indexer's open pool) is zeroed; the positional caches
+    // are rewritten as the prompt is fed again.
+    void rewind();
 
     int pos() const { return pos_; }
-    // Per-layer routed ids of the last step, [n_layers][8] (-1 on dense layers).
+    void set_log_routing(bool on) { cfg_.log_routing = on; }
+    void set_profile(bool on) { profile_ = on; }
     const std::vector<int> & routed_ids() const { return routed_; }
-    // The indexer runs its scoring only when ctx > IDX_N_SELECT (glm5next.cpp:
-    // "gated on n_ctx"); below that every visible cell is attended.
     bool scoring() const { return cfg_.ctx > IDX_N_SELECT; }
     void report_cache_bytes(FILE * out) const;
+    Adapter * adapter() { return adapt_.get(); }
 
 private:
     struct LayerState {
-        // KDA
         float * conv = nullptr;          // [KDA_CONV-1][KDA_QKV]
         float * ssm  = nullptr;          // [N_HEAD][KDA_DIM][KDA_DIM]
-        // DSA
         uint16_t * kv = nullptr;         // f16 [ctx][KV_LORA]: the latent K = V
         uint16_t * kg = nullptr;         // f16 [kg_rows][2*IDX_DIM]: indexer key | gate, ring
         uint16_t * pooled = nullptr;     // f16 [ctx/KPOOL + 1][IDX_DIM]
@@ -68,12 +76,9 @@ private:
     };
     struct Scratch {
         float *H, *Hn, *mixes, *pre, *post, *comb, *x, *xn, *ao, *fo;
-        // KDA
         float *qkv, *conv, *fa, *fb, *g, *beta, *ga, *gb, *o, *gated;
-        // DSA
         float *qr, *q, *kv, *qabs, *att, *kqv, *ik, *igate, *iq, *iw, *iscore;
         int   *isel;
-        // FFN
         float *dup, *dgate, *dh;
         float *rlog, *probs, *probs_b, *wraw, *wnorm, *wsc;
         float *yg, *yu, *yh, *yd, *ywt, *moe, *sg, *su, *sh, *sd;
@@ -98,6 +103,7 @@ private:
     Glm5Config cfg_;
     float eps_, ln_eps_, hc_eps_;
     int pos_ = 0;
+    bool profile_ = false;
     size_t iscore_stride_ = 0;
     std::vector<LayerState> st_;
     std::vector<Scratch> scr_;
@@ -105,6 +111,7 @@ private:
     float *hmean_ = nullptr, *hn_ = nullptr, *logits_ = nullptr;
     int   *greedy_ = nullptr;
     std::vector<std::pair<Backend *, void *>> owned_;
+    std::unique_ptr<Adapter> adapt_;
 };
 
 // The CLI of `franken_decode --model <glm5next gguf> ...` (dispatched from

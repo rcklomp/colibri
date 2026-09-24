@@ -735,8 +735,8 @@ public:
         const int b = bank & 1;
         const void * const * sp = own_sp_ + (size_t) b * G5::N_EXPERT_USED * 3;
         Glm5Pk * pk = pk_ + b;
-        launch_moe(t, t.type_gu, t.up,   sp, pk, me, 1, 1, t.row_gu, t.rows_gu, t.K_gu, pk->x, 0, yu, g_.stream_, true);
-        launch_moe(t, t.type_gu, t.gate, sp, pk, me, 1, 0, t.row_gu, t.rows_gu, t.K_gu, pk->x, 0, yg, g_.stream_, true);
+        launch_moe(t, t.type_gu, t.up,   sp, pk, me, 1, 1, t.row_gu, t.rows_gu, t.K_gu, pk_x(pk), 0, yu, g_.stream_, true);
+        launch_moe(t, t.type_gu, t.gate, sp, pk, me, 1, 0, t.row_gu, t.rows_gu, t.K_gu, pk_x(pk), 0, yg, g_.stream_, true);
         g_.mark(PC_GLM_XLINK); g_.last_op_ = "glm5_own_join";
         HIP_CHECK(hipStreamWaitEvent(g_.stream_, ev_own_[b], 0));
         run_slots(t, pk, sp, me, 2, yg, yu, yh, yd, limit, g_.stream_, true, /*gate_up_resident_done*/ true);
@@ -762,6 +762,8 @@ public:
     void set_profile(bool on) override { prof_ = on; }
 
 private:
+    // x is the packet's first member: its device address, without touching the device pointer
+    static const float * pk_x(const Glm5Pk * pk) { return reinterpret_cast<const float *>(pk); }
     [[noreturn]] static void die(const char * m) { std::fprintf(stderr, "glm5 gpu: %s\n", m); std::abort(); }
 
     template <int TY>
@@ -792,8 +794,8 @@ private:
     void run_slots(const D::ExpertTable & v, Glm5Pk * pk, const void * const * sp, int me, int pass,
                    float * yg, float * yu, float * yh, float * yd, float limit, hipStream_t s, bool main,
                    bool owner_tail = false) {
-        launch_moe(v, v.type_gu, v.up,   sp, pk, me, pass, 1, v.row_gu, v.rows_gu, v.K_gu, pk->x, 0, yu, s, main);
-        launch_moe(v, v.type_gu, v.gate, sp, pk, me, pass, 0, v.row_gu, v.rows_gu, v.K_gu, pk->x, 0, yg, s, main);
+        launch_moe(v, v.type_gu, v.up,   sp, pk, me, pass, 1, v.row_gu, v.rows_gu, v.K_gu, pk_x(pk), 0, yu, s, main);
+        launch_moe(v, v.type_gu, v.gate, sp, pk, me, pass, 0, v.row_gu, v.rows_gu, v.K_gu, pk_x(pk), 0, yg, s, main);
         if (main) { g_.mark(PC_GLM_EXP); g_.last_op_ = "glm5_swiglu_rows"; } else dev_ensure(g_.dev_);
         k_glm5_swiglu_rows<<<dim3((unsigned) ceil_div(v.rows_gu, BLK), G5::N_EXPERT_USED), BLK, 0, s>>>(
             yg, yu, yh, v.rows_gu, pk, me, limit);

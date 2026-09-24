@@ -14,6 +14,10 @@
 #                             2026-09-22). This one is not a container: it is openai_server.py
 #                             with franken_decode as its child, so it is the arm that measures
 #                             the new engine on the owner's own path.
+#   serve_alt.sh franken-ds4 -> same shape as `franken`, on DeepSeek-V4-Flash-0731 UD-IQ2_M
+#                             instead (franken_decode_ds4 as the gateway's child, M1). Not run
+#                             or measured on a GPU by the session that wrote this: see
+#                             tools/hot-expert/franken/decode/DEEPSEEK4.md and the M1 task body.
 #   serve_alt.sh glm       -> alt server out, GLM gateway back, accept_live.sh must PASS
 #   serve_alt.sh status    -> what is serving, since when, VRAM per card, lock holder
 #
@@ -150,6 +154,17 @@ F_SNAP_DIR=$Q_SNAP_DIR
 F_LABEL="Qwen3.8-Flash-Next UD-IQ4_XS (Franken engine)"
 F_LOG=$HOME/bench/serve_alt_franken.log
 
+# --- the Franken engine on DeepSeek-V4-Flash (M1: same shape as `franken` above) ------------
+# The DS4 runner behind the same gateway, binary franken_decode_ds4 (a distinct process name:
+# franken_decode_ds4 is 19 characters and a Linux comm field truncates at 15 -- `ps -C
+# franken_decode_ds4` therefore matches NOTHING; every check below uses `pgrep -f
+# "franken_decode_[d]s4"` (bracket self-match guard, CLAUDE.md) against the full argv instead,
+# the same trick the gateway's own "openai_[s]erver.py" pattern uses and for the same reason).
+D4_START=$HOME/src/colibri/tools/hot-expert/franken/start_franken_ds4.sh
+D4_SNAP_DIR=$D_SNAP_DIR
+D4_LABEL="DeepSeek-V4-Flash-0731 UD-IQ2_M (Franken engine)"
+D4_LOG=$HOME/bench/serve_alt_franken_ds4.log
+
 # --- backend: HIP docker, same bin dir/image the F11 chain used --------------------------------
 ALT_BIN_DIR=/home/ronald/src/llama-glm53/build-hip/bin
 ALT_IMAGE=rocm/dev-ubuntu-24.04:7.14.0-full
@@ -178,6 +193,21 @@ franken_alive() { ps -C franken_decode -o stat= 2>/dev/null | grep -qv '^Z'; }
 wait_no_franken() {   # bounded 240 s, 2 s steps
   for _ in $(seq 1 120); do franken_alive || return 0; sleep 2; done
   echo "FATAL: franken_decode still alive (non-zombie) after 240 s"; return 1
+}
+
+# franken_decode_ds4's comm truncates to "franken_decode_" (15 chars) at the kernel's
+# TASK_COMM_LEN, which `ps -C franken_decode_ds4` cannot match (see the D4_* header comment
+# above) -- pgrep -f matches the untruncated argv instead, with the bracket trick so this
+# check (and the ssh command carrying it) never matches itself.
+franken_ds4_alive() {
+  local pid
+  pid=$(pgrep -f "franken_decode_[d]s4" 2>/dev/null | head -1)
+  [ -n "$pid" ] && ps -p "$pid" -o stat= 2>/dev/null | grep -qv '^Z'
+}
+
+wait_no_franken_ds4() {   # bounded 240 s, 2 s steps
+  for _ in $(seq 1 120); do franken_ds4_alive || return 0; sleep 2; done
+  echo "FATAL: franken_decode_ds4 still alive (non-zombie) after 240 s"; return 1
 }
 
 wait_no_glm53() {   # bounded 240 s, 2 s steps; zombie-safe (a killed engine child is a ZOMBIE
@@ -256,11 +286,14 @@ stop_gateway() {
   # would leave franken_decode holding ~22 GB on each card, and the very next step
   # (assert_vram_free) would then refuse to start anything at all -- with nothing saying why.
   pkill -9 -x franken_decode 2>/dev/null || true
+  # franken_decode_ds4: pkill -x cannot match it either (comm truncation, see franken_ds4_alive);
+  # the bracket form is the self-match-safe pgrep -f equivalent of pkill -9 -x.
+  pkill -9 -f "franken_decode_[d]s4" 2>/dev/null || true
   # The engine runs inside the ROCm 7.14 image (~/bench/franken_decode_docker.sh, container
   # `franken_engine`): a host-side pkill by name did not reach it twice on 2026-09-23 and
   # the swap back found 24 GB still on the cards. Stop the container explicitly.
   docker stop -t 5 franken_engine >/dev/null 2>&1 || true
-  wait_no_glm53 && wait_no_franken
+  wait_no_glm53 && wait_no_franken && wait_no_franken_ds4
 }
 
 start_gateway() {   # requirement 6: exactly how every chain restarts the gateway
@@ -600,6 +633,64 @@ cmd_franken() {
   echo "=== to go back: $HERE/serve_alt.sh glm"
 }
 
+# start_franken_ds4 -- the gateway with the Franken engine on DeepSeek-V4-Flash behind it.
+# Same readiness rule as start_franken (server 200 AND a live engine), against the DS4 process
+# name (franken_ds4_alive, not franken_alive -- see the D4_* header comment).
+start_franken_ds4() {
+  [ -x "$D4_START" ] || { echo "FATAL: $D4_START is not executable"; return 1; }
+  FRANKEN_LOG="$D4_LOG" SKIP_WARM=1 setsid nohup "$D4_START" > "$D4_LOG" 2>&1 < /dev/null &
+  local i
+  for i in $(seq 1 240); do
+    if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $(cat "$KEY_FILE")" \
+         -w '%{http_code}' "http://127.0.0.1:${ALT_PORT}/v1/models" 2>/dev/null)" = 200 ] \
+       && franken_ds4_alive; then
+      return 0
+    fi
+    if ! pgrep -f "openai_[s]erver.py" >/dev/null && [ "$i" -gt 6 ]; then
+      echo "FATAL: the gateway process is gone; last lines of $D4_LOG:"; tail -20 "$D4_LOG"; return 1
+    fi
+    sleep 5
+  done
+  echo "FATAL: the Franken/DS4 gateway did not come up within 1200 s; last lines of $D4_LOG:"
+  tail -20 "$D4_LOG"
+  return 1
+}
+
+# cmd_franken_ds4 -- same shape and same safety order as cmd_franken (requirement 5), for the
+# DeepSeek-V4-Flash arm. The weights are D_SNAP_DIR (the same GGUF `deepseek` serves via
+# llama-server), so the two arms are comparable the same way `franken`/`qwen38` are.
+cmd_franken_ds4() {
+  echo "=== serve_alt: switching to $D4_LABEL $(date -Is)"
+  refuse_if_busy franken-ds4 || exit 1
+  serve_alt_lock_take "$$" "serve_alt-setup-franken-ds4" || exit 3
+  ensure_alt_stopped
+  echo "[1/7] stopping whatever the gateway is serving now"
+  if ! stop_gateway; then restore_glm "stop_gateway failed"; exit 1; fi
+  echo "[2/7] confirming VRAM is free on all three cards"
+  if ! assert_vram_free "pre-franken-ds4"; then restore_glm "VRAM not free before the Franken/DS4 engine"; exit 1; fi
+  echo "[3/7] warming the GGUF in page cache (two passes, target >=90% resident)"
+  warm_and_verify "$D4_SNAP_DIR" franken-ds4 || true
+  echo "[4/7] starting the gateway with the Franken/DS4 engine ($D4_LOG)"
+  if ! start_franken_ds4; then restore_glm "the Franken/DS4 gateway did not come up"; exit 1; fi
+  for c in 0 1 2; do echo "  card$c VRAM used: $(VRAM "$c") bytes"; done
+  echo "[5/7] sending one real chat completion to verify"
+  if ! send_test_chat "$D4_LABEL"; then restore_glm "the Franken/DS4 test chat failed"; exit 1; fi
+  echo "[6/7] accept_live.sh -- the owner's own path, including the request AFTER the one it tests"
+  GLM53_LOG="$D4_LOG" "$HERE/accept_live.sh" || echo "NOTE: accept_live.sh did not pass -- see its output above; the engine is still serving"
+  echo "[7/7] handing the rig lock to the running engine (safe to exit this script now)"
+  local epid keeper
+  epid=$(pgrep -f "franken_decode_[d]s4" | head -1)
+  nohup tail --pid="$epid" -f /dev/null > /dev/null 2>&1 < /dev/null &
+  keeper=$!
+  disown "$keeper" 2>/dev/null || true
+  SERVE_ALT_KEEPER_PID=$keeper
+  rig_lock_rebind_pid "serve_alt-franken-ds4" "$keeper"
+  write_state D4 "$D4_LABEL"
+  echo "=== now serving: $D4_LABEL on port $ALT_PORT (Open WebUI still shows it as 'glm-5.3-flash')"
+  echo "=== engine pid $epid, gateway log $D4_LOG"
+  echo "=== to go back: $HERE/serve_alt.sh glm"
+}
+
 cmd_glm() {
   echo "=== serve_alt: switching back to GLM-5.3 $(date -Is)"
   refuse_if_busy glm || exit 1
@@ -634,6 +725,12 @@ cmd_status() {
     flog=$(grep -h "gateway log " "$F_LOG" 2>/dev/null | tail -1 | sed 's/.*gateway log //')
     echo "engine pid: $(pgrep -x franken_decode | head -1), gateway log ${flog:-$F_LOG}"
     echo "accept_live against it: GLM53_LOG=${flog:-$F_LOG} $HERE/accept_live.sh"
+  elif pgrep -f "openai_[s]erver.py" >/dev/null && franken_ds4_alive; then
+    echo "serving: $D4_LABEL via the Colibri gateway on port $ALT_PORT (Open WebUI shows it as 'glm-5.3-flash')"
+    local d4log
+    d4log=$(grep -h "gateway log " "$D4_LOG" 2>/dev/null | tail -1 | sed 's/.*gateway log //')
+    echo "engine pid: $(pgrep -f "franken_decode_[d]s4" | head -1), gateway log ${d4log:-$D4_LOG}"
+    echo "accept_live against it: GLM53_LOG=${d4log:-$D4_LOG} $HERE/accept_live.sh"
   else
     echo "serving: NOTHING recognizable on port $ALT_PORT -- run '$HERE/serve_alt.sh glm' to restore GLM"
   fi
@@ -653,10 +750,11 @@ case "${1:-}" in
   deepseek) cmd_alt D ;;
   glm-llama) cmd_alt G ;;
   franken)  cmd_franken ;;
+  franken-ds4) cmd_franken_ds4 ;;
   glm)      cmd_glm ;;
   status)   cmd_status ;;
   *)
-    echo "usage: $0 {qwen38|deepseek|glm-llama|franken|glm|status}"
+    echo "usage: $0 {qwen38|deepseek|glm-llama|franken|franken-ds4|glm|status}"
     exit 2
     ;;
 esac

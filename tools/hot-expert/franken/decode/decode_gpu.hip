@@ -2656,12 +2656,16 @@ enum ProfClass {
     PC_DS4_MISS_WAIT,   // the main stream waiting on the side stream's miss copy
     PC_DS4_LID,         // the lightning indexer scan
     PC_DS4_TOPK,
-    PC_DS4_ATTN,        // attention split + combine
+    PC_DS4_ATTN,        // attention split + combine (L5 step 5: the raw-window-only layers 0-1)
     PC_DS4_ATTN_MISC,   // rope / de-rope / FWHT / f16 stores / compressor pools and rings
     PC_DS4_HC,          // the four-stream mix: split + Sinkhorn, weighted sum, post
     PC_DS4_MOE_TAIL,    // swiglu clamp, the weighted sum of the six
     PC_DS4_UPSTREAM,    // a card waiting for the previous card's share of the token
     PC_DS4_ADAPT,       // --adapt: counter read-back, table edits, the copy join (between tokens)
+    PC_DS4_ATTN_CSA,    // (L5 step 5) attention on the CSA layers (raw window + top-512); the
+    PC_DS4_ATTN_HCA,    //   HCA layers (raw window + every 128-token row); PC_DS4_ATTN: raw-only
+    PC_DS4_POOL,        // compressor rings, ape rows, pools, compressed-row stores
+    PC_DS4_EXP_SORT,    // a chunk's expert sort (expert-major routed GEMVs)
     PC_N
 };
 const char * prof_name(int c) {
@@ -2690,12 +2694,16 @@ const char * prof_name(int c) {
         case PC_DS4_MISS_WAIT: return "ds4_miss_wait";
         case PC_DS4_LID:       return "ds4_indexer_scan";
         case PC_DS4_TOPK:      return "ds4_topk";
-        case PC_DS4_ATTN:      return "ds4_attention";
+        case PC_DS4_ATTN:      return "ds4_attention_raw";
         case PC_DS4_ATTN_MISC: return "ds4_rope_pool_store";
         case PC_DS4_HC:        return "ds4_hc_mix";
         case PC_DS4_MOE_TAIL:  return "ds4_moe_tail";
         case PC_DS4_UPSTREAM:  return "ds4_upstream_wait";
         case PC_DS4_ADAPT:     return "ds4_adapt";
+        case PC_DS4_ATTN_CSA:  return "ds4_attention_csa";
+        case PC_DS4_ATTN_HCA:  return "ds4_attention_hca";
+        case PC_DS4_POOL:      return "ds4_compressor_pool";
+        case PC_DS4_EXP_SORT:  return "ds4_expert_sort";
         default:              return "copy";
     }
 }

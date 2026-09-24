@@ -6,11 +6,16 @@
 // (generic half) and Ds4Ops (ds4_ops.h, the DeepSeek-specific half). See
 // DEEPSEEK4.md for the op list per layer and what each tap is.
 //
-// One token a step (T == 1): every DS4 attention path is causal per token,
-// so feeding a prompt token by token IS the reference's ubatch result. The
-// span is split over the backends by layer range; each device has its own
-// scratch set and positional state, and the only thing that crosses a card
-// is the hyper-connection residual H (4 x 4096 f32), by Backend::boundary_recv.
+// A step is T tokens (L5 step 5, DEEPSEEK4.md section 13): T == 1 is the
+// decode token; T > 1 is a prompt CHUNK, every buffer token-major [T][width],
+// every positional op row t at position pos + t, and the caches written for
+// all T rows before any row attends (PREFILL.md section 3's order, whose
+// causality argument section 13 carries over). Every DS4 attention path is
+// causal per token, so a chunk is exactly T single-token steps -- the gate is
+// `--chunk 6 --oracle` against a `--chunk 1 --dump`. The span is split over
+// the backends by layer range; each device has its own scratch set and
+// positional state, and the only thing that crosses a card is the
+// hyper-connection residual H (T x 4 x 4096 f32), by Backend::boundary_recv.
 //
 // Taps use the reference's cb() names, so ../oracle_dump.cpp's dump of
 // llama.cpp -- or this binary's own --dump from another backend -- is
@@ -54,6 +59,17 @@ struct Ds4Config {
     // --adapt 1 (design L2, DEEPSEEK4.md section 12): learn the hot experts
     // from this run's own routing and swap them in between tokens.
     AdaptConfig adapt;
+    // --chunk C (L5 step 5): the largest step() will be handed. Every scratch
+    // buffer is sized for it once, and so are the rings: the raw window is
+    // N_SWA + C - 1 slots, a compressor ring 2*ratio + C - 1 (CSA) or
+    // ratio + C - 1 (HCA), because a chunk writes all its rows before any row
+    // reads, and a later row must not overwrite a slot an earlier one still
+    // needs. C = 1 gives step 4's sizes exactly.
+    int  max_chunk = 1;
+    // --prefill-pipeline 0|1 (default 1): chunk n+1 starts on a card as soon
+    // as that card has handed chunk n on (two banks of the boundary residual
+    // a card, PREFILL.md section 10). Changes no number.
+    int  prefill_pipeline = 1;
 };
 
 class Ds4Runner {
@@ -65,20 +81,32 @@ public:
 
     // One token at the next position. With the head placed, returns the
     // greedy id; otherwise -1.
-    int step(int32_t token, Recorder & rec);
+    int step(int32_t token, Recorder & rec) { return step(&token, 1, rec, true); }
+    // T tokens at the next T positions (a prompt chunk). Taps are the LAST
+    // row's. `flush` false (a pipelined prefill's inner chunk): enqueue and
+    // return -1 without computing the head or waiting; the recorder and the
+    // routing read-back force a flush.
+    int step(const int32_t * tokens, int T, Recorder & rec, bool flush = true);
+    // --probe-at: back to position 0 (the caches are then rewritten position
+    // by position as the prompt is fed again; nothing reads past pos).
+    void rewind() { pos_ = 0; }
 
     int pos() const { return pos_; }
     void set_log_routing(bool on) { cfg_.log_routing = on; }
     // --profile: every card closes its profile interval at the end of a step
     void set_profile(bool on) { profile_ = on; }
-    // Per-layer routed ids of the last step, [n_layers][6] (with log_routing).
+    // Per-layer routed ids of the last step's LAST row, [n_layers][6], and
+    // of every row, [T][n_layers][6] (with log_routing).
     const std::vector<int> & routed_ids() const { return routed_; }
+    const std::vector<int> & routed_rows() const { return routed_rows_; }
+    int last_T() const { return T_; }
     void report_cache_bytes(FILE * out) const;
     Adapter * adapter() { return adapt_.get(); }
 
 private:
     struct LayerState {
-        uint16_t * raw = nullptr;       // f16 [N_SWA][512], slot = pos % N_SWA
+        uint16_t * raw = nullptr;       // f16 [raw_rows][512], slot = pos % raw_rows
+        int raw_rows = N_SWA;
         float * ck = nullptr, * cs = nullptr;         // compressor ring [ring][coff*512]
         float * lk = nullptr, * ls = nullptr;         // lid ring [8][256] (CSA only)
         uint16_t * comp = nullptr;      // f16 [ctx/ratio + 1][512] compressed K
@@ -93,6 +121,8 @@ private:
         float *rlog, *probs, *probs_b, *wraw, *wnorm, *wsc;
         float *yg, *yu, *yh, *yd, *ywt, *moe, *sg, *su, *sh, *sd, *fo;
         int   *isel, *ids, *hash;
+        float *attg = nullptr, *oag = nullptr;      // a chunk's per-group wo_a in/out
+        float *hout[2] = {nullptr, nullptr};        // a chunk's boundary residual, two banks
     };
 
     void layer(int il, Recorder & rec);
@@ -112,6 +142,12 @@ private:
     Ds4Config cfg_;
     float eps_, hc_eps_;
     int pos_ = 0;
+    int T_ = 1;                        // rows of the step in flight
+    int Tm_ = 1;                       // cfg_.max_chunk
+    long long chunk_seq_ = 0;          // bank parity of the pipelined boundary
+    size_t iscore_stride_ = 0;         // floats a row of lid scores
+    // the last row of a token-major buffer of `width` floats (taps)
+    template <typename P> P * lr(P * p, size_t width) const { return p + (size_t) (T_ - 1) * width; }
     bool profile_ = false;
     // --hip-graph
     struct GraphSlot { void * exec = nullptr; int cls = -1; long long epoch = -1; };
@@ -125,7 +161,7 @@ private:
     int stage_slot(int il) const;
     std::vector<LayerState> st_;
     std::vector<Scratch> scr_;
-    std::vector<int> routed_;
+    std::vector<int> routed_, routed_rows_;
     // head, on the last device
     float *hmix_ = nullptr, *hpre_ = nullptr, *hx_ = nullptr, *hxn_ = nullptr, *logits_ = nullptr;
     int   *greedy_ = nullptr;

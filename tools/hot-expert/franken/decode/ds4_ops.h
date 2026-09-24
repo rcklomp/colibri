@@ -17,7 +17,12 @@
 // Every count the kernels need is a closed form of the position the host
 // already knows (raw window length, visible blocks, min(top_k, visible)).
 //
-// Buffers are one token wide (T == 1): the batched prefill is a later step.
+// ROWS (L5 step 5, batched prefill; DEEPSEEK4.md section 13). Every per-token
+// op takes `T`, the rows of a chunk, token-major (row t at `buf + t * width`),
+// and every position-semantic op's `pos` is the FIRST row's position: row t
+// is at pos + t. T == 1 is the decode token, and the kernels are the same ones
+// (one kernel per op, the rows a grid axis or a non-unrolled loop), so a
+// chunk's row t computes exactly what a decode step at pos + t computes.
 
 #pragma once
 
@@ -89,20 +94,24 @@ public:
     virtual ~Ds4Ops() {}
 
     // -- GEMV in any format the file carries (the six new ones included) ----
-    virtual void gemv(const Mat & W, const float * x, float * y) = 0;
+    // T > 1: x [T][K], y [T][rows] -- a GEMM whose column t is the T == 1 GEMV
+    virtual void gemv(const Mat & W, const float * x, float * y, int T = 1) = 0;
 
     // -- hyper-connections ---------------------------------------------------
+    // rows: mixes [T][HC_MIX], pre/post [T][HC], comb [T][HC*HC]
     virtual void hc_split(const float * mixes, const float * scale3, const float * base24,
-                          float * pre, float * post, float * comb, float eps, int iters) = 0;
+                          float * pre, float * post, float * comb, float eps, int iters,
+                          int T = 1) = 0;
     virtual void hc_head_pre(const float * mixes4, const float * scale1, const float * base4,
                              float * pre, float eps) = 0;
-    virtual void hc_weighted_sum(const float * H, const float * w, float * out) = 0;
+    // rows: H [T][HC_DIM], w [T][HC], out [T][N_EMBD]
+    virtual void hc_weighted_sum(const float * H, const float * w, float * out, int T = 1) = 0;
     // hc_init: the embedding row repeated into the four streams. An op of its
     // own because Backend::copy on a card is a NULL-stream memcpy, which a
     // stream capture cannot contain.
-    virtual void hc_init(const float * x, float * H) = 0;
+    virtual void hc_init(const float * x, float * H, int T = 1) = 0;
     virtual void hc_post(const float * x, const float * H, const float * post,
-                         const float * comb, float * Hout) = 0;
+                         const float * comb, float * Hout, int T = 1) = 0;
 
     // -- POSITION-SEMANTIC OPS (L5 step 3b) -------------------------------------
     // Every op below takes the token's position `pos` and derives from it
@@ -117,42 +126,57 @@ public:
 
     // Rotate at `pos`, or at the first position of the block that ends at
     // `pos` when block_ratio > 0 (a compressed row). NORM pairs, last N_ROT
-    // dims of every row; `inverse` is ggml_rope_ext_back.
+    // dims of every row; `inverse` is ggml_rope_ext_back. rows_per_pos > 0
+    // (a chunk): row r is at pos + r / rows_per_pos; 0: every row at pos.
     virtual void rope_tail(float * x, int n_rows, int row_len, int pos, int block_ratio,
-                           const RopeParams & rp, bool inverse) = 0;
+                           const RopeParams & rp, bool inverse, int rows_per_pos = 0) = 0;
     virtual void fwht(float * x, int n_rows, int n) = 0;
-    // f16 into the raw window, slot pos % N_SWA
-    virtual void store_raw(const float * kv, uint16_t * raw_ring, int pos) = 0;
-    // f16 into cache row pos / ratio -- only when (pos + 1) % ratio == 0
-    virtual void store_block(const float * x, uint16_t * cache, int width, int ratio, int pos) = 0;
-    // ring[pos % ring_rows][0..width) = src
-    virtual void ring_put(float * ring, int ring_rows, int width, int pos, const float * src) = 0;
-    // x[0..width) += table[pos % ratio][0..width)   (the compressor's ape row)
-    virtual void add_row(float * x, const float * table, int width, int ratio, int pos) = 0;
+    // f16 into the raw window, slot pos % raw_rows (raw_rows = N_SWA + the
+    // largest chunk - 1: a chunk's later rows must not overwrite a slot an
+    // earlier row still attends; values are addressed by POSITION, so the
+    // ring's size changes no number)
+    virtual void store_raw(const float * kv, uint16_t * raw_ring, int raw_rows, int pos, int T = 1) = 0;
+    // f16 into cache row p / ratio -- only for the rows with (p + 1) % ratio == 0
+    virtual void store_block(const float * x, uint16_t * cache, int width, int ratio, int pos,
+                             int T = 1) = 0;
+    // ring[p % ring_rows][0..width) = src row, p = pos + t
+    virtual void ring_put(float * ring, int ring_rows, int width, int pos, const float * src,
+                          int T = 1) = 0;
+    // x[t][0..width) += table[p % ratio][0..width)   (the compressor's ape row)
+    virtual void add_row(float * x, const float * table, int width, int ratio, int pos,
+                         int T = 1) = 0;
+    // dst[r * dst_stride + i] = src[r * src_stride + i], i < row_len: the
+    // grouped output projection's per-group column gather/scatter in a chunk
+    virtual void copy_rows(const float * src, size_t src_stride, float * dst, size_t dst_stride,
+                           int n_rows, int row_len) = 0;
 
-    // -- compressor pooling: the block that ends at `pos`, if one does ---------
+    // -- compressor pooling: the block that ends at `p`, if one does ---------
+    // (rows: out [T][d_out], row t written only when a block ends at pos + t)
     virtual void comp_pool(const float * ring_kv, const float * ring_sc, int ring_rows,
-                           int ratio, int d_out, int pos, float * out) = 0;
+                           int ratio, int d_out, int pos, float * out, int T = 1) = 0;
     virtual void comp_pool_overlap(const float * ring_kv, const float * ring_sc, int ring_rows,
-                                   int ratio, int d_out, int pos, float * out) = 0;
+                                   int ratio, int d_out, int pos, float * out, int T = 1) = 0;
 
-    // -- the lightning indexer: the (pos+1)/4 visible blocks ---------------------
+    // -- the lightning indexer: the (p+1)/4 visible blocks ---------------------
+    // rows: q [T][64*128], w [T][64], scores [T][score_stride]
     virtual void lid_scores(const float * q, const float * w, const uint16_t * keys, int pos,
-                            float * scores) = 0;
-    // The top min(k, n) of the n = (pos+1)/4 scores as a SET (order unspecified,
-    // as ggml_top_k's); n <= k writes the identity 0..n-1.
-    virtual void topk(const float * scores, int pos, int k, int * out) = 0;
+                            float * scores, int T = 1, int score_stride = 0) = 0;
+    // The top min(k, n) of the n = (p+1)/4 scores as a SET (order unspecified,
+    // as ggml_top_k's); n <= k writes the identity 0..n-1. rows: out [T][k].
+    virtual void topk(const float * scores, int pos, int k, int * out, int T = 1,
+                      int score_stride = 0) = 0;
 
     // -- attention: 64 query heads against one shared K=V head ------------------
-    // Keys: the raw window of `pos` (positions max(0, pos-127) .. pos) then
-    // n_comp = min((pos+1)/ratio, cap) compressed rows (ids, or 0.. when
-    // `comp_ids` is null); ratio 0 = the raw window alone.
-    virtual void attn(const float * q, const uint16_t * raw_ring, int pos, const uint16_t * comp,
-                      int ratio, int cap, const int * comp_ids, const float * sinks, float scale,
-                      float * out) = 0;
-    // Size whatever the attention needs for positions < ctx, once (a card must
-    // not allocate inside a captured graph).
-    virtual void reserve(int ctx) { (void) ctx; }
+    // Keys: the raw window of p (positions max(0, p-127) .. p, slot q % raw_rows)
+    // then n_comp = min((p+1)/ratio, cap) compressed rows (ids, or 0.. when
+    // `comp_ids` is null); ratio 0 = the raw window alone. rows: q/out
+    // [T][64*512], comp_ids [T][IDX_TOP_K].
+    virtual void attn(const float * q, const uint16_t * raw_ring, int raw_rows, int pos,
+                      const uint16_t * comp, int ratio, int cap, const int * comp_ids,
+                      const float * sinks, float scale, float * out, int T = 1) = 0;
+    // Size whatever the attention needs for positions < ctx and chunks of up
+    // to t_max rows, once (a card must not allocate inside a captured graph).
+    virtual void reserve(int ctx, int t_max = 1) { (void) ctx; (void) t_max; }
 
     // -- MoE ------------------------------------------------------------------
     // `hash_ids` (6 ids, backend memory) replaces the top-6 on hash layers.
@@ -160,9 +184,11 @@ public:
     // counters, which the router bumps for its six choices, reading `miss`
     // (the table's per-expert miss bytes) to count the misses. Neither
     // changes what the router computes.
+    // rows: logits/probs [T][256], hash_ids/ids/w_* [T][6]
     virtual void router(const float * logits, const float * bias, const int32_t * hash_ids,
                         float * probs, float * probs_biased, int * ids, float * w_raw,
-                        float * w_norm, float * w_scaled, const int * miss, uint32_t * stats) = 0;
+                        float * w_norm, float * w_scaled, const int * miss, uint32_t * stats,
+                        int T = 1) = 0;
     // THE MISS PATH (L5 step 3). moe_stage() starts bringing layer t's six
     // chosen experts to the card for staging `slot` and returns at once: a
     // resident expert is used where it is, a missed one is copied into a VRAM
@@ -175,16 +201,21 @@ public:
     // either way, so the numerics are too.
     virtual void reserve_moe(size_t max_slab_bytes, int n_slots) { (void) max_slab_bytes; (void) n_slots; }
     virtual void moe_stage(const ExpertTable & t, const int * ids, int slot) { (void) t; (void) ids; (void) slot; }
-    // y_gate / y_up [6][rows_gu] for the six experts `ids` names.
+    // y_gate / y_up [6][rows_gu] for the six experts `ids` names. Rows (T > 1,
+    // slot -1 only): ids [T][6], x [T][K_gu], y [T*6][rows_gu] -- assignment
+    // a = t*6 + k. A chunk may run them EXPERT-MAJOR (--ds4-expert-gather,
+    // the GPU: each expert's row read once for all its assignments); every
+    // assignment's dot is the same code either way.
     virtual void moe_gate_up(const ExpertTable & t, const int * ids, const float * x,
-                             float * y_gate, float * y_up, int slot) = 0;
-    // y [6][rows_d]; slot k reads h + k*K_d.
+                             float * y_gate, float * y_up, int slot, int T = 1) = 0;
+    // y [T*6][rows_d]; assignment a reads h + a*K_d.
     virtual void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y,
-                          int slot) = 0;
+                          int slot, int T = 1) = 0;
     virtual void swiglu_clamp(const float * gate, const float * up, float * h, int n,
                               float limit) = 0;
+    // rows: y/weighted [T][n_used][n], w [T][n_used], out [T][n]
     virtual void moe_accum(const float * y, const float * w, int n_used, int n,
-                           float * weighted, float * out) = 0;
+                           float * weighted, float * out, int T = 1) = 0;
 
     // -- profiling (--profile) ------------------------------------------------
     // Miss bytes counted ON THE DEVICE from the ids the router chose (no host
@@ -205,7 +236,12 @@ public:
     // --stage-wgs N: workgroups the staging copy uses (grid-stride). A bounded
     // grid leaves the CUs to the main stream's kernels it should overlap.
     virtual void set_stage_wgs(int n) { (void) n; }
-    virtual void count_misses(const ExpertTable & t, const int * ids) { (void) t; (void) ids; }
+    virtual void count_misses(const ExpertTable & t, const int * ids, int T = 1) { (void) t; (void) ids; (void) T; }
+    // --ds4-expert-gather 0|1 (GPU, chunks only): expert-major routed GEMVs
+    virtual void set_expert_gather(int on) { (void) on; }
+    // --ds4-attn-mb N (GPU): attention partials a card holds for a block of a
+    // chunk's query rows (the rows run in blocks under it; before reserve())
+    virtual void set_attn_mb(int mb) { (void) mb; }
     virtual double miss_bytes_total() { return 0.0; }
     virtual void reset_miss_count() {}
 

@@ -68,29 +68,44 @@ public:
 
     // The CPU backend's GEMV already decodes every format (decode_cpu.cpp
     // row_dot, the six new ones through ds4_quant.h).
-    void gemv(const Mat & W, const float * x, float * y) override { be_.gemv(W, x, y); }
+    // A chunk is the same GEMV per column (L5 step 5): bit-identical at any T.
+    void gemv(const Mat & W, const float * x, float * y, int T) override {
+        for (int t = 0; t < T; ++t) be_.gemv(W, x + (size_t) t * W.K, y + (size_t) t * W.rows);
+    }
 
     // One expert = a one-matrix Mat whose base is the table entry.
+    // Rows: assignment a = r*6 + k of row r reads x + r*K_gu (gate/up) or
+    // h + a*K_d (down) and writes y + a*rows. Same GEMV per assignment.
     void moe_gate_up(const ExpertTable & t, const int * ids, const float * x,
-                     float * yg, float * yu, int) override {
-        for (int k = 0; k < N_EXPERT_USED; ++k) {
-            be_.gemv(expert_mat(t.up[ids[k]],   t.type_gu, t.row_gu, t.K_gu, t.rows_gu), x,
-                     yu + (size_t) k * t.rows_gu);
-            be_.gemv(expert_mat(t.gate[ids[k]], t.type_gu, t.row_gu, t.K_gu, t.rows_gu), x,
-                     yg + (size_t) k * t.rows_gu);
-        }
+                     float * yg, float * yu, int, int T) override {
+        for (int r = 0; r < T; ++r)
+            for (int k = 0; k < N_EXPERT_USED; ++k) {
+                const int a = r * N_EXPERT_USED + k;
+                const float * xr = x + (size_t) r * t.K_gu;
+                be_.gemv(expert_mat(t.up[ids[a]],   t.type_gu, t.row_gu, t.K_gu, t.rows_gu), xr,
+                         yu + (size_t) a * t.rows_gu);
+                be_.gemv(expert_mat(t.gate[ids[a]], t.type_gu, t.row_gu, t.K_gu, t.rows_gu), xr,
+                         yg + (size_t) a * t.rows_gu);
+            }
     }
-    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y, int) override {
-        for (int k = 0; k < N_EXPERT_USED; ++k)
-            be_.gemv(expert_mat(t.down[ids[k]], t.type_d, t.row_d, t.K_d, t.rows_d),
-                     h + (size_t) k * t.K_d, y + (size_t) k * t.rows_d);
+    void moe_down(const ExpertTable & t, const int * ids, const float * h, float * y, int,
+                  int T) override {
+        for (int a = 0; a < T * N_EXPERT_USED; ++a)
+            be_.gemv(expert_mat(t.down[ids[a]], t.type_d, t.row_d, t.K_d, t.rows_d),
+                     h + (size_t) a * t.K_d, y + (size_t) a * t.rows_d);
     }
     const void * alloc_host_mapped(size_t bytes, void ** host) override {
         *host = be_.alloc_raw(bytes);
         return *host;
     }
     void hc_split(const float * m, const float * s, const float * b,
-                  float * pre, float * post, float * comb, float eps, int iters) override {
+                  float * pre, float * post, float * comb, float eps, int iters, int T) override {
+        for (int r = 0; r < T; ++r)
+            hc_split_1(m + (size_t) r * HC_MIX, s, b, pre + (size_t) r * HC, post + (size_t) r * HC,
+                       comb + (size_t) r * HC * HC, eps, iters);
+    }
+    void hc_split_1(const float * m, const float * s, const float * b,
+                    float * pre, float * post, float * comb, float eps, int iters) {
         for (int h = 0; h < HC; ++h) {
             // ggml_mul, ggml_add, ggml_sigmoid, ggml_scale_bias(1, eps)
             pre[h]  = sigmoidf_(m[h] * s[0] + b[h]) * 1.0f + eps;
@@ -146,10 +161,17 @@ public:
         for (int h = 0; h < HC; ++h) pre[h] = sigmoidf_(m[h] * s[0] + b[h]) * 1.0f + eps;
     }
 
-    void hc_init(const float * x, float * H) override {
-        for (int h = 0; h < HC; ++h) std::memcpy(H + (size_t) h * N_EMBD, x, N_EMBD * sizeof(float));
+    void hc_init(const float * x, float * H, int T) override {
+        for (int r = 0; r < T; ++r)
+            for (int h = 0; h < HC; ++h)
+                std::memcpy(H + (size_t) r * HC_DIM + (size_t) h * N_EMBD, x + (size_t) r * N_EMBD,
+                            N_EMBD * sizeof(float));
     }
-    void hc_weighted_sum(const float * H, const float * w, float * out) override {
+    void hc_weighted_sum(const float * H, const float * w, float * out, int T) override {
+        for (int r = 0; r < T; ++r)
+            hc_weighted_sum_1(H + (size_t) r * HC_DIM, w + (size_t) r * HC, out + (size_t) r * N_EMBD);
+    }
+    void hc_weighted_sum_1(const float * H, const float * w, float * out) {
         for (int i = 0; i < N_EMBD; ++i) {
             float sum = 0.0f;
             for (int h = 0; h < HC; ++h) sum += H[(size_t) h * N_EMBD + i] * w[h];
@@ -158,7 +180,13 @@ public:
     }
 
     void hc_post(const float * x, const float * H, const float * post, const float * comb,
-                 float * Hout) override {
+                 float * Hout, int T) override {
+        for (int r = 0; r < T; ++r)
+            hc_post_1(x + (size_t) r * N_EMBD, H + (size_t) r * HC_DIM, post + (size_t) r * HC,
+                      comb + (size_t) r * HC * HC, Hout + (size_t) r * HC_DIM);
+    }
+    void hc_post_1(const float * x, const float * H, const float * post, const float * comb,
+                   float * Hout) {
         for (int d = 0; d < HC; ++d) {
             for (int i = 0; i < N_EMBD; ++i) {
                 float sum = x[i] * post[d];
@@ -169,8 +197,13 @@ public:
     }
 
     void rope_tail(float * x, int n_rows, int row_len, int pos, int block_ratio,
-                   const RopeParams & rp, bool inverse) override {
-        rope_at(x, n_rows, row_len, block_ratio > 0 ? (pos / block_ratio) * block_ratio : pos, rp, inverse);
+                   const RopeParams & rp, bool inverse, int rows_per_pos) override {
+        const int per = rows_per_pos > 0 ? rows_per_pos : n_rows;
+        for (int r0 = 0; r0 < n_rows; r0 += per) {
+            const int p = pos + r0 / per;
+            rope_at(x + (size_t) r0 * row_len, std::min(per, n_rows - r0), row_len,
+                    block_ratio > 0 ? (p / block_ratio) * block_ratio : p, rp, inverse);
+        }
     }
     void rope_at(float * x, int n_rows, int row_len, int pos, const RopeParams & rp, bool inverse) {
         const int n_dims = N_ROT;
@@ -213,19 +246,34 @@ public:
         }
     }
 
-    void store_raw(const float * kv, uint16_t * raw, int pos) override {
-        to_f16(kv, raw + (size_t) (pos % N_SWA) * HEAD_DIM, HEAD_DIM);
+    void store_raw(const float * kv, uint16_t * raw, int raw_rows, int pos, int T) override {
+        for (int r = 0; r < T; ++r)
+            to_f16(kv + (size_t) r * HEAD_DIM, raw + (size_t) ((pos + r) % raw_rows) * HEAD_DIM, HEAD_DIM);
     }
-    void store_block(const float * x, uint16_t * cache, int width, int ratio, int pos) override {
-        if ((pos + 1) % ratio != 0) return;
-        to_f16(x, cache + (size_t) (pos / ratio) * width, width);
+    void store_block(const float * x, uint16_t * cache, int width, int ratio, int pos, int T) override {
+        for (int r = 0; r < T; ++r) {
+            const int p = pos + r;
+            if ((p + 1) % ratio != 0) continue;
+            to_f16(x + (size_t) r * width, cache + (size_t) (p / ratio) * width, width);
+        }
     }
-    void ring_put(float * ring, int ring_rows, int width, int pos, const float * src) override {
-        std::memcpy(ring + (size_t) (pos % ring_rows) * width, src, (size_t) width * sizeof(float));
+    void ring_put(float * ring, int ring_rows, int width, int pos, const float * src, int T) override {
+        for (int r = 0; r < T; ++r)
+            std::memcpy(ring + (size_t) ((pos + r) % ring_rows) * width, src + (size_t) r * width,
+                        (size_t) width * sizeof(float));
     }
-    void add_row(float * x, const float * table, int width, int ratio, int pos) override {
-        const float * t = table + (size_t) (pos % ratio) * width;
-        for (int i = 0; i < width; ++i) x[i] = x[i] + t[i];     // ggml_add(state_score, ape_rows)
+    void add_row(float * x, const float * table, int width, int ratio, int pos, int T) override {
+        for (int r = 0; r < T; ++r) {
+            const float * t = table + (size_t) ((pos + r) % ratio) * width;
+            float * xr = x + (size_t) r * width;
+            for (int i = 0; i < width; ++i) xr[i] = xr[i] + t[i];     // ggml_add(state_score, ape_rows)
+        }
+    }
+    void copy_rows(const float * src, size_t src_stride, float * dst, size_t dst_stride,
+                   int n_rows, int row_len) override {
+        for (int r = 0; r < n_rows; ++r)
+            std::memcpy(dst + (size_t) r * dst_stride, src + (size_t) r * src_stride,
+                        (size_t) row_len * sizeof(float));
     }
     void to_f16(const float * x, uint16_t * y, int n) {
         for (int i = 0; i < n; ++i) {
@@ -250,7 +298,11 @@ public:
     }
 
     void comp_pool(const float * rk, const float * rs, int ring_rows, int ratio, int d_out,
-                   int pos, float * out) override {
+                   int pos, float * out, int T) override {
+        for (int r = 0; r < T; ++r) comp_pool_1(rk, rs, ring_rows, ratio, d_out, pos + r, out + (size_t) r * d_out);
+    }
+    void comp_pool_1(const float * rk, const float * rs, int ring_rows, int ratio, int d_out,
+                     int pos, float * out) {
         if ((pos + 1) % ratio != 0) return;
         const int blk = pos / ratio;
         std::vector<float> v((size_t) ratio), sc((size_t) ratio);
@@ -265,7 +317,12 @@ public:
     }
 
     void comp_pool_overlap(const float * rk, const float * rs, int ring_rows, int ratio,
-                           int d_out, int pos, float * out) override {
+                           int d_out, int pos, float * out, int T) override {
+        for (int r = 0; r < T; ++r)
+            comp_pool_overlap_1(rk, rs, ring_rows, ratio, d_out, pos + r, out + (size_t) r * d_out);
+    }
+    void comp_pool_overlap_1(const float * rk, const float * rs, int ring_rows, int ratio,
+                             int d_out, int pos, float * out) {
         if ((pos + 1) % ratio != 0) return;
         const int blk = pos / ratio;
         const int width = 2 * d_out;
@@ -288,7 +345,13 @@ public:
     }
 
     void lid_scores(const float * q, const float * w, const uint16_t * keys, int pos,
-                    float * scores) override {
+                    float * scores, int T, int stride) override {
+        for (int r = 0; r < T; ++r)
+            lid_scores_1(q + (size_t) r * IDX_N_HEAD * IDX_DIM, w + (size_t) r * IDX_N_HEAD, keys, pos + r,
+                         scores + (size_t) r * stride);
+    }
+    void lid_scores_1(const float * q, const float * w, const uint16_t * keys, int pos,
+                      float * scores) {
         const int n_blocks = (pos + 1) / CSA_RATIO;
         float k[IDX_DIM];
         for (int b = 0; b < n_blocks; ++b) {
@@ -304,7 +367,10 @@ public:
         }
     }
 
-    void topk(const float * scores, int pos, int k, int * out) override {
+    void topk(const float * scores, int pos, int k, int * out, int T, int stride) override {
+        for (int r = 0; r < T; ++r) topk_1(scores + (size_t) r * stride, pos + r, k, out + (size_t) r * k);
+    }
+    void topk_1(const float * scores, int pos, int k, int * out) {
         const int n = (pos + 1) / CSA_RATIO;
         if (n <= k) { for (int i = 0; i < n; ++i) out[i] = i; return; }   // ggml_top_k's identity
         topk_n(scores, n, k, out);
@@ -319,9 +385,17 @@ public:
         return m;
     }
 
-    void attn(const float * q, const uint16_t * raw_ring, int pos, const uint16_t * comp,
+    void attn(const float * q, const uint16_t * raw_ring, int raw_rows, int pos, const uint16_t * comp,
               int ratio, int cap, const int * comp_ids, const float * sinks, float scale,
-              float * out) override {
+              float * out, int T) override {
+        for (int r = 0; r < T; ++r)
+            attn_1(q + (size_t) r * N_HEAD * HEAD_DIM, raw_ring, raw_rows, pos + r, comp, ratio, cap,
+                   comp_ids ? comp_ids + (size_t) r * IDX_TOP_K : nullptr, sinks, scale,
+                   out + (size_t) r * N_HEAD * HEAD_DIM);
+    }
+    void attn_1(const float * q, const uint16_t * raw_ring, int raw_rows, int pos, const uint16_t * comp,
+                int ratio, int cap, const int * comp_ids, const float * sinks, float scale,
+                float * out) {
         const int raw_pos0 = std::max(0, pos - N_SWA + 1);
         const int n_raw = pos - raw_pos0 + 1;
         const int n_comp = ratio ? std::min((pos + 1) / ratio, cap) : 0;
@@ -329,7 +403,7 @@ public:
         // K as f32 once for all 64 heads (it is shared: MQA)
         std::vector<float> K((size_t) n_keys * HEAD_DIM);
         for (int j = 0; j < n_raw; ++j) {
-            const uint16_t * src = raw_ring + (size_t) ((raw_pos0 + j) % N_SWA) * HEAD_DIM;
+            const uint16_t * src = raw_ring + (size_t) ((raw_pos0 + j) % raw_rows) * HEAD_DIM;
             for (int i = 0; i < HEAD_DIM; ++i) K[(size_t) j * HEAD_DIM + i] = h2f(src[i]);
         }
         for (int j = 0; j < n_comp; ++j) {
@@ -364,7 +438,17 @@ public:
 
     void router(const float * logits, const float * bias, const int32_t * hash_ids,
                 float * probs, float * probs_biased, int * ids, float * w_raw,
-                float * w_norm, float * w_scaled, const int * miss, uint32_t * stats) override {
+                float * w_norm, float * w_scaled, const int * miss, uint32_t * stats, int T) override {
+        for (int r = 0; r < T; ++r) {
+            const size_t e = (size_t) r * N_EXPERT, u = (size_t) r * N_EXPERT_USED;
+            router_1(logits + e, bias, hash_ids ? hash_ids + u : nullptr, probs + e,
+                     probs_biased ? probs_biased + e : nullptr, ids + u, w_raw + u, w_norm + u,
+                     w_scaled + u, miss, stats);
+        }
+    }
+    void router_1(const float * logits, const float * bias, const int32_t * hash_ids,
+                  float * probs, float * probs_biased, int * ids, float * w_raw,
+                  float * w_norm, float * w_scaled, const int * miss, uint32_t * stats) {
         for (int e = 0; e < N_EXPERT; ++e) probs[e] = sqrtf(softplusf_(logits[e]));
         if (hash_ids) {
             for (int k = 0; k < N_EXPERT_USED; ++k) ids[k] = hash_ids[k];
@@ -434,7 +518,13 @@ public:
     }
 
     void moe_accum(const float * y, const float * w, int n_used, int n, float * weighted,
-                   float * out) override {
+                   float * out, int T) override {
+        for (int r = 0; r < T; ++r)
+            moe_accum_1(y + (size_t) r * n_used * n, w + (size_t) r * n_used, n_used, n,
+                        weighted + (size_t) r * n_used * n, out + (size_t) r * n);
+    }
+    void moe_accum_1(const float * y, const float * w, int n_used, int n, float * weighted,
+                     float * out) {
         for (int e = 0; e < n_used; ++e)
             for (int i = 0; i < n; ++i)
                 weighted[(size_t) e * n + i] = y[(size_t) e * n + i] * w[e];

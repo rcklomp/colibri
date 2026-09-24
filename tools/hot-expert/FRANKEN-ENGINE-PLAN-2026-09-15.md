@@ -14,6 +14,13 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 70 (2026-09-24 03:45 CEST) -- ADAPTIVE PLACEMENT WORKS (record
+> §L5-DS4-ADAPT).** Bit-identical with swaps; over 8.4k prose tokens from a
+> wrong placement: misses 474 -> 101 MB/token, hit 93-96 %. New finding:
+> DeepSeek's decode grows from 50 ms (depth 53) to 89-102 ms (depth 8.5k) --
+> its attention/indexer depth cost, to profile next with the trunk GEMV on
+> short rows; DeepSeek batched prefill still missing.**
+>
 > **Rev 69 (2026-09-24 02:45 CEST) -- DEEPSEEK 19.8 TOK/S AT 256K (record
 > §L5-DS4-STEP3b).** Bit-identical throughout; placement learned on mixed
 > text cut misses 742 -> 276 MB a token; graph replay: 50.4 ms a token. The

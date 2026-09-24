@@ -34,6 +34,7 @@
 #include "decode_oracle.h"
 #include "franken_serve.h"
 #include "ds4_graph.h"
+#include "glm5_graph.h"
 
 using namespace fk;
 
@@ -191,6 +192,7 @@ int main(int argc, char ** argv) {
         std::string arch;
         try { arch = franken::GgufModel::open(argv[i + 1])->hparams().arch; } catch (...) {}
         if (arch == "deepseek4") return fk::ds4::ds4_main(argc, argv);
+        if (arch == "glm5next")  return fk::glm5::glm5_main(argc, argv);   // L5 GLM, GLM5.md
         break;
     }
 

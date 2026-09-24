@@ -47,11 +47,13 @@ GGML_LIB_DIR := $(LLAMA_DIR)/build-hip/bin
 COMMON_SRC := ../gguf_model.cpp ../ple.cpp \
               decode_model.cpp decode_graph.cpp decode_oracle.cpp \
               decode_cpu.cpp franken_serve.cpp franken_decode.cpp \
-              ds4_model.cpp ds4_graph.cpp ds4_cpu.cpp ds4_adapt.cpp
+              ds4_model.cpp ds4_graph.cpp ds4_cpu.cpp ds4_adapt.cpp \
+              glm5_model.cpp glm5_graph.cpp glm5_cpu.cpp
 HDRS := decode_shapes.h decode_quant.h decode_backend.h decode_model.h \
         decode_graph.h decode_oracle.h franken_serve.h ../gguf_model.h ../ple.h \
         ../../m1/m1_native_decode.h \
-        ds4_shapes.h ds4_quant.h ds4_ops.h ds4_model.h ds4_graph.h ds4_gpu.inc ds4_adapt.h
+        ds4_shapes.h ds4_quant.h ds4_ops.h ds4_model.h ds4_graph.h ds4_gpu.inc ds4_adapt.h \
+        glm5_shapes.h glm5_ops.h glm5_model.h glm5_graph.h
 
 CPU_BIN := franken_decode_cpu
 GPU_BIN := franken_decode
@@ -107,9 +109,10 @@ franken_moe_gather_test: moe_gather_test.cpp $(HDRS)
 
 # ds4_quant.h's six decoders against ggml's own dequantisers, bit for bit
 # (ds4_quant_emul.cpp). Host only, no HIP, seconds. DS4_MODEL=<shard> adds the
-# real-rows set (a few hundred KB read through the mmap).
+# real-rows set (a few hundred KB read through the mmap); GLM_MODEL=<shard> the
+# GLM-5.3 formats real rows (Q8_0, IQ3_S, IQ4_XS, Q6_K; GLM5.md section 4).
 ds4-emul: franken_ds4_quant_emul
-	./franken_ds4_quant_emul $(if $(DS4_MODEL),--model $(DS4_MODEL),)
+	./franken_ds4_quant_emul $(if $(DS4_MODEL),--model $(DS4_MODEL),) $(if $(GLM_MODEL),--glm-model $(GLM_MODEL),)
 
 franken_ds4_quant_emul: ds4_quant_emul.cpp ../gguf_model.cpp $(HDRS)
 	$(DOCKER_RUN) c++ -O2 -std=c++17 -Wall $(INCS) ds4_quant_emul.cpp ../gguf_model.cpp \

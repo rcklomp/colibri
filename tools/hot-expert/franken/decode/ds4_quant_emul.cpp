@@ -6,6 +6,11 @@
 // backend (and later the kernels) compile, and walks the lanes the way a
 // wave does.
 //
+// GLM-5.3-Flash UD-IQ4_XS (L5 GLM step 2, decode/GLM5.md section 4) needs no
+// new decoder for its 45-layer text tower -- Q8_0, IQ3_S, IQ4_XS and Q6_K are
+// decode_quant.h's / m1_native_decode.h's -- so those four are checked here
+// the same way, on random blocks and (--glm-model) on real GLM rows.
+//
 // Checks, per format, on two block populations:
 //   random  blocks of random bytes with a finite, normal scale field (every
 //           grid index, sign pattern, scale nibble and qh bit gets exercised);
@@ -59,6 +64,10 @@ static_assert(sizeof(block_iq2_xxs) == FK_IQ2XXS_BLOCK_BYTES, "iq2_xxs");
 static_assert(sizeof(block_iq2_s)   == FK_IQ2S_BLOCK_BYTES,   "iq2_s");
 static_assert(sizeof(block_iq3_xxs) == FK_IQ3XXS_BLOCK_BYTES, "iq3_xxs");
 static_assert(sizeof(block_mxfp4)   == FK_MXFP4_BLOCK_BYTES,  "mxfp4");
+static_assert(sizeof(block_q8_0)    == FK_Q8_0_BLOCK_BYTES,   "q8_0");
+static_assert(sizeof(block_iq3_s)   == IQ3S_BLOCK_BYTES,      "iq3_s");
+static_assert(sizeof(block_iq4_xs)  == FK_IQ4XS_BLOCK_BYTES,  "iq4_xs");
+static_assert(sizeof(block_q6_K)    == FK_Q6K_BLOCK_BYTES,    "q6_K");
 
 namespace {
 
@@ -77,6 +86,11 @@ const Fmt FMTS[] = {
     {"iq2_s",   GGML_TYPE_IQ2_S,   FK_Q_IQ2_S,   256, FK_IQ2S_BLOCK_BYTES},
     {"iq3_xxs", GGML_TYPE_IQ3_XXS, FK_Q_IQ3_XXS, 256, FK_IQ3XXS_BLOCK_BYTES},
     {"mxfp4",   GGML_TYPE_MXFP4,   FK_Q_MXFP4,    32, FK_MXFP4_BLOCK_BYTES},
+    // the GLM-5.3 trunk and experts (decoders that predate DeepSeek)
+    {"q8_0",    GGML_TYPE_Q8_0,    FK_Q_Q8_0,     32, FK_Q8_0_BLOCK_BYTES},
+    {"iq3_s",   GGML_TYPE_IQ3_S,   FK_Q_IQ3_S,   256, IQ3S_BLOCK_BYTES},
+    {"iq4_xs",  GGML_TYPE_IQ4_XS,  FK_Q_IQ4_XS,  256, FK_IQ4XS_BLOCK_BYTES},
+    {"q6_K",    GGML_TYPE_Q6_K,    FK_Q_Q6_K,    256, FK_Q6K_BLOCK_BYTES},
 };
 
 // One block's lane loop: exactly what decode_cpu.cpp's row_dot does per
@@ -92,6 +106,14 @@ double block_dot(int fk, const unsigned char * bp, const float * xblk) {
             case FK_Q_IQ2_S:   a += fk_iq2s_block_dot(bp, iq2s_grid, kmask_iq2xs, xblk + 8 * tid, tid); break;
             case FK_Q_IQ3_XXS: a += fk_iq3xxs_block_dot(bp, iq3xxs_grid, ksigns_iq2xs, kmask_iq2xs, xblk + 8 * tid, tid); break;
             case FK_Q_MXFP4:   a += fk_mxfp4_lane_dot(bp, kvalues_mxfp4, xblk, tid); break;
+            // decode_cpu.cpp row_dot's lane loops, verbatim
+            case FK_Q_Q8_0:    a += fk_q8_0_lane_dot(bp, xblk, tid); break;
+            case FK_Q_IQ4_XS:  a += fk_iq4xs_block_dot(bp, kvalues_iq4nl, xblk + 8 * tid, tid); break;
+            case FK_Q_Q6_K:    a += fk_q6k_block_dot(bp, xblk + 8 * tid, tid); break;
+            case FK_Q_IQ3_S: {
+                const int ib32 = tid >> 2, l = tid & 3;
+                a += m1n_iq3s_block_dot(bp, iq3s_grid, xblk + 8 * tid, tid, ib32, 8 - 2 * l, 7 - 2 * l);
+            } break;
         }
     }
     return a;
@@ -155,6 +177,7 @@ std::vector<unsigned char> random_blocks(const Fmt & f, int n, std::mt19937 & rn
         switch (f.fk) {
             case FK_Q_Q4_K: case FK_Q_Q5_K: put_half(bp); put_half(bp + 2); break;
             case FK_Q_MXFP4: bp[0] = (unsigned char) (110 + rng() % 31); break;
+            case FK_Q_Q6_K:  put_half(bp + FK_Q6K_OFF_D); break;
             default: put_half(bp); break;
         }
     }
@@ -164,14 +187,15 @@ std::vector<unsigned char> random_blocks(const Fmt & f, int n, std::mt19937 & rn
 } // namespace
 
 int main(int argc, char ** argv) {
-    std::string model;
+    std::string model, glm_model;
     int n_random = 512, rows_real = 4;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) model = argv[++i];
+        else if (a == "--glm-model" && i + 1 < argc) glm_model = argv[++i];
         else if (a == "--random" && i + 1 < argc) n_random = std::atoi(argv[++i]);
         else if (a == "--rows" && i + 1 < argc) rows_real = std::atoi(argv[++i]);
-        else { std::fprintf(stderr, "usage: %s [--model shard.gguf] [--random N] [--rows R]\n", argv[0]); return 2; }
+        else { std::fprintf(stderr, "usage: %s [--model shard.gguf] [--glm-model shard.gguf] [--random N] [--rows R]\n", argv[0]); return 2; }
     }
     std::mt19937 rng(0xD5E4C0DEu);
     bool ok = true;
@@ -185,25 +209,15 @@ int main(int argc, char ** argv) {
                     f.name, n_random, r.weights, r.mism, r.zero_ref, r.max_rel_dot, pass ? "PASS" : "FAIL");
     }
 
-    if (!model.empty()) {
-        // One real tensor per format, as the file carries it (DEEPSEEK4.md
-        // section 2). A few rows each: the reads are a few hundred KB.
-        struct Real { const char * tensor; int expert; };
-        const Real reals[] = {
-            {"output.weight", -1},                    // Q4_K
-            {"blk.0.attn_q_a.weight", -1},            // Q5_K
-            {"blk.3.ffn_gate_exps.weight", 17},       // IQ2_XXS
-            {"blk.26.ffn_up_exps.weight", 200},       // IQ2_S
-            {"blk.3.ffn_down_exps.weight", 17},       // IQ3_XXS
-            {"blk.42.ffn_down_exps.weight", 5},       // MXFP4
-        };
-        auto gm = franken::GgufModel::open(model);
+    struct Real { const char * tensor; int expert; };
+    auto check_reals = [&](const std::string & path, const std::vector<Real> & reals) {
+        auto gm = franken::GgufModel::open(path);
         for (const Real & re : reals) {
             const franken::TensorInfo * t = gm->find(re.tensor);
             if (!t) { std::printf("emul real %s MISSING\n", re.tensor); ok = false; continue; }
             const Fmt * f = nullptr;
             for (const Fmt & c : FMTS) if (c.gt == t->type) f = &c;
-            if (!f) { std::printf("emul real %s type %s not in ds4_quant.h\n", re.tensor, ggml_type_name(t->type)); ok = false; continue; }
+            if (!f) { std::printf("emul real %s type %s not in the table\n", re.tensor, ggml_type_name(t->type)); ok = false; continue; }
             const size_t row = t->row_size();
             const size_t slice = re.expert >= 0 ? t->slice_bytes(t->ne2()) : 0;
             const unsigned char * base = t->data + (re.expert >= 0 ? (size_t) re.expert * slice : 0);
@@ -223,6 +237,30 @@ int main(int argc, char ** argv) {
                         f->name, re.tensor, re.expert, rows_real, tot.weights, tot.mism, tot.zero_ref,
                         tot.max_rel_dot, pass ? "PASS" : "FAIL");
         }
+    };
+    if (!model.empty()) {
+        // One real tensor per format, as the DeepSeek-V4 file carries it
+        // (DEEPSEEK4.md section 4). A few rows each: a few hundred KB.
+        check_reals(model, {
+            {"output.weight", -1},                    // Q4_K
+            {"blk.0.attn_q_a.weight", -1},            // Q5_K
+            {"blk.3.ffn_gate_exps.weight", 17},       // IQ2_XXS
+            {"blk.26.ffn_up_exps.weight", 200},       // IQ2_S
+            {"blk.3.ffn_down_exps.weight", 17},       // IQ3_XXS
+            {"blk.42.ffn_down_exps.weight", 5},       // MXFP4
+        });
+    }
+    if (!glm_model.empty()) {
+        // Every format the GLM-5.3-Flash text tower carries (GLM5.md section 4).
+        check_reals(glm_model, {
+            {"token_embd.weight", -1},                // Q8_0 (the host gather's format)
+            {"blk.3.attn_q_b.weight", -1},            // Q8_0 (trunk)
+            {"blk.3.ffn_gate_exps.weight", 17},       // IQ3_S (41 layers)
+            {"blk.11.ffn_up_exps.weight", 200},       // IQ4_XS (gate/up, layer 11)
+            {"blk.3.ffn_down_exps.weight", 17},       // IQ4_XS (down, 39 layers)
+            {"blk.12.ffn_down_exps.weight", 5},       // Q6_K (down, layers 11, 12, 44)
+            {"output.weight", -1},                    // Q6_K (lm_head)
+        });
     }
     std::printf("emul verdict=%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

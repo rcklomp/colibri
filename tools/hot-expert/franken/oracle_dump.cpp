@@ -98,6 +98,27 @@ static const std::set<std::string> WANTED_DS4 = {
     "ffn_up", "ffn_gate", "ffn_swiglu_limited", "ffn_shexp", "ffn_out", "l_last",
     "hc_head_mixes", "hc_head_pre", "hc_head", "result_norm", "result_output",
 };
+// GLM-5.3-Flash (arch glm5next): the cb() names of src/models/glm5next.cpp,
+// the DeepSeek-V4 hyper-connection builders it inherits, build_ffn and
+// build_moe_ffn, that decode/glm5_graph.cpp taps under the same names
+// (decode/GLM5.md section 6). Chosen from general.architecture, so the other
+// dumps are byte-for-byte what they were.
+static const std::set<std::string> WANTED_GLM5 = {
+    "hc_init",
+    "hc_mixes", "hc_pre", "hc_post", "hc_comb", "hc_attn_pre", "attn_norm",
+    "kda_qkv", "kda_conv", "kda_q_norm", "kda_k_norm", "kda_gate", "kda_beta",
+    "kda_scan_out", "kda_normed", "kda_out",
+    "dsa_q_a_norm", "indexer_k", "indexer_gate", "indexer_q", "indexer_weights",
+    "indexer_pool_score", "indexer_top_k",
+    "dsa_q_b", "dsa_kv_a_norm", "dsa_q_absorbed", "dsa_kv_latent", "kqv_out", "dsa_out",
+    "hc_attn_post", "hc_ffn_pre", "ffn_norm",
+    "ffn_moe_logits", "ffn_moe_probs", "ffn_moe_probs_biased", "ffn_moe_topk",
+    "ffn_moe_weights", "ffn_moe_weights_norm", "ffn_moe_weights_scaled",
+    "ffn_moe_up", "ffn_moe_gate", "ffn_moe_swiglu_limited", "ffn_moe_down",
+    "ffn_moe_weighted", "ffn_moe_out",
+    "ffn_up", "ffn_gate", "ffn_swiglu_limited", "ffn_shexp", "ffn_out", "l_last",
+    "hc_mean", "result_norm", "result_output",
+};
 static const std::set<std::string> * g_wanted = &WANTED;
 
 struct Hit {
@@ -350,6 +371,7 @@ int main(int argc, char ** argv) {
     int n_greedy = 0;
     int stop_after = -1;
     bool no_extra_bufts = false;
+    int n_ctx_arg = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -363,6 +385,12 @@ int main(int argc, char ** argv) {
             n_greedy = atoi(argv[++i]);
         } else if (a == "--stop-after-layer" && i + 1 < argc) {
             stop_after = atoi(argv[++i]);
+        } else if (a == "--ctx" && i + 1 < argc) {
+            // an explicit context size. glm5next gates its indexer SCORING on
+            // n_ctx > top_k + kpool - 1 (2 051): below it every cell is attended
+            // and the pool scores / top-k are never computed, so a dump that
+            // is to carry them needs e.g. --ctx 4096. Default: unchanged.
+            n_ctx_arg = atoi(argv[++i]);
         } else if (a == "--no-extra-bufts") {
             // no CPU weight repacking: a repacked tensor is READ IN FULL at
             // load time, which is exactly the read --stop-after-layer avoids
@@ -378,7 +406,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s --model <first-shard.gguf> --tokens <id...> [--out <dir>] [--threads N] [--greedy N] [--stop-after-layer N] [--no-extra-bufts]\n", argv[0]);
+        fprintf(stderr, "usage: %s --model <first-shard.gguf> --tokens <id...> [--out <dir>] [--threads N] [--greedy N] [--stop-after-layer N] [--no-extra-bufts] [--ctx N]\n", argv[0]);
         return 1;
     }
     if (tokens.empty()) {
@@ -421,6 +449,9 @@ int main(int argc, char ** argv) {
         if (std::string(arch) == "deepseek4") {
             g_wanted = &WANTED_DS4;
             fprintf(stderr, "oracle_dump: arch deepseek4, using the DeepSeek-V4 tap names\n");
+        } else if (std::string(arch) == "glm5next") {
+            g_wanted = &WANTED_GLM5;
+            fprintf(stderr, "oracle_dump: arch glm5next, using the GLM-5.3 tap names\n");
         }
     }
     if (stop_after >= 0) {
@@ -434,6 +465,7 @@ int main(int argc, char ** argv) {
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = std::max<uint32_t>(64, (uint32_t) tokens.size() + (uint32_t) n_greedy + 8);
+    if (n_ctx_arg > 0) cparams.n_ctx = std::max<uint32_t>(cparams.n_ctx, (uint32_t) n_ctx_arg);
     cparams.n_batch         = (uint32_t) tokens.size();
     cparams.n_ubatch        = (uint32_t) tokens.size();
     cparams.n_threads       = n_threads;

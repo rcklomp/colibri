@@ -1,4 +1,3 @@
-49 /home/ronald/src/colibri-m1/tools/hot-expert/franken_quality_chain.sh
 #!/bin/bash
 # franken_quality_chain.sh -- the L0 quality number (design §9.5 step 4): the Franken engine
 # as served (FRANKEN_GEMM_LDS=1, three cards, 256k) against llama.cpp's Qwen3.8 on the same

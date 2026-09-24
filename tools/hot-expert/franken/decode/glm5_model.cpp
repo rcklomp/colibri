@@ -56,7 +56,7 @@ double kv_num(const gguf_context * ctx, const std::string & key, bool & found) {
 constexpr double CARD_GB    = 25.769803776;   // 24 GiB
 constexpr double RESERVE_GB = 1.0;            // HIP context + allocator slack (the Qwen3.8 run's)
 constexpr double SCRATCH_GB = 0.5;            // a 512-row prefill chunk's intermediates + attention
-constexpr double STAGING_GB = 0.3;            // miss staging ring: 2 layers x 8 slabs x <= 15.8 MB
+constexpr double STAGING_GB = 0.55;           // miss staging rings: own + helper, 2 banks x 8 slabs x <= 15.8 MB, + packets
 
 } // namespace
 
@@ -300,37 +300,125 @@ void Glm5Model::plan_placement(const Placement & pl) {
                 miss_all / 1e6, stream_serial_ms, miss_all / 62.4e9 * 1e3);
 }
 
-// The expert table of one layer. CPU arm: every entry is an mmap address.
+// The expert table of one layer.
+//   CPU arm: every entry is an mmap address (with --adapt 1 and a plan, the
+//     resident set is COPIED into a separate block, as a card holds it).
+//   A card: every expert in the pinned host mirror, the planned resident set
+//     also in one VRAM block; the owner's table points a resident expert at
+//     its VRAM slot and a missed one at the mirror; each other card gets its
+//     own view table of the mirror (the three-link helpers).
 void Glm5Model::place_experts(LayerWeights & L, Backend & be) {
     const int il = L.il;
     const TensorInfo * tg = need("blk." + std::to_string(il) + ".ffn_gate_exps.weight");
     const TensorInfo * tu = need("blk." + std::to_string(il) + ".ffn_up_exps.weight");
     const TensorInfo * td = need("blk." + std::to_string(il) + ".ffn_down_exps.weight");
     const size_t sg = tg->slice_bytes(N_EXPERT), su = tu->slice_bytes(N_EXPERT), sd = td->slice_bytes(N_EXPERT);
+    const size_t slab = sg + su + sd;
     L.et.type_gu = L.exp_gate.type; L.et.type_d = L.exp_down.type;
     L.et.row_gu  = L.exp_gate.row_bytes; L.et.row_d = L.exp_down.row_bytes;
     L.et.K_gu = (int) L.exp_gate.K; L.et.rows_gu = (int) L.exp_gate.rows;
     L.et.K_d  = (int) L.exp_down.K; L.et.rows_d  = (int) L.exp_down.rows;
     if (L.exp_up.type != L.exp_gate.type) throw std::runtime_error("gate/up formats differ on layer " + std::to_string(il));
     L.et.sz_g = sg; L.et.sz_u = su; L.et.sz_d = sd;
+    if ((sg | su | sd) % 16) throw std::runtime_error("expert slices of layer " + std::to_string(il) +
+                                                      " are not 16-byte multiples (the staged loads need it)");
     L.tab_host.assign(3 * N_EXPERT, nullptr);
     L.miss_host.assign(N_EXPERT, 0);
-    if (be.is_gpu()) throw std::runtime_error("GLM GPU expert placement is not built (GLM5.md section 8)");
-    for (int e = 0; e < N_EXPERT; ++e) {
-        L.tab_host[e]                = tg->data + (size_t) e * sg;
-        L.tab_host[N_EXPERT + e]     = tu->data + (size_t) e * su;
-        L.tab_host[2 * N_EXPERT + e] = td->data + (size_t) e * sd;
+    const int n_dev = (int) devs_.size();
+    auto file_ptr = [&](int e, int w) -> const void * {
+        return w == 0 ? tg->data + (size_t) e * sg : w == 1 ? tu->data + (size_t) e * su : td->data + (size_t) e * sd;
+    };
+    auto off_of = [&](int w) { return w == 0 ? (size_t) 0 : w == 1 ? sg : sg + su; };
+    auto len_of = [&](int w) { return w == 0 ? sg : w == 1 ? su : sd; };
+    auto set_tab = [&](int e, const void * g, const void * u, const void * d) {
+        L.tab_host[e] = g; L.tab_host[N_EXPERT + e] = u; L.tab_host[2 * N_EXPERT + e] = d;
+    };
+    std::vector<int> res;
+    for (int e = 0; e < N_EXPERT; ++e) if (resident_[il][e]) res.push_back(e);
+
+    if (!be.is_gpu()) {
+        L.mir_view.assign(3 * N_EXPERT, nullptr);
+        for (int e = 0; e < N_EXPERT; ++e) for (int w = 0; w < 3; ++w) L.mir_view[3 * e + w] = file_ptr(e, w);
+        L.mir_src = L.mir_view;
+        for (int e = 0; e < N_EXPERT; ++e) set_tab(e, file_ptr(e, 0), file_ptr(e, 1), file_ptr(e, 2));
+        if (adapt_cpu_ && planned_) {
+            unsigned char * blk = res.empty() ? nullptr : (unsigned char *) be.alloc_raw(res.size() * slab);
+            for (int e = 0; e < N_EXPERT; ++e) L.miss_host[e] = (int) slab;
+            for (size_t i = 0; i < res.size(); ++i) {
+                const int e = res[i];
+                unsigned char * dst = blk + i * slab;
+                for (int w = 0; w < 3; ++w) std::memcpy(dst + off_of(w), file_ptr(e, w), len_of(w));
+                set_tab(e, dst, dst + sg, dst + sg + su);
+                L.miss_host[e] = 0;
+            }
+            L.n_resident = (int) res.size();
+        } else {
+            L.n_resident = N_EXPERT;
+        }
+        L.et.gate = L.tab_host.data(); L.et.up = L.tab_host.data() + N_EXPERT; L.et.down = L.tab_host.data() + 2 * N_EXPERT;
+        L.et.miss_bytes = L.miss_host.data();
+        for (int c = 0; c < std::min(n_dev, 3); ++c) L.xt[c] = L.et;        // one process: one view
+        return;
     }
-    L.et.miss_bytes = L.miss_host.data();
-    L.et.gate = L.tab_host.data();
-    L.et.up   = L.tab_host.data() + N_EXPERT;
-    L.et.down = L.tab_host.data() + 2 * N_EXPERT;
+
+    // --- a card: the mirror (all 288), then the resident block, then the tables
+    void * host = nullptr;
+    const unsigned char * view = (const unsigned char *) dops_[(size_t) L.dev]->alloc_host_mapped((size_t) N_EXPERT * slab, &host);
+    unsigned char * h = (unsigned char *) host;
+    L.mir_view.assign(3 * N_EXPERT, nullptr);
+    L.mir_src.assign(3 * N_EXPERT, nullptr);
+    for (int e = 0; e < N_EXPERT; ++e)
+        for (int w = 0; w < 3; ++w) {
+            std::memcpy(h + e * slab + off_of(w), file_ptr(e, w), len_of(w));
+            L.mir_view[3 * e + w] = view + e * slab + off_of(w);
+            L.mir_src[3 * e + w]  = h + e * slab + off_of(w);
+        }
+    host_expert_bytes_ += (size_t) N_EXPERT * slab;
+    for (int e = 0; e < N_EXPERT; ++e) {
+        set_tab(e, L.mir_view[3 * e], L.mir_view[3 * e + 1], L.mir_view[3 * e + 2]);
+        L.miss_host[e] = (int) slab;
+    }
+    unsigned char * vram = res.empty() ? nullptr : (unsigned char *) be.alloc_raw(res.size() * slab);
+    for (size_t i = 0; i < res.size(); ++i) {
+        const int e = res[i];
+        unsigned char * dst = vram + i * slab;
+        be.upload(dst, h + e * slab, slab);            // one slab: gate | up | down
+        set_tab(e, dst, dst + sg, dst + sg + su);
+        L.miss_host[e] = 0;
+    }
+    L.n_resident = (int) res.size();
+    placed_ += res.size() * slab;
+    const void ** dtab = (const void **) be.alloc_raw(3 * N_EXPERT * sizeof(void *));
+    be.upload(dtab, L.tab_host.data(), 3 * N_EXPERT * sizeof(void *));
+    L.et.gate = dtab; L.et.up = dtab + N_EXPERT; L.et.down = dtab + 2 * N_EXPERT;
+    int * dmiss = (int *) be.alloc_raw(N_EXPERT * sizeof(int));
+    be.upload(dmiss, L.miss_host.data(), N_EXPERT * sizeof(int));
+    L.et.miss_bytes = dmiss;
+    // every other card's view of the mirror (a helper computes missed experts only)
+    for (int c = 0; c < std::min(n_dev, 3); ++c) {
+        if (c == L.dev) { L.xt[c] = L.et; continue; }
+        const unsigned char * vc = (const unsigned char *) gops_[(size_t) c]->host_view(host);
+        L.xt_host[c].assign(3 * N_EXPERT, nullptr);
+        for (int e = 0; e < N_EXPERT; ++e)
+            for (int w = 0; w < 3; ++w) L.xt_host[c][(size_t) (w * N_EXPERT + e)] = vc + e * slab + off_of(w);
+        Backend & bc = *devs_[(size_t) c];
+        const void ** t = (const void **) bc.alloc_raw(3 * N_EXPERT * sizeof(void *));
+        bc.upload(t, L.xt_host[c].data(), 3 * N_EXPERT * sizeof(void *));
+        L.xt[c] = L.et;
+        L.xt[c].gate = t; L.xt[c].up = t + N_EXPERT; L.xt[c].down = t + 2 * N_EXPERT;
+        L.xt[c].miss_bytes = nullptr;                   // the owner's packet carries the miss flags
+    }
 }
 
-Glm5Model::Glm5Model(const std::string & path, std::vector<Backend *> devs, int il0, int il1,
+Glm5Model::Glm5Model(const std::string & path, std::vector<Backend *> devs,
+                     std::vector<ds4::Ds4Ops *> dops, std::vector<Glm5Ops *> gops, int il0, int il1,
                      bool with_head, const std::vector<int> & split, const Placement & pl)
-    : devs_(std::move(devs)), split_(split), il0_(il0), il1_(il1) {
+    : devs_(std::move(devs)), dops_(std::move(dops)), gops_(std::move(gops)), split_(split), il0_(il0), il1_(il1) {
     if (devs_.empty()) throw std::runtime_error("Glm5Model needs at least one backend");
+    if (dops_.size() != devs_.size() || gops_.size() != devs_.size())
+        throw std::runtime_error("Glm5Model: one Ds4Ops and one Glm5Ops per backend");
+    if (devs_[0]->is_gpu() && devs_.size() > 3) throw std::runtime_error("at most three cards");
+    adapt_cpu_ = pl.adapt && !devs_[0]->is_gpu();
     if (il0 < 0 || il1 >= N_LAYER || il1 < il0)
         throw std::runtime_error("layer span out of range (0-44: the NextN block 45 is not run)");
     model_ = GgufModel::open(path);

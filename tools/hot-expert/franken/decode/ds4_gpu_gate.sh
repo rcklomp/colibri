@@ -7,7 +7,7 @@
 # reference reads ~15-40 GB of it, which is why it belongs in the same window.
 #
 #   DS4_GPU_OK=1 ds4_gpu_gate.sh [cpu|gpu|time|all]      (L5 step 2)
-#   DS4_GPU_OK=1 ds4_gpu_gate.sh [ident|graph|prof|speed|step3]   (L5 step 3, section 10)
+#   DS4_GPU_OK=1 ds4_gpu_gate.sh [ident|graph|prof|speed|hits|step3]   (L5 step 3, sections 10-11)
 set -u
 [ "${DS4_GPU_OK:-0}" = 1 ] || { echo "refusing: set DS4_GPU_OK=1 (rig lock held, gateway stopped)"; exit 2; }
 D=/home/ronald/src/colibri-m1/tools/hot-expert/franken/decode
@@ -62,7 +62,7 @@ fi
 if [ $what = prof ] || [ $what = step3 ]; then
   echo "=== (6) --profile, 256k allocated, 32 tokens: per-class device time a card, miss MB/token"
   $GPU $G --ctx 262144 --greedy 16 --time 32 --profile > $O/gpu_prof_stage.log 2>&1; echo "rc=$?"
-  grep -E "^--- device|prof_ds4|prof_norm|prof_elem|prof_router|prof_boundary|prof_copy|prof_argmax|prof_total|prof_launches|prof_host_syncs|ds4_miss|ds4_decode" $O/gpu_prof_stage.log
+  grep -E "^--- device|prof_ds4|prof_norm|prof_elem|prof_router|prof_boundary|prof_copy|prof_argmax|prof_gap_idle|prof_total|prof_busy|prof_launches|prof_host_syncs|ds4_miss|ds4_decode" $O/gpu_prof_stage.log
   echo "=== (6b) the same with step 2's miss path, the host-mapped slots in their own class"
   $GPU $G --ctx 262144 --greedy 16 --time 32 --profile --miss-stage 0 > $O/gpu_prof_inplace.log 2>&1; echo "rc=$?"
   grep -E "^--- device|prof_ds4_expert|prof_ds4_miss|prof_total|ds4_miss|ds4_decode" $O/gpu_prof_inplace.log
@@ -74,5 +74,10 @@ if [ $what = speed ] || [ $what = step3 ]; then
     echo "hip_graph=$g rc=$? $(grep -E 'ds4_decode_ms' $O/gpu_speed_g$g.log)"
   done
   grep -h "hip_graph_dev" $O/gpu_speed_g1.log
+fi
+if [ $what = hits ] || [ $what = step3 ]; then
+  echo "=== (8) per layer: resident experts, the hit fraction measured on THIS text, the M2 coverage"
+  $GPU $G --ctx 512 --greedy 16 --time 32 --hit-report --hist-out $O/hist_gate > $O/gpu_hits.log 2>&1; echo "rc=$?"
+  grep -E "^hit|hist-out" $O/gpu_hits.log
 fi
 echo "=== DONE"

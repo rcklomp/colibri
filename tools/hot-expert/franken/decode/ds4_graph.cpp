@@ -16,6 +16,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <sys/stat.h>
 
 #include "decode_oracle.h"
 
@@ -445,6 +446,10 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
     // uploaded (stream-ordered, pinned staging) BEFORE any card's segment
     std::vector<float> e(N_EMBD);
     model_.embed_row(token, e.data());
+    // --profile: a fresh per-token baseline for launches and host syncs on
+    // every card (the backend counts from its timer_start)
+    if (profile_)
+        for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).timer_start();
     b0.boundary_wait_free(0);     // the next card has read last token's H out of us
     b0.upload(s0.x, e.data(), N_EMBD * sizeof(float));
     for (int il = il0; il <= std::min(il1, HASH_LAYERS - 1); ++il)
@@ -458,6 +463,9 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
         int last = il;
         while (last + 1 <= il1 && dev_of(last + 1) == d) ++last;
         if (il > il0) {
+            // --profile: the wait for the previous card gets its own class, so
+            // boundary_p2p is the copy alone
+            if (profile_) op(il).upstream_wait(op(il - 1));
             // the only per-token traffic between cards: H, 64 KB (outside the graphs)
             be(il).boundary_recv(S(il).H, be(il - 1), S(il - 1).H, HC_DIM * sizeof(float), 0);
         }
@@ -490,6 +498,8 @@ int Ds4Runner::step(int32_t token, Recorder & rec) {
             }
         }
         seg_end(d);
+        // --profile: this card's share is over; what follows is idle (gap_idle)
+        if (profile_) op(last).prof_gap();
         il = last + 1;
     }
 
@@ -543,6 +553,9 @@ int ds4_main(int argc, char ** argv) {
     std::vector<int32_t> tokens;
     int il0 = 0, il1 = N_LAYER - 1, n_devices = 3, threads = 4, ctx = 512, greedy_n = 0, time_n = 0;
     bool with_head = true, use_cpu = false, plan_only = false, sync_debug = false, profile = false;
+    bool hit_report = false;
+    int stage_wgs = 64;
+    std::string hist_out;
     int miss_stage = 1, staged_loads = 1, hip_graph = 0, hip_graph_bucket = 1024, all_ops = 0;
     double min_cos = 0.999;
     Placement pl;
@@ -558,6 +571,9 @@ int ds4_main(int argc, char ** argv) {
         else if (a == "--plan-only")              plan_only = true;   // print placement, run nothing
         else if (a == "--sync-debug")             sync_debug = true;  // drain + check after every launch
         else if (a == "--profile")                profile = true;     // per-class device time, --time tokens
+        else if (a == "--hit-report")             hit_report = true;  // per-layer resident hits (reads ids back)
+        else if (a == "--stage-wgs" && i + 1 < argc) stage_wgs = std::atoi(argv[++i]);
+        else if (a == "--hist-out" && i + 1 < argc) hist_out = argv[++i];   // M2-format layer_<il>.csv of this run's routing
         else if (a == "--miss-stage" && i + 1 < argc) miss_stage = std::atoi(argv[++i]);
         else if (a == "--staged-loads" && i + 1 < argc) staged_loads = std::atoi(argv[++i]);
         else if (a == "--hip-graph" && i + 1 < argc) hip_graph = std::atoi(argv[++i]);
@@ -586,7 +602,7 @@ int ds4_main(int argc, char ** argv) {
                              "  [--placement DIR --expert-gb X]   (GPU: M2 histogram, VRAM for experts a card)\n"
                              "  [--oracle DIR] [--routing DIR] [--dump DIR] [--min-cos X]\n"
                              "  [--greedy N] [--time N] [--plan-only] [--sync-debug]\n"
-                             "  [--profile] [--miss-stage 0|1] [--staged-loads 0|1] [--hip-graph 0|1 [--hip-graph-bucket N]] [--all-ops 0|1]\n");
+                             "  [--profile] [--hit-report] [--hist-out DIR] [--stage-wgs N] [--miss-stage 0|1] [--staged-loads 0|1] [--hip-graph 0|1 [--hip-graph-bucket N]] [--all-ops 0|1]\n");
         return 2;
     }
     if ((int) tokens.size() + greedy_n + time_n > ctx) { std::fprintf(stderr, "--ctx too small\n"); return 2; }
@@ -628,8 +644,9 @@ int ds4_main(int argc, char ** argv) {
         for (int d = 0; d < n_report; ++d) placement_ok &= devs[d]->verify_placement(stdout);
         if (!placement_ok) { std::printf("DS4 FAIL (placement)\n"); return 1; }
 
-        for (Ds4Ops * o : ops) { o->set_profile(profile && !use_cpu); o->set_staged_loads(staged_loads); }
-        Ds4Config cfg; cfg.ctx = ctx; cfg.log_routing = !routing_dir.empty(); cfg.miss_stage = miss_stage;
+        for (Ds4Ops * o : ops) { o->set_profile(profile && !use_cpu); o->set_staged_loads(staged_loads); o->set_stage_wgs(stage_wgs); }
+        Ds4Config cfg; cfg.ctx = ctx; cfg.log_routing = !routing_dir.empty() || hit_report || !hist_out.empty();
+        cfg.miss_stage = miss_stage;
         // --sync-debug synchronises after every launch, which a capture cannot hold
         cfg.hip_graph = (use_cpu || sync_debug) ? 0 : hip_graph; cfg.hip_graph_bucket = hip_graph_bucket;
         cfg.all_ops = all_ops;
@@ -639,6 +656,10 @@ int ds4_main(int argc, char ** argv) {
                     : (sync_debug && hip_graph) ? " (off: --sync-debug)" : "");
         Ds4Runner run(model, ops, cfg);
         run.report_cache_bytes(stdout);
+        // --profile: every token closes its profile interval from the first one
+        // on, so the event pool never fills; the counts are reset before the
+        // --time tokens, which are the ones reported.
+        if (profile && !use_cpu) run.set_profile(true);
         for (int d = 0; d < n_report; ++d) devs[d]->vram_report(stdout, "after caches+scratch");
 
         std::map<std::pair<int, int>, std::vector<int>> ref_routes;
@@ -646,7 +667,29 @@ int ds4_main(int argc, char ** argv) {
         if (!routing_dir.empty() && !have_routes) std::printf("routing PENDING: no %s/moe_ids.txt\n", routing_dir.c_str());
         std::map<int, std::pair<double, int>> overlap;   // il -> (sum overlap, n)
         int exact_sets = 0, n_sets = 0;
+        // --hit-report: per layer, the share of the routed experts that the
+        // placement plan made resident, against the histogram's own coverage
+        // of the same resident set (model.m2_coverage) -- the check that the
+        // plan ranks the right experts.
+        std::vector<long long> hits((size_t) N_LAYER, 0), picks((size_t) N_LAYER, 0);
+        std::vector<std::vector<long long>> hist((size_t) N_LAYER, std::vector<long long>(N_EXPERT, 0));
+        auto count_hits = [&]() {
+            if (!hist_out.empty())
+                for (int il = il0; il <= il1; ++il)
+                    for (int k = 0; k < N_EXPERT_USED; ++k) {
+                        const int e = run.routed_ids()[(size_t) (il - il0) * N_EXPERT_USED + k];
+                        if (e >= 0 && e < N_EXPERT) ++hist[(size_t) il][(size_t) e];
+                    }
+            if (!hit_report || !model.planned()) return;
+            for (int il = il0; il <= il1; ++il)
+                for (int k = 0; k < N_EXPERT_USED; ++k) {
+                    const int e = run.routed_ids()[(size_t) (il - il0) * N_EXPERT_USED + k];
+                    if (e < 0) continue;
+                    hits[(size_t) il] += model.resident(il, e); ++picks[(size_t) il];
+                }
+        };
         auto observe = [&](int pos) {
+            count_hits();
             if (!have_routes) return;
             for (int il = il0; il <= il1; ++il) {
                 auto it = ref_routes.find({il, pos});
@@ -691,17 +734,17 @@ int ds4_main(int argc, char ** argv) {
         if (time_n > 0 && last >= 0) {
             // decode timing: one token a step, the id read back each token
             // (it feeds the next), routing capture off
-            run.set_log_routing(false);
+            run.set_log_routing(hit_report || !hist_out.empty());   // off unless the ids are wanted
             const bool prof = profile && !use_cpu;
             if (prof) {
                 // the warm tokens (prompt, greedy) are not in the profile
                 for (int d = 0; d < n_report; ++d) { devs[d]->sync(); devs[d]->prof_reset(); ops[d]->reset_miss_count(); }
-                run.set_profile(true);
             }
             std::vector<double> ms;
             for (int i = 0; i < time_n; ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
                 last = run.step(last, rec);
+                if (hit_report || !hist_out.empty()) count_hits();
                 ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             }
             const double med = median(ms);
@@ -712,7 +755,9 @@ int ds4_main(int argc, char ** argv) {
                 // Per card: device time by class (prof_*_us), the card's total,
                 // launches and host syncs a token; then the miss bytes counted
                 // on the device. Profiled tokens pay one event sync each, so
-                // the median above is NOT the unprofiled speed.
+                // the median above is NOT the unprofiled speed. prof_busy_us
+                // is the card's own work: total minus gap_idle (after its
+                // share) -- and ds4_upstream_wait is the wait before it.
                 run.set_profile(false);
                 double miss_all = 0.0;
                 for (int d = 0; d < n_report; ++d) {
@@ -726,6 +771,34 @@ int ds4_main(int argc, char ** argv) {
             }
         }
 
+        if (!hist_out.empty()) {
+            // the M2 format (moe_hist.cpp write_layer_csv): expert_id,count, hottest first
+            ::mkdir(hist_out.c_str(), 0755);
+            for (int il = il0; il <= il1; ++il) {
+                std::vector<int> order(N_EXPERT);
+                std::iota(order.begin(), order.end(), 0);
+                const auto & c = hist[(size_t) il];
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[(size_t) a] > c[(size_t) b]; });
+                std::ofstream f(hist_out + "/layer_" + std::to_string(il) + ".csv");
+                f << "expert_id,count\n";
+                for (int e : order) f << e << "," << c[(size_t) e] << "\n";
+            }
+            std::printf("hist-out: wrote %s/layer_<il>.csv for layers %d-%d (%d positions)\n",
+                        hist_out.c_str(), il0, il1, run.pos());
+        }
+        if (hit_report && model.planned()) {
+            long long h = 0, n = 0;
+            for (int il = il0; il <= il1; ++il) {
+                if (!picks[(size_t) il]) continue;
+                std::printf("hit layer=%d resident=%d measured_hit=%.3f m2_coverage=%.3f picks=%lld\n", il,
+                            model.n_resident(il), (double) hits[(size_t) il] / picks[(size_t) il],
+                            model.m2_coverage(il), picks[(size_t) il]);
+                h += hits[(size_t) il]; n += picks[(size_t) il];
+            }
+            if (n) std::printf("hit all measured_hit=%.3f picks=%lld\n", (double) h / n, n);
+        } else if (hit_report) {
+            std::printf("hit-report: no --placement given, nothing planned\n");
+        }
         bool ok = true;
         // SLOT ORDER (L5 step 1): align the per-expert-slot taps to the
         // reference's slot order only when the two routers picked the same

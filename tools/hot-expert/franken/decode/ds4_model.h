@@ -120,6 +120,13 @@ public:
 
     size_t placed_bytes() const { return placed_; }
     size_t host_expert_bytes() const { return host_expert_bytes_; }
+    // The placement plan, per layer, as planned (valid on any backend once a
+    // --placement histogram was given): is expert e resident, how many are,
+    // and the share of the histogram's selections the resident set covers.
+    bool   planned() const { return planned_; }
+    bool   resident(int il, int e) const { return resident_[(size_t) il][(size_t) e] != 0; }
+    int    n_resident(int il) const;
+    double m2_coverage(int il) const { return m2_cov_[(size_t) il]; }
 
 private:
     const TensorInfo * need(const std::string & name) const;
@@ -137,6 +144,8 @@ private:
     std::vector<unsigned char> embd_copy_;       // token_embd in host RAM (GPU runs)
     std::vector<std::vector<int32_t>> tid_copy_; // the hash layers' tid2eid, likewise
     size_t host_expert_bytes_ = 0;
+    bool planned_ = false;
+    std::vector<double> m2_cov_ = std::vector<double>(N_LAYER, 1.0);
     std::vector<LayerWeights> layers_;
     const TensorInfo * tok_embd_ = nullptr;
     bool have_head_ = false;

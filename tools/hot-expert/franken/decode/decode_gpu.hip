@@ -2660,6 +2660,7 @@ enum ProfClass {
     PC_DS4_ATTN_MISC,   // rope / de-rope / FWHT / f16 stores / compressor pools and rings
     PC_DS4_HC,          // the four-stream mix: split + Sinkhorn, weighted sum, post
     PC_DS4_MOE_TAIL,    // swiglu clamp, the weighted sum of the six
+    PC_DS4_UPSTREAM,    // a card waiting for the previous card's share of the token
     PC_N
 };
 const char * prof_name(int c) {
@@ -2692,6 +2693,7 @@ const char * prof_name(int c) {
         case PC_DS4_ATTN_MISC: return "ds4_rope_pool_store";
         case PC_DS4_HC:        return "ds4_hc_mix";
         case PC_DS4_MOE_TAIL:  return "ds4_moe_tail";
+        case PC_DS4_UPSTREAM:  return "ds4_upstream_wait";
         default:              return "copy";
     }
 }

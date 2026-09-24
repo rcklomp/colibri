@@ -1,4 +1,4 @@
-# DeepSeek-V4-Flash on the Franken engine — L5 steps 1-3 (2026-09-23/24)
+# DeepSeek-V4-Flash on the Franken engine — L5 steps 1-3c (2026-09-23/24)
 
 The model, the path Qwen3.8 took (design rev 13 §9; record §L0-STEP1..3), and
 what steps 1 and 2 built and proved. **Everything below that says "measured"
@@ -481,3 +481,100 @@ construction; the Sinkhorn's 4 threads each keep the single thread's order).
   change (the split-K count follows the batch), so it goes behind a knob.
 - If `ds4_miss_wait` is still large, the staging ring should start earlier:
   a router lookahead, design §3.1.
+
+## 11. Step 3c (2026-09-24): what the step-3 profile really said
+
+**The coordinator's step-3 gate** (`~/bench/franken/ds4/step3.txt`):
+- Bit-identity passed everywhere: (4) 2 036/2 036 taps, (5) graph against
+  eager bit-identical, greedy exact, CPU oracle PASS.
+- Decode: 82.2 ms profiled; (7) printed 71.7 / 69.7 / 69.5 / 71.4 ms (eager /
+  graph / graph / eager, A,B,B,A), with 904-943 graph nodes a card. The graph
+  is worth 3 %.
+
+The profile's class table was **not** trustworthy. Three bugs of the DeepSeek
+CLI's profile flow, none in the engine's work:
+
+1. **The event pool overflowed.** Profiling was on from the first token, but
+   only the `--time` tokens closed their interval (`prof_end_token`). The
+   prompt and greedy tokens' ~700 events a card piled up past the 8 192-event
+   pool, and whatever class was recorded last absorbed the rest of the
+   warm-up. That was then divided over the 32 timed tokens: the ~18 ms
+   "outlier" in one class on every card (card 0's indexer scan, card 1's
+   trunk / rope, card 2's norm), and card totals of 128-136 ms against an 82 ms
+   token. **Items 3 and 5 were this.** Fix: every token closes its interval,
+   and the counts are reset before the timed tokens.
+2. **Idle and upstream waits were charged to real classes.** A card's last
+   interval ran to the end-of-token flush: card 0's `hc_mix` 70 ms and card
+   1's 39 ms were the idle time while the later cards worked. A downstream
+   card's wait for its upstream sat inside `boundary_p2p` (41 / 70 ms). Fix:
+   `gap_idle` is marked at the end of each card's share (so
+   `prof_busy_us = total - gap_idle` is its own work), and
+   `ds4_upstream_wait` is its own class before the boundary copy.
+3. **Launches and host syncs were cumulative.** The backend counts per token
+   from `timer_start()`, which only the qwen4exp runner called: the 31-33 k
+   launches and 1 330-1 400 syncs "a token" were totals since process start.
+   **Item 2 was this; the mix is one kernel a call with no host sync.**
+   Fix: `timer_start()` on every card at each token start. The graph node
+   counts give the real launch count: ~920 a card, ~2 760 a token.
+
+**What was real** (the in-place `--miss-stage 0` run, minus the pool artifact):
+- **Trunk:** `ds4_trunk_l0_kernel` ~10.5 ms a card for ~1.9 GB (~180 GB/s;
+  `attn_q_b`'s 1 088-byte Q8_0 rows are the short-run case the L0 GEMV is
+  known to be slow on, README step 1). `ds4_trunk_kquant` 1.1-1.9 ms.
+- **Experts:** resident gate/up + down ~2.2-3.2 ms a card.
+- **Missed experts over PCIe:** 18.5 / 15.9 / 12.2 ms for 298 / 255 / 189 MB,
+  i.e. ~16 GB/s — **~46 ms a token, the largest term**. In the staged run
+  `ds4_miss_wait` was only 0.4 ms, but the copy's ~700 workgroups filled the
+  CUs, so the shared expert running beside it absorbed the time, and the
+  token barely moved (82 vs 84 ms).
+
+**Item 1, the misses: the ranking is right; the histogram's corpus is wrong
+for this text.** `--hit-report` prints, per layer, the resident count, the
+hit fraction measured on the run's own routing, and the M2 coverage of the
+same resident set. On the CPU arm, same resident sets (`--devices 1 --layers
+0-4 --expert-gb 5`):
+
+| text | layer 3 (116 resident) | layer 4 (89 resident) | layers 0-2 |
+|---|---|---|---|
+| M2's corpus (first 256 tokens of the record) | hit **0.827** vs M2 0.836 | **0.803** vs 0.840 | 0.748-0.770 vs 0.761-0.774 |
+| the gate's text (BOS "The capital of France is" + its 16 greedy tokens) | hit **0.606** vs 0.836 | **0.364** vs 0.840 (random: 0.348) | 0.780-0.811 |
+
+On M2's own corpus measured and predicted agree within 1-4 %, so the ids map
+correctly and the hottest experts are kept. The same llama.cpp routing
+(oracle136, layer 3) puts the chosen experts at mean rank 128-139 of 256 in
+M2's counts: uniform. **The hot set of the rig's technical record (markdown
+tables, numbers, code) does not transfer to English prose.** The 36 MB
+in-sample estimate and M2's 60 MB were both measured in that domain; on the
+gate's text 741 MB a token is what the placement actually costs. The first
+cards' layers 0-2 are fully resident because their flat token-hash
+histograms outrank the skewed layers' cold tails, which is also why card 0
+misses most.
+
+**Fix, in the placement input, not the engine:** a histogram of the text the
+engine will serve. `--hist-out DIR` writes one in M2's format from any run's
+own routing (the routing does not depend on the placement, so any placement
+serves the run). Commands in the next step's gate:
+`--tokens <a few thousand ids of chat / prose / code> --hist-out
+~/bench/m2/ds4_chat`, then `--placement ~/bench/m2/ds4_chat`. Or
+`run_moe_hist.sh` with a representative `PROMPT_FILE` (batched prefill,
+faster; out-of-sample like M2).
+
+**Engine changes (`79b94a1`), all bit-identical per slot:**
+- **Resident first:** a staged layer's resident experts run straight from the
+  table while the side stream copies the misses; then the join; then the
+  missed slots from their staged copies.
+- **Bounded copy:** the staging copy is grid-stride over a bounded grid
+  (`--stage-wgs`, 64 workgroups a layer) instead of ~700, leaving the card to
+  the main stream.
+- **Profile fixes** as above.
+- **CPU checks:** DeepSeek oracles unchanged (173/173 twice, routing 24/24
+  and 533/544); Qwen3.8 gate 1604/1604 bit-identical; 65/65 pre-L5 kernels
+  ISA-identical; `k_ds4_stage` 8 VGPR.
+
+**Rerun:** `DS4_GPU_OK=1 ./ds4_gpu_gate.sh step3` (it now also runs (8),
+`--hit-report --hist-out` on the gate's text). **Projected** (to be refuted):
+- with a matching histogram, the misses drop toward M2's 60 MB (~4 ms);
+- the token then sits at ~30-45 ms. The profiled per-card numbers
+  (themselves inflated by the profile's event syncs) leave the L0 trunk GEMV
+  at ~180 GB/s, ~31 ms over three cards, as the largest term — **that GEMV,
+  not DeepSeek code, is the road to ~15 ms**.

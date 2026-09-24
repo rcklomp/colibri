@@ -169,6 +169,16 @@ public:
     // default) or read in place with the decoders' byte loads (0). Same
     // decoder on the same bytes: the pair is a bit-identity check.
     virtual void set_staged_loads(int on) { (void) on; }
+    // --profile bookkeeping (no-ops unless profiling): prof_gap() closes this
+    // card's share of the token, so the idle time after it is charged to
+    // gap_idle rather than to the last op; upstream_wait(prev) makes this
+    // card's stream wait on everything `prev`'s stream has queued and charges
+    // that wait to ds4_upstream_wait (the boundary copy then finds it done).
+    virtual void prof_gap() {}
+    virtual void upstream_wait(Ds4Ops & prev) { (void) prev; }
+    // --stage-wgs N: workgroups the staging copy uses (grid-stride). A bounded
+    // grid leaves the CUs to the main stream's kernels it should overlap.
+    virtual void set_stage_wgs(int n) { (void) n; }
     virtual void count_misses(const ExpertTable & t, const int * ids) { (void) t; (void) ids; }
     virtual double miss_bytes_total() { return 0.0; }
     virtual void reset_miss_count() {}

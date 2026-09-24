@@ -202,6 +202,12 @@ const float * Ds4Model::place_f32(Backend & be, const std::string & name, int64_
 // count, taken in order until the budget is spent. Saving a slab saves
 // count x slab bytes of misses for slab bytes of VRAM, so count alone is the
 // ratio and a single ranking across the card's layers is the greedy optimum.
+int Ds4Model::n_resident(int il) const {
+    int n = 0;
+    for (int e = 0; e < N_EXPERT; ++e) n += resident_[(size_t) il][(size_t) e] != 0;
+    return n;
+}
+
 void Ds4Model::plan_placement(const Placement & pl) {
     resident_.assign(N_LAYER, std::vector<char>(N_EXPERT, 1));
     if (pl.hist_dir.empty()) {
@@ -232,6 +238,7 @@ void Ds4Model::plan_placement(const Placement & pl) {
         return b("ffn_gate_exps.weight") + b("ffn_up_exps.weight") + b("ffn_down_exps.weight");
     };
     const double budget = pl.expert_gb * 1e9;
+    planned_ = true;
     for (int d = 0; d < n_dev; ++d) {
         std::vector<std::tuple<long long, int, int>> c;   // (-count, il, e)
         int la = -1, lb = -1;
@@ -255,6 +262,11 @@ void Ds4Model::plan_placement(const Placement & pl) {
                 // positions = total / 6 -- IN-SAMPLE, see DEEPSEEK4.md 5
                 if (tot[il] > 0) miss += sb * (double) cnt[il][e] / ((double) tot[il] / N_EXPERT_USED);
             }
+        }
+        for (int il = la; il <= lb; ++il) {
+            long long covered = 0;
+            for (int e = 0; e < N_EXPERT; ++e) if (resident_[il][e]) covered += cnt[il][e];
+            m2_cov_[(size_t) il] = tot[il] > 0 ? (double) covered / (double) tot[il] : 1.0;
         }
         std::printf("placement dev=%d layers=%d-%d resident=%d experts_gb=%.2f host_gb=%.2f "
                     "est_miss_mb_per_token=%.1f (histogram %s, in-sample)\n",

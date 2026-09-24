@@ -228,6 +228,182 @@ void Ds4Runner::report_cache_bytes(FILE * out) const {
                  model_.il0(), model_.il1(), cfg_.ctx, Tm_);
 }
 
+// ------------------------------------------- serving: state save/restore --
+//
+// See ds4_graph.h's comment on the split. `state_pieces()` walks the RECURRENT
+// half -- the raw window (every attention layer) and the open block's
+// accumulation rings (compressed layers only) -- in the one order both
+// save_rec and load_rec use; `kv_plan()` walks the POSITIONAL half (the closed
+// blocks of `comp`, and on a CSA layer `lid`) the same way DecodeRunner's own
+// kv_plan walks Q8_0 cells: one running offset across every layer, so an image
+// taken at a longer length is a true prefix of one taken at a shorter length.
+void Ds4Runner::state_pieces(std::vector<StatePiece> & out) {
+    out.clear();
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        LayerState & st = st_[(size_t) (il - model_.il0())];
+        Backend * b = &be(il);
+        out.push_back({ b, st.raw, (size_t) st.raw_rows * HEAD_DIM * sizeof(uint16_t) });
+        const int ratio = model_.layer(il).ratio;
+        if (ratio == CSA_RATIO) {
+            out.push_back({ b, st.ck, (size_t) st.ring * 2 * HEAD_DIM * sizeof(float) });
+            out.push_back({ b, st.cs, (size_t) st.ring * 2 * HEAD_DIM * sizeof(float) });
+            out.push_back({ b, st.lk, (size_t) st.ring * 2 * IDX_DIM * sizeof(float) });
+            out.push_back({ b, st.ls, (size_t) st.ring * 2 * IDX_DIM * sizeof(float) });
+        } else if (ratio == HCA_RATIO) {
+            out.push_back({ b, st.ck, (size_t) st.ring * HEAD_DIM * sizeof(float) });
+            out.push_back({ b, st.cs, (size_t) st.ring * HEAD_DIM * sizeof(float) });
+        }
+    }
+}
+
+// `layout_len`/`copy_len` are TOKEN counts; each layer converts to its own
+// ratio's block count with ceil (`(n + ratio - 1) / ratio`), matching
+// DecodeRunner::kv_plan's `pl()` convention and report_cache_bytes' own
+// `max_blocks` -- so an image sized for `layout_len` tokens is exactly as
+// wide as the live `comp`/`lid` arrays (themselves sized `ctx/ratio + 1`,
+// i.e. ceil(ctx/ratio) rounded up by one), and a shorter `copy_len` copies a
+// true prefix of it. Copying one block more than is strictly CLOSED at
+// `copy_len` is harmless either way: `store_block` only ever writes a block
+// once, at the position it closes, and attention only ever reads blocks up
+// to the restored `pos_` -- an extra unclosed slot is simply never read
+// until it is written again.
+void Ds4Runner::kv_plan(std::vector<KvPiece> & out, int layout_len, int copy_len) {
+    out.clear();
+    if (copy_len > layout_len) copy_len = layout_len;
+    if (copy_len <= 0) return;
+    size_t off = 0;
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        const int ratio = model_.layer(il).ratio;
+        if (ratio == 0) continue;
+        LayerState & st = st_[(size_t) (il - model_.il0())];
+        Backend * b = &be(il);
+        const size_t nb_layout = (size_t) ((layout_len + ratio - 1) / ratio);
+        const size_t nb_copy   = (size_t) ((copy_len   + ratio - 1) / ratio);
+        out.push_back({ b, st.comp, off, nb_copy * HEAD_DIM * sizeof(uint16_t) });
+        off += nb_layout * HEAD_DIM * sizeof(uint16_t);
+        if (ratio == CSA_RATIO) {
+            out.push_back({ b, st.lid, off, nb_copy * IDX_DIM * sizeof(uint16_t) });
+            off += nb_layout * IDX_DIM * sizeof(uint16_t);
+        }
+    }
+}
+
+size_t Ds4Runner::kv_bytes(int len) const {
+    if (len <= 0) return 0;
+    size_t n = 0;
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        const int ratio = model_.layer(il).ratio;
+        if (ratio == 0) continue;
+        const size_t nb = (size_t) ((len + ratio - 1) / ratio);
+        n += nb * HEAD_DIM * sizeof(uint16_t);
+        if (ratio == CSA_RATIO) n += nb * IDX_DIM * sizeof(uint16_t);
+    }
+    return n;
+}
+
+void Ds4Runner::sync_devices() {
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+}
+
+void Ds4Runner::save_rec_async(void * dst) {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    char * p = (char *) dst;
+    for (const auto & s : pieces) { s.be->download_async(p, s.ptr, s.bytes); p += s.bytes; }
+}
+
+void Ds4Runner::save_kv_async(void * dst, int len) {
+    std::vector<KvPiece> plan;
+    kv_plan(plan, len, len);
+    char * base = (char *) dst;
+    for (const auto & p : plan) p.be->download_async(base + p.off, p.ptr, p.bytes);
+}
+
+void Ds4Runner::save_kv(void * dst, int len) {
+    std::vector<KvPiece> plan;
+    kv_plan(plan, len, len);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    char * base = (char *) dst;
+    for (const auto & p : plan) p.be->download(base + p.off, p.ptr, p.bytes);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+}
+
+void Ds4Runner::load_kv(const void * src, int layout_len, int copy_len, int pos) {
+    std::vector<KvPiece> plan;
+    kv_plan(plan, layout_len, copy_len);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    const char * base = (const char *) src;
+    for (const auto & p : plan) p.be->upload(p.ptr, base + p.off, p.bytes);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    pos_ = pos;
+}
+
+size_t Ds4Runner::rec_bytes() const {
+    // const, so it counts rather than walks state_pieces() -- same order,
+    // same arithmetic (checked against it by construction, not by a runtime
+    // assertion: both read LayerState::raw_rows/ring, nothing else).
+    size_t n = 0;
+    for (int il = model_.il0(); il <= model_.il1(); ++il) {
+        const LayerState & st = st_[(size_t) (il - model_.il0())];
+        n += (size_t) st.raw_rows * HEAD_DIM * sizeof(uint16_t);
+        const int ratio = model_.layer(il).ratio;
+        if (ratio == CSA_RATIO) {
+            n += (size_t) st.ring * 2 * HEAD_DIM * sizeof(float);   // ck
+            n += (size_t) st.ring * 2 * HEAD_DIM * sizeof(float);   // cs
+            n += (size_t) st.ring * 2 * IDX_DIM  * sizeof(float);   // lk
+            n += (size_t) st.ring * 2 * IDX_DIM  * sizeof(float);   // ls
+        } else if (ratio == HCA_RATIO) {
+            n += (size_t) st.ring * HEAD_DIM * sizeof(float);       // ck
+            n += (size_t) st.ring * HEAD_DIM * sizeof(float);       // cs
+        }
+    }
+    return n;
+}
+
+void Ds4Runner::save_rec(void * dst) {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    // Every device first: a download that races the chunk still in flight
+    // would copy a half-written state, and the chunk before a snapshot is
+    // exactly the one the pipeline was allowed not to wait for.
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    char * p = (char *) dst;
+    for (const auto & s : pieces) { s.be->download(p, s.ptr, s.bytes); p += s.bytes; }
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+}
+
+void Ds4Runner::load_rec(const void * src, int pos) {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    const char * p = (const char *) src;
+    for (const auto & s : pieces) { s.be->upload(s.ptr, p, s.bytes); p += s.bytes; }
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    pos_ = pos;
+}
+
+void Ds4Runner::reset_state() {
+    std::vector<StatePiece> pieces;
+    state_pieces(pieces);
+    size_t big = 0;
+    for (const auto & s : pieces) big = std::max(big, s.bytes);
+    std::vector<char> zero(big, 0);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    for (const auto & s : pieces) s.be->upload(s.ptr, zero.data(), s.bytes);
+    for (int d = 0; d < model_.n_devices(); ++d) model_.dev(d).sync();
+    pos_ = 0;
+}
+
+std::vector<float> Ds4Runner::logits_host() {
+    std::vector<float> v;
+    if (!model_.have_head()) return v;
+    v.resize((size_t) N_VOCAB);
+    Backend & b = model_.dev(model_.n_devices() - 1);
+    b.sync();
+    b.download(v.data(), logits_, v.size() * sizeof(float));
+    return v;
+}
+
 // build_hc_pre (DS4): flat RMS norm (no gamma), the 24-row mix, the
 // pre/post/comb split, then the pre-weighted sum of the four streams.
 void Ds4Runner::hc_pre(Scratch & s, const Mat & fn, const float * base, const float * scale, int il,

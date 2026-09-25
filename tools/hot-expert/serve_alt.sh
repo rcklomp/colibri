@@ -497,6 +497,14 @@ restore_glm() {
   local reason=$1
   echo "=== restoring GLM-5.3 ($reason)"
   ensure_alt_stopped
+  if [ -e "$HOME/bench/.dev_reserved" ]; then
+    # the owner reserved the rig for development (2026-09-25): stop the alternative, free the
+    # lock, and leave port 8081 empty instead of loading GLM for nobody
+    serve_alt_lock_release
+    rm -f "$STATE_FILE"
+    echo "=== rig reserved for development (~/bench/.dev_reserved): alternative stopped, GLM NOT restored, port $ALT_PORT empty"
+    return 0
+  fi
   echo "[1/4] confirming VRAM is free on all three cards"
   if ! assert_vram_free "pre-glm"; then
     echo "FATAL: VRAM stuck -- NOT starting GLM. Rig lock left HELD on purpose so the watchdog does not fight you; investigate by hand, then re-run 'serve_alt.sh glm'."

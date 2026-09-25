@@ -10,7 +10,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 QE="$HERE/quality_eval.py"; SERVE_ALT="$HERE/serve_alt.sh"
 KEY_FILE="$HOME/.colibri_api_key"; URL="http://127.0.0.1:8081"; MODEL_ID="glm-5.3-flash"
 OUT_DIR="$HOME/bench/franken_quality"; mkdir -p "$OUT_DIR"
-MMLU_SAMPLE="$HOME/bench/f11_quality/mmlu_pro_sample.json"   # the 2026-09-21 sample, seed-fixed
+MMLU_SAMPLE="${QE_MMLU_SAMPLE:-$HOME/bench/f11_quality/mmlu_pro_sample.json}"   # the 2026-09-21 sample, seed-fixed
 export QE_REASONING_EFFORT=${QE_REASONING_EFFORT:-xhigh}
 BUDGET=${QE_BUDGET:-16000}
 # engine paths are per arm: FRANKEN_BIN is the Qwen3.8 engine only (2026-09-25: exported globally it
@@ -29,7 +29,7 @@ trap on_exit EXIT INT TERM HUP
 run_eval() {   # run_eval <expect> <out_jsonl>
   echo "--- eval --expect $1 $(date -Is)"
   python3 "$QE" run --expect "$1" --url "$URL" --key-file "$KEY_FILE" --model-id "$MODEL_ID" \
-      --out "$2" --mmlu "$MMLU_SAMPLE" --max-context 262144 --parts mmlu,needle \
+      --out "$2" --mmlu "$MMLU_SAMPLE" --max-context 262144 --parts "${QE_PARTS:-mmlu,needle}" \
       --mmlu-max-tokens "$BUDGET"
   echo "--- eval --expect $1 exit=$? $(date -Is)"
 }

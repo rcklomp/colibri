@@ -510,7 +510,7 @@ def verify_expect(expect, url, key):
                 f"contain {want!r}"
             )
         print(f"[identity] --expect {expect}: /props model_path={model_path!r} OK")
-    elif expect in ("franken", "franken-ds4"):
+    elif expect in ("franken", "franken-ds4", "franken-glm"):
         # The Franken engine serves through the Colibri gateway (no /props): the swap script's
         # state says what is behind port 8081.
         st = subprocess.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve_alt.sh"), "status"],
@@ -849,7 +849,7 @@ def build_parser():
     pf.set_defaults(func=cmd_fetch)
 
     pr = sub.add_parser("run", help="evaluate one server, append to its jsonl")
-    pr.add_argument("--expect", required=True, choices=["qwen38", "deepseek", "glm", "glm-llama", "franken", "franken-ds4"])
+    pr.add_argument("--expect", required=True, choices=["qwen38", "deepseek", "glm", "glm-llama", "franken", "franken-ds4", "franken-glm"])
     pr.add_argument("--url", required=True, help="e.g. http://127.0.0.1:8081")
     pr.add_argument("--key-file", required=True)
     pr.add_argument("--model-id", required=True, help="the `model` field to send, e.g. glm-5.3-flash")

@@ -54,6 +54,17 @@ for arm in ${ARMS//,/ }; do
       "$SERVE_ALT" status 2>&1 | grep -q "Franken engine" || { echo "FATAL: not the Franken engine"; exit 1; }
       run_eval franken-ds4 "$OUT_DIR/franken_ds4.jsonl"
       SUMMARY_ARGS+=(--model "franken_ds4=$OUT_DIR/franken_ds4.jsonl") ;;
+    franken-glm)
+      # the Franken engine on GLM-5.3-Flash (franken_dec_glm, FRANKEN_GEMM_LDS=1 as served),
+      # against llama.cpp's own GLM-5.3-Flash UD-IQ4_XS below (serve_alt.sh glm-llama)
+      "$SERVE_ALT" franken-glm 2>&1 | grep "now serving\|FATAL\|accept_live" || { echo "FATAL: franken-glm did not come up"; exit 1; }
+      "$SERVE_ALT" status 2>&1 | grep -q "Franken engine" || { echo "FATAL: not the Franken engine"; exit 1; }
+      run_eval franken-glm "$OUT_DIR/franken_glm.jsonl"
+      SUMMARY_ARGS+=(--model "franken_glm=$OUT_DIR/franken_glm.jsonl") ;;
+    glm-llama)
+      "$SERVE_ALT" glm-llama 2>&1 | grep "now serving\|FATAL" || { echo "FATAL: glm-llama did not come up"; exit 1; }
+      run_eval glm-llama "$OUT_DIR/glm_llama.jsonl"
+      SUMMARY_ARGS+=(--model "glm_llama=$OUT_DIR/glm_llama.jsonl") ;;
     deepseek)
       # llama.cpp's own DeepSeek-V4-Flash-0731 UD-IQ2_M arm (serve_alt.sh's
       # pre-existing `deepseek` target, cmd_alt D) -- the comparison arm

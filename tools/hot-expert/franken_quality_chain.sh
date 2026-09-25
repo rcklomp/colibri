@@ -13,7 +13,8 @@ OUT_DIR="$HOME/bench/franken_quality"; mkdir -p "$OUT_DIR"
 MMLU_SAMPLE="$HOME/bench/f11_quality/mmlu_pro_sample.json"   # the 2026-09-21 sample, seed-fixed
 export QE_REASONING_EFFORT=${QE_REASONING_EFFORT:-xhigh}
 BUDGET=${QE_BUDGET:-16000}
-export FRANKEN_BIN=${FRANKEN_BIN:-$HOME/bench/franken_decode_docker.sh}
+# engine paths are per arm: FRANKEN_BIN is the Qwen3.8 engine only (2026-09-25: exported globally it
+# was picked up by start_franken_glm.sh and started the Qwen engine on the GLM model)
 ARMS=${ARMS:-franken,qwen38}
 
 echo "=== franken_quality_chain $(date -Is) arms=$ARMS reasoning=$QE_REASONING_EFFORT budget=$BUDGET"
@@ -37,7 +38,7 @@ SUMMARY_ARGS=()
 for arm in ${ARMS//,/ }; do
   case $arm in
     franken)
-      "$SERVE_ALT" franken 2>&1 | grep "now serving\|FATAL\|accept_live" || { echo "FATAL: franken did not come up"; exit 1; }
+      FRANKEN_BIN=${FRANKEN_BIN:-$HOME/bench/franken_decode_docker.sh} "$SERVE_ALT" franken 2>&1 | grep "now serving\|FATAL\|accept_live" || { echo "FATAL: franken did not come up"; exit 1; }
       "$SERVE_ALT" status 2>&1 | grep -q "Franken engine" || { echo "FATAL: not the Franken engine"; exit 1; }
       run_eval franken "$OUT_DIR/franken_lds1.jsonl"
       SUMMARY_ARGS+=(--model "franken_lds1=$OUT_DIR/franken_lds1.jsonl") ;;

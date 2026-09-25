@@ -61,13 +61,13 @@ set -u
 # franken_glm_alive/pgrep -f "franken_dec_[g]lm" is how the rig lock's keeper and `serve_alt.sh
 # status` find it; see that binary's own header comment (franken_dec_glm_main.cpp, in the
 # frankenstack/franken-engine repo) for why it is named 15 characters and not franken_decode_glm.
-BIN=${FRANKEN_BIN:-$HOME/bench/franken_decode_glm_docker.sh}
+BIN=${FRANKEN_GLM_BIN:-$HOME/bench/franken_decode_glm_docker.sh}
 GGUF=${FRANKEN_GGUF:-$HOME/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf}
 GGUF_DIR=$(dirname "$GGUF")
 # A real config.json for this model, for the family resolver only (see this file's own header).
 FAMILY_DIR=${FRANKEN_FAMILY_DIR:-$HOME/models/GLM-5.3-Flash-colibri-int4-g64}
 
-[ -x "$BIN" ]  || { echo "[start] FATAL: no engine at $BIN (set FRANKEN_BIN)"; exit 1; }
+[ -x "$BIN" ]  || { echo "[start] FATAL: no engine at $BIN (set FRANKEN_GLM_BIN)"; exit 1; }
 [ -s "$GGUF" ] || { echo "[start] FATAL: no model at $GGUF"; exit 1; }
 [ -s "$FAMILY_DIR/config.json" ] || {
   echo "[start] FATAL: $FAMILY_DIR/config.json is what --arch glm53 is resolved from"; exit 1; }

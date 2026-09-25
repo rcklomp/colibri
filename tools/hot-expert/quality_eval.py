@@ -414,6 +414,15 @@ def send_chat(url, key, model_id, prompt, max_tokens, timeout=10800, retries=2,
     # Qwen3.8 with COLI_THINK=0 for the UI; llama-server's default is the template's, on).
     if os.environ.get("QE_REASONING_EFFORT"):
         payload["reasoning_effort"] = os.environ["QE_REASONING_EFFORT"]
+    # QE_TEMPERATURE / QE_TOP_P / QE_SEED (2026-09-25): sample the way the model card says
+    # (GLM-5.3-Flash's generation_config: temperature 1.0, top_p 0.95) instead of greedy.
+    # Unset = the greedy default above, byte-identical requests to every earlier run.
+    if os.environ.get("QE_TEMPERATURE"):
+        payload["temperature"] = float(os.environ["QE_TEMPERATURE"])
+    if os.environ.get("QE_TOP_P"):
+        payload["top_p"] = float(os.environ["QE_TOP_P"])
+    if os.environ.get("QE_SEED"):
+        payload["seed"] = int(os.environ["QE_SEED"])
     body = json.dumps(payload).encode()
     last_err = None
     for attempt in range(retries + 1):
@@ -596,7 +605,12 @@ def run_mmlu_item(url, key, model_id, item, timeout, retries, max_tokens):
         "truncated": truncated,
         "unparsed": unparsed,
         "content_len": len(content) if content else 0,
+        "reasoning_len": len(reasoning) if reasoning else 0,
     })
+    if truncated:
+        # an answer that ran out of budget: keep its last 1 500 characters so a repetition
+        # loop can be seen, not guessed (2026-09-25; nothing else in the record says why)
+        rec["tail"] = ((reasoning or "") + (content or ""))[-1500:]
     return rec, True
 
 

@@ -17,7 +17,7 @@ BUDGET=${QE_BUDGET:-16000}
 # was picked up by start_franken_glm.sh and started the Qwen engine on the GLM model)
 ARMS=${ARMS:-franken,qwen38}
 
-echo "=== franken_quality_chain $(date -Is) arms=$ARMS reasoning=$QE_REASONING_EFFORT budget=$BUDGET"
+echo "=== franken_quality_chain $(date -Is) arms=$ARMS reasoning=$QE_REASONING_EFFORT budget=$BUDGET temperature=${QE_TEMPERATURE:-0 (greedy)} top_p=${QE_TOP_P:-server default} tag=${QE_TAG:-none}"
 on_exit() {
   local rc=$?; trap - EXIT INT TERM HUP
   echo "=== chain exit rc=$rc $(date -Is); restoring GLM"
@@ -60,12 +60,12 @@ for arm in ${ARMS//,/ }; do
       # against llama.cpp's own GLM-5.3-Flash UD-IQ4_XS below (serve_alt.sh glm-llama)
       "$SERVE_ALT" franken-glm 2>&1 | grep "now serving\|FATAL\|accept_live" || { echo "FATAL: franken-glm did not come up"; exit 1; }
       "$SERVE_ALT" status 2>&1 | grep -q "Franken engine" || { echo "FATAL: not the Franken engine"; exit 1; }
-      run_eval franken-glm "$OUT_DIR/franken_glm.jsonl"
-      SUMMARY_ARGS+=(--model "franken_glm=$OUT_DIR/franken_glm.jsonl") ;;
+      run_eval franken-glm "$OUT_DIR/franken_glm${QE_TAG:+_$QE_TAG}.jsonl"
+      SUMMARY_ARGS+=(--model "franken_glm=$OUT_DIR/franken_glm${QE_TAG:+_$QE_TAG}.jsonl") ;;
     glm-llama)
       "$SERVE_ALT" glm-llama 2>&1 | grep "now serving\|FATAL" || { echo "FATAL: glm-llama did not come up"; exit 1; }
-      run_eval glm-llama "$OUT_DIR/glm_llama.jsonl"
-      SUMMARY_ARGS+=(--model "glm_llama=$OUT_DIR/glm_llama.jsonl") ;;
+      run_eval glm-llama "$OUT_DIR/glm_llama${QE_TAG:+_$QE_TAG}.jsonl"
+      SUMMARY_ARGS+=(--model "glm_llama=$OUT_DIR/glm_llama${QE_TAG:+_$QE_TAG}.jsonl") ;;
     deepseek)
       # llama.cpp's own DeepSeek-V4-Flash-0731 UD-IQ2_M arm (serve_alt.sh's
       # pre-existing `deepseek` target, cmd_alt D) -- the comparison arm

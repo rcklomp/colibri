@@ -14,6 +14,20 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 76 (2026-09-25 07:00 CEST) -- GLM STEP 5 GATED: BIT-IDENTICAL, PREFILL
+> MISS-BOUND (record §L5-GLM-STEP5).** One GPU load ran all 23 gate
+> configurations: batched prefill, graph replay, three-link and adaptation
+> are bit-identical to the eager reference (the one "failure" was the gate
+> script checking a dump-only config for taps; fixed in franken-engine
+> `a08fff1`). Prefill is 17.5-18.1 ms a token against DeepSeek's 5.6: dev0
+> waits 7.7 ms a token on missed experts and the other cards wait on dev0,
+> while adaptation swaps GBs a chunk over the same links. Decode timing moved
+> inside each A,B,B,A (placement still learning), so no graph verdict yet.
+> Next, in order: (1) prefill with swaps held and each chunk's distinct
+> misses fetched once over all three links; (2) decode timing on a settled
+> placement; (3) GLM behind the gateway, accept_live/accept_ui, quality run
+> against llama.cpp's GLM.**
+>
 > **Rev 75 (2026-09-25 04:30 CEST) -- THE DEEPSEEK LOOPS ARE NEAR-TIES, NOT A BUG
 > (record §L5-DS4-SERVE).** Teacher-forced along llama.cpp's greedy sequence,
 > Franken differs at 2.3 % of steps, all near-ties in both engines

@@ -14,6 +14,17 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 77 (2026-09-25 08:00 CEST) -- GLM STAGED PREFILL LANDED, +4 %; THE
+> LEVER IS CHUNK SIZE (record §L5-GLM-STAGE).** Missed experts staged into a
+> VRAM ring by DMA plus swaps held during prefill: 34 of 34 gate configs
+> pass, all staged paths bit-identical; prefill 17.64/17.73 -> 16.98/17.00
+> ms/token (A,B,B,A), decode unchanged. Merged to franken-engine main
+> (`5f409c2`, knobs default off). The profile moved the wait from missed
+> experts to idle time: at T=256 a chunk uses nearly every expert, so it
+> fetches all non-resident experts (92.7 GB a chunk) whatever the routing;
+> per-token traffic falls as 1/chunk. Running now: chunk 512 against 256.
+> Then GLM behind the gateway and its quality run.**
+>
 > **Rev 76 (2026-09-25 07:00 CEST; DeepSeek browser acceptance PASS on an idle engine, first token 1.3 s on screen -- DeepSeek done for L5) -- GLM STEP 5 GATED: BIT-IDENTICAL, PREFILL
 > MISS-BOUND (record §L5-GLM-STEP5).** One GPU load ran all 23 gate
 > configurations: batched prefill, graph replay, three-link and adaptation

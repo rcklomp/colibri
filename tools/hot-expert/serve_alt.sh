@@ -165,6 +165,20 @@ D4_SNAP_DIR=$D_SNAP_DIR
 D4_LABEL="DeepSeek-V4-Flash-0731 UD-IQ2_M (Franken engine)"
 D4_LOG=$HOME/bench/serve_alt_franken_ds4.log
 
+# --- the Franken engine on GLM-5.3-Flash (same shape as `franken-ds4` above) -------------------
+# The GLM serve runner behind the same gateway, binary franken_dec_glm -- a SHORT process name,
+# 15 characters, deliberately chosen (see that binary's own header comment,
+# franken_dec_glm_main.cpp in frankenstack/franken-engine) so it does NOT truncate into the same
+# 15-byte comm franken_decode_ds4 already collides with ("franken_decode_"); it still truncates
+# to itself under ps -C, but every check below uses the same bracket pgrep -f form the D4_* arm
+# uses, for the same reason (it works whether the engine runs natively or inside the
+# franken_decode_glm_docker.sh wrapper, where the host-visible process is `docker run`, not the
+# binary -- the wrapper's argv still carries the binary's path, which pgrep -f matches).
+FG_START=$HOME/src/colibri/tools/hot-expert/franken/start_franken_glm.sh
+FG_SNAP_DIR=$G_SNAP_DIR
+FG_LABEL="GLM-5.3-Flash UD-IQ4_XS (Franken engine)"
+FG_LOG=$HOME/bench/serve_alt_franken_glm.log
+
 # --- backend: HIP docker, same bin dir/image the F11 chain used --------------------------------
 ALT_BIN_DIR=/home/ronald/src/llama-glm53/build-hip/bin
 ALT_IMAGE=rocm/dev-ubuntu-24.04:7.14.0-full
@@ -208,6 +222,19 @@ franken_ds4_alive() {
 wait_no_franken_ds4() {   # bounded 240 s, 2 s steps
   for _ in $(seq 1 120); do franken_ds4_alive || return 0; sleep 2; done
   echo "FATAL: franken_decode_ds4 still alive (non-zombie) after 240 s"; return 1
+}
+
+# franken_dec_glm: same pgrep -f shape as franken_ds4_alive, for the same reason (see the FG_*
+# header comment above) -- it also covers the docker-wrapped case ds4's own comment names.
+franken_glm_alive() {
+  local pid
+  pid=$(pgrep -f "franken_dec_[g]lm" 2>/dev/null | head -1)
+  [ -n "$pid" ] && ps -p "$pid" -o stat= 2>/dev/null | grep -qv '^Z'
+}
+
+wait_no_franken_glm() {   # bounded 240 s, 2 s steps
+  for _ in $(seq 1 120); do franken_glm_alive || return 0; sleep 2; done
+  echo "FATAL: franken_dec_glm still alive (non-zombie) after 240 s"; return 1
 }
 
 wait_no_glm53() {   # bounded 240 s, 2 s steps; zombie-safe (a killed engine child is a ZOMBIE
@@ -289,11 +316,15 @@ stop_gateway() {
   # franken_decode_ds4: pkill -x cannot match it either (comm truncation, see franken_ds4_alive);
   # the bracket form is the self-match-safe pgrep -f equivalent of pkill -9 -x.
   pkill -9 -f "franken_decode_[d]s4" 2>/dev/null || true
-  # The engine runs inside the ROCm 7.14 image (~/bench/franken_decode_docker.sh, container
-  # `franken_engine`): a host-side pkill by name did not reach it twice on 2026-09-23 and
+  # franken_dec_glm: pkill -x cannot match it either when it runs inside the docker wrapper (the
+  # host process is `docker run`, not the binary) -- the same bracket pgrep -f equivalent.
+  pkill -9 -f "franken_dec_[g]lm" 2>/dev/null || true
+  # The engine runs inside the ROCm 7.14 image (~/bench/franken_decode_docker.sh /
+  # franken_decode_glm_docker.sh, container `franken_engine` either way -- one engine at a time,
+  # CLAUDE.md): a host-side pkill by name did not reach it twice on 2026-09-23 and
   # the swap back found 24 GB still on the cards. Stop the container explicitly.
   docker stop -t 5 franken_engine >/dev/null 2>&1 || true
-  wait_no_glm53 && wait_no_franken && wait_no_franken_ds4
+  wait_no_glm53 && wait_no_franken && wait_no_franken_ds4 && wait_no_franken_glm
 }
 
 start_gateway() {   # requirement 6: exactly how every chain restarts the gateway
@@ -699,6 +730,64 @@ cmd_franken_ds4() {
   echo "=== to go back: $HERE/serve_alt.sh glm"
 }
 
+# start_franken_glm -- the gateway with the Franken engine on GLM-5.3-Flash behind it. Same
+# readiness rule as start_franken/start_franken_ds4 (server 200 AND a live engine), against the
+# GLM serve process name (franken_glm_alive -- see the FG_* header comment).
+start_franken_glm() {
+  [ -x "$FG_START" ] || { echo "FATAL: $FG_START is not executable"; return 1; }
+  FRANKEN_LOG="$FG_LOG" SKIP_WARM=1 setsid nohup "$FG_START" > "$FG_LOG" 2>&1 < /dev/null &
+  local i
+  for i in $(seq 1 240); do
+    if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $(cat "$KEY_FILE")" \
+         -w '%{http_code}' "http://127.0.0.1:${ALT_PORT}/v1/models" 2>/dev/null)" = 200 ] \
+       && franken_glm_alive; then
+      return 0
+    fi
+    if ! pgrep -f "openai_[s]erver.py" >/dev/null && [ "$i" -gt 6 ]; then
+      echo "FATAL: the gateway process is gone; last lines of $FG_LOG:"; tail -20 "$FG_LOG"; return 1
+    fi
+    sleep 5
+  done
+  echo "FATAL: the Franken/GLM gateway did not come up within 1200 s; last lines of $FG_LOG:"
+  tail -20 "$FG_LOG"
+  return 1
+}
+
+# cmd_franken_glm -- same shape and same safety order as cmd_franken_ds4 (requirement 5), for
+# the GLM-5.3-Flash arm. The weights are FG_SNAP_DIR ($G_SNAP_DIR, the same GGUF the `glm-llama`
+# arm serves via llama-server), so this arm is comparable the same way `franken`/`qwen38` are.
+cmd_franken_glm() {
+  echo "=== serve_alt: switching to $FG_LABEL $(date -Is)"
+  refuse_if_busy franken-glm || exit 1
+  serve_alt_lock_take "$$" "serve_alt-setup-franken-glm" || exit 3
+  ensure_alt_stopped
+  echo "[1/7] stopping whatever the gateway is serving now"
+  if ! stop_gateway; then restore_glm "stop_gateway failed"; exit 1; fi
+  echo "[2/7] confirming VRAM is free on all three cards"
+  if ! assert_vram_free "pre-franken-glm"; then restore_glm "VRAM not free before the Franken/GLM engine"; exit 1; fi
+  echo "[3/7] warming the GGUF in page cache (two passes, target >=90% resident)"
+  warm_and_verify "$FG_SNAP_DIR" franken-glm || true
+  echo "[4/7] starting the gateway with the Franken/GLM engine ($FG_LOG)"
+  if ! start_franken_glm; then restore_glm "the Franken/GLM gateway did not come up"; exit 1; fi
+  for c in 0 1 2; do echo "  card$c VRAM used: $(VRAM "$c") bytes"; done
+  echo "[5/7] sending one real chat completion to verify"
+  if ! send_test_chat "$FG_LABEL"; then restore_glm "the Franken/GLM test chat failed"; exit 1; fi
+  echo "[6/7] accept_live.sh -- the owner's own path, including the request AFTER the one it tests"
+  GLM53_LOG="$FG_LOG" "$HERE/accept_live.sh" || echo "NOTE: accept_live.sh did not pass -- see its output above; the engine is still serving"
+  echo "[7/7] handing the rig lock to the running engine (safe to exit this script now)"
+  local epid keeper
+  epid=$(pgrep -f "franken_dec_[g]lm" | head -1)
+  nohup tail --pid="$epid" -f /dev/null > /dev/null 2>&1 < /dev/null &
+  keeper=$!
+  disown "$keeper" 2>/dev/null || true
+  SERVE_ALT_KEEPER_PID=$keeper
+  rig_lock_rebind_pid "serve_alt-franken-glm" "$keeper"
+  write_state FG "$FG_LABEL"
+  echo "=== now serving: $FG_LABEL on port $ALT_PORT (Open WebUI still shows it as 'glm-5.3-flash')"
+  echo "=== engine pid $epid, gateway log $FG_LOG"
+  echo "=== to go back: $HERE/serve_alt.sh glm"
+}
+
 cmd_glm() {
   echo "=== serve_alt: switching back to GLM-5.3 $(date -Is)"
   refuse_if_busy glm || exit 1
@@ -739,6 +828,12 @@ cmd_status() {
     d4log=$(grep -h "gateway log " "$D4_LOG" 2>/dev/null | tail -1 | sed 's/.*gateway log //')
     echo "engine pid: $(pgrep -f "franken_decode_[d]s4" | head -1), gateway log ${d4log:-$D4_LOG}"
     echo "accept_live against it: GLM53_LOG=${d4log:-$D4_LOG} $HERE/accept_live.sh"
+  elif pgrep -f "openai_[s]erver.py" >/dev/null && franken_glm_alive; then
+    echo "serving: $FG_LABEL via the Colibri gateway on port $ALT_PORT (Open WebUI shows it as 'glm-5.3-flash')"
+    local fglog
+    fglog=$(grep -h "gateway log " "$FG_LOG" 2>/dev/null | tail -1 | sed 's/.*gateway log //')
+    echo "engine pid: $(pgrep -f "franken_dec_[g]lm" | head -1), gateway log ${fglog:-$FG_LOG}"
+    echo "accept_live against it: GLM53_LOG=${fglog:-$FG_LOG} $HERE/accept_live.sh"
   else
     echo "serving: NOTHING recognizable on port $ALT_PORT -- run '$HERE/serve_alt.sh glm' to restore GLM"
   fi
@@ -759,10 +854,11 @@ case "${1:-}" in
   glm-llama) cmd_alt G ;;
   franken)  cmd_franken ;;
   franken-ds4) cmd_franken_ds4 ;;
+  franken-glm) cmd_franken_glm ;;
   glm)      cmd_glm ;;
   status)   cmd_status ;;
   *)
-    echo "usage: $0 {qwen38|deepseek|glm-llama|franken|franken-ds4|glm|status}"
+    echo "usage: $0 {qwen38|deepseek|glm-llama|franken|franken-ds4|franken-glm|glm|status}"
     exit 2
     ;;
 esac

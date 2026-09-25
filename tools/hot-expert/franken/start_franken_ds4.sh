@@ -75,7 +75,7 @@ set -u
 # keeper and `serve_alt.sh status` find it (its comm truncates at 15 chars,
 # see serve_alt.sh's D4_* header comment -- pgrep -f matches the untruncated
 # argv instead of comm for exactly that reason).
-BIN=${FRANKEN_BIN:-$HOME/src/colibri/tools/hot-expert/franken/decode/franken_decode_ds4}
+BIN=${FRANKEN_BIN:-$HOME/bench/franken_decode_ds4_docker.sh}   # the engine lives in frankenstack/franken-engine since 2026-09-24; this tree has no binary
 GGUF=${FRANKEN_GGUF:-$HOME/models/DeepSeek-V4-Flash-0731-UD-IQ2_M/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf}
 GGUF_DIR=$(dirname "$GGUF")
 # The directory with a (stub) config.json, for the family resolver only.

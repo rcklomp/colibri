@@ -59,7 +59,7 @@ set -u
 # Whatever it is, the PROCESS the engine runs as must still be called
 # franken_decode: serve_alt.sh's `ps -C franken_decode` is how the rig lock's
 # keeper and `serve_alt.sh status` find it.
-BIN=${FRANKEN_BIN:-$HOME/src/colibri/tools/hot-expert/franken/decode/franken_decode}
+BIN=${FRANKEN_BIN:-$HOME/bench/franken_decode_docker.sh}   # the engine lives in frankenstack/franken-engine since 2026-09-24; this tree has no binary
 GGUF=${FRANKEN_GGUF:-$HOME/models/Qwen3.8-Flash-Next/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf}
 GGUF_DIR=$(dirname "$GGUF")
 # The directory with a config.json, for the family resolver only.

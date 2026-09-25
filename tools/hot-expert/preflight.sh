@@ -11,7 +11,10 @@ if [ -d ~/bench/.rig.lock ]; then
   owner=$(cat ~/bench/.rig.lock/owner 2>/dev/null); pid=$(echo "$owner" | awk '{print $2}')
   kill -0 "$pid" 2>/dev/null && [ "${PREFLIGHT_OWN_LOCK:-0}" != 1 ] && fail "rig lock held by: $owner"
 fi
-busy=$(pgrep -fa "quality_[e]val.py|franken_quality_[c]hain|_gpu_[g]ate.sh" | head -3)
+# exclude this script's own process tree: a caller's command line that merely NAMES a gate
+# script matched itself (2026-09-25). Only processes outside our ancestry count as busy.
+anc=" $$ "; p=$$; for _ in 1 2 3 4 5 6; do p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); [ -z "$p" ] || [ "$p" = 1 ] && break; anc="$anc$p "; done
+busy=$(pgrep -f "quality_[e]val.py|franken_quality_[c]hain|_gpu_[g]ate.sh" | while read q; do case "$anc" in *" $q "*) ;; *) ps -o pid=,args= -p "$q";; esac; done | head -3)
 [ -n "$busy" ] && fail "a measurement is running: $busy"
 m=0; for d in /sys/class/drm/card[0-9]/device; do u=$(( $(cat $d/mem_info_vram_used)/1048576 )); [ $u -gt $m ] && m=$u; done
 [ "${PREFLIGHT_ALLOW_VRAM:-0}" != 1 ] && [ $m -gt 1024 ] && fail "VRAM in use (max ${m} MiB on a card) -- the gateway or another engine is still up"

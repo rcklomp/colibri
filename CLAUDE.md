@@ -250,6 +250,15 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   the session is told; (2) sequences retry on rc 3 and report any other non-zero exit
   instead of waiting on a success marker; (3) a session never ends its turn with a rig
   job running and no such watcher armed.
+- **The Franken engine has its own repository since 2026-09-24: Gitea
+  `frankenstack/franken-engine`** (history extracted from this repo's
+  `tools/hot-expert/{franken,m1}` + the design doc). On the rig its working copy is
+  `~/src/franken-engine` (build there: `make -C franken/decode cpu gpu`, ds4/glm
+  targets per its README); agents commit there and the orchestrator pushes as
+  `claude-bot` (see the credential line for claude-bot). The copies under
+  `tools/hot-expert/franken` and `tools/hot-expert/m1` in THIS repo are frozen
+  history -- do not edit them. The measurement record, plan, gateway and all
+  serving/acceptance tooling stay here.
 - **Port 8081 may not be GLM (since 2026-09-21).** `tools/hot-expert/serve_alt.sh
   qwen38|deepseek|glm|status` swaps the model behind Open WebUI: llama-server
   (HIP build `~/src/llama-glm53/build-hip`, docker, `--fit on`, 262144 window)

@@ -22,7 +22,7 @@
 > (`5f409c2`, knobs default off). The profile moved the wait from missed
 > experts to idle time: at T=256 a chunk uses nearly every expert, so it
 > fetches all non-resident experts (92.7 GB a chunk) whatever the routing;
-> per-token traffic falls as 1/chunk. Running now: chunk 512 against 256.
+> per-token traffic falls as 1/chunk. Chunk 512 measured: -10 % (16.8 vs 18.6 ms), bit-identical; the adaptation read-back (2-4.4 ms a token, queued behind the staging DMA) and the trunk are now the limit.
 > Then GLM behind the gateway and its quality run.**
 >
 > **Rev 76 (2026-09-25 07:00 CEST; DeepSeek browser acceptance PASS on an idle engine, first token 1.3 s on screen -- DeepSeek done for L5) -- GLM STEP 5 GATED: BIT-IDENTICAL, PREFILL

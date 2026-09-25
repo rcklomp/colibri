@@ -242,6 +242,8 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   binary and flags for a minute. The rig draws real power under load: a wrong path, a
   missing library, an OOM at load or an overlapping measurement must fail in a minute,
   not after an hour. `accept_ui.sh` refuses by itself while a measurement runs.
+  Chain it with `&&` and never pipe its output through `tail`/`grep` in the same
+  pipeline: a piped refusal does not stop the launch (2026-09-25).
 - **No rig job runs unwatched, and no sequence waits only for success (rule since
   2026-09-24, after the rig sat idle five hours).** A queued step that was refused
   (lock held, rc 3) never printed the marker the next step waited for; nobody noticed.

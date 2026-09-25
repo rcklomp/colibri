@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 47, 2026-09-24)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 48, 2026-09-25)
+
+**Rev 48 (2026-09-25): pointer only -- Franken track plan rev 74 (DeepSeek quality verdict, GLM on the GPUs); GLM on Colibri still serves.**
 
 **Rev 47 (2026-09-24): pointer only -- the Franken track now carries DeepSeek-V4-Flash on the GPUs as well (plan rev 68, record §L5-DS4-STEP2); nothing on this roadmap's GLM/Colibri serving changed.**
 

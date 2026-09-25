@@ -14,6 +14,14 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 74 (2026-09-25) -- DEEPSEEK QUALITY: NOT DISTINGUISHABLE, BUT A DEFECT
+> FOUND (record §L5-DS4-SERVE).** 75.7 % vs llama.cpp's 82.9 %, p = 0.18;
+> 6 of llama.cpp's 7 wins are Franken answers running to the 16k budget
+> without stopping (11 truncations vs 4; equal lengths otherwise). First
+> DeepSeek item: reproduce mmlu:570 and read how it fails to stop.
+> Franken engine repo created: frankenstack/franken-engine (107 commits,
+> pushed by claude-bot).**
+>
 > **Rev 73 (2026-09-24 20:10 CEST) -- GLM-5.3 ON THE GPUS (record §L5-GLM-GPU).**
 > Bit-identical to its CPU arm on every path (three-link, adaptive, both);
 > 13.6-14.9 tok/s at a 256k window against Colibri's ~5; three-link split

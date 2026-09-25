@@ -276,7 +276,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   serves nothing.** The owner reserved the rig for development and does not need GLM on 8081;
   restoring it after every chain cost a 13-minute load plus acceptance each time. With the flag,
   `gateway_watchdog.sh` does not restart the gateway, `run_chain.sh` and the `~/bench/glm5*_chain.sh`
-  exit traps leave it down, and `accept_live.sh` (incl. the 05:00 canary) prints SKIPPED and exits 0.
+  exit traps leave it down, `serve_alt.sh glm` (and its fallback) only stops the alternative and frees the lock, and `accept_live.sh` (incl. the 05:00 canary) prints SKIPPED and exits 0.
   New chains must honour the flag the same way. Remove the flag (and start the gateway) only when
   the owner asks for the service back.
 - **The gateway is the owner's daily service.** `~/start_glm53.sh` runs

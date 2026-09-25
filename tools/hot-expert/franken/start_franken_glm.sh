@@ -128,7 +128,7 @@ python3 -u openai_server.py \
   --arch glm53 \
   --host 0.0.0.0 --port 8081 \
   --model-id glm-5.3-flash \
-  --max-tokens "${FRANKEN_MAX_TOKENS:-4096}" \
+  --max-tokens "${FRANKEN_MAX_TOKENS:-16384}" \
   --kv-slots 1 \
   --allowed-host 127.0.0.1 --allowed-host localhost \
   --allowed-host host.docker.internal \

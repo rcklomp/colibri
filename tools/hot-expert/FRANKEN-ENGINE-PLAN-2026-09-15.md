@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 75 (2026-09-25 04:30 CEST) -- THE DEEPSEEK LOOPS ARE NEAR-TIES, NOT A BUG
+> (record §L5-DS4-SERVE).** Teacher-forced along llama.cpp's greedy sequence,
+> Franken differs at 2.3 % of steps, all near-ties in both engines
+> (activation rounding, as on Qwen3.8). Greedy loops are chance; serving
+> samples normally. DeepSeek is done for L5 apart from browser acceptance on
+> an idle engine. Next: GLM batched prefill + graph + profiler fix + load-once
+> gates, then GLM behind the gateway and its quality run; the engine's
+> working copy moves to frankenstack/franken-engine.**
+>
 > **Rev 74 (2026-09-25) -- DEEPSEEK QUALITY: NOT DISTINGUISHABLE, BUT A DEFECT
 > FOUND (record §L5-DS4-SERVE).** 75.7 % vs llama.cpp's 82.9 %, p = 0.18;
 > 6 of llama.cpp's 7 wins are Franken answers running to the 16k budget

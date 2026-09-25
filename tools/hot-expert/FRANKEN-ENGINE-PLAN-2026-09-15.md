@@ -14,6 +14,20 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 78 (2026-09-25 09:20 CEST) -- GLM PREFILL 1.8x WITH THE LDS GEMM
+> (record §L5-GLM-LDS); GLM BEHIND THE GATEWAY BUILT. The rig is reserved
+> for development (owner, 2026-09-25): nothing serves on 8081, chains leave
+> the gateway down (`~/bench/.dev_reserved`).** Chunk 512 staged prefill
+> 16.9 -> 9.3 ms/token with `--gemm-lds 1` (A,B,B,A), decode 67-70 ms at 8k
+> unchanged; bit-identical paths all exact; the LDS kernel moves one
+> near-tied expert at the last layer (greedy exact) -- judged by the quality
+> run, as on Qwen3.8. The counter read-back fix measured nothing. GLM serve
+> port (franken-engine `glm-serve` b9bd25d, colibri `franken-glm` arm,
+> live-prefix reuse only, no checkpoints yet) is under its first serve test.
+> Next: serve test -> GLM quality (Franken with LDS vs llama.cpp) -> the
+> pipeline between cards (dev0 busy 30 %) -> checkpoints for prefix reuse;
+> the DeepSeek gate for the shared snapshot change.**
+>
 > **Rev 77 (2026-09-25 08:00 CEST) -- GLM STAGED PREFILL LANDED, +4 %; THE
 > LEVER IS CHUNK SIZE (record §L5-GLM-STAGE).** Missed experts staged into a
 > VRAM ring by DMA plus swaps held during prefill: 34 of 34 gate configs

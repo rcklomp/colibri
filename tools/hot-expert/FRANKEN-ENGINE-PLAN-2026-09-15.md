@@ -14,7 +14,7 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
-> **Rev 76 (2026-09-25 07:00 CEST) -- GLM STEP 5 GATED: BIT-IDENTICAL, PREFILL
+> **Rev 76 (2026-09-25 07:00 CEST; DeepSeek browser acceptance PASS on an idle engine, first token 1.3 s on screen -- DeepSeek done for L5) -- GLM STEP 5 GATED: BIT-IDENTICAL, PREFILL
 > MISS-BOUND (record §L5-GLM-STEP5).** One GPU load ran all 23 gate
 > configurations: batched prefill, graph replay, three-link and adaptation
 > are bit-identical to the eager reference (the one "failure" was the gate

@@ -262,6 +262,10 @@ def mmlu_load_sample(path):
     with open(path) as f:
         data = json.load(f)
     items = data["items"]
+    # a deliberate subset file (e.g. the questions one arm missed) says so in "note"
+    if data.get("note", "").startswith("subset:"):
+        print(f"[mmlu] {path}: {data['note']} ({len(items)} items)")
+        return items
     if len(items) != MMLU_EXPECTED_CATEGORIES * MMLU_PER_CATEGORY:
         raise RuntimeError(f"{path}: expected "
                             f"{MMLU_EXPECTED_CATEGORIES * MMLU_PER_CATEGORY} items, "

@@ -35,7 +35,9 @@ if [ "$code" = 200 ] && pgrep -f "openai_[s]erver.py" >/dev/null && ! engine_ali
   echo "run_chain: /v1/models=200 but the gateway's glm53 engine is GONE -- treating as down"
   code=dead-engine
 fi
-if [ "$code" != 200 ]; then
+if [ -e "$HOME/bench/.dev_reserved" ]; then
+  echo "run_chain: rig reserved for development (~/bench/.dev_reserved): gateway left down"; code=reserved
+elif [ "$code" != 200 ]; then
   echo "run_chain: the gateway is NOT answering after the chain (/v1/models=$code) -- restarting"
   pkill -f "openai_[s]erver.py"; sleep 3; pkill -9 -x glm53 2>/dev/null
   SKIP_WARM=1 setsid nohup "$HOME/start_glm53.sh" > "$HOME/glm53_server.log" 2>&1 < /dev/null &

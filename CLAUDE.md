@@ -272,6 +272,13 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `--tensor-split` or `--n-cpu-moe` here: its fit aborts and one card stays
   nearly empty (record §F11-STEP0). The owner does not need the rig by day:
   run measurements at once.
+- **Development reservation (since 2026-09-25): while `~/bench/.dev_reserved` exists the rig
+  serves nothing.** The owner reserved the rig for development and does not need GLM on 8081;
+  restoring it after every chain cost a 13-minute load plus acceptance each time. With the flag,
+  `gateway_watchdog.sh` does not restart the gateway, `run_chain.sh` and the `~/bench/glm5*_chain.sh`
+  exit traps leave it down, and `accept_live.sh` (incl. the 05:00 canary) prints SKIPPED and exits 0.
+  New chains must honour the flag the same way. Remove the flag (and start the gateway) only when
+  the owner asks for the service back.
 - **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
   `openai_server.py` on 8081 with **`--max-tokens 4096`** (2026-09-14: it was
   `256` from the first day of Open WebUI service, and `openai_server.py` clamps

@@ -24,6 +24,7 @@
 #                                        makes one visible without anybody watching.
 #  3. API two-turn, memory on         -> turn 2 reused >= prompt-32 and ttft <= 15 s (P6/P7 pin)
 #  4. abandoned 1 000-token request   -> the short request behind it answers in <= 45 s (CANCEL)
+if [ -e "$HOME/bench/.dev_reserved" ]; then echo "=== accept_live SKIPPED $(date -Is): rig reserved for development (~/bench/.dev_reserved), no service to check"; exit 0; fi
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); LOG="${GLM53_LOG:-$HOME/glm53_server.log}"; MODE="${1:-full}"
 K=$(cat "$HOME/.colibri_api_key"); URL=http://127.0.0.1:8081; FAIL=0

@@ -17,6 +17,7 @@ LOG="${WATCHDOG_LOG:-$HOME/bench/gateway_watchdog.log}"
 say() { echo "$(date +%Y-%m-%dT%H:%M:%S%z) $*" >> "$LOG"; }
 
 if rig_lock_maintenance; then exit 0; fi                      # a chain owns the box
+if [ -e "$HOME/bench/.dev_reserved" ]; then exit 0; fi   # the owner reserved the rig for development: no service to keep up (2026-09-25)
 
 KEY=$(cat "$HOME/.colibri_api_key" 2>/dev/null)
 code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" \

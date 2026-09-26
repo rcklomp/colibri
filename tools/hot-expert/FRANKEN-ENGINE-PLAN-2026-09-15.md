@@ -14,6 +14,18 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 79 (2026-09-26 04:20 CEST) -- GLM ON THE FRANKEN ENGINE: QUALITY =
+> LLAMA.CPP'S, ~4x FASTER (record §L5-GLM-QUALITY, §L5-GLM-CKPT).** MMLU-Pro
+> 70: greedy 58/70 (82.9 %), sampled as the model card says 60/70 (85.7 %),
+> p = 0.63; needle 8/8 at 30k-200k. The misses are the model's: llama.cpp,
+> greedy, on the 12 Franken misses gets 1 right (a near-tie); the
+> budget-exhausted answers are overthinking at xhigh (all-distinct tails),
+> in both engines. Prefix checkpoints bit-identical (2/2). Setup faults
+> fixed on the way: a leaked FRANKEN_BIN, a 4 096 max-tokens cap. Next:
+> GLM with checkpoints end to end through the gateway and Open WebUI
+> (accept_ui), then the pipeline between cards (dev0 busy 30 % in prefill),
+> the DeepSeek gate for the shared snapshot change.**
+>
 > **Rev 78 (2026-09-25 09:20 CEST) -- GLM PREFILL 1.8x WITH THE LDS GEMM
 > (record §L5-GLM-LDS); GLM BEHIND THE GATEWAY BUILT. The rig is reserved
 > for development (owner, 2026-09-25): nothing serves on 8081, chains leave

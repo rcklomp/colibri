@@ -27,6 +27,9 @@ stop_all() {
   pkill -f "openai_[s]erver.py" 2>/dev/null; sleep 2; pkill -9 -f "openai_[s]erver.py" 2>/dev/null
   pkill -9 -f "franken_dec_[g]lm" 2>/dev/null
   docker stop -t 5 franken_engine >/dev/null 2>&1 || true
+  # the container of a 144 GB-pinned engine lingers for minutes while the kernel unpins: a new `docker run --name franken_engine` then fails with "name already in use"
+  # (the second B arm of the first run died that way): wait until the container is gone, not just the process
+  for _ in $(seq 1 120); do [ -z "$(docker ps -aq -f name='^franken_engine$' 2>/dev/null)" ] && break; sleep 5; done
 }
 trap 'stop_all; echo "=== chain exit trap $(date -Is): gateway and engine stopped, port 8081 left empty (rig reserved)"' EXIT
 if pgrep -f "[m]ake .*glm-serve|[h]ipcc|[c]c1plus|[c]lang.*offload" > /dev/null; then

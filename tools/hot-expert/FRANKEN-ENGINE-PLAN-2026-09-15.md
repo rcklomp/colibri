@@ -39,8 +39,10 @@
 > configs), -16 % at chunk 512; with chunk 1024: **6.41 ms/token (G=4), 6.29 (G=8, not gated)**
 > against 9.53 stock. (5) Landed ON THE RIG ONLY as local branch `chunk1024` (42d7ddc) of
 > `~/src/franken-engine`; not pushed, `main` untouched; the serving path (FRANKEN_GLM_CHUNK=1024,
-> FRANKEN_SNAP_EVERY=1024, FRANKEN_GLM_STAGE_MB=256) is being A/B-tested through the gateway
-> (`glm_serve_chunk_chain.sh`), a blocked `head_gemv` (0.5 ms a token) is with an agent.
+> FRANKEN_SNAP_EVERY=1024, FRANKEN_GLM_STAGE_MB=256) was A/B-tested through the real gateway
+> (`glm_serve_chunk_chain.sh`): cold ~8.3k prompts 9.87 -> 7.19 ms/token, -27.1 % on means (-20.8 %
+> conservative), about 1.8 GB VRAM free a card in service; a blocked `head_gemv` (0.5 ms a token,
+> branch `head-gemv-blk` f39b449) is being gated.
 > Next: HANDOFF-2026-10-06 §9.**
 >
 > **Rev 80 (2026-10-06 07:00 CEST) -- THE HANDOFF'S FIVE ITEMS RUN. GLM PREFIX

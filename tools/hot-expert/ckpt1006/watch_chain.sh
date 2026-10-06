@@ -15,7 +15,7 @@ RIG=${RIG:-rome}
 CHAIN=${1:?chain log on the rig}
 ENGINE=${2:-}
 SILENT_POLLS=${SILENT_POLLS:-27}              # 27 polls x 45 s = 20 minutes without a new line in either log
-PAT='=== gate-plan|=== glm5|=== dpf|=== run_chain|^[a-z0-9_]+ +(none|exact|cos|ref) +(ok|FAIL|PASS)|FAIL|PASS|rror|HIP error|[Aa]bort|core dumped|out of memory|OOM|needs [0-9]|REFUSED|Killed|Traceback|glm5_dpf |glm5_decode_ms_median|decode ms/token|covered_frac|vram_dev.*(caches|steady)|resident=|exit rc|active=0|decode_prefetch='
+PAT='=== gate-plan|=== glm5|=== dpf|=== run_chain|^[a-z0-9_]+ +(none|exact|cos|ref) +(ok|FAIL|PASS)|FAIL|PASS|rror|HIP error|[Aa]bort|core dumped|out of memory|OOM|needs [0-9]|REFUSED|Killed|Traceback|glm5_dpf |glm5_decode_ms_median|decode ms/token|covered_frac|vram_dev.*(caches|steady)|resident=|exit(ed)? rc|active=0|decode_prefetch='
 last_c=0; last_e=0; quiet=0; dead=0; bad=0
 while :; do
   out=$(ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 "$RIG" '
@@ -38,9 +38,9 @@ while :; do
   last_c=${nc:-$last_c}; last_e=${ne:-$last_e}
   if [ "$quiet" -ge "$SILENT_POLLS" ]; then echo "SILENT: no new line in either log for $((SILENT_POLLS*45/60)) min (engine alive=$alive)"; quiet=0; fi
   # a dead engine with a chain that has not exited = a silent death (a crashed engine, a refused launch)
-  if [ "$alive" = 0 ] && ! echo "$body" | grep -q "exit rc"; then dead=$((dead+1)); else dead=0; fi
+  if [ "$alive" = 0 ] && ! echo "$body" | grep -qE "exit(ed)? rc"; then dead=$((dead+1)); else dead=0; fi
   if [ "$dead" -ge 4 ]; then echo "DEAD: no engine/gate process for 3 min and the chain has not exited"; bad=1; dead=0; fi
-  if echo "$body" | grep -q "exit rc"; then
+  if echo "$body" | grep -qE "exit(ed)? rc"; then
     [ "$bad" = 1 ] && { echo "--- last lines of both logs (a bad end):"; echo "$out" | grep -E "^(CHAINTAIL|ENGINETAIL) " | cut -c1-260; }
     echo "WATCH END (bad=$bad)"; exit 0
   fi

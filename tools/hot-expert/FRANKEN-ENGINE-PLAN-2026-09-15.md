@@ -14,6 +14,19 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 85 (2026-10-07 01:30 CEST) -- DECODE LOOKAHEAD PREFETCH IS BUILT, BIT-EXACT AND A NET LOSS: CLOSED (records
+> §L4-LOOKAHEAD-OUTSIDE, §L4-LOOKAHEAD-STEP1).** Outside sources first (llama.cpp's prefetch is prefill-only; a decode prefetch
+> that syncs the host cost 8-13 % elsewhere), then a device-driven design: predict layer l+1's top-k experts on a side stream, copy the
+> missed ones into VRAM rings, redirect the real plan. Exact in every comparable line (chunk-1 1 788 / 1 788 in dry and use mode, a
+> 64-token decode identical across off / dry / use / use + swaps), **slower in time: 70.8 ms/token off, 95-101 ms on** at k = 2, 4, 8 --
+> ~31 ms of FIXED machinery (0.8 ms a layer from a few extra streams, events and P2P hops, far above the §M5 floors) plus 3-14 us per MB
+> moved against 9-27 us saved per MB covered; best case without the fixed cost <= 8 %. Lesson: the decode layer is LATENCY-bound on its
+> cross-card / cross-stream chain; the fetch is ~25-39 ms of the 70, the other ~40 ms is not fetch. **Next: a kernel-level decode trace
+> (`ckpt1006/glm_decode_trace_chain.sh`, rocprofv3) to read one layer's critical path.** Found on the way: **decode past 2 051 tokens of
+> context is not run-to-run reproducible** (two mode-0 runs diverge at the 10th generated token; below 2 051 identical), so exactness gates
+> run below it. Process: three gate starts died at setup on VRAM budget (rule in CLAUDE.md, two-log watcher `ckpt1006/watch_chain.sh`,
+> a gate verdict that names an engine death -- franken-engine `gate-robustness`). The `decode-prefetch` branch is kept, not merged.
+>
 > **Rev 84 (2026-10-06 22:00 CEST) -- THE ROOT CLOCK TEST RAN (record §M7-CLOCKTEST): CLOCKS ARE NOT
 > THE CAUSE OF THE SLOW COPIES; NO SOFTWARE KNOB; THE DEFAULT POWER PROFILE STAYS.** The owner ran
 > `ckpt1006/clock_test.sh` once (sudo): with `profile_peak` and with the COMPUTE profile the memory /

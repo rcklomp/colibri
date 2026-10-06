@@ -1,0 +1,39 @@
+=== run_chain ds4_adapt_decode_chain 2026-10-06T00:55:00+0000 (lock held by ds4_adapt_decode_chain 1144512 2026-10-06T00:55:00+0000)
+=== ds4_adapt_decode start 2026-10-06T00:55:00+00:00 bin=c480144d15034f77
+=== arm X0 --adapt 0 00:55:00
+ds4_probe depth=64 tokens=32 ms_median=46.902 tok_s=21.32 ms_min=45.089 ms_max=71.994 hip_graph=1 profile=0 (prefill 0->64 in 1103.9 ms)
+ds4_probe depth=8192 tokens=32 ms_median=47.229 tok_s=21.17 ms_min=45.708 ms_max=64.323 hip_graph=1 profile=0 (prefill 96->8192 in 46721.6 ms)
+ds4_probe depth=64 tokens=32 ms_median=47.020 tok_s=21.27 ms_min=45.243 ms_max=56.197 hip_graph=1 profile=0 (prefill 0->64 in 1083.9 ms)
+=== arm X1 --adapt 1 --adapt-every 16 --adapt-mb-per-token 64 --adapt-halflife 2048 00:56:31
+ds4_probe depth=8192 tokens=32 ms_median=92.842 tok_s=10.77 ms_min=90.960 ms_max=148.489 hip_graph=1 profile=0 (prefill 96->8192 in 46351.1 ms)
+ds4_probe depth=64 tokens=32 ms_median=89.984 tok_s=11.11 ms_min=86.158 ms_max=95.205 hip_graph=1 profile=0 (prefill 0->64 in 1074.2 ms)
+adapt_total dev=0 pos=96 tokens=8208 hit=0.8606 miss_mb_per_token=94.5 swaps=1420 swap_gb=10.70 rounds=11 inflight=0
+=== arm X2 --adapt 1 --adapt-every 16 --adapt-mb-per-token 0 --adapt-halflife 2048 00:59:08
+ds4_probe depth=8192 tokens=32 ms_median=91.223 tok_s=10.96 ms_min=90.064 ms_max=104.198 hip_graph=1 profile=0 (prefill 96->8192 in 45654.2 ms)
+ds4_probe depth=64 tokens=32 ms_median=90.055 tok_s=11.10 ms_min=87.290 ms_max=98.318 hip_graph=1 profile=0 (prefill 0->64 in 1086.1 ms)
+adapt_total dev=0 pos=96 tokens=8208 hit=0.9179 miss_mb_per_token=55.7 swaps=0 swap_gb=0.00 rounds=0 inflight=0
+=== arm X2 --adapt 1 --adapt-every 16 --adapt-mb-per-token 0 --adapt-halflife 2048 01:01:39
+ds4_probe depth=8192 tokens=32 ms_median=90.991 tok_s=10.99 ms_min=89.754 ms_max=105.461 hip_graph=1 profile=0 (prefill 96->8192 in 45718.4 ms)
+ds4_probe depth=64 tokens=32 ms_median=89.341 tok_s=11.19 ms_min=86.137 ms_max=96.102 hip_graph=1 profile=0 (prefill 0->64 in 1084.5 ms)
+adapt_total dev=0 pos=96 tokens=8208 hit=0.9179 miss_mb_per_token=55.7 swaps=0 swap_gb=0.00 rounds=0 inflight=0
+=== arm X1 --adapt 1 --adapt-every 16 --adapt-mb-per-token 64 --adapt-halflife 2048 01:04:10
+ds4_probe depth=8192 tokens=32 ms_median=92.495 tok_s=10.81 ms_min=90.347 ms_max=148.023 hip_graph=1 profile=0 (prefill 96->8192 in 45993.7 ms)
+ds4_probe depth=64 tokens=32 ms_median=89.602 tok_s=11.16 ms_min=85.917 ms_max=93.990 hip_graph=1 profile=0 (prefill 0->64 in 1063.7 ms)
+adapt_total dev=0 pos=96 tokens=8208 hit=0.8606 miss_mb_per_token=94.5 swaps=1420 swap_gb=10.70 rounds=11 inflight=0
+=== arm X0 --adapt 0 01:06:41
+ds4_probe depth=64 tokens=32 ms_median=46.644 tok_s=21.44 ms_min=44.883 ms_max=71.663 hip_graph=1 profile=0 (prefill 0->64 in 1089.5 ms)
+ds4_probe depth=8192 tokens=32 ms_median=47.227 tok_s=21.17 ms_min=45.670 ms_max=63.957 hip_graph=1 profile=0 (prefill 96->8192 in 45752.5 ms)
+ds4_probe depth=64 tokens=32 ms_median=46.813 tok_s=21.36 ms_min=44.783 ms_max=55.641 hip_graph=1 profile=0 (prefill 0->64 in 1066.0 ms)
+=== verdicts (decode ms/token): X0 adapt off | X1 adapt on, served values | X2 adapt on, no swaps
+  depth 8192: X0 vs X1               A=47.228 [47.227-47.229]  B=92.668 [92.495-92.842]
+                                     SEPARATED: +96.2% on means, +95.8% conservative (worst-against-best) -- quote the conservative figure
+  depth 8192: X2 vs X1               A=91.107 [90.991-91.223]  B=92.668 [92.495-92.842]
+                                     SEPARATED: +1.7% on means, +1.4% conservative (worst-against-best) -- quote the conservative figure
+  depth 8192: X0 vs X2               A=47.228 [47.227-47.229]  B=91.107 [90.991-91.223]
+                                     SEPARATED: +92.9% on means, +92.7% conservative (worst-against-best) -- quote the conservative figure
+  depth 64:   X0 vs X1               A=46.845 [46.644-47.020]  B=89.660 [89.375-89.984]
+                                     SEPARATED: +91.4% on means, +90.1% conservative (worst-against-best) -- quote the conservative figure
+  depth 64:   X2 vs X1               A=89.802 [89.341-90.055]  B=89.660 [89.375-89.984]
+                                     OVERLAPPING ranges -- NO VERDICT. The means differ by -0.2% but the arms do not separate; report 'did not move'.
+=== ds4_adapt_decode end 2026-10-06T01:08:09+00:00 failures=0
+=== run_chain ds4_adapt_decode_chain exited rc=0 2026-10-06T01:08:09+0000

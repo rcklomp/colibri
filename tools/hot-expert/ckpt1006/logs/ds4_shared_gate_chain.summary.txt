@@ -1,0 +1,65 @@
+=== run_chain ds4_shared_gate_chain 2026-10-06T00:22:34+0000 (lock held by ds4_shared_gate_chain 935038 2026-10-06T00:22:34+0000)
+=== ds4_shared_gate start 2026-10-06T00:22:34+00:00 kernel=7.0.0-38-generic
+A=c70f5dc3049a61c5 B=c480144d15034f77
+=== warm 00:22:35
+=== preflight smoke (B) 00:23:10
+--- preflight smoke: bash -c "$@"; rc=$?; [ $rc -eq 4 ] && rc=0; exit $rc _ docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --ipc=host --ulimit 
+greedy_ids: 11111 14 305 436
+PREFLIGHT OK rc=0 in 37 s
+=== identity eager: rc(A)=0 rc(B)=0 taps=2014 not_bitexact=0
+greedy_ids: 11111 14 305 436 344 834 294 270 1473 12734 11234 295 270 2058 16 983
+oracle greedy_ids exact=1 mine=16 ref=16
+rm: cannot remove '/home/ronald/bench/ds4gate/ref_eager/greedy_ids.f32': Permission denied
+=== identity graph: rc(A)=0 rc(B)=0 taps=2014 not_bitexact=0
+greedy_ids: 11111 14 305 436 344 834 294 270 1473 12734 11234 295 270 2058 16 983
+oracle greedy_ids exact=1 mine=16 ref=16
+rm: cannot remove '/home/ronald/bench/ds4gate/ref_graph/greedy_ids.f32': Permission denied
+=== identity adapt: rc(A)=0 rc(B)=0 taps=2014 not_bitexact=0
+greedy_ids: 11111 14 305 436 344 834 294 270 1473 12734 11234 295 270 2058 16 983
+adapt_total dev=0 pos=21 tokens=19 hit=0.7673 miss_mb_per_token=157.9 swaps=101 swap_gb=0.76 rounds=16 inflight=1
+adapt_total dev=1 pos=21 tokens=19 hit=0.7964 miss_mb_per_token=132.3 swaps=86 swap_gb=0.67 rounds=18 inflight=1
+adapt_total dev=2 pos=21 tokens=19 hit=0.8315 miss_mb_per_token=107.9 swaps=63 swap_gb=0.48 rounds=17 inflight=1
+oracle greedy_ids exact=1 mine=16 ref=16
+rm: cannot remove '/home/ronald/bench/ds4gate/ref_adapt/greedy_ids.f32': Permission denied
+=== identity adapt64: rc(A)=0 rc(B)=0 taps=2014 not_bitexact=0
+greedy_ids: 201 14128 11 406 3578 2346 477 9450 110585 14 17224 2690 29605 1347 3275 4171
+adapt_total dev=0 pos=79 tokens=77 hit=0.8899 miss_mb_per_token=74.7 swaps=247 swap_gb=1.86 rounds=67 inflight=0
+adapt_total dev=1 pos=79 tokens=77 hit=0.9165 miss_mb_per_token=53.9 swaps=167 swap_gb=1.29 rounds=64 inflight=1
+adapt_total dev=2 pos=79 tokens=77 hit=0.9344 miss_mb_per_token=41.9 swaps=125 swap_gb=0.95 rounds=52 inflight=0
+oracle greedy_ids exact=1 mine=16 ref=16
+rm: cannot remove '/home/ronald/bench/ds4gate/ref_adapt64/greedy_ids.f32': Permission denied
+=== identity adapt_graph: rc(A)=0 rc(B)=0 taps=2014 not_bitexact=0
+greedy_ids: 11111 14 305 436 344 834 294 270 1473 12734 11234 295 270 2058 16 983
+adapt_total dev=0 pos=21 tokens=19 hit=0.7673 miss_mb_per_token=157.9 swaps=101 swap_gb=0.76 rounds=16 inflight=1
+adapt_total dev=1 pos=21 tokens=19 hit=0.7964 miss_mb_per_token=132.3 swaps=86 swap_gb=0.67 rounds=18 inflight=1
+adapt_total dev=2 pos=21 tokens=19 hit=0.8315 miss_mb_per_token=107.9 swaps=63 swap_gb=0.48 rounds=17 inflight=1
+oracle greedy_ids exact=1 mine=16 ref=16
+rm: cannot remove '/home/ronald/bench/ds4gate/ref_adapt_graph/greedy_ids.f32': Permission denied
+=== timing arm A 00:33:46
+ds4_probe depth=64 tokens=32 ms_median=45.712 tok_s=21.88 ms_min=41.152 ms_max=72.033 hip_graph=1 profile=0 (prefill 0->64 in 4248.9 ms)
+ds4_probe depth=8192 tokens=32 ms_median=92.552 tok_s=10.80 ms_min=90.600 ms_max=163.856 hip_graph=1 profile=0 (prefill 96->8192 in 46119.6 ms)
+ds4_probe depth=64 tokens=32 ms_median=89.675 tok_s=11.15 ms_min=86.086 ms_max=94.875 hip_graph=1 profile=0 (prefill 0->64 in 1056.9 ms)
+rc=0
+=== timing arm B 00:36:21
+ds4_probe depth=64 tokens=32 ms_median=89.404 tok_s=11.19 ms_min=86.356 ms_max=110.135 hip_graph=1 profile=0 (prefill 0->64 in 1078.5 ms)
+ds4_probe depth=8192 tokens=32 ms_median=92.713 tok_s=10.79 ms_min=88.401 ms_max=148.547 hip_graph=1 profile=0 (prefill 96->8192 in 50955.4 ms)
+ds4_probe depth=64 tokens=32 ms_median=90.056 tok_s=11.10 ms_min=86.819 ms_max=96.792 hip_graph=1 profile=0 (prefill 0->64 in 1051.3 ms)
+rc=0
+=== timing arm B 00:38:59
+ds4_probe depth=64 tokens=32 ms_median=89.353 tok_s=11.19 ms_min=86.427 ms_max=109.668 hip_graph=1 profile=0 (prefill 0->64 in 1080.6 ms)
+ds4_probe depth=8192 tokens=32 ms_median=92.978 tok_s=10.76 ms_min=90.743 ms_max=148.036 hip_graph=1 profile=0 (prefill 96->8192 in 47780.6 ms)
+ds4_probe depth=64 tokens=32 ms_median=87.421 tok_s=11.44 ms_min=86.099 ms_max=94.377 hip_graph=1 profile=0 (prefill 0->64 in 1067.7 ms)
+rc=0
+=== timing arm A 00:41:33
+ds4_probe depth=64 tokens=32 ms_median=88.858 tok_s=11.25 ms_min=86.007 ms_max=111.010 hip_graph=1 profile=0 (prefill 0->64 in 1092.1 ms)
+ds4_probe depth=8192 tokens=32 ms_median=89.848 tok_s=11.13 ms_min=87.393 ms_max=148.301 hip_graph=1 profile=0 (prefill 96->8192 in 46141.3 ms)
+ds4_probe depth=64 tokens=32 ms_median=89.332 tok_s=11.19 ms_min=86.197 ms_max=93.535 hip_graph=1 profile=0 (prefill 0->64 in 1071.6 ms)
+rc=0
+=== verdicts (decode ms/token, medians of 32; A = pre473, B = tip)
+  decode at depth 64                 A=78.394 [45.712-89.675]  B=89.058 [87.421-90.056]
+                                     OVERLAPPING ranges -- NO VERDICT. The means differ by +13.6% but the arms do not separate; report 'did not move'.
+  decode at depth 8192               A=91.200 [89.848-92.552]  B=92.845 [92.713-92.978]
+                                     SEPARATED: +1.8% on means, +0.2% conservative (worst-against-best) -- quote the conservative figure
+=== ds4_shared_gate end 2026-10-06T00:44:04+00:00 failures=0
+DS4 SHARED-CHANGE GATE: PASS
+=== run_chain ds4_shared_gate_chain exited rc=0 2026-10-06T00:44:04+0000

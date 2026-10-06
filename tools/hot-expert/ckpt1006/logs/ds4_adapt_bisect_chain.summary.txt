@@ -1,0 +1,45 @@
+=== run_chain ds4_adapt_bisect_chain 2026-10-06T01:38:11+0000 (lock held by ds4_adapt_bisect_chain 1301417 2026-10-06T01:38:11+0000)
+=== ds4_adapt_bisect start 2026-10-06T01:38:11+00:00 tip=c480144d15034f77 nostats=2175f31c1c35434c
+=== arm R --adapt 0  01:38:11
+  decode_ms_median=51.070 rc=0
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=21.95
+=== arm N --adapt 1 --adapt-every 100000000 --adapt-mb-per-token 0  01:38:53
+  decode_ms_median=92.543 rc=0
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=22.17
+=== arm S --adapt 1 --adapt-every 100000000 --adapt-mb-per-token 0 [FRANKEN_NO_ADAPT_STATS=1] 01:40:34
+  decode_ms_median=90.986 rc=0
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=19.30
+=== arm M --adapt 1 --adapt-every 100000000 --adapt-mb-per-token 0 --miss-stage 0  01:42:14
+  decode_ms_median=52.973 rc=0
+hip_graph_dev0 nodes=913 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=6.50
+=== arm C --adapt 0 --miss-stage 0  01:43:54
+  decode_ms_median=53.070 rc=0
+hip_graph_dev0 nodes=913 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=6.39
+=== arm C --adapt 0 --miss-stage 0  01:44:36
+  decode_ms_median=53.087 rc=0
+hip_graph_dev0 nodes=913 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=6.26
+=== arm M --adapt 1 --adapt-every 100000000 --adapt-mb-per-token 0 --miss-stage 0  01:45:18
+  decode_ms_median=53.189 rc=0
+hip_graph_dev0 nodes=913 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=6.35
+=== arm S --adapt 1 --adapt-every 100000000 --adapt-mb-per-token 0 [FRANKEN_NO_ADAPT_STATS=1] 01:46:57
+  decode_ms_median=92.603 rc=0
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=19.42
+=== arm N --adapt 1 --adapt-every 100000000 --adapt-mb-per-token 0  01:48:39
+  decode_ms_median=92.662 rc=0
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=20.78
+=== arm R --adapt 0  01:50:20
+  decode_ms_median=51.131 rc=0
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=18.89
+=== verdicts (decode ms/token, graph replay): R adapt off | N adapt on | S adapt on, null stats | M adapt on, miss-stage 0 | C adapt off, miss-stage 0
+  R vs N  (adapt effect)             A=51.100 [51.070-51.131]  B=92.603 [92.543-92.662]
+                                     SEPARATED: +81.2% on means, +81.0% conservative (worst-against-best) -- quote the conservative figure
+  N vs S  (router counters)          A=92.603 [92.543-92.662]  B=91.794 [90.986-92.603]
+                                     OVERLAPPING ranges -- NO VERDICT. The means differ by -0.9% but the arms do not separate; report 'did not move'.
+  R vs S  (adapt minus counters)     A=51.100 [51.070-51.131]  B=91.794 [90.986-92.603]
+                                     SEPARATED: +79.6% on means, +77.9% conservative (worst-against-best) -- quote the conservative figure
+  C vs M  (adapt effect, in-place misses) A=53.079 [53.070-53.087]  B=53.081 [52.973-53.189]
+                                     OVERLAPPING ranges -- NO VERDICT. The means differ by +0.0% but the arms do not separate; report 'did not move'.
+  N vs M  (staged vs in-place, adapt on) A=92.603 [92.543-92.662]  B=53.081 [52.973-53.189]
+                                     SEPARATED: -42.7% on means, -42.5% conservative (worst-against-best) -- quote the conservative figure
+=== ds4_adapt_bisect end 2026-10-06T01:51:00+00:00 failures=0
+=== run_chain ds4_adapt_bisect_chain exited rc=0 2026-10-06T01:51:00+0000

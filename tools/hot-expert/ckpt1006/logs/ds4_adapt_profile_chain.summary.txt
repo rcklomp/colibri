@@ -1,0 +1,42 @@
+=== run_chain ds4_adapt_profile_chain 2026-10-06T01:27:18+0000 (lock held by ds4_adapt_profile_chain 1285838 2026-10-06T01:27:18+0000)
+=== ds4_adapt_profile start 2026-10-06T01:27:18+00:00 bin=c480144d15034f77
+=== G0 --adapt 0 --hip-graph 1 01:27:18
+ds4_decode_ms_median=51.339 tok_s=19.48 tokens=32 depth_end=53 ctx=262144 hip_graph=1
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=36.37
+=== G1 --adapt 1 --adapt-every 16 --adapt-mb-per-token 64 --adapt-halflife 2048 --hip-graph 1 01:29:23
+ds4_decode_ms_median=88.815 tok_s=11.26 tokens=32 depth_end=53 ctx=262144 hip_graph=1
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=58.94
+adapt_total dev=0 pos=53 tokens=48 hit=0.8799 miss_mb_per_token=81.5 swaps=120 swap_gb=0.90 rounds=3 inflight=0
+=== E0 --adapt 0 --hip-graph 0 01:31:38
+ds4_decode_ms_median=53.234 tok_s=18.78 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+=== E1 --adapt 1 --adapt-every 16 --adapt-mb-per-token 64 --adapt-halflife 2048 --hip-graph 0 01:32:24
+ds4_decode_ms_median=48.824 tok_s=20.48 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+adapt_total dev=0 pos=53 tokens=48 hit=0.8799 miss_mb_per_token=81.5 swaps=120 swap_gb=0.90 rounds=3 inflight=0
+=== N1 --adapt 1 --adapt-every 100000000 --adapt-mb-per-token 0 --hip-graph 1 01:34:03
+ds4_decode_ms_median=92.741 tok_s=10.78 tokens=32 depth_end=53 ctx=262144 hip_graph=1
+hip_graph_dev0 nodes=973 captures=1 instantiates=1 updates=0 replays=52 capture_ms_total=18.48
+adapt_total dev=0 pos=53 tokens=0 hit=1.0000 miss_mb_per_token=0.0 swaps=0 swap_gb=0.00 rounds=0 inflight=0
+=== P0 --adapt 0 --profile 01:35:46
+ds4_decode_ms_median=63.306 tok_s=15.80 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+prof_total_us=61214.94
+ds4_miss_mb_per_token_dev0=122.47
+prof_total_us=58136.55
+ds4_miss_mb_per_token_dev1=76.88
+=== P1 --adapt 1 --adapt-every 16 --adapt-mb-per-token 64 --adapt-halflife 2048 --profile 01:36:29
+ds4_decode_ms_median=59.619 tok_s=16.77 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+prof_ds4_adapt_us=154.25
+prof_total_us=57192.58
+ds4_miss_mb_per_token_dev0=61.94
+prof_ds4_adapt_us=664.08
+prof_total_us=55077.78
+ds4_miss_mb_per_token_dev1=28.53
+=== summary: ds4_decode_ms per arm
+G0  ds4_decode_ms_median=51.339 tok_s=19.48 tokens=32 depth_end=53 ctx=262144 hip_graph=1
+G1  ds4_decode_ms_median=88.815 tok_s=11.26 tokens=32 depth_end=53 ctx=262144 hip_graph=1
+E0  ds4_decode_ms_median=53.234 tok_s=18.78 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+E1  ds4_decode_ms_median=48.824 tok_s=20.48 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+N1  ds4_decode_ms_median=92.741 tok_s=10.78 tokens=32 depth_end=53 ctx=262144 hip_graph=1
+P0  ds4_decode_ms_median=63.306 tok_s=15.80 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+P1  ds4_decode_ms_median=59.619 tok_s=16.77 tokens=32 depth_end=53 ctx=262144 hip_graph=0
+=== ds4_adapt_profile end 2026-10-06T01:38:07+00:00
+=== run_chain ds4_adapt_profile_chain exited rc=0 2026-10-06T01:38:07+0000

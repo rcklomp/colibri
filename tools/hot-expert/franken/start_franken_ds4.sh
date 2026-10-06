@@ -99,6 +99,9 @@ export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-1}
 export FRANKEN_PLACEMENT=${FRANKEN_PLACEMENT:-$HOME/bench/m2/deepseek_mix}
 export FRANKEN_EXPERT_GB=${FRANKEN_EXPERT_GB:-20}
 export FRANKEN_ADAPT=${FRANKEN_ADAPT:-1}
+# DO NOT set FRANKEN_HIP_GRAPH=1 while FRANKEN_ADAPT=1 (and FRANKEN_MISS_STAGE is at its default 1): the three together run
+# 81 % slower (51 -> 92 ms a token at depth 53, any depth); any two are fine, and the engine's own default is graph OFF. Record
+# §DS4-ADAPT-GRAPH (2026-10-06); the mechanism is not isolated, so this is a rule, not a fix.
 
 # Prefix reuse (ds4_serve.cpp's Slot/Snapshot, ported from franken_serve.cpp's
 # own -- see that file's header comment for why checkpointing is not optional

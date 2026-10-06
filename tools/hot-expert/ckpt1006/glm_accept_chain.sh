@@ -1,10 +1,10 @@
 #!/bin/bash
 # glm_accept_chain.sh -- bring the CANDIDATE serving build up behind the real gateway and Open WebUI, hold it while accept_ui.sh (from the Mac; it also runs accept_live.sh over ssh) judges it,
-# then stop everything and put the reservation back. Launch ONLY through run_chain.sh (it holds the rig lock, so gateway_watchdog.sh cannot start the Colibri gateway while the flag is aside).
-#   BIN (default franken_dec_glm.hgblk) with FRANKEN_GLM_CHUNK=1024 FRANKEN_SNAP_EVERY=1024 FRANKEN_GLM_STAGE_MB=256.
+# then stop everything and put the reservation back. The chain takes the rig lock itself, so gateway_watchdog.sh cannot start the Colibri gateway while the flag is aside.
+#   BIN (default: the INSTALLED ~/bench/franken_bin/franken_dec_glm; set BIN=... to judge a candidate) with FRANKEN_GLM_CHUNK=1024 FRANKEN_SNAP_EVERY=1024 FRANKEN_GLM_STAGE_MB=256.
 # NOT through run_chain.sh: accept_ui.sh refuses while any process named run_chain.sh is alive (it takes that for a measurement). The chain takes the rig lock itself, the way run_chain.sh does.
 # Launch:  setsid nohup ~/bench/glm_accept_chain.sh > ~/bench/glm_accept_chain.log 2>&1 < /dev/null &
-# Protocol: the line "=== READY_FOR_UI" in the chain log says the gateway is up and the flag is moved aside; the caller touches ~/bench/.accept_ui_done when it has finished (45 min cap).
+# Protocol: the line "=== READY_FOR_UI" in the chain log says the gateway is up and the flag is moved aside; the caller touches ~/bench/.accept_ui_done when it has finished (cap 20 min: 240 x 5 s).
 set -u
 BIN=${BIN:-$HOME/bench/franken_bin/franken_dec_glm}      # the INSTALLED served binary; the shipped defaults of start_franken_glm.sh are NOT overridden below
 OUT=$HOME/bench/glm_accept; mkdir -p "$OUT"

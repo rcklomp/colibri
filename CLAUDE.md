@@ -21,7 +21,8 @@ that is a claim to verify, not to assume.**
 
 
 **Then, ahead of the numbered list:
-**LATEST HANDOFF: `tools/hot-expert/HANDOFF-2026-10-06.md` (state after plan rev 84: GLM prefill 9.5 -> 5.8 ms/token bit-exact, staging off in service, the clock hypothesis refuted by the root test, acceptance passed, installed as the served binary, merged into franken-engine main, service still off -- its §9 and §9a are the parts to read; it replaces §1-§4 of `HANDOFF-2026-09-26.md`, whose rig rules and owner notes still hold). Read it first.**
+**START HERE: `tools/hot-expert/HANDOFF-2026-10-06b.md` -- the single entry point (state after plan rev 84, 2026-10-06; repos/remotes/accounts, the service and its traps, open tasks in priority order, exact recipes). Older handoffs (`HANDOFF-2026-10-06.md`, `-09-26.md`, `PROJECT-HANDOFF-2026-09-20.md`) are history: their rig rules and owner notes still hold, their state lines do not. Run `tools/hot-expert/doc_currency.sh` first.**
+**WARNING for everything below about `~/start_glm53.sh`, `glm53`, `serve_alt.sh glm`, `gateway_watchdog.sh`: that is the OLD Colibri engine. GLM is served by the Franken engine (`serve_alt.sh franken-glm`); the service is currently OFF behind `~/bench/.dev_reserved`. See §3 of the 06b handoff before touching the flag.**
 THE CURRENT TRUTH SINCE 2026-09-22 IS `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md` (rev 13): the Franken-engine is a NEW engine assembled from the best-measuring parts of Colibri, llama.cpp, hipFire and hipEngine for this rig, with a measurement program M0-M5 and a build ladder L0-L5; acceptable models are Qwen3.8, DeepSeek V4.x, GLM-5.3 and successors at a 256k window; the rig is a development machine (measure at once, never schedule for the night, never hand a decision back); quality is measured, never asked of the owner. `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` carries the decision log (read its highest `Rev N`; 84 on 2026-10-06) -- its items F0-F10 are all closed, F3/Qwen3.6 by the owner, and its 09-15 body is history.** Before that:
 `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` was the ACTIVE track
 since 2026-09-16 (items F0–F10), and until 2026-09-20 this list did not
@@ -258,7 +259,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `tools/hot-expert/{franken,m1}` + the design doc). On the rig its working copy is
   `~/src/franken-engine` (build there: `make -C franken/decode cpu gpu`, ds4/glm
   targets per its README); agents commit there and the orchestrator pushes as
-  `claude-bot` (see the credential line for claude-bot). The copies under
+  `claude-bot` (Gitea only; the Mac's `~/.config/git/gitea-credentials`, mode 600, never printed): `git -c credential.helper= -c "credential.helper=store --file=$HOME/.config/git/gitea-credentials" push origin main` (land recipe: handoff 06b §2). The copies under
   `tools/hot-expert/franken` and `tools/hot-expert/m1` in THIS repo are frozen
   history -- do not edit them. The measurement record, plan, gateway and all
   serving/acceptance tooling stay here.
@@ -280,7 +281,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   exit traps leave it down, `serve_alt.sh glm` (and its fallback) only stops the alternative and frees the lock, and `accept_live.sh` (incl. the 05:00 canary) prints SKIPPED and exits 0.
   New chains must honour the flag the same way. Remove the flag (and start the gateway) only when
   the owner asks for the service back.
-- **The gateway is the owner's daily service.** `~/start_glm53.sh` runs
+- **The gateway is the owner's daily service -- when it is on. Since 2026-10-06 it is OFF (reservation flag) and GLM is meant to be served by the FRANKEN engine, not by `~/start_glm53.sh`. TRAP: `gateway_watchdog.sh` (cron, every 5 min) starts the OLD engine below whenever :8081 is down, no lock is held and the flag is absent -- removing the flag while the Franken engine is not up silently serves the old, ~3x slower engine (handoff 06b §3).** The OLD engine: `~/start_glm53.sh` runs
   `openai_server.py` on 8081 with **`--max-tokens 4096`** (2026-09-14: it was
   `256` from the first day of Open WebUI service, and `openai_server.py` clamps
   every request DOWN to the server cap while Open WebUI sends no `max_tokens` of
@@ -492,12 +493,12 @@ answer that question from memory — run the script.**
   is the GitHub mirror, `rome` is the rig's tree over ssh and `upstream` is
   JustVugg's. Landing a gated item: `git push origin hot-expert-tier`, then
   `git push rome hot-expert-tier:refs/heads/p0-sync`, then on the rig
-  `git merge --ff-only p0-sync && git branch -d p0-sync`. GitHub is a mirror of Gitea. The rig
+  `git merge --ff-only p0-sync && git branch -d p0-sync`. GitHub (`fork`) is NOT an automatic mirror: it is public, pushed by hand only with the owner's go-ahead after a secret scan of the commits it lacks. The rig
   has no push credentials; push from the owner's Mac, which relays the branch.
 - One item, one branch or one commit series; commit message body = what was
   measured, in numbers, plus which oracle passed.
-- Do not push to `hot-expert-tier` directly; land on a `perf/...` branch and
-  merge after the gate is met.
+- Engine code (franken-engine repo): work in a worktree on a branch, merge to `main` after the gate is met. This repo (records, plan, handoffs, scripts, gateway): commits go
+  straight to `hot-expert-tier`; an item that changes the served Colibri engine still lands via a `perf/...` branch after its gate.
 - **No whole-`upstream/dev` merges (decided 2026-09-15,
   `tools/hot-expert/UPSTREAM-POLICY-2026-09-15.md`).** Take upstream fixes by
   `git cherry-pick -x`, one at a time, each through its own gate; send ours up

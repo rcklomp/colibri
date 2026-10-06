@@ -8,7 +8,12 @@
 //
 //   OWUI_TOKEN=<jwt> node ui_probe.mjs --url http://rome.local:3000 [--question "..."]
 //        [--timeout 900] [--headed] [--shot out.png] [--keep-chat]
-//        [--follow-up "..."] [--follow-ups N] [--nonce TEXT]
+//        [--follow-up "..."] [--follow-ups N] [--nonce TEXT] [--model ID]
+// --model ID opens the page as /?model=ID so the chat goes to THAT model. Without it the front
+// end uses its own default, which since 2026-10-05 (llama-swap added as connection 0, no
+// ui.default_models) is llama-swap's `glm53-flash` -- a different backend than the gateway on
+// :8081 -- and the probe then waited 15 minutes on an answer the gateway under test never saw.
+// The RESULT line carries model=<the name the model selector shows> so that is visible.
 // Prints one machine-readable line:
 //   RESULT ok=<0|1> first_token_s=<s> done_s=<s> chars=<n> chat=<id|-> error=<...>
 // plus one `TURN <n> first_token_s=.. done_s=..` line per turn.
@@ -57,6 +62,7 @@ if (textFile) question = (await import('node:fs')).readFileSync(String(textFile)
 const followUp = arg('follow-up', null);
 const followUps = Number(arg('follow-ups', followUp ? 1 : 0)) || 0;
 const nonce = String(arg('nonce', String(Date.now()).slice(-6)));
+const modelId = String(arg('model', ''));
 const timeoutMs = Number(arg('timeout', 900)) * 1000;
 const shot = arg('shot', null);
 const token = process.env.OWUI_TOKEN;
@@ -66,7 +72,7 @@ const out = { ok: 0, first_token_s: '-', done_s: '-', chars: 0, chat: '-', error
 const done = (code) => {
   console.log(`RESULT ok=${out.ok} first_token_s=${out.first_token_s} done_s=${out.done_s} ` +
               `follow_first_s=${out.follow_first_s ?? '-'} follow_done_s=${out.follow_done_s ?? '-'} ` +
-              `turns=${out.turns ?? 1} chars=${out.chars} chat=${out.chat} cleaned=${out.cleaned} browser=${out.browser} error=${out.error}` +
+              `turns=${out.turns ?? 1} model=${out.model ?? '-'} chars=${out.chars} chat=${out.chat} cleaned=${out.cleaned} browser=${out.browser} error=${out.error}` +
               (out.reply ? ` reply="${out.reply}"` : ''));
   process.exit(code);
 };
@@ -100,8 +106,18 @@ page.on('pageerror', (e) => pageErrors.push(String(e).slice(0, 120)));
 try {
   // The front end keeps its session in localStorage as well as the cookie.
   await page.addInitScript((t) => { try { localStorage.setItem('token', t); } catch {} }, token);
-  await page.goto(url + '/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto(url + '/' + (modelId ? '?model=' + encodeURIComponent(modelId) : ''), { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
+  // Which model will this chat go to? The front end keeps the selection in sessionStorage.
+  // A wrong one fails here, not after the 15-minute first-token wait.
+  const sel = await page.evaluate(() => {
+    try { return JSON.parse(sessionStorage.getItem('selectedModels') || '[]'); } catch { return []; }
+  }).catch(() => []);
+  out.model = (Array.isArray(sel) && sel.length) ? sel.join(',') : '-';
+  if (modelId && Array.isArray(sel) && sel.length && !sel.includes(modelId)) {
+    out.error = `wrong_model_selected`;
+    done(1);
+  }
 
   // The composer: a ProseMirror contenteditable in 0.11.x, a textarea in older builds.
   const box = page.locator('#chat-input, textarea#chat-textarea, [contenteditable="true"]').first();
@@ -217,6 +233,23 @@ try {
     console.log(`TURN ${turn} first_token_s=${firstS} done_s=${doneS}`);
   }
   void askedQuestions;
+
+  // Which model actually answered: the saved chat records it. This is the evidence for model=,
+  // and with --model a mismatch fails the probe (ok=0) even though an answer came back.
+  if (out.chat !== '-') {
+    const used = await page.evaluate(async ([base, id, t]) => {
+      try {
+        const r = await fetch(`${base}/api/v1/chats/${id}`, { headers: { Authorization: `Bearer ${t}` } });
+        const c = await r.json();
+        const ms = (c.chat && c.chat.models) || [];
+        const msgs = Object.values((c.chat && c.chat.history && c.chat.history.messages) || {});
+        const am = msgs.filter((m) => m.role === 'assistant' && m.model).map((m) => m.model);
+        return [...new Set([...ms, ...am])];
+      } catch { return []; }
+    }, [url, out.chat, token]).catch(() => []);
+    if (used.length) out.model = used.join(',');
+    if (modelId && used.length && !used.every((m) => m === modelId)) { out.ok = 0; out.error = 'wrong_model_answered'; }
+  }
 
   // Leave no trace: the probe's chat is deleted unless --keep-chat.
   if (out.chat !== '-' && arg('keep-chat') !== true) {

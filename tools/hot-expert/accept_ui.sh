@@ -6,7 +6,7 @@
 # It exists because every gate on this track imitated the client and both regressions the
 # owner hit lived in the gap between the imitation and the real front end (P7b, 2026-09-09).
 #
-#   accept_ui.sh [--url http://rome.local:3000] [--max-first-token 25] [--shot dir]
+#   accept_ui.sh [--url http://rome.local:3000] [--max-first-token 25] [--shot dir] [--model glm-5.3-flash]
 #
 # Checks, each a fresh chat with its own question:
 #   1. new chat A -> a reply appears, first token within --max-first-token
@@ -16,10 +16,14 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 URL="http://rome.local:3000"; MAXFT=25; SHOTDIR=""; RIG="${RIG_HOST:-rome}"
+# The model the chats go to. Open WebUI has had two connections since 2026-10-05 (llama-swap on :8080
+# as well as the gateway on :8081) and no default model, so the UI's own default became llama-swap's
+# `glm53-flash`; a probe that does not choose a model tests the wrong backend (found 2026-10-06).
+MODEL="${ACCEPT_UI_MODEL:-glm-5.3-flash}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --url) URL="$2"; shift 2;; --max-first-token) MAXFT="$2"; shift 2;;
-    --shot) SHOTDIR="$2"; shift 2;; *) echo "unknown argument: $1"; exit 2;;
+    --shot) SHOTDIR="$2"; shift 2;; --model) MODEL="$2"; shift 2;; *) echo "unknown argument: $1"; exit 2;;
   esac
 done
 # rome.local resolves through mDNS to a link-local IPv6 address; curl copes, Chrome does not
@@ -63,7 +67,7 @@ PY' > "$TOKENFILE"
 FAIL=0; A=""; B=""
 run() {   # run <label> <question> -> echoes the RESULT line
   local shot=""; [ -n "$SHOTDIR" ] && shot="--shot $SHOTDIR/ui_$1.png"
-  OWUI_TOKEN=$(cat "$TOKENFILE") node "$HERE/ui/ui_probe.mjs" --url "$URL" --question "$2" $shot | grep "^RESULT"
+  OWUI_TOKEN=$(cat "$TOKENFILE") node "$HERE/ui/ui_probe.mjs" --url "$URL" --model "$MODEL" --question "$2" $shot | grep "^RESULT"
 }
 A=$(run A "Which day comes after Tuesday? Answer in one word.")
 B=$(run B "Name one prime number greater than ten. One word.")

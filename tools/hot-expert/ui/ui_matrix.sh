@@ -54,7 +54,7 @@ body = " ".join(text)[:chars]
 open(sys.argv[2], "w").write((body + "\n\n" if body else "") + "Reply with the single word OK.")
 PY
   mark=$(ssh "$RIG" 'grep -c "\[req\] " ~/glm53_server.log')
-  R=$(OWUI_TOKEN=$(cat "$TOKENFILE") node "$HERE/ui_probe.mjs" --url "$URL" --text-file "$WORK/paste.txt" \
+  R=$(OWUI_TOKEN=$(cat "$TOKENFILE") node "$HERE/ui_probe.mjs" --url "$URL" --model "${ACCEPT_UI_MODEL:-glm-5.3-flash}" --text-file "$WORK/paste.txt" \
         --follow-up "In one word: what colour is a clear sky?" --timeout 1800 | grep "^RESULT")
   v() { echo "$R" | sed -n "s/.* $1=\([0-9.-]*\).*/\1/p"; }
   # the engine's own two lines for the two turns we just drove

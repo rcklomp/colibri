@@ -50,8 +50,13 @@
 #                           for the COLIBRI glm53 engine, which has per-slot KDA device state
 #                           (P6b) and prefix checkpoints; this engine's Adapter is untested with
 #                           more than one slot live at once (glm5_serve.cpp's own comment on
-#                           ensure_slot), and it has no checkpoint/snapshot reuse at all
-#                           (glm5_serve.h) so a second slot would only cost VRAM for nothing.
+#                           ensure_slot). Prefix checkpoints (the ds4_serve.cpp machinery, franken-
+#                           engine b5cf4e0, in service since 2026-10-06, record §L5-GLM-CKPT-E2E)
+#                           are per slot too, so a second slot would cost VRAM and ~1.4 GB of host
+#                           buffers for a workload (one owner, one conversation at a time) that
+#                           does not need it. NB: the engine binary must be the checkpoint build
+#                           (franken_dec_glm since 2026-10-06; ~/bench/franken_bin/franken_dec_glm.nockpt
+#                           is the live-prefix-only build before it).
 set -u
 
 # FRANKEN_BIN may be the engine itself or the docker wrapper
@@ -89,13 +94,24 @@ export FRANKEN_PLACEMENT=${FRANKEN_PLACEMENT:-$HOME/bench/m2/glm}
 export FRANKEN_EXPERT_GB=${FRANKEN_EXPERT_GB:-17}
 export FRANKEN_ADAPT=${FRANKEN_ADAPT:-1}
 
+# Prefix checkpoints (glm5_serve.cpp, franken-engine b5cf4e0): the same knobs and defaults the DeepSeek
+# and Qwen launchers set, written out so the served values are visible here and so the docker
+# wrapper (which passes them through since 2026-10-06) cannot drop them silently. Boundary tokens
+# default to GLM's own turn markers ("<|user|>,<|assistant|>", FRANKEN_BOUNDARY_TOKENS). One
+# checkpoint is ~156 MB of recurrent state plus ~1 kB a token of cells (record §L5-GLM-CKPT-E2E).
+export FRANKEN_SNAP_EVERY=${FRANKEN_SNAP_EVERY:-512}
+export FRANKEN_SNAP_KEEP=${FRANKEN_SNAP_KEEP:-8}
+export FRANKEN_SNAP_BUDGET_MB=${FRANKEN_SNAP_BUDGET_MB:-6144}
+export FRANKEN_SNAP_TURNS=${FRANKEN_SNAP_TURNS:-3}
+
 # --- THE ENV DIFF AGAINST start_franken_ds4.sh ----------------------------------------------
 # Same three gateway-side, family-neutral knobs both other launchers set, for the same reasons
-# (start_franken.sh's own comment on each): COLI_REQ_LOG, COLI_PREFIX_PIN, COLI_LEDGER (a no-op
-# here too -- ledger_enabled() is ARCH == "glm53" only, which THIS process's --arch actually IS,
-# so unlike Qwen/DS4 this one is not exempted by architecture; it is exempted because this
-# engine reports no prefix checkpoint at all -- see glm5_serve.h -- so there is nothing for the
-# ledger's own accounting to be wrong about, just nothing for it to speed up either).
+# (start_franken.sh's own comment on each): COLI_REQ_LOG, COLI_PREFIX_PIN, COLI_LEDGER (ACTIVE
+# here, unlike Qwen/DS4 -- ledger_enabled() is ARCH == "glm53" only, which THIS process's --arch
+# actually IS; with the checkpoint build it does real work: the second `[ledger]` line of a
+# follow-up reads `state=continuation expect_reuse=146 engine_reuse=146 ok`, and accept_live's
+# check 2b judges exactly that -- PASS, 0 MISMATCH on 2026-10-06. Before the checkpoint build
+# this comment called the ledger a no-op because the engine reported no checkpoint at all).
 # COLI_THINK is NOT forced here, for a third reason again: --arch glm53 means this process hits
 # EXACTLY the same COLI_THINK default branch the real glm53 engine hits (unlike DS4's
 # deepseek_v4, which needed its own explanation) -- whatever the owner is used to from GLM stays

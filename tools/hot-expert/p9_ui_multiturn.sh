@@ -51,7 +51,7 @@ PY' > "$TOKENFILE"
 NONCE=$(date +%H%M%S)
 MARK=$(ssh "$RIG" 'grep -c "\[ledger\] " ~/glm53_server.log 2>/dev/null || echo 0')
 echo "=== p9_ui_multiturn $TURNS turns $(date +%Y-%m-%dT%H:%M:%S%z) nonce=$NONCE ledger_mark=$MARK"
-R=$(OWUI_TOKEN=$(cat "$TOKENFILE") node "$HERE/ui/ui_probe.mjs" --url "$URL" \
+R=$(OWUI_TOKEN=$(cat "$TOKENFILE") node "$HERE/ui/ui_probe.mjs" --url "$URL" --model "${ACCEPT_UI_MODEL:-glm-5.3-flash}" \
       --question "Hello. Answer each of my next questions in one word. [$NONCE]" \
       --follow-ups $((TURNS - 1)) --nonce "$NONCE" --timeout 1800 | tee -a /dev/stderr | grep "^RESULT")
 FAIL=0

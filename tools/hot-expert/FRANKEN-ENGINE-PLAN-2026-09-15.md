@@ -27,7 +27,7 @@
 > fast-forwarded into franken-engine `main` (8256d53..a1362d2, the rig's repo too);
 > `~/bench/franken_bin/franken_dec_glm` = the final build (`.ckpt` is the
 > rollback), `start_franken_glm.sh` defaults chunk 1024 / snapshots 1024 / ring 256 MB. **The service
-> is still off** (reserved). Open: a 64k-200k needle run of the installed build; G = 8 (+1.9 %) is not
+> is still off** (reserved). The installed build also passes the needle test, 8/8 at 30k / 60k / 120k / 200k tokens, 35-38 % faster than the old build (record end of §L5-GLM-SHIPPED). Open: G = 8 (+1.9 %) is not
 > gated for exactness; the trunk GEMMs (2.45 ms a token) need a quality-gated tile kernel; the
 > clock-pinning root test needs the owner's sudo (`ckpt1006/clock_test.sh`). HANDOFF-2026-10-06 §9a.**
 >

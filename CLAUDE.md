@@ -336,6 +336,23 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
 - Dropping caches needs sudo; ask the owner or run it yourself in an
   interactive shell. Never write the password into a file or a script.
 
+## Before a build that allocates device memory (rule since 2026-10-07)
+
+Three gate starts of the decode-prefetch work died at setup on 2026-10-06, each a full model load (4-14 min) lost: the
+brief quoted a free-VRAM figure from a different config, the reserve-time check ran before the backend's lazily grown
+GEMV scratch (`gemv_part_`, up to ~512 MB at chunk 1024) took what was left, and the watcher read only the chain log
+while the engine's error line sits in `gate_run.log`. The cards are ~99 % full at steady state (card 2, which holds the
+head, had 588 MB free at reserve time and ~50-100 MB after the first chunk).
+- **Write the budget first.** Free VRAM per card at STEADY state (after the first full-size prefill chunk) for the exact
+  shipped flags, taken from a log of that config, against what the change adds; if it does not fit, the brief says who
+  pays (`--expert-gb`, a smaller ring) and the commit repeats it. Never reuse a number from another config.
+- **An optional feature never aborts the engine on a failed allocation:** it disables itself with one loud line and the
+  gate fails that line (`active=0`), so the plan reports it instead of dying 16 of 16.
+- **Watch with `tools/hot-expert/ckpt1006/watch_chain.sh <chain log> <engine log>`** (both logs, a dead engine, 20 minutes
+  of silence, the tails of both on a bad end). An ad-hoc grep on the chain log alone is not a watcher.
+- **The first config of a new-feature gate is a smoke at the largest shapes** (262 144 cells, chunk 1024, decode on)
+  and its failure must name the cause in the chain log, not only in the engine log.
+
 ## How a change is measured (no exceptions)
 
 - Before and after, same prompt, same regime. The serving regime is

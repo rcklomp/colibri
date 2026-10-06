@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 51, 2026-10-06)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 52, 2026-10-06)
+
+**Rev 52 (2026-10-06): pointer only -- Franken track plan rev 83 (GLM prefill staging is OFF in service: in place is faster at every chunk size and bit-identical, new chats and follow-ups start ~1 s sooner; MTP speculative decoding measured and dropped; record §L5-GLM-VERIFYCOST / §L5-GLM-STAGECROSS); GLM on Colibri still serves nothing while the rig is reserved.**
 
 **Rev 51 (2026-10-06): pointer only -- Franken track plan rev 82 (the GLM prefill speed-up passed the acceptance gate and is the installed served binary, branches pushed, service still off; record §L5-GLM-SHIPPED); GLM on Colibri still serves nothing while the rig is reserved.**
 

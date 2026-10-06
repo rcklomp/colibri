@@ -36,6 +36,9 @@ rm -f "$MARK"
 # accept_ui.sh's own rig-side step asks `serve_alt.sh status` for the gateway log; this gateway is not started by serve_alt, so that step reads the stale ~/glm53_server.log and its verdict is
 # meaningless (first run, 2026-10-06: reused=4548 from the old Colibri log while the engine reused 4096). So accept_live runs HERE with the right log, first: it also captures the tool block,
 # so the browser's chat A afterwards is warm. Ignore the rig-side part of accept_ui's output.
+# Open WebUI caches its model list: after the gateway has been down, its first chat gets "Model not found" (HTTP 400) until the list is refreshed (a person's page load does it). The first run of the
+# shipped defaults failed checks 1-3 that way, one second after the gateway came up. Refresh it and wait until glm-5.3-flash is listed.
+"$HOME/bench/owui_refresh.sh" || echo "WARN: Open WebUI does not list glm-5.3-flash -- the UI checks will fail"
 echo "=== accept_live (GLM53_LOG=$log) $(date -Is)"
 GLM53_LOG=$log "$HE/accept_live.sh" 2>&1 | cut -c1-250
 echo "=== accept_live rc=${PIPESTATUS[0]} $(date -Is)"

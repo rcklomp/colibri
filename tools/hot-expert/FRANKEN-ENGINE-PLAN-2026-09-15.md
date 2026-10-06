@@ -14,6 +14,24 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 83 (2026-10-06 20:00 CEST) -- PREFILL STAGING IS OFF IN SERVICE: IN PLACE IS FASTER AT EVERY
+> CHUNK SIZE AND BIT-IDENTICAL; NEW CHATS AND FOLLOW-UPS START ~1 S SOONER (records §L5-GLM-VERIFYCOST,
+> §L5-GLM-STAGECROSS, §L5-GLM-SHIPPED).** (1) A probe of what a speculative-decoding verify step costs
+> (GLM's GGUF does carry the NextN/MTP head, `blk.45.nextn.*`; llama.cpp merged support) showed the
+> existing multi-row path at 5.4-6.9x the cost of a 1-row step for at most ~2.5 tokens: MTP does not pay
+> while decode is bound by missed experts; dropped. (2) The same probe exposed that the served prefill
+> stages ALL missed experts (~92 GB, ~2 s) for every chunk of more than one row. In place (only the
+> experts the rows pick) is faster at every size: 16-256 rows -23..-77 %, 1024 rows 5.77 vs 6.01 ms/token
+> (A,B,B,A), 512 rows 6.98 vs 7.51; bit-exact (full model + decode at chunk 1024: 1 788 of 1 788 taps; small
+> chunks 1 788 / 1 788 / 124). (3) `start_franken_glm.sh` `FRANKEN_GLM_PREFILL_STAGE` default 0. Acceptance
+> on the installed binary with the shipped defaults: `accept_live` PASS (warm new chat 0.86 s against 1.86;
+> follow-up turn 1.1 s against 2.2-2.4) and `accept_ui` PASS (1.05 s / 1.05 s to the first token on
+> screen). The needle test of the installed build: 8/8 at 30k / 60k / 120k / 200k tokens, 35-38 % faster.
+> (4) An Open WebUI stale model list ("Model not found") made the first acceptance run fail for a reason
+> outside the engine; the chain now refreshes it. Open: G = 8; the trunk GEMMs (2.45 ms a token, need a
+> quality-gated kernel); lookahead prefetch for decode (ceiling +27 %); the owner's sudo root test
+> (`ckpt1006/clock_test.sh`). The service is still off (reserved). HANDOFF-2026-10-06 §9a.**
+>
 > **Rev 82 (2026-10-06 18:00 CEST) -- THE GLM PREFILL SPEED-UP PASSED THE ACCEPTANCE GATE, IS
 > INSTALLED AS THE SERVED BINARY AND ITS BRANCHES ARE PUSHED (record §L5-GLM-SHIPPED).**
 > `accept_live` (own log) found one defect in the first candidate: with a 1024-row chunk the

@@ -33,7 +33,8 @@ while :; do
   body=$(echo "$out" | sed -n '/^--- chain/,/^--- tails/p' | grep -v '^--- ')
   ev=$(echo "$body" | grep -E "$PAT" | cut -c1-260)
   [ -n "$ev" ] && echo "$ev"
-  echo "$ev" | grep -qE "FAIL|rror|[Aa]bort|core dumped|out of memory|OOM|REFUSED|Killed|Traceback|active=0|needs [0-9]" && bad=1
+  # glog lines (rocprofv3's `E1006 ... Opened result file`) are not errors whatever the letter says
+  echo "$ev" | grep -vE '^[EWI][0-9]{4} ' | grep -qE "FAIL|rror|[Aa]bort|core dumped|out of memory|OOM|REFUSED|Killed|Traceback|active=0|needs [0-9]" && bad=1
   if [ "${nc:-0}" = "$last_c" ] && [ "${ne:-0}" = "$last_e" ]; then quiet=$((quiet+1)); else quiet=0; fi
   last_c=${nc:-$last_c}; last_e=${ne:-$last_e}
   if [ "$quiet" -ge "$SILENT_POLLS" ]; then echo "SILENT: no new line in either log for $((SILENT_POLLS*45/60)) min (engine alive=$alive)"; quiet=0; fi

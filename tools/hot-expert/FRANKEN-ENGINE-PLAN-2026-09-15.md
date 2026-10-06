@@ -20,9 +20,11 @@
 > missed ones into VRAM rings, redirect the real plan. Exact in every comparable line (chunk-1 1 788 / 1 788 in dry and use mode, a
 > 64-token decode identical across off / dry / use / use + swaps), **slower in time: 70.8 ms/token off, 95-101 ms on** at k = 2, 4, 8 --
 > ~31 ms of FIXED machinery (0.8 ms a layer from a few extra streams, events and P2P hops, far above the §M5 floors) plus 3-14 us per MB
-> moved against 9-27 us saved per MB covered; best case without the fixed cost <= 8 %. Lesson: the decode layer is LATENCY-bound on its
-> cross-card / cross-stream chain; the fetch is ~25-39 ms of the 70, the other ~40 ms is not fetch. **Next: a kernel-level decode trace
-> (`ckpt1006/glm_decode_trace_chain.sh`, rocprofv3) to read one layer's critical path.** Found on the way: **decode past 2 051 tokens of
+> moved against 9-27 us saved per MB covered; best case without the fixed cost <= 8 %. The fixed cost is NOT synchronisation latency (the
+> decode trace, record §L5-GLM-DECODE-TRACE: helper wake 20 us, join 21 us, 65 us of a 1.6 ms layer); the added work disturbs the critical path on the
+> cards (HW-queue sharing / host-read kernels beside the trunk kernels; `GPU_MAX_HW_QUEUES=16` run under way). **The trace of one decode token
+> (`ckpt1006/glm_decode_trace_chain.sh`, rocprofv3): a layer is half fetch (critical ~35 ms of 76, ~8 ms of it imbalance), half trunk (~36 ms, the
+> trunk GEMVs at ~40 % of VRAM bandwidth: ~15 ms headroom).** Found on the way: **decode past 2 051 tokens of
 > context is not run-to-run reproducible** (two mode-0 runs diverge at the 10th generated token; below 2 051 identical), so exactness gates
 > run below it. Process: three gate starts died at setup on VRAM budget (rule in CLAUDE.md, two-log watcher `ckpt1006/watch_chain.sh`,
 > a gate verdict that names an engine death -- franken-engine `gate-robustness`). The `decode-prefetch` branch is kept, not merged.

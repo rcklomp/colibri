@@ -32,10 +32,9 @@
 #                           token fall as 1/chunk; -10 % at the served context, bit-exact; needs franken-engine glm-prefill-final, an older binary
 #                           clamps it to 512 and still runs); decode is chunk 1
 #   FRANKEN_DEVICES         3
-#   FRANKEN_GEMM_LDS        0 here (glm5_serve.cpp's own default too) -- UNLIKE ds4_serve.cpp's
-#                           default of 1: GLM5.md section 13's batched-prefill LDS gain was
-#                           measured for DS4, not asserted for GLM (glm5_serve.cpp's own top
-#                           comment). Override up to 1 only behind a quality/speed gate.
+#   FRANKEN_GEMM_LDS        1 here since 2026-09-25 (served ON, as Qwen3.8 is: prefill 16.9 -> 9.3 ms/token, record
+#                           §L5-GLM-LDS; a last-bits order change, judged by the quality run). The engine's own
+#                           default (glm5_serve.cpp) is 0; the export below overrides it.
 #   FRANKEN_GLM_PREFILL_STAGE  0 since 2026-10-06 (was 1: GLM5.md section 12's prefill miss path; a chunk's missed
 #                           experts DMA'd into a VRAM ring instead of read in place)
 #   FRANKEN_ADAPT_PREFILL   0 -- GLM5.md section 13: hold adaptation swaps during a chunked

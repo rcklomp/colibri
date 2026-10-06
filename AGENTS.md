@@ -3,6 +3,7 @@
 This is the fork `rcklomp/colibri`, worked on a rig called "rome". Before
 forming any plan, read, in this order:
 
+0. Run `tools/hot-expert/doc_currency.sh` (seconds, no rig) -- it fails when the docs are behind the tree.
 1. `CLAUDE.md` — the rules and traps of this machine. They apply to every
    agent, not only Claude. Its "Read first" section lists the rest.
 2. `tools/hot-expert/HANDOFF-2026-10-06b.md` — the single current entry point (state, repos and accounts, the service and its traps, open tasks, recipes). The older

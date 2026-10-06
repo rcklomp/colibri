@@ -20,21 +20,13 @@ the first of those. **This section calls the roadmaps "current by construction";
 that is a claim to verify, not to assume.**
 
 
-**Then, ahead of the numbered list:
-**START HERE: `tools/hot-expert/HANDOFF-2026-10-06b.md` -- the single entry point (state after plan rev 84, 2026-10-06; repos/remotes/accounts, the service and its traps, open tasks in priority order, exact recipes). Older handoffs (`HANDOFF-2026-10-06.md`, `-09-26.md`, `PROJECT-HANDOFF-2026-09-20.md`) are history: their rig rules and owner notes still hold, their state lines do not. Run `tools/hot-expert/doc_currency.sh` first.**
-**WARNING for everything below about `~/start_glm53.sh`, `glm53`, `serve_alt.sh glm`, `gateway_watchdog.sh`: that is the OLD Colibri engine. GLM is served by the Franken engine (`serve_alt.sh franken-glm`); the service is currently OFF behind `~/bench/.dev_reserved`. See §3 of the 06b handoff before touching the flag.**
-THE CURRENT TRUTH SINCE 2026-09-22 IS `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md` (rev 13): the Franken-engine is a NEW engine assembled from the best-measuring parts of Colibri, llama.cpp, hipFire and hipEngine for this rig, with a measurement program M0-M5 and a build ladder L0-L5; acceptable models are Qwen3.8, DeepSeek V4.x, GLM-5.3 and successors at a 256k window; the rig is a development machine (measure at once, never schedule for the night, never hand a decision back); quality is measured, never asked of the owner. `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` carries the decision log (read its highest `Rev N`; 84 on 2026-10-06) -- its items F0-F10 are all closed, F3/Qwen3.6 by the owner, and its 09-15 body is history.** Before that:
-`tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` was the ACTIVE track
-since 2026-09-16 (items F0–F10), and until 2026-09-20 this list did not
-name it at all.** Read its highest `Rev N` for what is open, its §8.3 table
-   for the state of every item, and `tools/hot-expert/HANDOFF-2026-09-20.md`
-   for how the track got where it is: what was refuted, why each decision was
-   taken, the working method, what waits on the owner. **For the whole project
-   in one file -- history of all three tracks, every bug and what found it,
-   what is left and whose decision it is -- read
-   `tools/hot-expert/PROJECT-HANDOFF-2026-09-20.md` (written 2026-09-20 evening,
-   after F3 steps 0-2a; it predates the design and still treats F3 as continuable -- it is not).** The two roadmaps below
-   are both finished; they are history and rules, not a to-do list.
+**Orientation -- read these first (the numbered list below is the older Colibri-era reading order; it still holds for the Colibri engine):**
+
+- **START HERE: `tools/hot-expert/HANDOFF-2026-10-06b.md`** -- the single entry point for STATE and OPERATION (state after plan rev 84, 2026-10-06: repos/remotes/accounts, the service and its traps, open tasks in priority order, exact recipes). The older handoffs (`HANDOFF-2026-10-06.md`, `HANDOFF-2026-09-26.md`, `HANDOFF-2026-09-20.md`, `PROJECT-HANDOFF-2026-09-20.md`) are history: their rig rules and owner notes still hold, their state lines do not; the two 2026-09-20 files predate the design and still treat F3 as continuable -- it is not.
+- **Architecture and decisions of record:** `tools/hot-expert/FRANKEN-ENGINE-DESIGN-2026-09-22.md` (rev 13: the Franken engine is a NEW engine assembled from the best-measuring parts of Colibri, llama.cpp, hipFire and hipEngine for this rig; measurement program M0-M5, build ladder L0-L5; acceptable models Qwen3.8, DeepSeek V4.x, GLM-5.3 and successors at a 256k window; the rig is a development machine -- measure at once, never schedule for the night, never hand a decision back; quality is measured, never asked of the owner) and `tools/hot-expert/FRANKEN-ENGINE-PLAN-2026-09-15.md` (the decision log: read its highest `Rev N`, 84 on 2026-10-06, and its §8.3 table). The plan's items F0-F10 are closed (F3/Qwen3.6 by the owner) except F10's shader, parked for the owner; its 09-15 body is history. The 06b handoff says what is true NOW; the design says what the engine is meant to be.
+- **WARNING -- everything below about `~/start_glm53.sh`, `glm53`, `serve_alt.sh glm`, `gateway_watchdog.sh` describes the OLD Colibri engine.** GLM is served by the Franken engine (`serve_alt.sh franken-glm`); the service is currently OFF behind `~/bench/.dev_reserved`. Read §3 of the 06b handoff before touching that flag.
+
+The two roadmaps below are both finished; they are history and rules, not a to-do list.
 0. `tools/hot-expert/PREFILL-ROADMAP-2026-09.md` — the prefill /
    interactive-use track, opened 2026-09-06 when Open WebUI exposed that
    nothing had ever measured time-to-first-token. **Read the top of the
@@ -270,7 +262,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `glm-5.3-flash` whatever answers. Run `serve_alt.sh status` before assuming
   anything about what serves; while an alternative serves the rig lock is held
   by `serve_alt-<model>`, `accept_live.sh` REFUSES, and no engine benchmark can
-  run until `serve_alt.sh glm` has passed. Never give llama-server `-ngl`,
+  run until the alternative is stopped (`serve_alt.sh glm` under the reservation flag only stops it; without the flag it restores the OLD engine). Never give llama-server `-ngl`,
   `--tensor-split` or `--n-cpu-moe` here: its fit aborts and one card stays
   nearly empty (record §F11-STEP0). The owner does not need the rig by day:
   run measurements at once.
@@ -279,8 +271,8 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   restoring it after every chain cost a 13-minute load plus acceptance each time. With the flag,
   `gateway_watchdog.sh` does not restart the gateway, `run_chain.sh` and the `~/bench/glm5*_chain.sh`
   exit traps leave it down, `serve_alt.sh glm` (and its fallback) only stops the alternative and frees the lock, and `accept_live.sh` (incl. the 05:00 canary) prints SKIPPED and exits 0.
-  New chains must honour the flag the same way. Remove the flag (and start the gateway) only when
-  the owner asks for the service back.
+  New chains must honour the flag the same way. Remove the flag only when
+  the owner asks for the service back, and in this order (handoff 06b §3): start the Franken engine with the flag STILL in place (`serve_alt.sh franken-glm`, detached over ssh; its test chat must pass; under the flag a failure only stops everything and leaves :8081 empty), THEN remove the flag, THEN judge with `accept_live.sh` (`GLM53_LOG` = the gateway log `serve_alt.sh status` names) and `accept_ui.sh`. Never remove the flag first: any failure of `serve_alt.sh`'s fallback then runs `restore_glm`, which warms 182 GiB twice and starts the OLD engine.
 - **The gateway is the owner's daily service -- when it is on. Since 2026-10-06 it is OFF (reservation flag) and GLM is meant to be served by the FRANKEN engine, not by `~/start_glm53.sh`. TRAP: `gateway_watchdog.sh` (cron, every 5 min) starts the OLD engine below whenever :8081 is down, no lock is held and the flag is absent -- removing the flag while the Franken engine is not up silently serves the old, ~3x slower engine (handoff 06b §3).** The OLD engine: `~/start_glm53.sh` runs
   `openai_server.py` on 8081 with **`--max-tokens 4096`** (2026-09-14: it was
   `256` from the first day of Open WebUI service, and `openai_server.py` clamps

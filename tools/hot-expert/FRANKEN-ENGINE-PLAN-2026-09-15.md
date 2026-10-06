@@ -14,6 +14,43 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 80 (2026-10-06 07:00 CEST) -- THE HANDOFF'S FIVE ITEMS RUN. GLM PREFIX
+> CHECKPOINTS SERVE END TO END; DEEPSEEK'S SHARED CHANGE GATED AND A TRAP FOUND;
+> THE GLM PREFILL STALL FOUND, HALF-FIXED AND THE HOST SOURCE EXONERATED
+> (records §L5-GLM-CKPT-E2E, §DS4-SHARED-GATE, §DS4-ADAPT-GRAPH, §M6-SMALLGEMV,
+> §L5-GLM-TIMELINE, §L5-GLM-EMBED, §M7-HOSTSRC, §L4-LOOKAHEAD-STEP0).** (1) GLM
+> checkpoints: `accept_live` PASS and `accept_ui` PASS on the checkpoint build (a
+> new chat over the 4.5k-token tool block reuses 4 548 of 4 575 tokens, first
+> token 1.72 s; cold 41 s); it is now the served `franken_dec_glm`. Faults found
+> in the harness, none in the engine: `accept_ui` had been testing llama-swap's
+> `glm53-flash` (Open WebUI has two connections since 2026-10-05 and no default
+> model; the probe now selects its model and verifies which one answered),
+> conformance phase 3 sent Qwen's markers, the docker wrapper dropped the
+> snapshot knobs, `serve_alt glm` left the gateway up. (2) DeepSeek's shared
+> `ds4_gpu.inc` change: bit-exact in five configurations, decode unchanged in the
+> served configuration (47.87 vs 47.96 ms). **New: adaptation + the staged miss
+> path + graph replay together run 81 % slower (51 -> 92 ms); any two are fine;
+> the service runs eager and is unaffected; rev 71's "wrong placement" reading of
+> the 89-102 ms is corrected.** (3) GLM prefill: a device timeline (`--timeline`)
+> found card 0's 8.4 MB embedding upload waiting ~3.0 s of every ~4.4 s chunk
+> behind the staging ring's DMAs; the host is not late. Moving it to a kernel is
+> bit-exact and worth -3 %; 16 hardware queues -8 % more at +8 % GLM decode (not
+> for the service); with no expert kernels prefill would be -25 % (the upper
+> bound for a better expert chunk kernel); the staged DMA reaches 21 GB/s
+> aggregate (27 without the expert kernels) against M4's 52, and **the host
+> source, its span, flags, copy size, queue count, ring size and generic compute
+> contention are all exonerated (a replay of the engine's own copy lists
+> reaches 57 GB/s)**: a factor of ~2 in what the engine does beside the copies
+> is the open GLM question. (4) Card 0's small GEMVs (handoff item 5) are NOT the
+> card: a microbenchmark reads 145-147 GB/s on all three. (5) Layer lookahead
+> STEP0: one layer ahead predicts 57 % (prose) to 70 % (chat) of GLM's experts and
+> covers 55-60 % of the missed bytes at ~1.15x the traffic (previous token: 24 % /
+> 13 %); positive, modest, not adopted. MTP for Qwen3.8 is blocked at STEP0: the
+> served GGUF has no `mtp` tensors (the FP8 checkpoint does). The two upstream
+> PRs and `step0_gate.sh` were not touched. Next: the trunk-skip and consumer-
+> shaped DMA probes, a routed-expert chunk kernel, the served-path snapshot D2H
+> candidate, DeepSeek's embedding upload, lookahead STEP1; see HANDOFF-2026-10-06.**
+>
 > **Rev 79 (2026-09-26 04:20 CEST) -- GLM ON THE FRANKEN ENGINE: QUALITY =
 > LLAMA.CPP'S, ~4x FASTER (record §L5-GLM-QUALITY, §L5-GLM-CKPT).** MMLU-Pro
 > 70: greedy 58/70 (82.9 %), sampled as the model card says 60/70 (85.7 %),

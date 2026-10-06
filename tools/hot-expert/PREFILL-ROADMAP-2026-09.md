@@ -1,4 +1,6 @@
-# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 48, 2026-09-25)
+# Prefill / TTFT roadmap — GLM-5.3 on rome (opened 2026-09-06, rev 49, 2026-10-06)
+
+**Rev 49 (2026-10-06): pointer only -- Franken track plan rev 80 (GLM checkpoints served end to end; the GLM prefill DMA findings, record §L5-GLM-TIMELINE / §L5-GLM-EMBED / §M7-HOSTSRC); GLM on Colibri still serves nothing while the rig is development-reserved.**
 
 **Rev 48 (2026-09-25): pointer only -- Franken track plan rev 74 (DeepSeek quality verdict, GLM on the GPUs); GLM on Colibri still serves.**
 

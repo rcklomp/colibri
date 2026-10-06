@@ -6,7 +6,7 @@
 # Launch:  setsid nohup ~/bench/glm_accept_chain.sh > ~/bench/glm_accept_chain.log 2>&1 < /dev/null &
 # Protocol: the line "=== READY_FOR_UI" in the chain log says the gateway is up and the flag is moved aside; the caller touches ~/bench/.accept_ui_done when it has finished (45 min cap).
 set -u
-BIN=${BIN:-$HOME/bench/franken_bin/franken_dec_glm.hgblk}
+BIN=${BIN:-$HOME/bench/franken_bin/franken_dec_glm}      # the INSTALLED served binary; the shipped defaults of start_franken_glm.sh are NOT overridden below
 OUT=$HOME/bench/glm_accept; mkdir -p "$OUT"
 HE=$HOME/src/colibri/tools/hot-expert
 KEY=$(cat "$HOME/.colibri_api_key")
@@ -23,7 +23,7 @@ trap 'restore; stop_all; rig_lock_release; echo "=== accept chain exit $(date -I
 echo "=== glm_accept start $(date -Is) bin=$(basename $BIN) $(sha256sum "$BIN" | cut -c1-16)"
 stop_all; quiet_wait || exit 2
 log="$OUT/gw_$(date +%H%M%S).log"
-env FRANKEN_GLM_CHUNK=1024 FRANKEN_SNAP_EVERY=1024 FRANKEN_GLM_STAGE_MB=256 FRANKEN_DOCKER_BIN=$BIN FRANKEN_LOG=$log SKIP_WARM=1 setsid nohup "$START" > "$log" 2>&1 < /dev/null &
+env FRANKEN_DOCKER_BIN=$BIN FRANKEN_LOG=$log SKIP_WARM=1 setsid nohup "$START" > "$log" 2>&1 < /dev/null &
 up=0
 for i in $(seq 1 180); do
   sleep 5

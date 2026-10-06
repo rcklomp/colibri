@@ -36,7 +36,7 @@
 #                           default of 1: GLM5.md section 13's batched-prefill LDS gain was
 #                           measured for DS4, not asserted for GLM (glm5_serve.cpp's own top
 #                           comment). Override up to 1 only behind a quality/speed gate.
-#   FRANKEN_GLM_PREFILL_STAGE  1 -- GLM5.md section 12's prefill miss path (a chunk's missed
+#   FRANKEN_GLM_PREFILL_STAGE  0 since 2026-10-06 (was 1: GLM5.md section 12's prefill miss path; a chunk's missed
 #                           experts DMA'd into a VRAM ring instead of read in place)
 #   FRANKEN_ADAPT_PREFILL   0 -- GLM5.md section 13: hold adaptation swaps during a chunked
 #                           prefill, resume at the first decode token (this port's own served
@@ -89,7 +89,7 @@ export FRANKEN_CTX=${FRANKEN_CTX:-262144}
 export FRANKEN_GLM_CHUNK=${FRANKEN_GLM_CHUNK:-1024}   # 2026-10-06: was 512; 1024 + the blocked kernels = prefill 9.5 -> 6.0 ms/token at 262 144 cells (records §L5-GLM-CHUNK, §L5-GLM-MOEBLK, §L5-GLM-HGBLK)
 export FRANKEN_DEVICES=${FRANKEN_DEVICES:-3}
 export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-1}   # 2026-09-25: served ON, as Qwen3.8 is -- prefill 16.9 -> 9.3 ms/token (record §L5-GLM-LDS); a last-bits order change, judged by the quality run
-export FRANKEN_GLM_PREFILL_STAGE=${FRANKEN_GLM_PREFILL_STAGE:-1}
+export FRANKEN_GLM_PREFILL_STAGE=${FRANKEN_GLM_PREFILL_STAGE:-0}   # 2026-10-06: was 1. In place (the chunk reads only the experts its rows pick) beats staging at every chunk size: -4 % at 1024 rows, -23..-77 % at 16-256 rows (a short follow-up paid ~2 s of staging), bit-identical (record §L5-GLM-STAGECROSS)
 export FRANKEN_GLM_STAGE_MB=${FRANKEN_GLM_STAGE_MB:-256}   # staging ring a card, MB: a 1024-row chunk doubles the per-chunk scratch and a 400 MB ring OOMs dev 2 at 262 144 cells; the ring was measured flat from 400 MB up
 export FRANKEN_ADAPT_PREFILL=${FRANKEN_ADAPT_PREFILL:-0}
 export FRANKEN_HIP_GRAPH=${FRANKEN_HIP_GRAPH:-0}

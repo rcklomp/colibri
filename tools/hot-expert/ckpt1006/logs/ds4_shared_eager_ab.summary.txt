@@ -1,0 +1,25 @@
+=== run_chain ds4_shared_eager_ab_chain 2026-10-06T02:06:28+0000 (lock held by ds4_shared_eager_ab_chain 1335094 2026-10-06T02:06:28+0000)
+=== ds4_shared_eager_ab start 2026-10-06T02:06:28+00:00 A=c70f5dc3049a61c5 B=c480144d15034f77
+=== arm A 02:06:29
+ds4_probe depth=64 tokens=32 ms_median=47.769 tok_s=20.93 ms_min=44.713 ms_max=58.580 hip_graph=0 profile=0 (prefill 0->64 in 1113.5 ms)
+ds4_probe depth=8192 tokens=32 ms_median=51.641 tok_s=19.36 ms_min=45.854 ms_max=88.552 hip_graph=0 profile=0 (prefill 96->8192 in 46216.8 ms)
+ds4_probe depth=64 tokens=32 ms_median=48.023 tok_s=20.82 ms_min=46.719 ms_max=49.660 hip_graph=0 profile=0 (prefill 0->64 in 1046.8 ms)
+=== arm B 02:10:01
+ds4_probe depth=64 tokens=32 ms_median=47.933 tok_s=20.86 ms_min=44.746 ms_max=59.161 hip_graph=0 profile=0 (prefill 0->64 in 1082.4 ms)
+ds4_probe depth=8192 tokens=32 ms_median=51.552 tok_s=19.40 ms_min=46.854 ms_max=87.794 hip_graph=0 profile=0 (prefill 96->8192 in 45966.5 ms)
+ds4_probe depth=64 tokens=32 ms_median=48.065 tok_s=20.81 ms_min=46.830 ms_max=50.182 hip_graph=0 profile=0 (prefill 0->64 in 1044.5 ms)
+=== arm B 02:12:28
+ds4_probe depth=64 tokens=32 ms_median=47.815 tok_s=20.91 ms_min=44.894 ms_max=58.512 hip_graph=0 profile=0 (prefill 0->64 in 1080.1 ms)
+ds4_probe depth=8192 tokens=32 ms_median=51.637 tok_s=19.37 ms_min=46.371 ms_max=87.865 hip_graph=0 profile=0 (prefill 96->8192 in 45922.6 ms)
+ds4_probe depth=64 tokens=32 ms_median=48.029 tok_s=20.82 ms_min=46.577 ms_max=50.142 hip_graph=0 profile=0 (prefill 0->64 in 1044.8 ms)
+=== arm A 02:14:55
+ds4_probe depth=64 tokens=32 ms_median=47.760 tok_s=20.94 ms_min=44.527 ms_max=58.364 hip_graph=0 profile=0 (prefill 0->64 in 1082.3 ms)
+ds4_probe depth=8192 tokens=32 ms_median=51.687 tok_s=19.35 ms_min=46.470 ms_max=87.666 hip_graph=0 profile=0 (prefill 96->8192 in 46110.2 ms)
+ds4_probe depth=64 tokens=32 ms_median=47.921 tok_s=20.87 ms_min=46.765 ms_max=49.721 hip_graph=0 profile=0 (prefill 0->64 in 1045.5 ms)
+=== verdicts (decode ms/token, EAGER, adaptation on; A = pre473, B = tip)
+  decode at depth 64                 A=47.868 [47.760-48.023]  B=47.960 [47.815-48.065]
+                                     OVERLAPPING ranges -- NO VERDICT. The means differ by +0.2% but the arms do not separate; report 'did not move'.
+  decode at depth 8192               A=51.664 [51.641-51.687]  B=51.594 [51.552-51.637]
+                                     SEPARATED: -0.1% on means, -0.0% conservative (worst-against-best) -- quote the conservative figure
+=== ds4_shared_eager_ab end 2026-10-06T02:17:20+00:00 failures=0
+=== run_chain ds4_shared_eager_ab_chain exited rc=0 2026-10-06T02:17:20+0000

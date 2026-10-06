@@ -27,6 +27,13 @@
 if [ -e "$HOME/bench/.dev_reserved" ]; then echo "=== accept_live SKIPPED $(date -Is): rig reserved for development (~/bench/.dev_reserved), no service to check"; exit 0; fi
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); LOG="${GLM53_LOG:-$HOME/glm53_server.log}"; MODE="${1:-full}"
+# When a Franken engine serves, its gateway log is NOT ~/glm53_server.log (the daily 05:00 canary would poll a
+# stale file for up to an hour). Unless the caller named a log, ask serve_alt status for the live one (2026-10-06,
+# the same way accept_ui.sh does).
+if [ -z "${GLM53_LOG:-}" ]; then
+  _fl=$("$HERE/serve_alt.sh" status 2>/dev/null | sed -n 's/^engine pid: .*gateway log \(.*\)$/\1/p' | head -1)
+  [ -n "$_fl" ] && LOG=$_fl
+fi
 K=$(cat "$HOME/.colibri_api_key"); URL=http://127.0.0.1:8081; FAIL=0
 say() { printf '%-44s %s\n' "$1" "$2"; }
 pgrep -f "openai_[s]erver.py" >/dev/null || { echo "REFUSED: gateway not running"; exit 2; }

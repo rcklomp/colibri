@@ -9,7 +9,8 @@
 #
 # Launch chains this way and nothing else has to remember the rules.
 set -u
-HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/rig_lock.sh"
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd); . "$HERE/rig_lock.sh"; . "$HERE/service_lib.sh"
+svc_say() { echo "run_chain: $*"; }
 CHAIN=${1:?a chain script}; shift || true
 [ -x "$CHAIN" ] || { echo "run_chain: $CHAIN is not executable"; exit 2; }
 NAME=$(basename "$CHAIN" .sh)
@@ -21,31 +22,25 @@ echo "=== run_chain $NAME $(date +%Y-%m-%dT%H:%M:%S%z) (lock held by $(rig_lock_
 "$CHAIN" "$@"; rc=$?
 echo "=== run_chain $NAME exited rc=$rc $(date +%Y-%m-%dT%H:%M:%S%z)"
 
-# Whatever the chain decided, the owner's service must be up when we let go of the lock.
+# Whatever the chain decided, the owner's service must be up when we let go of the lock -- unless the rig is reserved.
+# Which engine "the service" is, and whether it is alive, is service_lib.sh's call (2026-10-06: this block used to test
+# `ps -C glm53` only and restart the OLD Colibri engine, which would have killed a healthy Franken service).
 KEY=$(cat "$HOME/.colibri_api_key" 2>/dev/null)
-code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" \
-        http://127.0.0.1:8081/v1/models 2>/dev/null)
+code=$(service_models_code)
 # A server whose engine child is gone still answers /v1/models=200 while every chat request
 # fails (2026-09-16: a chain's exit trap killed the engine by name; 28 min unnoticed). Treat
-# "server alive, no glm53" as down.
-# `pgrep -x glm53` also matches a ZOMBIE ("[glm53] <defunct>", the killed child the server has
-# not reaped), which is how this check stayed blind on 2026-09-20: count only non-Z processes.
-engine_alive() { ps -C glm53 -o stat= 2>/dev/null | grep -qv "^Z"; }
+# "server alive, no live engine" as down.
 if [ "$code" = 200 ] && pgrep -f "openai_[s]erver.py" >/dev/null && ! engine_alive; then
-  echo "run_chain: /v1/models=200 but the gateway's glm53 engine is GONE -- treating as down"
+  echo "run_chain: /v1/models=200 but the gateway's engine (glm53 / franken_dec_glm) is GONE -- treating as down"
   code=dead-engine
 fi
 if [ -e "$HOME/bench/.dev_reserved" ]; then
   echo "run_chain: rig reserved for development (~/bench/.dev_reserved): gateway left down"; code=reserved
 elif [ "$code" != 200 ]; then
-  echo "run_chain: the gateway is NOT answering after the chain (/v1/models=$code) -- restarting"
-  pkill -f "openai_[s]erver.py"; sleep 3; pkill -9 -x glm53 2>/dev/null
-  SKIP_WARM=1 setsid nohup "$HOME/start_glm53.sh" > "$HOME/glm53_server.log" 2>&1 < /dev/null &
-  for i in $(seq 1 60); do sleep 10
-    code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -H "Authorization: Bearer $KEY" \
-            http://127.0.0.1:8081/v1/models 2>/dev/null)
-    [ "$code" = 200 ] && break
-  done
+  echo "run_chain: the gateway is NOT answering after the chain (/v1/models=$code) -- restoring the service engine"
+  rig_lock_release                     # serve_alt.sh takes the lock itself and refuses while another process holds it
+  service_restore && code=200 || code=restore-failed
 fi
-echo "run_chain: in service $(sha256sum "$HOME/src/colibri/c/glm53" | cut -c1-16), /v1/models=$code"
+if [ "$code" = 200 ]; then service_engine_select; echo "run_chain: in service (engine: $SERVICE_ENGINE_NAME, alive: $(engine_alive && echo yes || echo NO)), /v1/models=$code"
+else echo "run_chain: NOT in service: $code"; fi
 exit $rc

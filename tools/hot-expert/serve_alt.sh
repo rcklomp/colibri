@@ -540,6 +540,16 @@ restore_glm() {
     echo "=== rig reserved for development (~/bench/.dev_reserved): alternative stopped, GLM NOT restored, port $ALT_PORT empty"
     return 0
   fi
+  if [ "${SERVE_ALT_NO_OLD_FALLBACK:-0}" = 1 ]; then
+    # Set by gateway_watchdog.sh (2026-10-06): a failed start of the Franken engine must NOT silently
+    # become the old, ~3x slower Colibri engine behind the same port. Stop everything, free the lock,
+    # leave :8081 empty and let the caller (and its log) say that the Franken start failed.
+    stop_gateway
+    serve_alt_lock_release
+    rm -f "$STATE_FILE"
+    echo "=== SERVE_ALT_NO_OLD_FALLBACK=1 ($reason): alternative stopped, the OLD engine was NOT started, port $ALT_PORT empty"
+    return 1
+  fi
   echo "[1/4] confirming VRAM is free on all three cards"
   if ! assert_vram_free "pre-glm"; then
     echo "FATAL: VRAM stuck -- NOT starting GLM. Rig lock left HELD on purpose so the watchdog does not fight you; investigate by hand, then re-run 'serve_alt.sh glm'."

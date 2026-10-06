@@ -14,6 +14,22 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 82 (2026-10-06 18:00 CEST) -- THE GLM PREFILL SPEED-UP PASSED THE ACCEPTANCE GATE, IS
+> INSTALLED AS THE SERVED BINARY AND ITS BRANCHES ARE PUSHED (record §L5-GLM-SHIPPED).**
+> `accept_live` (own log) found one defect in the first candidate: with a 1024-row chunk the
+> snapshot-point gap `chunk_ / 2` became 512 and a new chat reused 4 096 of 4 575 tokens (first
+> token 4.04 s against 1.84 s); fixed in franken-engine `glm-prefill-final` a1362d2 (gap
+> `min(chunk_ / 2, 256)`). The final candidate `franken_dec_glm.final` 90f5e845306f79e0: `accept_live`
+> PASS (chat B warm 4 548 of 4 575 reused, 1.86 s) and `accept_ui` PASS in a real browser (chat A
+> 2.31 s, chat B 2.56 s). Prefill at the served 262 144 cells: 9.53 -> 6.02 ms/token (-36.8 %,
+> 105 -> 166 tok/s), through the gateway on cold ~8.3k prompts 9.87 -> 7.19 (-27 %), bit-exact.
+> Pushed as new branches `moe-regblock`, `chunk1024`, `head-gemv-blk`, `glm-prefill-final` (main
+> untouched, 8256d53); `~/bench/franken_bin/franken_dec_glm` = the final build (`.ckpt` is the
+> rollback), `start_franken_glm.sh` defaults chunk 1024 / snapshots 1024 / ring 256 MB. **The service
+> is still off** (reserved). Open: merge the chain into franken-engine `main`; G = 8 (+1.9 %) is not
+> gated for exactness; the trunk GEMMs (2.45 ms a token) need a quality-gated tile kernel; the
+> clock-pinning root test needs the owner's sudo (`ckpt1006/clock_test.sh`). HANDOFF-2026-10-06 §9a.**
+>
 > **Rev 81 (2026-10-06 11:30 CEST) -- GLM PREFILL 9.5 -> 6.4 MS/TOKEN (-33 %, 105 -> 156
 > TOK/S) WITH NO CHANGE OF A BIT: A BLOCKED EXPERT KERNEL AND A 1024-ROW CHUNK; THE
 > "DMA-RATE" STALL WAS COMPUTE RUNNING BESIDE THE COPIES (records §M7-SKIPCLASS,

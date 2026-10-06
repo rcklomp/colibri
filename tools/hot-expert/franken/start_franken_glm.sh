@@ -28,7 +28,9 @@
 # --- WHAT THE ENGINE TAKES FROM THE ENVIRONMENT (glm5_serve.cpp) ---------------------------
 #   FRANKEN_GGUF          the shard to load (the other four shards are found beside it)
 #   FRANKEN_CTX            cells per KV slot -- 262144, same target window as DS4/Qwen
-#   FRANKEN_GLM_CHUNK       prefill chunk, 512 (this port's own served brief; decode is chunk 1)
+#   FRANKEN_GLM_CHUNK       prefill chunk, 1024 since 2026-10-06 (record §L5-GLM-CHUNK: every chunk streams ALL the staged experts, so DMA bytes a
+#                           token fall as 1/chunk; -10 % at the served context, bit-exact; needs franken-engine glm-prefill-final, an older binary
+#                           clamps it to 512 and still runs); decode is chunk 1
 #   FRANKEN_DEVICES         3
 #   FRANKEN_GEMM_LDS        0 here (glm5_serve.cpp's own default too) -- UNLIKE ds4_serve.cpp's
 #                           default of 1: GLM5.md section 13's batched-prefill LDS gain was
@@ -84,10 +86,11 @@ export OMP_NUM_THREADS=8 OMP_PLACES=cores OMP_PROC_BIND=close
 
 export FRANKEN_GGUF="$GGUF"
 export FRANKEN_CTX=${FRANKEN_CTX:-262144}
-export FRANKEN_GLM_CHUNK=${FRANKEN_GLM_CHUNK:-512}
+export FRANKEN_GLM_CHUNK=${FRANKEN_GLM_CHUNK:-1024}   # 2026-10-06: was 512; 1024 + the blocked kernels = prefill 9.5 -> 6.0 ms/token at 262 144 cells (records §L5-GLM-CHUNK, §L5-GLM-MOEBLK, §L5-GLM-HGBLK)
 export FRANKEN_DEVICES=${FRANKEN_DEVICES:-3}
 export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-1}   # 2026-09-25: served ON, as Qwen3.8 is -- prefill 16.9 -> 9.3 ms/token (record §L5-GLM-LDS); a last-bits order change, judged by the quality run
 export FRANKEN_GLM_PREFILL_STAGE=${FRANKEN_GLM_PREFILL_STAGE:-1}
+export FRANKEN_GLM_STAGE_MB=${FRANKEN_GLM_STAGE_MB:-256}   # staging ring a card, MB: a 1024-row chunk doubles the per-chunk scratch and a 400 MB ring OOMs dev 2 at 262 144 cells; the ring was measured flat from 400 MB up
 export FRANKEN_ADAPT_PREFILL=${FRANKEN_ADAPT_PREFILL:-0}
 export FRANKEN_HIP_GRAPH=${FRANKEN_HIP_GRAPH:-0}
 export FRANKEN_PLACEMENT=${FRANKEN_PLACEMENT:-$HOME/bench/m2/glm}
@@ -99,7 +102,7 @@ export FRANKEN_ADAPT=${FRANKEN_ADAPT:-1}
 # wrapper (which passes them through since 2026-10-06) cannot drop them silently. Boundary tokens
 # default to GLM's own turn markers ("<|user|>,<|assistant|>", FRANKEN_BOUNDARY_TOKENS). One
 # checkpoint is ~156 MB of recurrent state plus ~1 kB a token of cells (record §L5-GLM-CKPT-E2E).
-export FRANKEN_SNAP_EVERY=${FRANKEN_SNAP_EVERY:-512}
+export FRANKEN_SNAP_EVERY=${FRANKEN_SNAP_EVERY:-1024}   # 2026-10-06: was 512; the prefill loop cuts chunks at snapshot points, 512 would cut every 1024-row chunk back to 512
 export FRANKEN_SNAP_KEEP=${FRANKEN_SNAP_KEEP:-8}
 export FRANKEN_SNAP_BUDGET_MB=${FRANKEN_SNAP_BUDGET_MB:-6144}
 export FRANKEN_SNAP_TURNS=${FRANKEN_SNAP_TURNS:-3}

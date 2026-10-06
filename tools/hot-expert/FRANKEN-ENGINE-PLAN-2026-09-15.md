@@ -14,6 +14,17 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 84 (2026-10-06 22:00 CEST) -- THE ROOT CLOCK TEST RAN (record §M7-CLOCKTEST): CLOCKS ARE NOT
+> THE CAUSE OF THE SLOW COPIES; NO SOFTWARE KNOB; THE DEFAULT POWER PROFILE STAYS.** The owner ran
+> `ckpt1006/clock_test.sh` once (sudo): with `profile_peak` and with the COMPUTE profile the memory /
+> fabric / SoC clocks sat at their maxima (1 249 / 2 301 / 1 500 MHz) in every arm, and the prefill was
+> not faster (normal arm 9.15 default, 9.90 peak = +8 %, 9.45 compute = +3 %: the lower shader clock);
+> the skeleton and the loaded arms did not move. Rev 81's hypothesis (clocks fall 11-18 % under compute)
+> is refuted: a bystander. Open question narrowed to arbitration inside the GPU between kernels and
+> the copy engines, which no setting reaches. Under `profile_peak` one card touched 110.1 C junction
+> (its critical limit); the cards are restored to `auto`. Open: G = 8; the trunk GEMMs; decode by
+> lookahead prefetch; the service is still off (reserved).**
+>
 > **Rev 83 (2026-10-06 20:00 CEST) -- PREFILL STAGING IS OFF IN SERVICE: IN PLACE IS FASTER AT EVERY
 > CHUNK SIZE AND BIT-IDENTICAL; NEW CHATS AND FOLLOW-UPS START ~1 S SOONER (records §L5-GLM-VERIFYCOST,
 > §L5-GLM-STAGECROSS, §L5-GLM-SHIPPED).** (1) A probe of what a speculative-decoding verify step costs

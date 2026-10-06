@@ -15,7 +15,7 @@ RIG=${RIG:-rome}
 CHAIN=${1:?chain log on the rig}
 ENGINE=${2:-}
 SILENT_POLLS=${SILENT_POLLS:-27}              # 27 polls x 45 s = 20 minutes without a new line in either log
-PAT='=== gate-plan|=== glm5|=== dpf|=== run_chain|^[a-z0-9_]+ +(none|exact|cos|ref) +(ok|FAIL|PASS)|FAIL|PASS|rror|HIP error|[Aa]bort|core dumped|out of memory|OOM|needs [0-9]|REFUSED|Killed|Traceback|glm5_dpf |glm5_decode_ms_median|decode ms/token|covered_frac|vram_dev.*(caches|steady)|resident=|exit(ed)? rc|active=0|decode_prefetch='
+PAT='=== gate-plan|=== glm5|=== dpf|=== run_chain|^[a-z0-9_]+ +(none|exact|cos|ref) +(ok|FAIL|PASS)|FAIL|PASS|rror|HIP error|[Aa]bort|core dumped|out of memory|OOM|needs [0-9]|REFUSED|Killed|Traceback|glm5_dpf |glm5_decode_ms_median|decode ms/token|covered_frac|vram_dev.*steady|^placement all|exit(ed)? rc|active=0|decode_prefetch='
 last_c=0; last_e=0; quiet=0; dead=0; bad=0
 while :; do
   out=$(ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 "$RIG" '

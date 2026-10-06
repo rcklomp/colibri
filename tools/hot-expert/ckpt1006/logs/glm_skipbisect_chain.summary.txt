@@ -1,0 +1,91 @@
+=== run_chain glm_skipbisect_chain 2026-10-06T05:28:27+0000 (lock held by glm_skipbisect_chain 2055155 2026-10-06T05:28:27+0000)
+=== skipbisect start 2026-10-06T05:28:27+00:00 bin=989357eebbebb563
+smoke31 --tokens-fil
+smoke7 --tokens-file
+m0_a --tokens-file /
+m1_a --tokens-file /
+m5_a --tokens-file /
+m25_a --tokens-file 
+m3_a --tokens-file /
+m7_a --tokens-file /
+m31_a --tokens-file 
+m31_b --tokens-file 
+m7_b --tokens-file /
+m3_b --tokens-file /
+m25_b --tokens-file 
+m5_b --tokens-file /
+m1_b --tokens-file /
+m0_b --tokens-file /
+tl31 --tokens-file /
+tl3 --tokens-file /h
+gpu rc=0
+gate_plan_summary configs=18 ok=18 fail=0
+=== prefill ms/token per config (dma-equiv = 180.7 MB a token / ms: the staged bytes of the 8k prompt at the rate that would just carry them)
+smoke31      3.546 ms/token  dma-equiv  51.0 GB/s
+smoke7       3.668 ms/token  dma-equiv  49.3 GB/s
+m0_a         8.822 ms/token  dma-equiv  20.5 GB/s
+m1_a         6.668 ms/token  dma-equiv  27.1 GB/s
+m5_a         6.567 ms/token  dma-equiv  27.5 GB/s
+m25_a        6.189 ms/token  dma-equiv  29.2 GB/s
+m3_a         4.249 ms/token  dma-equiv  42.5 GB/s
+m7_a         4.184 ms/token  dma-equiv  43.2 GB/s
+m31_a        3.731 ms/token  dma-equiv  48.4 GB/s
+m31_b        3.738 ms/token  dma-equiv  48.3 GB/s
+m7_b         4.190 ms/token  dma-equiv  43.1 GB/s
+m3_b         4.233 ms/token  dma-equiv  42.7 GB/s
+m25_b        6.208 ms/token  dma-equiv  29.1 GB/s
+m5_b         6.587 ms/token  dma-equiv  27.4 GB/s
+m1_b         6.707 ms/token  dma-equiv  26.9 GB/s
+m0_b         9.220 ms/token  dma-equiv  19.6 GB/s
+tl31         3.751 ms/token  dma-equiv  48.2 GB/s
+tl3          4.214 ms/token  dma-equiv  42.9 GB/s
+=== timeline, mask 31
+=== steady state, chunks 3..7: period 3.794 ms a token (mean of 5)
+  links (chunks 3..7; a card's link carries all three of its rings' DMA):
+    link 0: DMA busy 98% of 9713.3 ms, 126.25 GB, avg 13.0 GB/s, 13.2 GB/s while busy; 1/2/3 rings copying 47/53/0% of busy; ring-region waits 12379.3 ms (after issue)
+      its 745 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 208.8, hidden (no recorded cause) 13609.5, transfer 15334.6
+    link 1: DMA busy 98% of 9713.3 ms, 126.33 GB, avg 13.0 GB/s, 13.3 GB/s while busy; 1/2/3 rings copying 70/30/0% of busy; ring-region waits 14595.9 ms (after issue)
+      its 660 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 2522.6, hidden (no recorded cause) 13480.2, transfer 13142.0
+    link 2: DMA busy 95% of 9713.3 ms, 210.16 GB, avg 21.6 GB/s, 22.7 GB/s while busy; 1/2/3 rings copying 64/36/0% of busy; ring-region waits 15121.8 ms (after issue)
+      its 1627 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 3025.1, hidden (no recorded cause) 12096.8, transfer 12614.2
+    all links: 462.75 GB in 9713.3 ms = 47.6 GB/s aggregate
+  critical path over these chunks (total ms; us a token):
+    own_dma(hidden)                                7187.5 ms  [ 2808]
+    upstream                                       6410.4 ms  [ 2504]
+    helper2 dma(link 24 GB/s)                      1761.1 ms  [  688]
+    own_dma(ring_region)                           1433.0 ms  [  560]
+    own_dma(link 24 GB/s)                           906.7 ms  [  354]
+    helper2 dma(link 15 GB/s)                       533.4 ms  [  208]
+    helper2 dma(link 14 GB/s)                       376.8 ms  [  147]
+    helper2 dma(link 25 GB/s)                       331.2 ms  [  129]
+    helper2 dma(link 16 GB/s)                       174.5 ms  [   68]
+    own_dma(link 14 GB/s)                           167.9 ms  [   66]
+    helper1 dma(link 12 GB/s)                        59.9 ms  [   23]
+    helper2 plan                                     59.3 ms  [   23]
+=== timeline, mask 3
+=== steady state, chunks 3..7: period 4.300 ms a token (mean of 5)
+  links (chunks 3..7; a card's link carries all three of its rings' DMA):
+    link 0: DMA busy 94% of 11007.6 ms, 126.26 GB, avg 11.5 GB/s, 12.2 GB/s while busy; 1/2/3 rings copying 52/48/0% of busy; ring-region waits 15170.5 ms (after issue)
+      its 745 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 933.6, hidden (no recorded cause) 15765.7, transfer 16162.7
+    link 1: DMA busy 93% of 11007.6 ms, 126.33 GB, avg 11.5 GB/s, 12.3 GB/s while busy; 1/2/3 rings copying 72/28/0% of busy; ring-region waits 17367.2 ms (after issue)
+      its 660 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 3220.0, hidden (no recorded cause) 15643.1, transfer 13998.4
+    link 2: DMA busy 91% of 11007.6 ms, 210.23 GB, avg 19.1 GB/s, 21.1 GB/s while busy; 1/2/3 rings copying 66/34/0% of busy; ring-region waits 18019.8 ms (after issue)
+      its 1628 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 4304.7, hidden (no recorded cause) 13715.1, transfer 13344.9
+    all links: 462.81 GB in 11007.6 ms = 42.0 GB/s aggregate
+  critical path over these chunks (total ms; us a token):
+    own_dma(hidden)                                7894.0 ms  [ 3084]
+    upstream                                       7260.4 ms  [ 2836]
+    own_dma(ring_region)                           2115.9 ms  [  827]
+    helper2 dma(link 24 GB/s)                       863.8 ms  [  337]
+    helper2 dma(link 13 GB/s)                       588.3 ms  [  230]
+    own_dma(link 24 GB/s)                           421.6 ms  [  165]
+    own_dma(link 14 GB/s)                           363.8 ms  [  142]
+    helper2 dma(link 14 GB/s)                       202.2 ms  [   79]
+    helper2 dma(link 12 GB/s)                       200.6 ms  [   78]
+    helper2 dma(link 25 GB/s)                       179.0 ms  [   70]
+    helper2 dma(ring_region)                        177.7 ms  [   69]
+    helper2 dma(link 4 GB/s)                        118.1 ms  [   46]
+=== skipbisect end 2026-10-06T05:45:40+00:00
+=== run_chain glm_skipbisect_chain exited rc=0 2026-10-06T05:45:40+0000
+run_chain: rig reserved for development (~/bench/.dev_reserved): gateway left down
+run_chain: in service 189fd9451c8e1c2e, /v1/models=reserved

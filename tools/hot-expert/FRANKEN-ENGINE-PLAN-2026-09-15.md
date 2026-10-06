@@ -14,6 +14,35 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 81 (2026-10-06 11:30 CEST) -- GLM PREFILL 9.5 -> 6.4 MS/TOKEN (-33 %, 105 -> 156
+> TOK/S) WITH NO CHANGE OF A BIT: A BLOCKED EXPERT KERNEL AND A 1024-ROW CHUNK; THE
+> "DMA-RATE" STALL WAS COMPUTE RUNNING BESIDE THE COPIES (records §M7-SKIPCLASS,
+> §L5-GLM-CHUNK, §L5-GLM-MOEBLK).** (1) Rev 80's open factor ~2 answered with a timing-only
+> `--debug-skip MASK` build (`ckpt1006/build_dbgskip.sh`): with no compute beside them the
+> three links move 47.6 GB/s (91 % of M4's 52), so the engine's copy-issue structure, events,
+> router/plan and boundary P2P are cleared; each compute class alone cuts the DMA (trunk GEMMs
+> only 29.9 GB/s, experts only 27.8) by leaving the links idle AND slowing every copy in flight
+> (-21..-27 % a link). Critical-path cost a token: trunk GEMMs 2.45 ms, experts 2.33, attention +
+> indexer 0.49, KDA 0.11. A clock/power sampler: memory, fabric and SoC clocks fall 11-18 % under
+> compute, PCIe stays gen4 x16, power stays under the 300 W cap, temperature is not it --
+> correlation only, cause NOT established (the clock-pinning test needs root: `ckpt1006/
+> clock_test.sh`, one `sudo bash ~/bench/clock_test.sh start`, restores the settings itself).
+> (2) The owner asked for outside sources first: Reddit (public RSS), X (a patched twitter-cli),
+> GitHub/GitLab issues. No report of the symptom; but they showed that a bigger micro-batch
+> amortises expert streaming over PCIe (380 -> 2 091 tok/s on a 3090), and the engine capped
+> chunks at 512 in four places. (3) **Chunk 1024:** -10.4 % at the served 262 144-cell context
+> (ring 256 MB; 400 MB OOMs dev 2), bit-exact in a fresh process (1 788 of 1 788 taps against the
+> stock chunk-512 dump); `--gate-plan` configs of DIFFERENT chunk sizes in one process diverge
+> (state carried across configs; a harness artifact, not root-caused). (4) **`k_glm5_moe_blk`**
+> (an Opus agent; branch `moe-regblock` f6c69e5): each weight row decoded once for G = 4
+> assignments, same per-lane accumulation order; bit-exact in the standard `emb` gate (four exact
+> configs), -16 % at chunk 512; with chunk 1024: **6.41 ms/token (G=4), 6.29 (G=8, not gated)**
+> against 9.53 stock. (5) Landed ON THE RIG ONLY as local branch `chunk1024` (42d7ddc) of
+> `~/src/franken-engine`; not pushed, `main` untouched; the serving path (FRANKEN_GLM_CHUNK=1024,
+> FRANKEN_SNAP_EVERY=1024, FRANKEN_GLM_STAGE_MB=256) is being A/B-tested through the gateway
+> (`glm_serve_chunk_chain.sh`), a blocked `head_gemv` (0.5 ms a token) is with an agent.
+> Next: HANDOFF-2026-10-06 §9.**
+>
 > **Rev 80 (2026-10-06 07:00 CEST) -- THE HANDOFF'S FIVE ITEMS RUN. GLM PREFIX
 > CHECKPOINTS SERVE END TO END; DEEPSEEK'S SHARED CHANGE GATED AND A TRAP FOUND;
 > THE GLM PREFILL STALL FOUND, HALF-FIXED AND THE HOST SOURCE EXONERATED

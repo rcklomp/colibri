@@ -1,0 +1,71 @@
+=== run_chain glm_skipclass_chain 2026-10-06T05:47:14+0000 (lock held by glm_skipclass_chain 2060268 2026-10-06T05:47:14+0000)
+=== skipclass start 2026-10-06T05:47:14+00:00 bin=989357eebbebb563
+smoke29 --tokens-fil
+smoke30 --tokens-fil
+m29_a --tokens-file 
+m30_a --tokens-file 
+m30_b --tokens-file 
+m29_b --tokens-file 
+tl29 --tokens-file /
+tl30 --tokens-file /
+gpu rc=0
+gate_plan_summary configs=8 ok=8 fail=0
+=== prefill ms/token per config (dma-equiv = 180.7 MB a token / ms: the staged bytes of the 8k prompt at the rate that would just carry them)
+smoke29      5.741 ms/token  dma-equiv  31.5 GB/s
+smoke30      6.969 ms/token  dma-equiv  25.9 GB/s
+m29_a        6.055 ms/token  dma-equiv  29.8 GB/s
+m30_a        7.107 ms/token  dma-equiv  25.4 GB/s
+m30_b        7.115 ms/token  dma-equiv  25.4 GB/s
+m29_b        6.075 ms/token  dma-equiv  29.7 GB/s
+tl29         6.023 ms/token  dma-equiv  30.0 GB/s
+tl30         6.490 ms/token  dma-equiv  27.8 GB/s
+=== timeline, mask 29
+=== steady state, chunks 3..7: period 6.055 ms a token (mean of 5)
+  links (chunks 3..7; a card's link carries all three of its rings' DMA):
+    link 0: DMA busy 84% of 15501.7 ms, 126.26 GB, avg 8.1 GB/s, 9.6 GB/s while busy; 1/2/3 rings copying 61/39/0% of busy; ring-region waits 24843.6 ms (after issue)
+      its 745 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 3709.6, hidden (no recorded cause) 23377.3, transfer 19416.7
+    link 1: DMA busy 84% of 15501.7 ms, 126.34 GB, avg 8.1 GB/s, 9.7 GB/s while busy; 1/2/3 rings copying 77/23/0% of busy; ring-region waits 27103.2 ms (after issue)
+      its 660 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 6035.3, hidden (no recorded cause) 23284.4, transfer 17181.7
+    link 2: DMA busy 82% of 15501.7 ms, 210.24 GB, avg 13.6 GB/s, 16.5 GB/s while busy; 1/2/3 rings copying 74/26/0% of busy; ring-region waits 28258.7 ms (after issue)
+      its 1628 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 8869.7, hidden (no recorded cause) 19389.0, transfer 16030.5
+    all links: 462.83 GB in 15501.7 ms = 29.9 GB/s aggregate
+  critical path over these chunks (total ms; us a token):
+    upstream                                      10434.7 ms  [ 4076]
+    own_dma(hidden)                               10347.6 ms  [ 4042]
+    own_dma(ring_region)                           1484.1 ms  [  580]
+    own_dma(link 24 GB/s)                          1147.3 ms  [  448]
+    helper2 dma(link 4 GB/s)                       1002.5 ms  [  392]
+    helper2 dma(ring_region)                        568.8 ms  [  222]
+    helper2 plan                                    560.4 ms  [  219]
+    helper2 dma(link 24 GB/s)                       121.0 ms  [   47]
+    helper1 dma(link 5 GB/s)                         52.5 ms  [   21]
+    helper2 dma(link 25 GB/s)                        30.9 ms  [   12]
+    helper2 dma(link 26 GB/s)                        15.5 ms  [    6]
+    none(compute)                                     0.0 ms  [    0]
+=== timeline, mask 30
+=== steady state, chunks 3..7: period 6.488 ms a token (mean of 5)
+  links (chunks 3..7; a card's link carries all three of its rings' DMA):
+    link 0: DMA busy 73% of 16609.1 ms, 126.11 GB, avg 7.6 GB/s, 10.4 GB/s while busy; 1/2/3 rings copying 73/27/0% of busy; ring-region waits 30492.8 ms (after issue)
+      its 745 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 8626.7, hidden (no recorded cause) 24348.7, transfer 16830.2
+    link 1: DMA busy 69% of 16609.1 ms, 125.59 GB, avg 7.6 GB/s, 10.9 GB/s while busy; 1/2/3 rings copying 82/18/0% of busy; ring-region waits 32414.9 ms (after issue)
+      its 655 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 9732.5, hidden (no recorded cause) 22692.5, transfer 13600.7
+    link 2: DMA busy 71% of 16609.1 ms, 210.30 GB, avg 12.7 GB/s, 17.9 GB/s while busy; 1/2/3 rings copying 75/25/0% of busy; ring-region waits 32569.7 ms (after issue)
+      its 1628 copies: from the previous copy's end to this one's end, ms: host issue 0.0, ring region 11961.7, hidden (no recorded cause) 20609.1, transfer 14783.5
+    all links: 461.99 GB in 16609.1 ms = 27.8 GB/s aggregate
+  critical path over these chunks (total ms; us a token):
+    own_dma(hidden)                               12004.3 ms  [ 4689]
+    upstream                                      10987.1 ms  [ 4292]
+    helper2 compute                                2500.7 ms  [  977]
+    helper0 compute                                 621.8 ms  [  243]
+    own_dma(ring_region)                            568.2 ms  [  222]
+    own_dma(link 28 GB/s)                           309.4 ms  [  121]
+    own_dma(link 26 GB/s)                           221.9 ms  [   87]
+    helper0 plan                                    189.9 ms  [   74]
+    own_dma(link 20 GB/s)                            33.8 ms  [   13]
+    own_dma(link 21 GB/s)                            33.8 ms  [   13]
+    own_dma(link 19 GB/s)                            16.9 ms  [    7]
+    none(compute)                                     0.0 ms  [    0]
+=== skipclass end 2026-10-06T05:57:01+00:00
+=== run_chain glm_skipclass_chain exited rc=0 2026-10-06T05:57:01+0000
+run_chain: rig reserved for development (~/bench/.dev_reserved): gateway left down
+run_chain: in service 189fd9451c8e1c2e, /v1/models=reserved

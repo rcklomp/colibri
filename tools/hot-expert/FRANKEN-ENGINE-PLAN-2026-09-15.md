@@ -23,10 +23,11 @@
 > PASS (chat B warm 4 548 of 4 575 reused, 1.86 s) and `accept_ui` PASS in a real browser (chat A
 > 2.31 s, chat B 2.56 s). Prefill at the served 262 144 cells: 9.53 -> 6.02 ms/token (-36.8 %,
 > 105 -> 166 tok/s), through the gateway on cold ~8.3k prompts 9.87 -> 7.19 (-27 %), bit-exact.
-> Pushed as new branches `moe-regblock`, `chunk1024`, `head-gemv-blk`, `glm-prefill-final` (main
-> untouched, 8256d53); `~/bench/franken_bin/franken_dec_glm` = the final build (`.ckpt` is the
+> Pushed as branches `moe-regblock`, `chunk1024`, `head-gemv-blk`, `glm-prefill-final` and
+> fast-forwarded into franken-engine `main` (8256d53..a1362d2, the rig's repo too);
+> `~/bench/franken_bin/franken_dec_glm` = the final build (`.ckpt` is the
 > rollback), `start_franken_glm.sh` defaults chunk 1024 / snapshots 1024 / ring 256 MB. **The service
-> is still off** (reserved). Open: merge the chain into franken-engine `main`; G = 8 (+1.9 %) is not
+> is still off** (reserved). Open: a 64k-200k needle run of the installed build; G = 8 (+1.9 %) is not
 > gated for exactness; the trunk GEMMs (2.45 ms a token) need a quality-gated tile kernel; the
 > clock-pinning root test needs the owner's sudo (`ckpt1006/clock_test.sh`). HANDOFF-2026-10-06 §9a.**
 >

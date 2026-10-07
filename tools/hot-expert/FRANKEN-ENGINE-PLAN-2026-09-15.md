@@ -14,6 +14,12 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 94 (2026-10-07 18:20 CEST) -- THE CPU LANE IS FEASIBLE ON ALL THREE COUNTS AND WORTH 2-4 %: THE NUMERICS COST 0.54 % OF A LAYER'S MoE OUTPUT FOR ONE SLOT OF EIGHT (record §L5-GLM-CPULANE-QUALITY); RECOMMENDATION: PARK IT, BUILD THE TRUNK GEMVs FIRST.**
+> The three questions that could kill it are answered: sync 20-40 us a layer (rev 92), 6 of 8 physical cores free (rev 93), numerics: int8 activations on one expert slot change the layer's MoE output by 0.54 % on average (max 2.6 %), a third of what llama.cpp
+> injects in every layer (672 real expert slots, two prompts; harness reproduces the GPU taps to 2e-7). The lane is a quality-GATED change (off by default, quality chain on, logit diff in the commit). Gain: modeled 4-5.4 ms a token, realistically 1.3-2.7 ms
+> (2-4 %), a multi-day engine build (plan -> host, pinned worker pool with spin barriers on cores 2-7, engine threads pinned to 0-1, ggml kernels linked, slot-ordered accumulation, quality gate); a faster IQ3_S AVX2 kernel (2.6 GB/s a core) could double it.
+> **Parked, fully specified in the records; the trunk GEMVs (<= ~6 ms, bit-exact if the lane order is kept) rank above it.**
+>
 > **Rev 93 (2026-10-07 18:00 CEST) -- THE CPU LANE'S CORE BUDGET IS MEASURED: THE SERVING ENGINE USES TWO CORES IN DECODE (TWO BUSY-WAITING THREADS) AND NONE IDLE; 6 OF 8 PHYSICAL CORES ARE FREE (record §L5-GLM-CPULANE-CORES).**
 > A 6-worker lane (0.57 ms an expert) fits on cores 2-7 with the engine's two threads pinned to cores 0-1 (they float today). Of the three questions that could kill the lane, two are now answered in its favour (sync cost: rev 92; cores: this rev);
 > left: the numerics (a quality-gated int8-activation lane; an offline experiment on real expert weights and real activations is being written) and the IQ3_S kernel speed. The modeled gain stays 4-5 ms, realistically 1.3-2.7 ms (2-4 %).

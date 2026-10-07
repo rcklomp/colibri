@@ -14,6 +14,22 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 88 (2026-10-07 11:55 CEST) -- THE PLACEMENT POLICY WAS THE DECODE LEVER: ADAPTATION WAS DEAD AFTER THE FIRST LONG REQUEST OF A SERVING PROCESS (fixed, serve path +15 %);
+> A PREFILL CAP FOR THE PLACEMENT AVERAGE (-4 to -24 % in the gates); G=8 SHIPPED (-2.6 % prefill); THE FETCH-BALANCE LEVER IS CLOSED BY ARITHMETIC (records §L5-GLM-G8,
+> §L5-GLM-FETCH-FLOOR, §L5-GLM-ADAPT, §L5-GLM-ADAPT-MONO, §L5-GLM-DECODE-TRACE2).** (1) **Fetch is link-bound:** the critical fetch (35.2 ms a token) moves 1 686 MB at 48 GB/s = 92 % of M4's
+> 52 GB/s for all three cards; the "8 ms of imbalance" of rev 87 divided by the sum of single-link rates (62.4), which M4 refutes; at 52 GB/s a perfect split is 0.2 ms better than the shipped
+> slab table (offline model, `ckpt1006/lane_model.py`). Only FEWER MISSED BYTES help (a CPU lane that avoids the links is the other structural option: 3-5 ms if an AVX2 expert kernel reaches
+> ~20 GB/s, unmeasured). (2) **The placement average is the prompt:** a held prefill enters it as one snapshot of the whole span, so after 8 192 prompt tokens decode cannot move the placement
+> (hit 0.61 -> 0.56 over the decode). `--adapt-prefill-cap N` (a span counts as at most N tokens; shipped 64 with half-life 512): chat prompt 53.8 -> 51.2-51.5 ms, 8 192-token prompt 64.8 ->
+> 49.5-56.7 ms, missed MB a token -40..-66 %, bit-exact (1 788 taps x 4 with a swap round every token). (3) **The serving bug:** `Adapter::tick` ran its cadence on the runner's SEQUENCE position, which
+> jumps back for every new chat; a chat shorter than the previous one's end took no snapshot at all (the acceptance log of the cap build: ONE adapter window, none after). A monotonic position fixes it;
+> serve-path A/B (real gateway, greedy, old build against new, two arms each): four short chats after a long request 13.5 -> 15.6 tok/s mean, the repeated prompt +19 %, windows 0 -> 25 a chat, identical
+> text; the CLI gates are unchanged (their position never rewinds). The DeepSeek adapter (`ds4_adapt.cpp`) has the same condition: not tested, not fixed. (4) **G=8:** `FRANKEN_GLM_MOE_G=8` bit-exact at chunk
+> 1024 / 512 / 32 in place, prefill 5.769 -> 5.621 ms/token; the rig's docker wrapper dropped knobs not on its env allowlist (now fixed). franken-engine main `aa7ff56` (engine code `5b47ef9`, notes GLM5.md
+> section 19). **Both serving builds passed acceptance (accept_live PASS + browser first token 1.06 / 1.31 s) and the last is INSTALLED (~11:50 CEST): `~/bench/franken_bin/franken_dec_glm` = `.adm`, sha256
+> `c97b0eb293f4d181`; rollbacks `.cap` `7751760b419de4bc`, `.wr` `11acdb9135664f19`. The service is still off (rig reserved).** Open decode levers, by size: placement follow-ups (the DeepSeek port, persisting the
+> average across restarts, watching `adapt_all` counts in the real service), the trunk GEMVs (18.9 ms a token at ~440 GB/s: <= ~6 ms realistic, quality gate if the split changes), the CPU lane.
+>
 > **Rev 87 (2026-10-07 03:20 CEST) -- DECODE -8.2 % MORE: THE SEPARATE REDUCE ONE WAVE A ROW (`k_reduce_splits_gemm_w`), BIT-EXACT; FETCH-ASSIGN
 > BUILT, EXACT, NO MEASURABLE GAIN (record §L5-GLM-GEMV-REDUCE addendum).** A second trace showed the new hot spot of rev 86's change: the thread-per-row reduce
 > (278 launches a token, ~20 us each, 5.5 ms; up to 512 dependent loads a row). One wave a row, the lanes loading the partials in parallel into LDS, lane 0 summing

@@ -1,76 +1,43 @@
 #!/bin/bash
-# glm_serve_ab_chain.sh -- is the checkpoint build of the Franken GLM serve engine slower at decode
-# than the build before it? (record §L5-GLM-CKPT-E2E: served decode was 11.4-11.8 tok/s against
-# 12.7-14.8 in §L5-GLM-SERVE, unexplained, other sessions were compiling on the host.)
-#   A = ~/bench/franken_bin/franken_dec_glm.nockpt  (franken-engine b9bd25d, live-prefix reuse only)
-#   B = ~/bench/franken_bin/franken_dec_glm.ckpt    (franken-engine b5cf4e0, prefix checkpoints)
-# Each arm: a FRESH gateway + engine (same start script, same env as serve_alt.sh franken-glm, only
-# FRANKEN_DOCKER_BIN differs), one warm-up request, then two timed requests; greedy (temperature 0) and
-# the same three prompts in the same order in every arm, so the routing and the adaptation trajectory
-# are the same. The number is the engine's own `tok/s=` for the request (decode only), from the
-# gateway log. Order A,B,B,A. Launch ONLY through run_chain.sh (rig lock):
-#   ssh -n -f rome 'setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glmserve_ab/glm_serve_ab_chain.sh \
-#       > ~/bench/glmserve_ab/chain.log 2>&1 < /dev/null &'
-# Refuses to start if anything is compiling on the host (a build competes for the host issue thread).
+# glm_serve_ab_chain.sh -- the SERVE path, old build against the monotonic-position build (2026-10-07; record section L5-GLM-ADAPT-MONO).
+# Why: the acceptance run of the cap build logged exactly ONE adapter window (`adapt_all pos=4573`, the first request) and none after it, through a 349-token answer and the
+#  browser chats: the adapter's cadence ran on the runner's sequence position, which jumps back for every new chat, so a chat that stays below the previous one's end took no snapshot.
+#  franken-engine branch adapt-mono (5b47ef9) runs the cadence on a monotonic position. The CLI gate cannot show it (its pos never rewinds): this chain drives the real gateway.
+# Each arm: stop everything, start the serving build through start_franken_glm.sh (the shipped defaults: G=8, cap 64, half-life 512), wait for :8081, run serve_ab_driver.py (W1 a long
+#  document, then four short fresh greedy chats, the last a repeat of the second), stop everything. Arms, in order: OLD (the installed cap build), NEW (adapt-mono), OLD, NEW.
+#  Greedy below 2 051 tokens of depth is deterministic, so W2-W5 must emit the SAME text in both builds (the emitted counts must match: placement moves no bit) and only the speed may differ.
+# Launch through run_chain.sh (the reservation flag stays in place; the chain never moves it), watch with a tail of $SAB_OUT/*.res.txt and the chain log.
+#   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_serve_ab_chain.sh > ~/bench/glm_serve_ab_chain.log 2>&1 < /dev/null &
+# Env: SAB_OLD / SAB_NEW (binaries), SAB_ARMS (default "old new old new"), SAB_OUT (default ~/bench/franken/glm5/serve_ab).
 set -u
-OUT=$HOME/bench/glmserve_ab; mkdir -p "$OUT"
-HE=$HOME/src/colibri/tools/hot-expert
-. "$HE/gate_lib.sh"
+. "$HOME/bench/chain_preflight.sh"
+HE=$HOME/src/colibri/tools/hot-expert; START=$HE/franken/start_franken_glm.sh
+OLD=${SAB_OLD:-$HOME/bench/franken_bin/franken_dec_glm.cap}; NEW=${SAB_NEW:-$HOME/bench/franken_bin/franken_dec_glm.adm}
+O=${SAB_OUT:-$HOME/bench/franken/glm5/serve_ab}; rm -rf "$O"; mkdir -p "$O"
 KEY=$(cat "$HOME/.colibri_api_key")
-BIN_A=$HOME/bench/franken_bin/franken_dec_glm.nockpt
-BIN_B=$HOME/bench/franken_bin/franken_dec_glm.ckpt
-START=$HE/franken/start_franken_glm.sh
-P1="Explain in detail how a hash table handles collisions, then compare open addressing with chaining."
-P2="Write a detailed explanation of how TCP congestion control works, covering slow start, congestion avoidance and fast recovery."
-P3="Describe step by step how a compiler turns source code into machine code, covering lexing, parsing, optimization and code generation."
-MAXTOK=${MAXTOK:-256}
-
-vram_max() { m=0; for d in /sys/class/drm/card[0-9]/device; do u=$(( $(cat $d/mem_info_vram_used)/1048576 )); [ $u -gt $m ] && m=$u; done; echo $m; }
-vram_wait() { for _ in $(seq 1 60); do [ "$(vram_max)" -lt 1024 ] && return 0; sleep 2; done; echo "vram still $(vram_max) MiB"; return 1; }
-stop_all() {
-  pkill -f "openai_[s]erver.py" 2>/dev/null; sleep 2; pkill -9 -f "openai_[s]erver.py" 2>/dev/null
-  pkill -9 -f "franken_dec_[g]lm" 2>/dev/null
-  docker stop -t 5 franken_engine >/dev/null 2>&1 || true
-}
-trap 'stop_all; echo "=== chain exit trap $(date -Is): gateway and engine stopped, port 8081 left empty (rig reserved)"' EXIT
-
-if pgrep -f "[m]ake .*glm-serve|[h]ipcc|[c]c1plus|[c]lang.*offload" > /dev/null; then
-  echo "REFUSED: a compile is running on the host -- it would compete with the decode loop; retry later"; exit 3
-fi
-[ -x "$BIN_A" ] && [ -x "$BIN_B" ] || { echo "FATAL: binaries missing"; exit 2; }
-echo "=== glm_serve_ab start $(date -Is) A=$(sha256sum $BIN_A | cut -c1-16) B=$(sha256sum $BIN_B | cut -c1-16)"
-stop_all; vram_wait || exit 2
-
-declare -A TPS
-arm() {   # arm <A|B> <bin>
-  local name=$1 bin=$2 log="$OUT/gw_${1}_$(date +%H%M%S).log"
-  vram_wait || return 1
-  echo "=== arm $name ($(basename "$bin")) $(date +%T)"
-  FRANKEN_DOCKER_BIN=$bin FRANKEN_LOG=$log SKIP_WARM=1 setsid nohup "$START" > "$log" 2>&1 < /dev/null &
-  local up=0
-  for i in $(seq 1 120); do
+[ -x "$OLD" ] && [ -x "$NEW" ] || { echo "FATAL: missing binary ($OLD / $NEW)"; echo "=== glm_serve_ab exit rc=2 $(date -Is)"; exit 2; }
+[ -e "$HOME/bench/.dev_reserved" ] || { echo "FATAL: the reservation flag is gone: this chain starts an engine and must run under it"; echo "=== glm_serve_ab exit rc=2 $(date -Is)"; exit 2; }
+echo "=== glm_serve_ab start $(date -Is) old=$(sha256sum "$OLD" | cut -c1-16) new=$(sha256sum "$NEW" | cut -c1-16)"
+trap 'rig_stop_serving; echo "=== glm_serve_ab chain end $(date -Is): everything stopped"' EXIT
+n=0; rcs=0
+for arm in ${SAB_ARMS:-old new old new}; do
+  n=$((n+1)); tag="${n}_$arm"; bin=$OLD; [ "$arm" = new ] && bin=$NEW
+  echo "=== arm $tag bin=$(basename "$bin") $(date -Is)"
+  rig_stop_serving; rig_quiet_wait 900 || { echo "arm $tag: rig not quiet"; rcs=1; continue; }
+  log="$O/$tag.gw.log"
+  env FRANKEN_DOCKER_BIN=$bin FRANKEN_LOG=$log SKIP_WARM=1 setsid nohup "$START" > "$log" 2>&1 < /dev/null &
+  up=0
+  for i in $(seq 1 240); do
     sleep 5
-    if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $KEY" -w '%{http_code}' http://127.0.0.1:8081/v1/models)" = 200 ] \
-       && pgrep -f "franken_dec_[g]lm" > /dev/null; then up=1; break; fi
+    if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $KEY" -w '%{http_code}' http://127.0.0.1:8081/v1/models)" = 200 ] && pgrep -f "franken_dec_[g]lm" > /dev/null; then up=1; break; fi
   done
-  [ $up = 1 ] || { echo "FAIL: arm $name did not come up"; tail -5 "$log"; stop_all; return 1; }
-  echo "up after $((i*5)) s"
-  local n=0
-  for P in "$P1" "$P2" "$P3"; do
-    n=$((n+1))
-    curl -s -m 900 -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-      http://127.0.0.1:8081/v1/chat/completions \
-      -d "$(python3 -c 'import json,sys; print(json.dumps({"model":"glm-5.3-flash","messages":[{"role":"user","content":sys.argv[1]}],"max_tokens":int(sys.argv[2]),"temperature":0}))' "$P" "$MAXTOK")" > /dev/null
-    sleep 1
-    local line; line=$(grep -a "serve-glm5\] req=" "$log" | tail -1)
-    local t; t=$(echo "$line" | sed -n 's/.*tok\/s=\([0-9.]*\).*/\1/p'); local e; e=$(echo "$line" | sed -n 's/.*emitted=\([0-9]*\).*/\1/p')
-    echo "  req $n: emitted=$e tok/s=$t ($(echo "$line" | sed -n 's/.*\(prefill_s=[0-9.]*\).*/\1/p'))"
-    [ $n -ge 2 ] && TPS[$name]="${TPS[$name]:-}$t "
-  done
-  stop_all
-  for _ in $(seq 1 30); do pgrep -f "franken_dec_[g]lm" > /dev/null || break; sleep 1; done
-}
-arm A "$BIN_A"; arm B "$BIN_B"; arm B "$BIN_B"; arm A "$BIN_A"
-echo "=== verdict (decode tok/s, requests 2 and 3 of each arm; A = no-checkpoint build, B = checkpoint build)"
-gate_ab_verdict "decode tok/s, 256 greedy tokens" "${TPS[A]:-}" "${TPS[B]:-}"
-echo "=== glm_serve_ab end $(date -Is)"
+  [ $up = 1 ] || { echo "arm $tag: the engine did not come up"; tail -6 "$log" | cut -c1-200; rcs=1; rig_stop_serving; continue; }
+  echo "arm $tag up after $((i*5)) s"
+  python3 -I "$HOME/bench/serve_ab_driver.py" "$log" "$O/$tag.res.json" 2>&1 | tee "$O/$tag.res.txt"
+  echo "arm $tag adapter windows in the whole log: $(grep -a -c 'adapt_all pos=' "$log")"
+  rig_stop_serving
+done
+echo "=== SUMMARY (decode tok/s per request; W2-W5 are fresh short chats after the long W1)"
+for f in "$O"/*.res.txt; do echo "--- $(basename "$f" .res.txt)"; cut -c1-150 "$f"; done
+echo "=== glm_serve_ab exit rc=$rcs $(date -Is)"
+exit $rcs

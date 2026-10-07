@@ -27,6 +27,7 @@ while :; do
     echo "--- chain"; tail -n +'$((last_c+1))' $c 2>/dev/null
     echo "--- engine"; [ "$e" != /dev/null ] && tail -n +'$((last_e+1))' $e 2>/dev/null
     echo "--- tails"; tail -n 8 $c 2>/dev/null | sed "s/^/CHAINTAIL /"; [ "$e" != /dev/null ] && tail -n 8 $e 2>/dev/null | sed "s/^/ENGINETAIL /"
+    true   # the remote command must exit 0: without an engine log the line above exits 1 and the watcher took that for a dead ssh (2026-10-07: blind for a whole acceptance run)
   ' 2>&1) || { echo "ssh failed (retrying)"; sleep 30; continue; }
   nc=$(echo "$out" | sed -n 's/^N \([0-9]*\) .*/\1/p' | head -1); ne=$(echo "$out" | sed -n 's/^N [0-9]* \([0-9]*\)/\1/p' | head -1)
   alive=$(echo "$out" | sed -n 's/^ALIVE //p' | head -1)

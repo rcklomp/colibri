@@ -15,7 +15,7 @@ REQS = [("W1_long_doc", DOC + "\n\nSummarize the passage above in about 300 word
         ("W3_bash", "Write a bash script that watches a directory and prints a line whenever a file in it changes. Explain each part.", 400),
         ("W4_btree", "Compare B-trees and LSM trees for a write-heavy workload and say when you would pick each.", 400),
         ("W5_hash_again", W2, 400)]
-REQ_RE = re.compile(r"\[serve-glm5\] req=(\d+) slot=\d+ prompt=(\d+) reused=(\d+) .*?emitted=(\d+) .*?prefill_s=([\d.]+) .*?decode_s=([\d.]+) tok/s=([\d.]+)")
+REQ_RE = re.compile(r"\[serve-(?:glm5|ds4)\] req=(\d+) slot=\d+ prompt=(\d+) reused=(\d+) .*?emitted=(\d+) .*?prefill_s=([\d.]+) .*?decode_s=([\d.]+) tok/s=([\d.]+)")
 
 def log_text():
     with open(LOG, errors="replace") as f:

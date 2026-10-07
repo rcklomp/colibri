@@ -8,10 +8,10 @@
 #  Greedy below 2 051 tokens of depth is deterministic, so W2-W5 must emit the SAME text in both builds (the emitted counts must match: placement moves no bit) and only the speed may differ.
 # Launch through run_chain.sh (the reservation flag stays in place; the chain never moves it), watch with a tail of $SAB_OUT/*.res.txt and the chain log.
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_serve_ab_chain.sh > ~/bench/glm_serve_ab_chain.log 2>&1 < /dev/null &
-# Env: SAB_OLD / SAB_NEW (binaries), SAB_ARMS (default "old new old new"), SAB_OUT (default ~/bench/franken/glm5/serve_ab).
+# Env: SAB_OLD / SAB_NEW (binaries), SAB_ARMS (default "old new old new"), SAB_OUT (default ~/bench/franken/glm5/serve_ab), SAB_START / SAB_PGREP (another model's start script and engine process pattern).
 set -u
 . "$HOME/bench/chain_preflight.sh"
-HE=$HOME/src/colibri/tools/hot-expert; START=$HE/franken/start_franken_glm.sh
+HE=$HOME/src/colibri/tools/hot-expert; START=${SAB_START:-$HE/franken/start_franken_glm.sh}; PG=${SAB_PGREP:-franken_dec_[g]lm}   # DeepSeek: SAB_START=$HE/franken/start_franken_ds4.sh SAB_PGREP=franken_decode_[d]s4
 OLD=${SAB_OLD:-$HOME/bench/franken_bin/franken_dec_glm.cap}; NEW=${SAB_NEW:-$HOME/bench/franken_bin/franken_dec_glm.adm}
 O=${SAB_OUT:-$HOME/bench/franken/glm5/serve_ab}; rm -rf "$O"; mkdir -p "$O"
 KEY=$(cat "$HOME/.colibri_api_key")
@@ -29,7 +29,7 @@ for arm in ${SAB_ARMS:-old new old new}; do
   up=0
   for i in $(seq 1 240); do
     sleep 5
-    if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $KEY" -w '%{http_code}' http://127.0.0.1:8081/v1/models)" = 200 ] && pgrep -f "franken_dec_[g]lm" > /dev/null; then up=1; break; fi
+    if [ "$(curl -s -o /dev/null -m 5 -H "Authorization: Bearer $KEY" -w '%{http_code}' http://127.0.0.1:8081/v1/models)" = 200 ] && pgrep -f "$PG" > /dev/null; then up=1; break; fi
   done
   [ $up = 1 ] || { echo "arm $tag: the engine did not come up"; tail -6 "$log" | cut -c1-200; rcs=1; rig_stop_serving; continue; }
   echo "arm $tag up after $((i*5)) s"

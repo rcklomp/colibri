@@ -1,0 +1,28 @@
+# cpulane part B. ggml 39931761a, expert GEMV = part A whole-expert worker (ggml AVX2 dot kernels, Q8_K activations)
+# H2D host threads -> cpu 0+1+2 ; CPU workers -> cpu 3+4+5+6+7+8+9+10 (first 5 are distinct physical cores, the rest SMT siblings of the H2D cores)
+# secs=8.0 warm=2.0 host_gb/card=2.00 cpu_gb=4.00 piece=11665408 B cpu_region=plain thp=1 blocking_sync=0
+# card 0: AMD Radeon RX 7900 XTX gfx1100 pci_bus=131 vram=24.0 GiB
+# card 1: AMD Radeon RX 7900 XTX gfx1100 pci_bus=134 vram=24.0 GiB
+# card 2: AMD Radeon RX 7900 XTX gfx1100 pci_bus=72 vram=24.0 GiB
+# card 0: 184 pieces of 11665408 B pinned (2.15 GB), H2D roundtrip check ok
+# card 1: 184 pieces of 11665408 B pinned (2.15 GB), H2D roundtrip check ok
+# card 2: 184 pieces of 11665408 B pinned (2.15 GB), H2D roundtrip check ok
+B1,card=0,GBps=27.873
+B1,card=1,GBps=27.860
+B1,card=2,GBps=27.846
+B2,card0_GBps=17.052,card1_GBps=16.967,card2_GBps=27.841,agg_GBps=61.860,sum_B1_GBps=83.579,agg_vs_sum_B1=0.740,h2d_exp_per_s=5302.8
+# iq4_xs: CPU region filled: 368 pieces of 11665536 B in 0.16 s, AnonHugePages=4194304 kB
+B4,N=2,cpu_GBps=20.791,cpu_exp_per_s=1782.2,qtype=iq4_xs,cpus=3+4,smt_shared=0
+B3,N=2,card0_GBps=15.979,card1_GBps=15.823,card2_GBps=27.844,agg_GBps=59.645,cpu_GBps=18.112,qtype=iq4_xs,cpus=3+4,smt_shared=0,agg_vs_B2=0.964,card0_vs_B2=0.937,card1_vs_B2=0.933,card2_vs_B2=1.000,cpu_vs_B4=0.871,h2d_exp_per_s=5113.0,cpu_exp_per_s=1552.6,total_exp_per_s=6665.6,total_vs_B2=1.257
+B4,N=4,cpu_GBps=41.021,cpu_exp_per_s=3516.4,qtype=iq4_xs,cpus=3+4+5+6,smt_shared=0
+B3,N=4,card0_GBps=14.996,card1_GBps=14.869,card2_GBps=27.835,agg_GBps=57.700,cpu_GBps=34.441,qtype=iq4_xs,cpus=3+4+5+6,smt_shared=0,agg_vs_B2=0.933,card0_vs_B2=0.879,card1_vs_B2=0.876,card2_vs_B2=1.000,cpu_vs_B4=0.840,h2d_exp_per_s=4946.2,cpu_exp_per_s=2952.4,total_exp_per_s=7898.6,total_vs_B2=1.489
+B4,N=6,cpu_GBps=60.711,cpu_exp_per_s=5204.3,qtype=iq4_xs,cpus=3+4+5+6+7+8,smt_shared=1
+B3,N=6,card0_GBps=13.879,card1_GBps=13.946,card2_GBps=27.752,agg_GBps=55.576,cpu_GBps=47.815,qtype=iq4_xs,cpus=3+4+5+6+7+8,smt_shared=1,agg_vs_B2=0.898,card0_vs_B2=0.814,card1_vs_B2=0.822,card2_vs_B2=0.997,cpu_vs_B4=0.788,h2d_exp_per_s=4764.2,cpu_exp_per_s=4098.8,total_exp_per_s=8863.1,total_vs_B2=1.671
+# glm: CPU region filled: 368 pieces of 11665408 B in 0.13 s, AnonHugePages=4194304 kB
+B4,N=2,cpu_GBps=7.138,cpu_exp_per_s=611.9,qtype=glm,cpus=3+4,smt_shared=0
+B3,N=2,card0_GBps=16.638,card1_GBps=16.480,card2_GBps=27.829,agg_GBps=60.947,cpu_GBps=7.114,qtype=glm,cpus=3+4,smt_shared=0,agg_vs_B2=0.985,card0_vs_B2=0.976,card1_vs_B2=0.971,card2_vs_B2=1.000,cpu_vs_B4=0.997,h2d_exp_per_s=5224.6,cpu_exp_per_s=609.9,total_exp_per_s=5834.5,total_vs_B2=1.100
+B4,N=4,cpu_GBps=14.424,cpu_exp_per_s=1236.5,qtype=glm,cpus=3+4+5+6,smt_shared=0
+B3,N=4,card0_GBps=16.240,card1_GBps=16.082,card2_GBps=27.833,agg_GBps=60.155,cpu_GBps=14.170,qtype=glm,cpus=3+4+5+6,smt_shared=0,agg_vs_B2=0.972,card0_vs_B2=0.952,card1_vs_B2=0.948,card2_vs_B2=1.000,cpu_vs_B4=0.982,h2d_exp_per_s=5156.7,cpu_exp_per_s=1214.7,total_exp_per_s=6371.5,total_vs_B2=1.202
+B4,N=6,cpu_GBps=21.626,cpu_exp_per_s=1853.9,qtype=glm,cpus=3+4+5+6+7+8,smt_shared=1
+B3,N=6,card0_GBps=15.719,card1_GBps=15.734,card2_GBps=27.841,agg_GBps=59.293,cpu_GBps=20.973,qtype=glm,cpus=3+4+5+6+7+8,smt_shared=1,agg_vs_B2=0.959,card0_vs_B2=0.922,card1_vs_B2=0.927,card2_vs_B2=1.000,cpu_vs_B4=0.970,h2d_exp_per_s=5082.8,cpu_exp_per_s=1797.9,total_exp_per_s=6880.7,total_vs_B2=1.298
+B_DONE rc=0

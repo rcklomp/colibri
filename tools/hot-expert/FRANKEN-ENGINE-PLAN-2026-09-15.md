@@ -14,6 +14,13 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 91 (2026-10-07 14:50 CEST) -- THE CPU LANE IS MEASURED: A REAL EXPERT IN 0.57-0.68 ms ON 5-6 CORES WHILE THREE GPUs STREAM, WITH ~3-4 % LOSS ON EITHER SIDE; MODELED 3-5 ms A TOKEN, THREE OPEN QUESTIONS (record §L5-GLM-CPULANE).**
+> Standalone benchmark `tools/hot-expert/cpulane/` (ggml AVX2 kernels, the real IQ3_S + IQ4_XS expert): one expert split over 5 / 6 / 8 cores 0.68 / 0.57 / 0.44 ms (17 / 20 / 26 GB/s, linear, COMPUTE-bound: the weak link is the IQ3_S
+> kernel at 2.6 GB/s a core); with the CPU working while the three cards stream (aggregate 61.9 GB/s alone, §L5-GLM-FETCH-FLOOR-ERRATUM confirmed) the GPU side loses 1.5 / 2.8 / 4.1 % at 2 / 4 / 6 workers and the CPU 0-3 %.
+> The FreeToken worry (DDR contention) does not bite with the real mix; it does with the memory-hungrier IQ4_XS kernel above ~35 GB/s. Modeled saving 3.7-5.0 ms at d = 60 us, honest range 1.5-5 ms (2-8 %). **Open, each can kill it:**
+> (1) numerics (ggml quantises activations to int8, the GPU kernels use float: a quality-gated change, or slower float AVX2 kernels), (2) how many cores the engine's own host threads leave free in decode, (3) the GPU-host-GPU sync cost per layer
+> (a microbenchmark answers it in an hour; the lookahead work found 0.8 ms a layer of fixed stream/event cost). Next: the sync microbenchmark, then the IQ3_S kernel, then the numerics decision.
+>
 > **Rev 90 (2026-10-07 13:45 CEST) -- `--fetch-assign optimal` IS A REAL -0.97 ms A TOKEN (-3.0 % OF THE CRITICAL FETCH) AND IS NOW THE DEFAULT; THE MODEL HAD PREDICTED A THIRD MORE (record §L5-GLM-FETCH-FLOOR-ERRATUM addendum).**
 > Three rocprofv3 decode traces of identical flags, per-token critical fetch (the span of the three cards' stage kernels per layer, summed): pattern 32.64 and 32.63 ms (noise floor 0.01 ms), optimal 31.68 ms, fewer in 10 of
 > 12 tokens; the per-card kernel durations follow the link model (417 us a slab on the lone card; 417 / 678 us on the pair when its partner is idle / busy). The decode-timing A/B of rev 87 could not resolve a 1.4 % effect.

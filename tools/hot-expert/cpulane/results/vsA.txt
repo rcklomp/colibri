@@ -1,0 +1,12 @@
+B4vsA,N=2,qtype=iq4_xs,cpu_GBps=20.791,A_whole_dram_GBps=20.646,ratio=1.007
+B3vsA,N=2,qtype=iq4_xs,cpu_GBps=18.112,A_whole_dram_GBps=20.646,ratio=0.877
+B4vsA,N=4,qtype=iq4_xs,cpu_GBps=41.021,A_whole_dram_GBps=40.709,ratio=1.008
+B3vsA,N=4,qtype=iq4_xs,cpu_GBps=34.441,A_whole_dram_GBps=40.709,ratio=0.846
+B4vsA,N=6,qtype=iq4_xs,cpu_GBps=60.711,A_whole_dram_GBps=60.119,ratio=1.010
+B3vsA,N=6,qtype=iq4_xs,cpu_GBps=47.815,A_whole_dram_GBps=60.119,ratio=0.795
+B4vsA,N=2,qtype=glm,cpu_GBps=7.138,A_whole_dram_GBps=7.115,ratio=1.003
+B3vsA,N=2,qtype=glm,cpu_GBps=7.114,A_whole_dram_GBps=7.115,ratio=1.000
+B4vsA,N=4,qtype=glm,cpu_GBps=14.424,A_whole_dram_GBps=14.347,ratio=1.005
+B3vsA,N=4,qtype=glm,cpu_GBps=14.170,A_whole_dram_GBps=14.347,ratio=0.988
+B4vsA,N=6,qtype=glm,cpu_GBps=21.626,A_whole_dram_GBps=21.521,ratio=1.005
+B3vsA,N=6,qtype=glm,cpu_GBps=20.973,A_whole_dram_GBps=21.521,ratio=0.975

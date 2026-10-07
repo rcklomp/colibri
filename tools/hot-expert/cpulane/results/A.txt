@@ -1,0 +1,141 @@
+# cpulane part A. ggml 39931761a (llama-glm53), kernels ggml_vec_dot_{iq4_xs,iq3_s,q6_K}_q8_K x86 AVX2, nrc=1, Q8_K activations
+# physical cores (first hw thread of each): core0=cpu0/8 core1=cpu1/9 core2=cpu2/10 core3=cpu3/11 core4=cpu4/12 core5=cpu5/13 core6=cpu6/14 core7=cpu7/15
+# thread slots -> cpu: 1=3 2=4 3=5 4=6 5=7 6=0 7=1 8=2
+# whole: secs=1.00 warm=0.30 | rows: >=200 experts and >=0.60 s | dram region 4.00 GB, cache piece 2.10 MB, thp=1
+# selfcheck iq4_xs expert=11665536 B (gate/up 1787 rows iq4_xs, down 3574 rows iq4_xs) g[0]=508.9 u[0]=-669.1 o[0]=6.899e+04 mean|o|=6.922e+04 finite=1
+# iq4_xs: filled 368 pieces of 11665536 B in 0.17 s, AnonHugePages=4194304 kB
+A,iq4_xs,whole,threads=1,cache,GBps=10.812,expert_ms=0.1907,expert_ms_p90=0.1960,experts_per_s=5159.5,piece_MB=2.095,n=5160,cpus=3
+A,iq4_xs,whole,threads=2,cache,GBps=21.905,expert_ms=0.1905,expert_ms_p90=0.1958,experts_per_s=10453.3,piece_MB=2.095,n=10454,cpus=3+4
+A,iq4_xs,whole,threads=3,cache,GBps=32.922,expert_ms=0.1896,expert_ms_p90=0.1946,experts_per_s=15711.0,piece_MB=2.095,n=15712,cpus=3+4+5
+A,iq4_xs,whole,threads=4,cache,GBps=43.992,expert_ms=0.1890,expert_ms_p90=0.1941,experts_per_s=20993.6,piece_MB=2.095,n=20995,cpus=3+4+5+6
+A,iq4_xs,whole,threads=5,cache,GBps=54.965,expert_ms=0.1892,expert_ms_p90=0.1945,experts_per_s=26230.2,piece_MB=2.095,n=26232,cpus=3+4+5+6+7
+A,iq4_xs,whole,threads=6,cache,GBps=65.792,expert_ms=0.1891,expert_ms_p90=0.1944,experts_per_s=31396.9,piece_MB=2.095,n=31399,cpus=3+4+5+6+7+0
+A,iq4_xs,whole,threads=7,cache,GBps=76.690,expert_ms=0.1892,expert_ms_p90=0.1948,experts_per_s=36597.5,piece_MB=2.095,n=36600,cpus=3+4+5+6+7+0+1
+A,iq4_xs,whole,threads=8,cache,GBps=87.778,expert_ms=0.1892,expert_ms_p90=0.1944,experts_per_s=41889.2,piece_MB=2.095,n=41892,cpus=3+4+5+6+7+0+1+2
+A,iq4_xs,rows,threads=1,cache,GBps=10.918,expert_ms=0.1909,expert_ms_p90=0.1957,experts_per_s=5210.5,piece_MB=2.095,n=3127,cpus=3
+A,iq4_xs,rows,threads=2,cache,GBps=19.247,expert_ms=0.1066,expert_ms_p90=0.1117,experts_per_s=9185.2,piece_MB=2.095,n=5512,cpus=3+4
+A,iq4_xs,rows,threads=3,cache,GBps=27.201,expert_ms=0.0758,expert_ms_p90=0.0799,experts_per_s=12980.8,piece_MB=2.095,n=7789,cpus=3+4+5
+A,iq4_xs,rows,threads=4,cache,GBps=33.938,expert_ms=0.0602,expert_ms_p90=0.0643,experts_per_s=16196.0,piece_MB=2.095,n=9718,cpus=3+4+5+6
+A,iq4_xs,rows,threads=5,cache,GBps=39.847,expert_ms=0.0511,expert_ms_p90=0.0540,experts_per_s=19015.6,piece_MB=2.095,n=11410,cpus=3+4+5+6+7
+A,iq4_xs,rows,threads=6,cache,GBps=42.490,expert_ms=0.0467,expert_ms_p90=0.0542,experts_per_s=20276.8,piece_MB=2.095,n=12167,cpus=3+4+5+6+7+0
+A,iq4_xs,rows,threads=7,cache,GBps=46.762,expert_ms=0.0424,expert_ms_p90=0.0492,experts_per_s=22315.7,piece_MB=2.095,n=13390,cpus=3+4+5+6+7+0+1
+A,iq4_xs,rows,threads=8,cache,GBps=51.296,expert_ms=0.0390,expert_ms_p90=0.0409,experts_per_s=24479.0,piece_MB=2.095,n=14688,cpus=3+4+5+6+7+0+1+2
+A,iq4_xs,whole,threads=1,dram,GBps=10.311,expert_ms=1.1292,expert_ms_p90=1.1376,experts_per_s=883.9,piece_MB=11.666,n=884,cpus=3
+A,iq4_xs,whole,threads=2,dram,GBps=20.646,expert_ms=1.1267,expert_ms_p90=1.1375,experts_per_s=1769.8,piece_MB=11.666,n=1770,cpus=3+4
+A,iq4_xs,whole,threads=3,dram,GBps=30.643,expert_ms=1.1395,expert_ms_p90=1.1482,experts_per_s=2626.8,piece_MB=11.666,n=2627,cpus=3+4+5
+A,iq4_xs,whole,threads=4,dram,GBps=40.709,expert_ms=1.1453,expert_ms_p90=1.1543,experts_per_s=3489.7,piece_MB=11.666,n=3490,cpus=3+4+5+6
+A,iq4_xs,whole,threads=5,dram,GBps=50.483,expert_ms=1.1531,expert_ms_p90=1.1655,experts_per_s=4327.6,piece_MB=11.666,n=4328,cpus=3+4+5+6+7
+A,iq4_xs,whole,threads=6,dram,GBps=60.119,expert_ms=1.1593,expert_ms_p90=1.1744,experts_per_s=5153.5,piece_MB=11.666,n=5155,cpus=3+4+5+6+7+0
+A,iq4_xs,whole,threads=7,dram,GBps=69.335,expert_ms=1.1733,expert_ms_p90=1.1893,experts_per_s=5943.6,piece_MB=11.666,n=5944,cpus=3+4+5+6+7+0+1
+A,iq4_xs,whole,threads=8,dram,GBps=77.755,expert_ms=1.1956,expert_ms_p90=1.2137,experts_per_s=6665.4,piece_MB=11.666,n=6666,cpus=3+4+5+6+7+0+1+2
+A,iq4_xs,rows,threads=1,dram,GBps=10.276,expert_ms=1.1274,expert_ms_p90=1.1375,experts_per_s=880.9,piece_MB=11.666,n=529,cpus=3
+A,iq4_xs,rows,threads=2,dram,GBps=19.552,expert_ms=0.5885,expert_ms_p90=0.5971,experts_per_s=1676.1,piece_MB=11.666,n=1006,cpus=3+4
+A,iq4_xs,rows,threads=3,dram,GBps=28.522,expert_ms=0.4028,expert_ms_p90=0.4112,experts_per_s=2445.0,piece_MB=11.666,n=1468,cpus=3+4+5
+A,iq4_xs,rows,threads=4,dram,GBps=36.863,expert_ms=0.3108,expert_ms_p90=0.3201,experts_per_s=3160.0,piece_MB=11.666,n=1896,cpus=3+4+5+6
+A,iq4_xs,rows,threads=5,dram,GBps=43.910,expert_ms=0.2562,expert_ms_p90=0.2924,experts_per_s=3764.1,piece_MB=11.666,n=2259,cpus=3+4+5+6+7
+A,iq4_xs,rows,threads=6,dram,GBps=52.112,expert_ms=0.2195,expert_ms_p90=0.2278,experts_per_s=4467.2,piece_MB=11.666,n=2681,cpus=3+4+5+6+7+0
+A,iq4_xs,rows,threads=7,dram,GBps=57.699,expert_ms=0.1960,expert_ms_p90=0.2195,experts_per_s=4946.1,piece_MB=11.666,n=2968,cpus=3+4+5+6+7+0+1
+A,iq4_xs,rows,threads=8,dram,GBps=64.576,expert_ms=0.1772,expert_ms_p90=0.1858,experts_per_s=5535.6,piece_MB=11.666,n=3322,cpus=3+4+5+6+7+0+1+2
+# selfcheck glm    expert=11665408 B (gate/up 2048 rows iq3_s, down 4096 rows iq4_xs) g[0]=65.17 u[0]=80.75 o[0]=-1.109e+04 mean|o|=6.791e+04 finite=1
+# glm: filled 368 pieces of 11665408 B in 0.15 s, AnonHugePages=4194304 kB
+A,glm,whole,threads=1,cache,GBps=3.620,expert_ms=0.5792,expert_ms_p90=0.5838,experts_per_s=1726.8,piece_MB=2.096,n=1727,cpus=3
+A,glm,whole,threads=2,cache,GBps=7.235,expert_ms=0.5801,expert_ms_p90=0.5840,experts_per_s=3451.8,piece_MB=2.096,n=3452,cpus=3+4
+A,glm,whole,threads=3,cache,GBps=10.849,expert_ms=0.5804,expert_ms_p90=0.5851,experts_per_s=5175.7,piece_MB=2.096,n=5176,cpus=3+4+5
+A,glm,whole,threads=4,cache,GBps=14.460,expert_ms=0.5805,expert_ms_p90=0.5856,experts_per_s=6898.6,piece_MB=2.096,n=6899,cpus=3+4+5+6
+A,glm,whole,threads=5,cache,GBps=18.042,expert_ms=0.5807,expert_ms_p90=0.5861,experts_per_s=8607.4,piece_MB=2.096,n=8608,cpus=3+4+5+6+7
+A,glm,whole,threads=6,cache,GBps=21.643,expert_ms=0.5808,expert_ms_p90=0.5864,experts_per_s=10325.3,piece_MB=2.096,n=10326,cpus=3+4+5+6+7+0
+A,glm,whole,threads=7,cache,GBps=25.257,expert_ms=0.5809,expert_ms_p90=0.5862,experts_per_s=12049.2,piece_MB=2.096,n=12050,cpus=3+4+5+6+7+0+1
+A,glm,whole,threads=8,cache,GBps=28.866,expert_ms=0.5807,expert_ms_p90=0.5862,experts_per_s=13771.1,piece_MB=2.096,n=13772,cpus=3+4+5+6+7+0+1+2
+A,glm,rows,threads=1,cache,GBps=3.617,expert_ms=0.5794,expert_ms_p90=0.5847,experts_per_s=1725.4,piece_MB=2.096,n=1036,cpus=3
+A,glm,rows,threads=2,cache,GBps=6.927,expert_ms=0.2987,expert_ms_p90=0.3067,experts_per_s=3304.6,piece_MB=2.096,n=1983,cpus=3+4
+A,glm,rows,threads=3,cache,GBps=10.016,expert_ms=0.2042,expert_ms_p90=0.2145,experts_per_s=4778.1,piece_MB=2.096,n=2867,cpus=3+4+5
+A,glm,rows,threads=4,cache,GBps=13.165,expert_ms=0.1564,expert_ms_p90=0.1618,experts_per_s=6280.8,piece_MB=2.096,n=3769,cpus=3+4+5+6
+A,glm,rows,threads=5,cache,GBps=15.814,expert_ms=0.1290,expert_ms_p90=0.1371,experts_per_s=7544.4,piece_MB=2.096,n=4527,cpus=3+4+5+6+7
+A,glm,rows,threads=6,cache,GBps=18.355,expert_ms=0.1108,expert_ms_p90=0.1205,experts_per_s=8756.9,piece_MB=2.096,n=5255,cpus=3+4+5+6+7+0
+A,glm,rows,threads=7,cache,GBps=20.749,expert_ms=0.0987,expert_ms_p90=0.1035,experts_per_s=9898.6,piece_MB=2.096,n=5940,cpus=3+4+5+6+7+0+1
+A,glm,rows,threads=8,cache,GBps=23.383,expert_ms=0.0865,expert_ms_p90=0.0936,experts_per_s=11155.4,piece_MB=2.096,n=6694,cpus=3+4+5+6+7+0+1+2
+A,glm,whole,threads=1,dram,GBps=3.569,expert_ms=3.2722,expert_ms_p90=3.2838,experts_per_s=306.0,piece_MB=11.665,n=306,cpus=3
+A,glm,whole,threads=2,dram,GBps=7.115,expert_ms=3.2772,expert_ms_p90=3.2880,experts_per_s=609.9,piece_MB=11.665,n=610,cpus=3+4
+A,glm,whole,threads=3,dram,GBps=10.778,expert_ms=3.2346,expert_ms_p90=3.2835,experts_per_s=923.9,piece_MB=11.665,n=924,cpus=3+4+5
+A,glm,whole,threads=4,dram,GBps=14.347,expert_ms=3.2363,expert_ms_p90=3.2856,experts_per_s=1229.9,piece_MB=11.665,n=1230,cpus=3+4+5+6
+A,glm,whole,threads=5,dram,GBps=17.928,expert_ms=3.2395,expert_ms_p90=3.2545,experts_per_s=1536.9,piece_MB=11.665,n=1537,cpus=3+4+5+6+7
+A,glm,whole,threads=6,dram,GBps=21.521,expert_ms=3.2396,expert_ms_p90=3.2560,experts_per_s=1844.9,piece_MB=11.665,n=1845,cpus=3+4+5+6+7+0
+A,glm,whole,threads=7,dram,GBps=25.090,expert_ms=3.2420,expert_ms_p90=3.2566,experts_per_s=2150.8,piece_MB=11.665,n=2151,cpus=3+4+5+6+7+0+1
+A,glm,whole,threads=8,dram,GBps=28.671,expert_ms=3.2436,expert_ms_p90=3.2598,experts_per_s=2457.8,piece_MB=11.665,n=2458,cpus=3+4+5+6+7+0+1+2
+A,glm,rows,threads=1,dram,GBps=3.551,expert_ms=3.2720,expert_ms_p90=3.2887,experts_per_s=304.4,piece_MB=11.665,n=200,cpus=3
+A,glm,rows,threads=2,dram,GBps=6.966,expert_ms=1.6661,expert_ms_p90=1.6782,experts_per_s=597.1,piece_MB=11.665,n=359,cpus=3+4
+A,glm,rows,threads=3,dram,GBps=10.492,expert_ms=1.1040,expert_ms_p90=1.1301,experts_per_s=899.4,piece_MB=11.665,n=540,cpus=3+4+5
+A,glm,rows,threads=4,dram,GBps=13.800,expert_ms=0.8365,expert_ms_p90=0.8594,experts_per_s=1183.0,piece_MB=11.665,n=710,cpus=3+4+5+6
+A,glm,rows,threads=5,dram,GBps=16.959,expert_ms=0.6801,expert_ms_p90=0.7022,experts_per_s=1453.8,piece_MB=11.665,n=873,cpus=3+4+5+6+7
+A,glm,rows,threads=6,dram,GBps=20.166,expert_ms=0.5722,expert_ms_p90=0.5917,experts_per_s=1728.7,piece_MB=11.665,n=1038,cpus=3+4+5+6+7+0
+A,glm,rows,threads=7,dram,GBps=22.989,expert_ms=0.4971,expert_ms_p90=0.5275,experts_per_s=1970.7,piece_MB=11.665,n=1183,cpus=3+4+5+6+7+0+1
+A,glm,rows,threads=8,dram,GBps=26.171,expert_ms=0.4397,expert_ms_p90=0.4579,experts_per_s=2243.5,piece_MB=11.665,n=1347,cpus=3+4+5+6+7+0+1+2
+# selfcheck iq3_s  expert=11663520 B (gate/up 2209 rows iq3_s, down 4418 rows iq3_s) g[0]=60.96 u[0]=6.433 o[0]=-4962 mean|o|=7534 finite=1
+# iq3_s: filled 368 pieces of 11663520 B in 0.13 s, AnonHugePages=4194304 kB
+A,iq3_s,whole,threads=1,cache,GBps=2.559,expert_ms=0.8182,expert_ms_p90=0.8225,experts_per_s=1220.9,piece_MB=2.096,n=1221,cpus=3
+A,iq3_s,whole,threads=2,cache,GBps=5.106,expert_ms=0.8205,expert_ms_p90=0.8244,experts_per_s=2435.8,piece_MB=2.096,n=2436,cpus=3+4
+A,iq3_s,whole,threads=3,cache,GBps=7.661,expert_ms=0.8194,expert_ms_p90=0.8245,experts_per_s=3654.8,piece_MB=2.096,n=3655,cpus=3+4+5
+A,iq3_s,whole,threads=4,cache,GBps=10.212,expert_ms=0.8209,expert_ms_p90=0.8248,experts_per_s=4871.7,piece_MB=2.096,n=4872,cpus=3+4+5+6
+A,iq3_s,whole,threads=5,cache,GBps=12.763,expert_ms=0.8197,expert_ms_p90=0.8248,experts_per_s=6088.6,piece_MB=2.096,n=6089,cpus=3+4+5+6+7
+A,iq3_s,whole,threads=6,cache,GBps=15.318,expert_ms=0.8202,expert_ms_p90=0.8246,experts_per_s=7307.5,piece_MB=2.096,n=7308,cpus=3+4+5+6+7+0
+A,iq3_s,whole,threads=7,cache,GBps=17.866,expert_ms=0.8198,expert_ms_p90=0.8256,experts_per_s=8523.4,piece_MB=2.096,n=8524,cpus=3+4+5+6+7+0+1
+A,iq3_s,whole,threads=8,cache,GBps=20.428,expert_ms=0.8197,expert_ms_p90=0.8244,experts_per_s=9745.4,piece_MB=2.096,n=9746,cpus=3+4+5+6+7+0+1+2
+A,iq3_s,rows,threads=1,cache,GBps=2.559,expert_ms=0.8190,expert_ms_p90=0.8233,experts_per_s=1220.7,piece_MB=2.096,n=733,cpus=3
+A,iq3_s,rows,threads=2,cache,GBps=4.889,expert_ms=0.4247,expert_ms_p90=0.4310,experts_per_s=2332.3,piece_MB=2.096,n=1400,cpus=3+4
+A,iq3_s,rows,threads=3,cache,GBps=7.232,expert_ms=0.2851,expert_ms_p90=0.2934,experts_per_s=3450.1,piece_MB=2.096,n=2071,cpus=3+4+5
+A,iq3_s,rows,threads=4,cache,GBps=9.439,expert_ms=0.2192,expert_ms_p90=0.2257,experts_per_s=4502.8,piece_MB=2.096,n=2702,cpus=3+4+5+6
+A,iq3_s,rows,threads=5,cache,GBps=11.598,expert_ms=0.1768,expert_ms_p90=0.1847,experts_per_s=5532.8,piece_MB=2.096,n=3320,cpus=3+4+5+6+7
+A,iq3_s,rows,threads=6,cache,GBps=13.687,expert_ms=0.1503,expert_ms_p90=0.1579,experts_per_s=6529.6,piece_MB=2.096,n=3918,cpus=3+4+5+6+7+0
+A,iq3_s,rows,threads=7,cache,GBps=15.668,expert_ms=0.1310,expert_ms_p90=0.1381,experts_per_s=7474.8,piece_MB=2.096,n=4485,cpus=3+4+5+6+7+0+1
+A,iq3_s,rows,threads=8,cache,GBps=17.085,expert_ms=0.1173,expert_ms_p90=0.1267,experts_per_s=8150.7,piece_MB=2.096,n=4891,cpus=3+4+5+6+7+0+1+2
+A,iq3_s,whole,threads=1,dram,GBps=2.566,expert_ms=4.5278,expert_ms_p90=4.5404,experts_per_s=220.0,piece_MB=11.664,n=220,cpus=3
+A,iq3_s,whole,threads=2,dram,GBps=5.120,expert_ms=4.5411,expert_ms_p90=4.5551,experts_per_s=439.0,piece_MB=11.664,n=439,cpus=3+4
+A,iq3_s,whole,threads=3,dram,GBps=7.697,expert_ms=4.5363,expert_ms_p90=4.5581,experts_per_s=659.9,piece_MB=11.664,n=660,cpus=3+4+5
+A,iq3_s,whole,threads=4,dram,GBps=10.263,expert_ms=4.5439,expert_ms_p90=4.5588,experts_per_s=879.9,piece_MB=11.664,n=880,cpus=3+4+5+6
+A,iq3_s,whole,threads=5,dram,GBps=12.817,expert_ms=4.5405,expert_ms_p90=4.5643,experts_per_s=1098.9,piece_MB=11.664,n=1099,cpus=3+4+5+6+7
+A,iq3_s,whole,threads=6,dram,GBps=15.406,expert_ms=4.5409,expert_ms_p90=4.5584,experts_per_s=1320.9,piece_MB=11.664,n=1321,cpus=3+4+5+6+7+0
+A,iq3_s,whole,threads=7,dram,GBps=17.948,expert_ms=4.5358,expert_ms_p90=4.5625,experts_per_s=1538.8,piece_MB=11.664,n=1539,cpus=3+4+5+6+7+0+1
+A,iq3_s,whole,threads=8,dram,GBps=20.514,expert_ms=4.5382,expert_ms_p90=4.5587,experts_per_s=1758.8,piece_MB=11.664,n=1759,cpus=3+4+5+6+7+0+1+2
+A,iq3_s,rows,threads=1,dram,GBps=2.573,expert_ms=4.5305,expert_ms_p90=4.5421,experts_per_s=220.6,piece_MB=11.664,n=200,cpus=3
+A,iq3_s,rows,threads=2,dram,GBps=5.023,expert_ms=2.3159,expert_ms_p90=2.3228,experts_per_s=430.7,piece_MB=11.664,n=259,cpus=3+4
+A,iq3_s,rows,threads=3,dram,GBps=7.497,expert_ms=1.5539,expert_ms_p90=1.5613,experts_per_s=642.8,piece_MB=11.664,n=386,cpus=3+4+5
+A,iq3_s,rows,threads=4,dram,GBps=9.889,expert_ms=1.1754,expert_ms_p90=1.1819,experts_per_s=847.9,piece_MB=11.664,n=509,cpus=3+4+5+6
+A,iq3_s,rows,threads=5,dram,GBps=12.261,expert_ms=0.9469,expert_ms_p90=0.9524,experts_per_s=1051.3,piece_MB=11.664,n=631,cpus=3+4+5+6+7
+A,iq3_s,rows,threads=6,dram,GBps=14.608,expert_ms=0.7942,expert_ms_p90=0.8003,experts_per_s=1252.5,piece_MB=11.664,n=752,cpus=3+4+5+6+7+0
+A,iq3_s,rows,threads=7,dram,GBps=16.869,expert_ms=0.6862,expert_ms_p90=0.6934,experts_per_s=1446.3,piece_MB=11.664,n=868,cpus=3+4+5+6+7+0+1
+A,iq3_s,rows,threads=8,dram,GBps=19.184,expert_ms=0.6037,expert_ms_p90=0.6097,experts_per_s=1644.8,piece_MB=11.664,n=987,cpus=3+4+5+6+7+0+1+2
+# selfcheck q6_k   expert=11662560 B (gate/up 1157 rows q6_k, down 2314 rows q6_k) g[0]=2855 u[0]=-1279 o[0]=-3.182e+04 mean|o|=7.475e+04 finite=1
+# q6_k: filled 368 pieces of 11662560 B in 0.12 s, AnonHugePages=4194304 kB
+A,q6_k,whole,threads=1,cache,GBps=21.216,expert_ms=0.0982,expert_ms_p90=0.1021,experts_per_s=10119.0,piece_MB=2.097,n=10120,cpus=3
+A,q6_k,whole,threads=2,cache,GBps=42.639,expert_ms=0.0978,expert_ms_p90=0.1016,experts_per_s=20336.6,piece_MB=2.097,n=20338,cpus=3+4
+A,q6_k,whole,threads=3,cache,GBps=63.956,expert_ms=0.0976,expert_ms_p90=0.1016,experts_per_s=30504.0,piece_MB=2.097,n=30506,cpus=3+4+5
+A,q6_k,whole,threads=4,cache,GBps=85.200,expert_ms=0.0978,expert_ms_p90=0.1018,experts_per_s=40636.2,piece_MB=2.097,n=40639,cpus=3+4+5+6
+A,q6_k,whole,threads=5,cache,GBps=106.661,expert_ms=0.0976,expert_ms_p90=0.1015,experts_per_s=50872.6,piece_MB=2.097,n=50876,cpus=3+4+5+6+7
+A,q6_k,whole,threads=6,cache,GBps=128.287,expert_ms=0.0970,expert_ms_p90=0.1014,experts_per_s=61186.8,piece_MB=2.097,n=61191,cpus=3+4+5+6+7+0
+A,q6_k,whole,threads=7,cache,GBps=148.921,expert_ms=0.0977,expert_ms_p90=0.1018,experts_per_s=71028.2,piece_MB=2.097,n=71033,cpus=3+4+5+6+7+0+1
+A,q6_k,whole,threads=8,cache,GBps=168.808,expert_ms=0.0982,expert_ms_p90=0.1024,experts_per_s=80513.4,piece_MB=2.097,n=80519,cpus=3+4+5+6+7+0+1+2
+A,q6_k,rows,threads=1,cache,GBps=21.211,expert_ms=0.0983,expert_ms_p90=0.1020,experts_per_s=10116.5,piece_MB=2.097,n=6070,cpus=3
+A,q6_k,rows,threads=2,cache,GBps=34.441,expert_ms=0.0594,expert_ms_p90=0.0619,experts_per_s=16426.9,piece_MB=2.097,n=9857,cpus=3+4
+A,q6_k,rows,threads=3,cache,GBps=46.009,expert_ms=0.0443,expert_ms_p90=0.0463,experts_per_s=21944.0,piece_MB=2.097,n=13167,cpus=3+4+5
+A,q6_k,rows,threads=4,cache,GBps=54.234,expert_ms=0.0375,expert_ms_p90=0.0389,experts_per_s=25867.2,piece_MB=2.097,n=15521,cpus=3+4+5+6
+A,q6_k,rows,threads=5,cache,GBps=57.228,expert_ms=0.0355,expert_ms_p90=0.0392,experts_per_s=27295.1,piece_MB=2.097,n=16378,cpus=3+4+5+6+7
+A,q6_k,rows,threads=6,cache,GBps=61.848,expert_ms=0.0324,expert_ms_p90=0.0351,experts_per_s=29498.4,piece_MB=2.097,n=17700,cpus=3+4+5+6+7+0
+A,q6_k,rows,threads=7,cache,GBps=66.698,expert_ms=0.0301,expert_ms_p90=0.0316,experts_per_s=31812.0,piece_MB=2.097,n=19088,cpus=3+4+5+6+7+0+1
+A,q6_k,rows,threads=8,cache,GBps=70.809,expert_ms=0.0278,expert_ms_p90=0.0309,experts_per_s=33772.5,piece_MB=2.097,n=20264,cpus=3+4+5+6+7+0+1+2
+A,q6_k,whole,threads=1,dram,GBps=12.186,expert_ms=0.9567,expert_ms_p90=0.9614,experts_per_s=1044.9,piece_MB=11.663,n=1045,cpus=3
+A,q6_k,whole,threads=2,dram,GBps=25.212,expert_ms=0.9240,expert_ms_p90=0.9320,experts_per_s=2161.8,piece_MB=11.663,n=2162,cpus=3+4
+A,q6_k,whole,threads=3,dram,GBps=36.792,expert_ms=0.9513,expert_ms_p90=0.9657,experts_per_s=3154.7,piece_MB=11.663,n=3155,cpus=3+4+5
+A,q6_k,whole,threads=4,dram,GBps=48.746,expert_ms=0.9563,expert_ms_p90=0.9785,experts_per_s=4179.7,piece_MB=11.663,n=4180,cpus=3+4+5+6
+A,q6_k,whole,threads=5,dram,GBps=59.381,expert_ms=0.9822,expert_ms_p90=0.9948,experts_per_s=5091.6,piece_MB=11.663,n=5092,cpus=3+4+5+6+7
+A,q6_k,whole,threads=6,dram,GBps=69.713,expert_ms=1.0053,expert_ms_p90=1.0221,experts_per_s=5977.5,piece_MB=11.663,n=5978,cpus=3+4+5+6+7+0
+A,q6_k,whole,threads=7,dram,GBps=78.587,expert_ms=1.0397,expert_ms_p90=1.0550,experts_per_s=6738.4,piece_MB=11.663,n=6739,cpus=3+4+5+6+7+0+1
+A,q6_k,whole,threads=8,dram,GBps=86.727,expert_ms=1.0737,expert_ms_p90=1.0887,experts_per_s=7436.3,piece_MB=11.663,n=7437,cpus=3+4+5+6+7+0+1+2
+A,q6_k,rows,threads=1,dram,GBps=12.049,expert_ms=0.9561,expert_ms_p90=0.9631,experts_per_s=1033.2,piece_MB=11.663,n=620,cpus=3
+A,q6_k,rows,threads=2,dram,GBps=24.097,expert_ms=0.4778,expert_ms_p90=0.4849,experts_per_s=2066.1,piece_MB=11.663,n=1240,cpus=3+4
+A,q6_k,rows,threads=3,dram,GBps=34.031,expert_ms=0.3379,expert_ms_p90=0.3443,experts_per_s=2917.9,piece_MB=11.663,n=1751,cpus=3+4+5
+A,q6_k,rows,threads=4,dram,GBps=44.016,expert_ms=0.2618,expert_ms_p90=0.2679,experts_per_s=3774.2,piece_MB=11.663,n=2265,cpus=3+4+5+6
+A,q6_k,rows,threads=5,dram,GBps=52.681,expert_ms=0.2181,expert_ms_p90=0.2238,experts_per_s=4517.1,piece_MB=11.663,n=2711,cpus=3+4+5+6+7
+A,q6_k,rows,threads=6,dram,GBps=60.421,expert_ms=0.1900,expert_ms_p90=0.1995,experts_per_s=5180.7,piece_MB=11.663,n=3109,cpus=3+4+5+6+7+0
+A,q6_k,rows,threads=7,dram,GBps=67.500,expert_ms=0.1710,expert_ms_p90=0.1763,experts_per_s=5787.8,piece_MB=11.663,n=3473,cpus=3+4+5+6+7+0+1
+A,q6_k,rows,threads=8,dram,GBps=73.581,expert_ms=0.1564,expert_ms_p90=0.1629,experts_per_s=6309.2,piece_MB=11.663,n=3786,cpus=3+4+5+6+7+0+1+2
+A_DONE rc=0

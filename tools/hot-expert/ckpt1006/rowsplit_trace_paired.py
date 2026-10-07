@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """rowsplit_trace_paired.py -- index-aligned per-token wall of four rocprof decode traces (glm_rowsplit_trace_seq.sh: rowsplit 0, 1, 1, 0 -> ~/bench/franken/glm5/dtrace_rs{0_1,1_2,1_3,0_4}); run ON THE RIG (it imports decode_trace_report from ~/src/colibri/tools/hot-expert/ckpt1006).
 A token counts only if both same-flag pairs agree within 1 ms and none exceeds 100 ms (the 100-320 ms hiccup tokens are placement-swap rounds that land on different tokens in different runs); the other tokens give the paired on-off difference. 2026-10-07: 17 of 24 usable, median -1.66 ms; the 15 cleanest tokens -1.68 ms (SE 0.13)."""
+import sys, statistics as st
 sys.path.insert(0, "/home/ronald/src/colibri/tools/hot-expert/ckpt1006")
 import decode_trace_report as r
 def walls(name):
@@ -9,7 +10,8 @@ def walls(name):
     last = [a for a in agents if a != "Agent 0"][-1]
     ends = [k[1] for k in ks if k[2] == last and k[3] == "k_glm5_hc_mean"]
     return [(ends[i] - ends[i - 1]) / 1e6 for i in range(len(ends) - 24, len(ends))]   # ms
-o1, n2, n3, o4 = (walls(x) for x in ("rs0_1", "rs1_2", "rs1_3", "rs0_4"))
+ARMS = sys.argv[1:5] if len(sys.argv) >= 5 else ["rs0_1", "rs1_2", "rs1_3", "rs0_4"]      # trace dir suffixes after dtrace_: off, on, on, off (group traces: gr0_1 gr1_2 gr1_3 gr0_4)
+o1, n2, n3, o4 = (walls(x) for x in ARMS)
 rows = []
 for i in range(24):
     ok = abs(o1[i] - o4[i]) < 1.0 and abs(n2[i] - n3[i]) < 1.0 and max(o1[i], o4[i], n2[i], n3[i]) < 100

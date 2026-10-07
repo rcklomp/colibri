@@ -57,6 +57,16 @@ The two roadmaps below are both finished; they are history and rules, not a to-d
 4. `git log` on the branch you are on. Commit bodies carry the numbers
    behind every landed change; the history is the benchmark archive.
 
+## Closing a task (rule since 2026-10-07 -- the owner had to ask for it after EVERY finished task)
+
+Before the final message of any task that changed code, docs, scripts, the rig or the installed binary, run the **`task-closeout` skill** (canonical copy
+`tools/hot-expert/skills/task-closeout/SKILL.md`, installed in `~/.claude/skills/`) without being asked: `bash tools/hot-expert/closeout_check.sh --full` checks repo sync
+(Mac / Gitea / rig for colibri and franken-engine), clean trees, `doc_currency.sh`, that the handoff names the installed serving binary, the rig's state, drifted `~/bench` script
+copies, the skill/hook install and the memory index; then fix every FAIL, read the governance docs through (plan Rev, record section at the end, handoff, this file, memory), clean
+up, and report plainly what was verified and what was not. A **Stop hook** (`tools/hot-expert/closeout_stop_hook.sh`, registered in `~/.claude/settings.json`) runs the quick check
+when a turn ends and blocks the stop when a repo is unsynced or dirty and the rig is idle (never while a rig job runs, never twice in a row, only for sessions in `~/Projects`).
+The public GitHub fork is never pushed by this: report its lag, push only on the owner's go-ahead after the secret scan.
+
 ## Where sessions run
 
 Claude Code sessions run on the owner's Mac in a checkout of this repo

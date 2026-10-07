@@ -14,6 +14,18 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 87 (2026-10-07 03:20 CEST) -- DECODE -8.2 % MORE: THE SEPARATE REDUCE ONE WAVE A ROW (`k_reduce_splits_gemm_w`), BIT-EXACT; FETCH-ASSIGN
+> BUILT, EXACT, NO MEASURABLE GAIN (record §L5-GLM-GEMV-REDUCE addendum).** A second trace showed the new hot spot of rev 86's change: the thread-per-row reduce
+> (278 launches a token, ~20 us each, 5.5 ms; up to 512 dependent loads a row). One wave a row, the lanes loading the partials in parallel into LDS, lane 0 summing
+> them in the same order: A 68.23 -> B 62.62 ms/token in one process (A,B,C,D,D,C,B,A); both landed changes together ~-10.5 % against the installed build
+> (14.3 -> 16.0 tok/s). franken-engine main `24b2826`. `--fetch-assign optimal` (an optimal split of a layer's missed slabs over the three cards by miss count,
+> simulated -8.6 % of the critical fetch) is exact but shows nothing on top of B (D/B 0.997): off by default. Process: `run_chain.sh` now runs a private copy of the chain
+> script (an scp over a running chain made bash read the new file mid-run), the staged-prefill gate line goes last. **The build carrying both changes passed acceptance and is INSTALLED
+> (2026-10-07 03:35 CEST): `~/bench/franken_bin/franken_dec_glm` = `franken_dec_glm.wr`, sha256 `11acdb9135664f19`, franken-engine `24b2826`; `accept_live` PASS (warm new chat
+> 0.89 s, 4 548 of 4 576 tokens reused; follow-up turn 1.2 s; a request behind an abandoned one 1.4 s; ledger 0 mismatches), `accept_ui` browser first token 1.31 s on both
+> chats; rollback `franken_dec_glm.final` (sha 90f5e845306f79e0). The service is still off (rig reserved).** Open decode levers, by size: the
+> trunk GEMVs and the remaining reduce (the 24-row matrices ~10 us each), the critical fetch (~35 ms of ~63: a finer split of the missed experts over the links up to ~8 ms).
+>
 > **Rev 86 (2026-10-07 02:20 CEST) -- DECODE -4.7 % FOR FREE: THE SPLIT-GEMV REDUCE AS A SEPARATE LAUNCH (record §L5-GLM-GEMV-REDUCE),
 > BIT-EXACT, A FLAG; GLM DEFAULT NOW.** The decode trace (§L5-GLM-DECODE-TRACE) showed the K-split trunk GEMVs costing ~10 us + 0.1 us x nsplit
 > (the 512-split hc_*_fn GEMVs: 62 us for 0.4 MB, 5.6 ms a token): the fused reduce's one atomic counter per output row serialises. The other path

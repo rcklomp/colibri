@@ -137,6 +137,18 @@ newhome r5; fake_http; fake_server; sleep 1; rc_run FAKE_SA_RC=1
 check "200 but no engine behind the server: treated as down and restored" 'outq "treating as down" && calls | grep -q "serve_alt franken-glm"'
 kill -9 "$FHTTP" "$FSRV" 2>/dev/null; wait "$FHTTP" "$FSRV" 2>/dev/null; sleep 1
 
+echo "== 11b. run_chain.sh runs a private copy: overwriting the chain script while it runs must not change what runs (2026-10-07: an scp over a running chain made bash resume in the middle of the new file, rc=127)"
+newhome r6; touch "$T/bench/.dev_reserved"
+printf '#!/bin/bash\nsleep 3\necho OLD_SECOND_PART\necho OLD_THIRD_PART\nexit 0\n' > "$T/chain_ow.sh"; chmod +x "$T/chain_ow.sh"
+( env HOME="$T" SERVICE_SERVE_ALT="$T/fake_serve_alt.sh" SERVICE_FRANKEN_LOG="$T/franken.log" SERVICE_WAIT_STEPS=3 SERVICE_POLL=1 \
+    bash "$T/bench/run_chain.sh" "$T/chain_ow.sh" > "$T/out" 2>&1; echo $? > "$T/rc" ) &
+OWPID=$!; sleep 1
+# the same write an scp makes: truncate and rewrite IN PLACE (same inode), different length, different lines
+{ printf '#!/bin/bash\n# a replacement written while the old one is running: padding padding padding padding padding padding padding padding\n'; printf 'echo NEW_SCRIPT_LINE\nexit 7\n'; } > "$T/chain_ow.sh"
+wait "$OWPID"
+check "the old chain ran to its end (OLD_THIRD_PART), the replacement did not" 'outq "OLD_THIRD_PART" && ! outq "NEW_SCRIPT_LINE" && [ "$(cat "$T/rc")" = 0 ]'
+check "the private copy is gone afterwards" '! ls "$T"/.run_chain.* >/dev/null 2>&1'
+
 echo "== 12. serve_alt.sh restore_glm honours SERVE_ALT_NO_OLD_FALLBACK (functions sourced, every effect stubbed)"
 SA=$ROOT/serve_alt_funcs.sh; sed '/^case "\${1:-}" in/,$d' "$HERE/serve_alt.sh" > "$SA"; cp "$HERE/rig_lock.sh" "$ROOT/"
 unit() {   # unit <home-name> <flag 0|1> <env fallback 0|1> -> prints the call log

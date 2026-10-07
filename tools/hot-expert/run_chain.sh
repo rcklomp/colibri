@@ -16,10 +16,17 @@ CHAIN=${1:?a chain script}; shift || true
 NAME=$(basename "$CHAIN" .sh)
 
 rig_lock_take "$NAME" || exit 3
-trap 'rig_lock_release' EXIT INT TERM
+# The chain runs from a PRIVATE COPY, next to the original (so `dirname $0` still resolves): bash reads a script incrementally, so
+# overwriting a running chain (an scp, a cp, an editor) made it resume in the middle of the NEW file -- on 2026-10-07 a chain whose
+# engine had just died carried on into garbage (`line 47: ama-glm53/build-hip/bin: No such file`, rc=127) and reported a death in
+# setup. With the copy, a chain script can be replaced at any time; RUN_CHAIN_ORIG names the original for a chain that wants it.
+SNAP="$(dirname "$CHAIN")/.run_chain.$NAME.$$.sh"
+cp -p "$CHAIN" "$SNAP" 2>/dev/null && chmod +x "$SNAP" || SNAP="$CHAIN"
+trap '[ "$SNAP" != "$CHAIN" ] && rm -f "$SNAP"; rig_lock_release' EXIT INT TERM
+export RUN_CHAIN_ORIG="$CHAIN"
 
 echo "=== run_chain $NAME $(date +%Y-%m-%dT%H:%M:%S%z) (lock held by $(rig_lock_holder))"
-"$CHAIN" "$@"; rc=$?
+"$SNAP" "$@"; rc=$?
 echo "=== run_chain $NAME exited rc=$rc $(date +%Y-%m-%dT%H:%M:%S%z)"
 
 # Whatever the chain decided, the owner's service must be up when we let go of the lock -- unless the rig is reserved.

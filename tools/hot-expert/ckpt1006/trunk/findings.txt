@@ -1,0 +1,65 @@
+GLM decode trunk GEMVs (k_gemm_batch<1,4>), offline analysis of dtrace_wr (repeat: dtrace_optimal, dtrace_pattern2), last 12 decode tokens
+Scripts (stdlib): trunk_gemv_table.py TRACE N | moe_shexp_crit.py TRACE N [--dump] | hc_bimodal.py TRACE | gguf_tensors.py SHARDS (types/bytes from the GGUF header)
+Outputs: out_wr.txt out_optimal.txt out_pattern2.txt moe_all.txt tensors.tsv
+
+1. TOTAL  662 launches/token, 18.90 ms (wr) / 18.50 (optimal) / 18.79 (pattern2); 8.600 GB/token through k_gemm_batch
+   (8.080 trunk + 0.520 head) = 455 GB/s. Floor at 800 GB/s 10.75 ms, at 650 GB/s 13.23 ms.
+   Record's "8.3 GB" ~= 8.08 + wk_b/wv_b 0.196 GB (those run in k_glm5_head_gemv_q8, 22/token, 0.58 ms, 338 GB/s) -- inference.
+   Every GLM trunk GEMV is a batch of ONE (Ds4Ops::gemv -> g_.gemv); b.n > 1 never occurs in GLM decode.
+   All trunk matrices Q8_0 except gate_inp, idx_proj (F32) and the head (Q6_K). VGPR 88 (16 waves/SIMD) for every launch.
+
+2. MAPPING (parsed by launch order, 662/662 mapped; grid in work-items, nsplit = gridX/256, row groups = gridY)
+   matrix      rows   K     fmt   MB    nsplit rg    n/tok med us  ms/tok GB/s %800
+   kda_q/k/v   8192  4096   Q8_0 35.65  1   1024   3x34  52-54  5.41   661-681 83-85
+   kda_o       4096  8192   Q8_0 35.65  1    512    34   59.8   2.05   591  74
+   dsa_o       4096 16384   Q8_0 71.30  1    512    11  108.8   1.21   648  81
+   dsa_q_b    16384  1536   Q8_0 26.74  1   2048    11   37.1   0.41   714  89
+   dsa_q_a     1536  4096   Q8_0  6.68  1    192    11   14.2   0.16   466  58
+   idx_q_b     4096  1536   Q8_0  6.68  1    512    11   13.1   0.15   505  63
+   dense up/gate 12288 4096 Q8_0 53.48  1   1536   2x3  74-76  0.48   668-677 84
+   dense_down  4096 12288   Q8_0 53.48  1    512     3   79.4   0.25   638  80
+   head      154880  4096   Q6_K 520.4  1  19360     1  718.3   0.72   722  90
+   sh_up/gate  2048  4096   Q8_0  8.91  1    256   2x42 24/49  3.09   190-335 (clean sh_gate 17.3 us = 515)
+   sh_down     4096  2048   Q8_0  8.91  1    512    42   29.8   1.26   297 (clean 16.4 us = 543)
+   hc_attn/ffn_fn 24 16384  Q8_0  0.42 512      3  2x45   9.4   1.09   34   (p90 21.5: 22 % of launches ~21 us, unexplained)
+   f_a/g_a/idx_k/idx_gate 128 4096 Q8_0 0.56 128 16 90  11.3   1.04   48
+   kda_beta      64  4096   Q8_0  0.28 128      8    34    7.4   0.26   37
+   idx_proj      32  4096   F32   0.52 128      4    11    5.6   0.06   93
+   dsa_kv_a     512  4096   Q8_0  2.23  32     64    11   12.6   0.14  175
+   gate_inp     288  4096   F32   4.72  57     36    42   13.3   0.58  343
+   f_b/g_b     8192   128   Q8_0  1.11   1   1024  2x34  7.8-8.2 0.55 134-139
+   counts: hc 90 + KDA 9x34 + DSA 8x11 (scoring on) + dense 3x3 + MoE 4x42 + head 1 = 662.
+   + k_reduce_splits_gemm_w 278/token x 4.8 us = 1.35 ms (one per split launch).
+
+3. FITS
+   split GEMVs and f_b/g_b (< 3 MB): t = 4.0 us + 3.62 us per 1000 workgroups, rms 0.3 us, identical on all 3 traces.
+     -> they are workgroup-count bound, not byte bound; GEMV_TARGET_WGS 2048 sets ~11.4 us. The record's
+        "10 us + 0.1 us x nsplit" is gone (nsplit coefficient -0.004 us now: it was the fused atomic counter).
+   unsplit, clean (no sh_*): t = 4.2 us + 1.353 us/MB (739 GB/s marginal) excluding kda_o/dsa_o; those two sit ~8-10 us
+     above the line (512 row groups x 8 waves = 4096 waves = 1.33 rounds of 3072 resident waves: tail).
+   launch floor: 662 x 4.0 us = 2.6 ms kernel intercept + 662 x 3.3 us gap = 2.2 ms; bandwidth part 10.75 ms.
+
+4. CANDIDATES (savings per token, summed over the sequential cards; estimates, not measured)
+   NOT A LEVER: sh_up/gate/down = 4.35 ms of the 18.9 but run beside the owner's own k_glm5_stage (79-100 % overlapped,
+     2-3x slower than clean). moe_shexp_crit.py: the work the owner's main queue launched before its stage ended
+     finishes a median 389 us BEFORE the stage ends (later than it in only 105/504 layers, p90 +10 us); bound on what a faster shared expert saves: 0.02 ms/token
+     (all 3 traces). The "18.9 ms" overstates the critical GEMV time by ~2.2 ms.
+   A+ split GEMVs, exact restructure (nsplit unchanged, each partial computed by the same code, summed s = 0.. in order
+     from 0.0f inside the kernel): WG per row (or per 8 rows), each wave loops over a range of splits, partials in LDS,
+     lane 0 sums in s order, epilogue; no k_reduce_splits_gemm_w, no part[] round trip. 278 split launches today cost
+     3.17 + 1.35 (reduce) + 0.92 (reduce gaps) = 5.4 ms. Assumed ~5-6 us a launch afterwards -> -2.5 to -3.7 ms.
+     A (multi-split waves, reduce launch kept): -1.0 to -1.5 ms. f_b/g_b several rows a wave: -0.2 ms.
+     Step 0 (timing only, ORDER-CHANGING, not to ship): GEMV_TARGET_WGS as a runtime knob, 2048 vs 256, to see whether
+     the 3.6 ns/WG law extrapolates down.
+   B merges of GEMVs on the same x (bit-exact when each member's solo nsplit equals the batch's):
+     kda q+k+v (ns 1): -0.3 to -0.6 ms, 68 launches. kda f_a+beta+g_a, dsa idx_k+idx_gate+idx_proj (all ns 128 = units,
+     one Q8_0 block a split; the host formula would give 52 / 57 for the concatenation -> must FORCE 128, else
+     ORDER-CHANGING): alone -1.0 / -0.33 ms; on top of A+ ~-0.4 ms. dsa q_b+idx_q_b -0.05, dense up+gate -0.015,
+     sh up+gate ~0 (hidden). Not mergeable exactly: dsa_q_a (ns 1) with kv_a (ns 32); gate_inp (ns 57).
+   E kda_o / dsa_o tail (1.33 waves): run a row's four accumulator chains (blocks g = u mod 4) on four waves and
+     combine (a0+a1)+(a2+a3) then wave_sum as today: exact by construction; -0.3 to -0.5 ms; higher risk.
+   C second stream for the KDA f/g/beta chain: dominated by A+/B; §M5 31 us a cross-stream dependency eats it.
+   F --hip-graph: GPU gap before a k_gemm_batch median 3.3 us p90 4.5 (all kernels 3.4 / 4.3-5.3) after short and long
+     kernels alike -> the command processor's dependent-dispatch latency, the host is ahead (inference). Upper bound if
+     gaps -> 2 us: -1.25 ms (GEMV gaps only). Expected from graphs: ~0 (GLM step5 "buys nothing"; DS4 graph+adapt +40 ms).
+   G --gemv-lds 0|1 for GLM (backend knob exists, CLI not plumbed): exact, sign unknown, +-0.5 ms.

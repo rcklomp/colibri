@@ -1,0 +1,15 @@
+== dtrace_wr
+own stage present  n  504  sh GEMVs med 104.9 us (sum 4.35 ms/tok)  main busy med 354.3  main idle med 562.6 p10 220.8  main_end - max(own stage, helpers) med -112.8 p90 144.0  sh overlapping own stage med 3 of 3
+layers where the owner's main queue ends last: 228 (19.0/token); by how much (us): med 99.9 p90 157.0; sum over them of min(margin, sh time) 1.71 ms/token
+main-queue work launched before the own stage ends, minus the stage end (us): med -388.8 p90 10.0; layers > 0: 105/504
+upper bound of what a faster shared expert can save (min(pre_end - stage_end, main_end - helpers_end, sh time) summed): 0.02 ms/token
+== dtrace_optimal
+own stage present  n  504  sh GEMVs med 76.0 us (sum 4.02 ms/tok)  main busy med 356.2  main idle med 463.3 p10 215.7  main_end - max(own stage, helpers) med 30.6 p90 95.3  sh overlapping own stage med 3 of 3
+layers where the owner's main queue ends last: 265 (22.1/token); by how much (us): med 73.3 p90 149.5; sum over them of min(margin, sh time) 1.52 ms/token
+main-queue work launched before the own stage ends, minus the stage end (us): med -221.9 p90 11.2; layers > 0: 154/504
+upper bound of what a faster shared expert can save (min(pre_end - stage_end, main_end - helpers_end, sh time) summed): 0.02 ms/token
+== dtrace_pattern2
+own stage present  n  504  sh GEMVs med 104.6 us (sum 4.31 ms/tok)  main busy med 353.1  main idle med 567.2 p10 215.8  main_end - max(own stage, helpers) med -113.1 p90 142.7  sh overlapping own stage med 3 of 3
+layers where the owner's main queue ends last: 227 (18.9/token); by how much (us): med 91.7 p90 157.9; sum over them of min(margin, sh time) 1.69 ms/token
+main-queue work launched before the own stage ends, minus the stage end (us): med -390.3 p90 10.0; layers > 0: 105/504
+upper bound of what a faster shared expert can save (min(pre_end - stage_end, main_end - helpers_end, sh time) summed): 0.02 ms/token

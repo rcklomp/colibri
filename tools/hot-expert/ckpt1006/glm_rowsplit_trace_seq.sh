@@ -5,10 +5,10 @@
 # the kernel-level quantities (the split GEMVs' own time, the layer_a / tail segments of decode_trace_report.py, per-token kernel sums) have a noise floor far below the wall clock's.
 # Launch: setsid nohup ~/bench/glm_rowsplit_trace_seq.sh > ~/bench/glm_rowsplit_trace_seq.log 2>&1 < /dev/null &   (it calls run_chain.sh itself: one lock per arm)
 #   watch: ckpt1006/watch_chain.sh ~/bench/glm_rowsplit_trace_seq.log      then:  python3 -I ckpt1006/decode_trace_report.py ~/bench/franken/glm5/dtrace_rs0 --tokens 20   (and rs1)
-# Env: TS_BIN (default the rowsplit worktree's franken_decode_glm_rowsplit), TS_TOKENS (decode tokens traced, default 24), TS_ARMS (default "0 1 1 0").
+# Env: TS_BIN (default ~/bench/franken_bin/franken_decode_glm.rowsplit), TS_TOKENS (decode tokens traced, default 24), TS_ARMS (default "0 1 1 0").
 set -u
 . "$HOME/bench/chain_preflight.sh"
-BIN=${TS_BIN:-$HOME/src/franken-engine-rowsplit/franken/decode/franken_decode_glm_rowsplit}
+BIN=${TS_BIN:-$HOME/bench/franken_bin/franken_decode_glm.rowsplit}
 N=${TS_TOKENS:-24}
 echo "=== glm_rowsplit_trace_seq start $(date -Is) bin=$(sha256sum "$BIN" 2>/dev/null | cut -c1-16) arms=${TS_ARMS:-0 1 1 0}"
 i=0

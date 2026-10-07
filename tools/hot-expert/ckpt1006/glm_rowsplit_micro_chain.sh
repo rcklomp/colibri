@@ -9,10 +9,10 @@
 # Launch through run_chain.sh, watch with ckpt1006/watch_chain.sh <chain log> <bench log>:
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_rowsplit_micro_chain.sh > ~/bench/glm_rowsplit_micro_chain.log 2>&1 < /dev/null &
 #   watch: ckpt1006/watch_chain.sh ~/bench/glm_rowsplit_micro_chain.log ~/bench/franken/glm5/rowsplit_micro/bench.log
-# Env: RSM_ENV (extra docker -e options, e.g. "-e AMD_LOG_LEVEL=3"), RSM_ARGS (bench arguments, e.g. --exact-only), RSM_TIMEOUT (s, default 900; the bench container is killed after it), RSM_BIN (default the worktree's bench_rowsplit, `make -C franken/decode bench-rowsplit`), RSM_OUT (default ~/bench/franken/glm5/rowsplit_micro).
+# Env: RSM_ENV (extra docker -e options, e.g. "-e AMD_LOG_LEVEL=3"), RSM_ARGS (bench arguments, e.g. --exact-only), RSM_TIMEOUT (s, default 900; the bench container is killed after it), RSM_BIN (default ~/bench/franken_bin/bench_rowsplit, `make -C franken/decode bench-rowsplit`), RSM_OUT (default ~/bench/franken/glm5/rowsplit_micro).
 set -u
 . "$HOME/bench/chain_preflight.sh"
-BIN=${RSM_BIN:-$HOME/src/franken-engine-rowsplit/franken/decode/bench_rowsplit}
+BIN=${RSM_BIN:-$HOME/bench/franken_bin/bench_rowsplit}
 O=${RSM_OUT:-$HOME/bench/franken/glm5/rowsplit_micro}; rm -rf "$O"; mkdir -p "$O"
 say_end() { echo "=== glm_rowsplit_micro exit rc=$1 $(date -Is)"; exit "$1"; }
 echo "=== glm_rowsplit_micro start $(date -Is) bin=$(sha256sum "$BIN" 2>/dev/null | cut -c1-16) branch=$(git -C "$(dirname "$BIN")" log --oneline -1 2>/dev/null)"

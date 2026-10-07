@@ -9,10 +9,10 @@
 # Launch through run_chain.sh, watch with ckpt1006/watch_chain.sh <chain log> <engine log>:
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_rowsplit_ab_chain.sh > ~/bench/glm_rowsplit_ab_chain.log 2>&1 < /dev/null &
 #   watch: ckpt1006/watch_chain.sh ~/bench/glm_rowsplit_ab_chain.log ~/bench/franken/glm5/rowsplit_ab/gate_run.log
-# Env: RB_BIN (default the worktree's franken_decode_glm_rowsplit), RB_OUT (default ~/bench/franken/glm5/rowsplit_ab).
+# Env: RB_BIN (default ~/bench/franken_bin/franken_decode_glm.rowsplit = franken-engine gemv-rowsplit e10f196, now in main: `make -C franken/decode gpu`), RB_OUT (default ~/bench/franken/glm5/rowsplit_ab).
 set -u
 . "$HOME/bench/chain_preflight.sh"
-BIN=${RB_BIN:-$HOME/src/franken-engine-rowsplit/franken/decode/franken_decode_glm_rowsplit}
+BIN=${RB_BIN:-$HOME/bench/franken_bin/franken_decode_glm.rowsplit}
 VERDICT=${RB_VERDICT:-$HOME/src/franken-engine/franken/decode/glm5_gate_verdict.sh}
 O=${RB_OUT:-$HOME/bench/franken/glm5/rowsplit_ab}; rm -rf "$O"; mkdir -p "$O"
 M=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf

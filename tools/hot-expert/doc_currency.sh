@@ -45,6 +45,20 @@ if [ "${rev_top:-0}" != "${rev_max:-0}" ]; then echo "  STALE: the plan's top re
 else echo "  ok: plan top rev is $rev_top (look this up before writing the next one)"; fi
 
 echo
+echo "=== the entry-point docs name the plan's current top rev ==="
+# Added 2026-10-07: the handoff CLAUDE.md calls "THE entry point" kept saying "after plan rev 84" (and "decode 14 tok/s is the open item") through three
+# revs, because this script checked that items had rows and paths resolved but never that the entry point was about the CURRENT state. The handoff's
+# first lines and CLAUDE.md must both say "plan rev <top rev of the plan>"; writing a new plan rev therefore means touching them (and §0 / §1 / §4 of the handoff).
+HO=$(grep -oE 'tools/hot-expert/HANDOFF-[0-9a-z-]+\.md' CLAUDE.md | head -1)
+if [ -z "$HO" ] || [ ! -f "$HO" ]; then echo "  MISSING: CLAUDE.md names no existing START HERE handoff ($HO)"; fail=1
+else
+  if head -12 "$HO" | grep -q "plan rev ${rev_top}\b"; then echo "  ok: $(basename "$HO") says plan rev $rev_top"
+  else echo "  STALE: $(basename "$HO") does not say 'plan rev $rev_top' in its first lines (its state sections are behind the plan)"; fail=1; fi
+fi
+if grep -q "plan rev ${rev_top}\b" CLAUDE.md; then echo "  ok: CLAUDE.md says plan rev $rev_top"
+else echo "  STALE: CLAUDE.md does not say 'plan rev $rev_top' (its START HERE paragraph is behind the plan)"; fail=1; fi
+
+echo
 echo "=== pointer freshness ==="
 newest=$(git log --merges -1 --format=%ad --date=short)
 prev=$(grep -oE 'rev [0-9]+, [0-9]{4}-[0-9]{2}-[0-9]{2}' "$PF" | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
@@ -83,6 +97,7 @@ git ls-files 'tools/hot-expert/*.md' CLAUDE.md | xargs grep -ohE '`[A-Za-z0-9_][
   | tr -d '`' | sort -u | while read -r n; do
       grep -qE "\b$n\b" <<<"$(git ls-files)" && continue
       case "$n" in *_chain.sh|q7_lib.sh|owui_report.sh) continue;; esac   # rig-side, live in ~/bench
+      case "$n" in glm5_*.sh|ds4_*.sh|test_gate_verdict.sh) continue;; esac   # the franken-engine repo's own scripts (franken/decode/)
       grep -qE "(~/bench|bench/)$n" $(git ls-files 'tools/hot-expert/*.md' CLAUDE.md) 2>/dev/null && continue
       # a name the docs explicitly record as deleted is documentation, not rot;
       # look at the surrounding paragraph, not the single line -- the marker

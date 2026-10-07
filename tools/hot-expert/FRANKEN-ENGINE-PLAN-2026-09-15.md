@@ -34,7 +34,7 @@
 > taps, chunk 1 + 8 tokens, and 64 tokens at depth 1 500); decode 69.95 -> 66.66 ms/token (A,B,C,C,B,A, one process). **Not yet in service: the installed
 > binary is unchanged; acceptance (`glm_accept_chain.sh`, then `run_ui2.sh`) on a build carrying it is the gate.** Also measured: the steady-state free
 > VRAM at the shipped flags is 732 / 818 / 458 MiB a card (use it for budgets). Open decode levers, by size: the trunk GEMVs further (~10 ms, a reorder needs the
-> quality gate), an optimal per-layer assignment of the missed slabs to the three cards (~3 ms, bit-exact; an agent is building it, branch `fetch-assign`), a
+> quality gate), an optimal per-layer assignment of the missed slabs to the three cards (built, exact, no measurable gain: rev 87), a
 > finer split of the missed experts over the links (up to ~8 ms).
 >
 > **Rev 85 (2026-10-07 01:30 CEST) -- DECODE LOOKAHEAD PREFETCH IS BUILT, BIT-EXACT AND A NET LOSS: CLOSED (records
@@ -50,7 +50,7 @@
 > trunk GEMVs at ~40 % of VRAM bandwidth: ~15 ms headroom).** Found on the way: **decode past 2 051 tokens of
 > context is not run-to-run reproducible** (two mode-0 runs diverge at the 10th generated token; below 2 051 identical), so exactness gates
 > run below it. Process: three gate starts died at setup on VRAM budget (rule in CLAUDE.md, two-log watcher `ckpt1006/watch_chain.sh`,
-> a gate verdict that names an engine death -- franken-engine `gate-robustness`). The `decode-prefetch` branch is kept, not merged.
+> a gate verdict that names an engine death -- franken-engine main `89303c5`). The `decode-prefetch` branch is kept, not merged.
 >
 > **Rev 84 (2026-10-06 22:00 CEST) -- THE ROOT CLOCK TEST RAN (record §M7-CLOCKTEST): CLOCKS ARE NOT
 > THE CAUSE OF THE SLOW COPIES; NO SOFTWARE KNOB; THE DEFAULT POWER PROFILE STAYS.** The owner ran

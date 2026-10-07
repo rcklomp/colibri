@@ -2,7 +2,7 @@
 # glm_fr_chain.sh -- is a SEPARATE reduce launch faster than the fused in-kernel reduce for the high-split decode GEMVs, bit-exactly? (2026-10-07)
 # Why: the decode trace (record §L5-GLM-DECODE-TRACE) shows the trunk GEMVs with many K splits take ~10 us + 0.1 us x nsplit
 # (hc_*_fn: 512 splits, 62 us for 0.4 MB, 90 launches a token = 5.6 ms; ffn_gate_inp: 57 splits, 22 us): the fused reduce's one counter
-# per output row, incremented by every split workgroup, serialises. franken-engine branch `fused-reduce-split` wires `--gemv-fused-reduce 0|1`
+# per output row, incremented by every split workgroup, serialises. franken-engine main `5a4fa03` wires `--gemv-fused-reduce 0|1`
 # and `--gemv-fused-max-split N` (fuse only up to N splits) into the GLM runner, per --gate-plan line. ONE process, one load:
 #   exactness (every tap bit-exact against the pre-change reference, chunk 1 + 8 greedy tokens; and 64 greedy tokens at depth 1 500 against an
 #   in-process default dump) for the cap-64 and the all-separate variants, then decode timing A,B,C,C,B,A:

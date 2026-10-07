@@ -14,6 +14,12 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 92 (2026-10-07 17:30 CEST) -- THE CPU LANE'S SYNC COST IS MEASURED: ~20 us A LAYER IDLE, 32-41 us UNDER THE FULL STREAM (record §L5-GLM-CPULANE-SYNC); THE MODEL'S 60-120 us WAS 2-4x TOO PESSIMISTIC.**
+> Round trip GPU kernel -> pinned host flag -> spinning host thread -> pinned result -> GPU wait kernel: 3.7 us bare, 13 us with 16 KB each way; the full layer pattern adds 16-22 us (spin wait), 20-26 us (`hipStreamWaitValue32`), under the three-card
+> stream 32 / 41 us, and the GPU streams keep 99.4-100.1 % of their rates. The spin kernel is the choice. Modeled saving with d = 35 us: 4.0 ms (5 cores), 5.4 ms (6 cores), 7.5 ms (8); at the realisation seen for the whole-slab table (1/3 to 1/2) 1.3-2.7 ms
+> = **2-4 % of a decode token** for a multi-day engine build. Still open: the numerics (a quality-gated int8-activation lane vs the GPU's float), the cores free in decode, a faster IQ3_S AVX2 kernel (the lever that could double it). **Recommendation:** measure the cores and the quality
+> effect (cheap) before any engine work; do not start the lane build for 2-4 % alone.
+>
 > **Rev 91 (2026-10-07 14:50 CEST) -- THE CPU LANE IS MEASURED: A REAL EXPERT IN 0.57-0.68 ms ON 5-6 CORES WHILE THREE GPUs STREAM, WITH ~3-4 % LOSS ON EITHER SIDE; MODELED 3-5 ms A TOKEN, THREE OPEN QUESTIONS (record §L5-GLM-CPULANE).**
 > Standalone benchmark `tools/hot-expert/cpulane/` (ggml AVX2 kernels, the real IQ3_S + IQ4_XS expert): one expert split over 5 / 6 / 8 cores 0.68 / 0.57 / 0.44 ms (17 / 20 / 26 GB/s, linear, COMPUTE-bound: the weak link is the IQ3_S
 > kernel at 2.6 GB/s a core); with the CPU working while the three cards stream (aggregate 61.9 GB/s alone, §L5-GLM-FETCH-FLOOR-ERRATUM confirmed) the GPU side loses 1.5 / 2.8 / 4.1 % at 2 / 4 / 6 workers and the CPU 0-3 %.

@@ -19,10 +19,12 @@ def avg(tc=None, delta=0.0):
 base = avg()
 print("n   : " + " ".join("%5d"%n for n in range(9)))
 print("opt : " + " ".join("%5.0f"%best(n) for n in range(9)), " avg/layer %.0f us -> %.1f ms/token" % (base, base*LAYERS/1000))
-# continuous bound at the aggregate 52 GB/s (M4): slab 11.67 MB
-agg = 11.67/52e3*1e6   # us per slab at 52 GB/s
-cont = sum(p*n*agg for n,p in enumerate(P))
-print("continuous 3-link bound (52 GB/s aggregate): %.0f us/layer -> %.1f ms/token (%.1f ms below the best slab split)" % (cont, cont*LAYERS/1000, (base-cont)*LAYERS/1000))
+# continuous bound. ERRATUM 2026-10-07: this used 52 GB/s, which is M4's all-three figure for an EQUAL split (3 GB over the slowest card's time, the lone card idles
+# after 35 ms); with the loads balanced all three run at once (lone 28 + the shared pair 18 + 18 = 62-64 GB/s, the engine's own 62.4), and THAT is the bound.
+for agg_gbs, why in ((52.0, "WRONG: M4's equal-split artifact"), (62.4, "balanced: 28 + 17.2 + 17.2, the engine's own figure")):
+    agg = 11.67/(agg_gbs*1e3)*1e6   # us per slab
+    cont = sum(p*n*agg for n,p in enumerate(P))
+    print("continuous 3-link bound at %.1f GB/s (%s): %.0f us/layer -> %.1f ms/token (%.1f ms below the best slab split)" % (agg_gbs, why, cont, cont*LAYERS/1000, (base-cont)*LAYERS/1000))
 mean_n = sum(n*p for n,p in enumerate(P)); print("mean slabs/layer %.2f" % mean_n)
 print()
 print("CPU lane (4th lane), per slab time tc and fixed overhead delta per layer that uses it; ms/token saved vs best slab split:")

@@ -14,6 +14,15 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 89 (2026-10-07 13:30 CEST) -- CORRECTION OF REV 88 POINT (1): THE FETCH IS NOT "AT THE LINK CEILING"; THE FINER-SPLIT LEVER IS OPEN AGAIN, CEILING ~5.6 ms A TOKEN (record §L5-GLM-FETCH-FLOOR-ERRATUM, §M4-TOPOLOGY).**
+> Rev 88 divided the fetch bytes by 52 GB/s, which is §M4's EQUAL-split figure (total bytes over the slowest card's time), and concluded the shipped slab table was 0.2 ms from a perfect split. With the loads
+> balanced the three links run at once at 28 + 18 + 18 = 62-64 GB/s (the engine prints 62.4): the critical fetch (1 686 MB in 35.2 ms = 47.9 GB/s) is at 77 % of that, the best whole-slab split models at 32.6 ms and a
+> perfect continuous split at 27.0 ms (5.6 ms below the table; `ckpt1006/lane_model.py`). The unexplained part: `--fetch-assign optimal` (modeled -2.6 ms) showed nothing measurable, so expect a fraction of 5.6 ms, and
+> find out why before building a tensor-level split (gate+up | down on two cards: bit-exact, one more ~30 us hand-off per cut expert). Points (2)-(4) of rev 88 (the placement cap, the adapter position fix, G=8) and the
+> installed build stand; the CPU-lane arithmetic never used the aggregate and stands. **Topology (§M4-TOPOLOGY):** all three cards run PCIe 4.0 x16; 83:00.0 and 86:00.0 hang off the SAME root complex (`0000:80`) and
+> together reach 36 GB/s, 48:00.0 is alone on `0000:40`; root complex `0000:c0` carries no device. **A hardware option for the owner:** if a ROMED8-2T x16 slot hangs off `0000:c0`, moving the 86:00.0 card there
+> would let all three run at 28 GB/s (84 GB/s, +31 %): the balanced ideal fetch 27.0 -> ~20 ms a token. Untested; the board manual's block diagram says whether such a slot exists, `m4_chain.sh` measures it.
+>
 > **Rev 88 (2026-10-07 11:55 CEST) -- THE PLACEMENT POLICY WAS THE DECODE LEVER: ADAPTATION WAS DEAD AFTER THE FIRST LONG REQUEST OF A SERVING PROCESS (fixed, serve path +15 %);
 > A PREFILL CAP FOR THE PLACEMENT AVERAGE (-4 to -24 % in the gates); G=8 SHIPPED (-2.6 % prefill); THE FETCH-BALANCE LEVER IS CLOSED BY ARITHMETIC (records §L5-GLM-G8,
 > §L5-GLM-FETCH-FLOOR, §L5-GLM-ADAPT, §L5-GLM-ADAPT-MONO, §L5-GLM-DECODE-TRACE2).** (1) **Fetch is link-bound:** the critical fetch (35.2 ms a token) moves 1 686 MB at 48 GB/s = 92 % of M4's

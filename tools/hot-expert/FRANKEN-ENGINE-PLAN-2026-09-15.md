@@ -14,6 +14,11 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 90 (2026-10-07 13:45 CEST) -- `--fetch-assign optimal` IS A REAL -0.97 ms A TOKEN (-3.0 % OF THE CRITICAL FETCH) AND IS NOW THE DEFAULT; THE MODEL HAD PREDICTED A THIRD MORE (record §L5-GLM-FETCH-FLOOR-ERRATUM addendum).**
+> Three rocprofv3 decode traces of identical flags, per-token critical fetch (the span of the three cards' stage kernels per layer, summed): pattern 32.64 and 32.63 ms (noise floor 0.01 ms), optimal 31.68 ms, fewer in 10 of
+> 12 tokens; the per-card kernel durations follow the link model (417 us a slab on the lone card; 417 / 678 us on the pair when its partner is idle / busy). The decode-timing A/B of rev 87 could not resolve a 1.4 % effect.
+> Bit-exact, `FRANKEN_GLM_FETCH_ASSIGN=optimal` in the start script (the wrapper's allowlist forwards it). A tensor-level split would be worth ~2 ms if a third of the model carries over: low priority.
+>
 > **Rev 89 (2026-10-07 13:30 CEST) -- CORRECTION OF REV 88 POINT (1): THE FETCH IS NOT "AT THE LINK CEILING"; THE FINER-SPLIT LEVER IS OPEN AGAIN, CEILING ~5.6 ms A TOKEN (record §L5-GLM-FETCH-FLOOR-ERRATUM, §M4-TOPOLOGY).**
 > Rev 88 divided the fetch bytes by 52 GB/s, which is §M4's EQUAL-split figure (total bytes over the slowest card's time), and concluded the shipped slab table was 0.2 ms from a perfect split. With the loads
 > balanced the three links run at once at 28 + 18 + 18 = 62-64 GB/s (the engine prints 62.4): the critical fetch (1 686 MB in 35.2 ms = 47.9 GB/s) is at 77 % of that, the best whole-slab split models at 32.6 ms and a

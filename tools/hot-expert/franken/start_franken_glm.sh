@@ -36,6 +36,7 @@
 #                           §L5-GLM-LDS; a last-bits order change, judged by the quality run). The engine's own
 #                           default (glm5_serve.cpp) is 0; the export below overrides it.
 #   FRANKEN_GEMV_FUSED_REDUCE  0 since 2026-10-07 (record §L5-GLM-GEMV-REDUCE: -4.7 % decode, bit-exact; 1 = the in-kernel fused reduce)
+#   FRANKEN_GLM_FETCH_ASSIGN optimal since 2026-10-07 (pattern before; bit-exact, critical fetch -3 %, record §L5-GLM-FETCH-FLOOR-ERRATUM addendum)
 #   FRANKEN_GLM_MOE_G       8 since 2026-10-07 (4 before; 1|2|4|8|16 are valid; record §L5-GLM-G8: prefill -2.6 %, bit-exact). Only the docker wrapper's
 #                           allowlist carries it into the container (rig_copies/franken_decode_glm_docker.sh: it forwards FRANKEN_GLM_MOE_G and the FRANKEN_GEMV_* /
 #                           FRANKEN_GLM_FETCH_ASSIGN knobs since 2026-10-07; before that a knob not on the list was DROPPED silently)
@@ -94,6 +95,7 @@ export FRANKEN_GLM_CHUNK=${FRANKEN_GLM_CHUNK:-1024}   # 2026-10-06: was 512; 102
 export FRANKEN_DEVICES=${FRANKEN_DEVICES:-3}
 export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-1}   # 2026-09-25: served ON, as Qwen3.8 is -- prefill 16.9 -> 9.3 ms/token (record §L5-GLM-LDS); a last-bits order change, judged by the quality run
 export FRANKEN_GEMV_FUSED_REDUCE=${FRANKEN_GEMV_FUSED_REDUCE:-0}   # 2026-10-07: a split GEMV's partials summed by a SEPARATE launch, not in-kernel behind one atomic counter a row: decode 69.9 -> 66.7 ms/token, bit-exact (record §L5-GLM-GEMV-REDUCE); needs franken-engine fused-reduce-split, an older binary ignores it
+export FRANKEN_GLM_FETCH_ASSIGN=${FRANKEN_GLM_FETCH_ASSIGN:-optimal}   # 2026-10-07: a decode layer's missed slabs split over the three cards by the best table (was the 11-long pattern): the critical fetch -0.97 ms a token (-3.0 %, paired over 12 tokens in two decode traces against two pattern traces whose own difference is 0.01 ms), token wall -0.6..-0.9 ms; bit-exact (record §L5-GLM-GEMV-REDUCE addendum, §L5-GLM-FETCH-FLOOR-ERRATUM addendum)
 export FRANKEN_GLM_MOE_G=${FRANKEN_GLM_MOE_G:-8}   # 2026-10-07: routed-expert assignments taken in groups of 8 by a prefill chunk's kernel (was 4): prefill 5.769 -> 5.621 ms/token (-2.6 %, 3 processes G=4,8,4), bit-exact at chunk 1024 / 512 / 32 in place (record §L5-GLM-G8); decode keeps the old kernel
 export FRANKEN_GLM_PREFILL_STAGE=${FRANKEN_GLM_PREFILL_STAGE:-0}   # 2026-10-06: was 1. In place (the chunk reads only the experts its rows pick) beats staging at every chunk size: -4 % at 1024 rows, -23..-77 % at 16-256 rows (a short follow-up paid ~2 s of staging), bit-identical (record §L5-GLM-STAGECROSS)
 export FRANKEN_GLM_STAGE_MB=${FRANKEN_GLM_STAGE_MB:-256}   # staging ring a card, MB: a 1024-row chunk doubles the per-chunk scratch and a 400 MB ring OOMs dev 2 at 262 144 cells; the ring was measured flat from 400 MB up

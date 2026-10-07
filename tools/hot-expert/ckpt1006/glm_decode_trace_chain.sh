@@ -9,7 +9,8 @@
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh \
 #     ~/bench/glm_decode_trace_chain.sh > ~/bench/glm_decode_trace_chain.log 2>&1 < /dev/null &
 # Env: TRACE_BIN (default franken-engine main's franken_decode_glm, `make -C franken/decode gpu`),
-#      TRACE_OUT (default ~/bench/franken/glm5/dtrace), TRACE_TOKENS (decode tokens traced after the settle, default 12).
+#      TRACE_OUT (default ~/bench/franken/glm5/dtrace), TRACE_TOKENS (decode tokens traced after the settle, default 12),
+#      TRACE_EXTRA (more flags for the plan line, e.g. "--fetch-assign optimal").
 set -u
 BIN=${TRACE_BIN:-$HOME/src/franken-engine/franken/decode/franken_decode_glm}
 O=${TRACE_OUT:-$HOME/bench/franken/glm5/dtrace}; rm -rf "$O"; mkdir -p "$O"
@@ -17,7 +18,7 @@ N=${TRACE_TOKENS:-12}
 M=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
 P=/home/ronald/bench/m2/glm; EG=17; PR=/home/ronald/bench/franken/glm5/prose8400.txt
 # 2 048 prompt tokens (two 1 024-row chunks, so the lazily grown scratch is at its steady size), 24 settle + N timed decode tokens
-echo "dtrace --tokens-file $PR --ctx 262144 --chunk 1024 --time-prefill 2048 --time $N --time-settle 24 --adapt-prefill 0" > "$O/plan.txt"
+echo "dtrace --tokens-file $PR --ctx 262144 --chunk 1024 --time-prefill 2048 --time $N --time-settle 24 --adapt-prefill 0 ${TRACE_EXTRA:-}" > "$O/plan.txt"
 echo "=== glm_decode_trace start $(date -Is) bin=$(sha256sum "$BIN" 2>/dev/null | cut -c1-16)"
 [ -x "$BIN" ] || { echo "FATAL: no binary $BIN"; exit 2; }
 m=0; for d in /sys/class/drm/card[0-9]/device; do u=$(( $(cat $d/mem_info_vram_used) / 1048576 )); [ $u -gt $m ] && m=$u; done

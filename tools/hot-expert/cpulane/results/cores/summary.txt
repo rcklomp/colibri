@@ -1,0 +1,12 @@
+== IDLE (engine loaded, nothing running): 10 one-second samples
+   hardware threads busy %: cpu0=0 cpu1=2 cpu2=0 cpu3=0 cpu4=0 cpu5=1 cpu6=1 cpu7=0 cpu8=0 cpu9=0 cpu10=0 cpu11=1 cpu12=0 cpu13=6 cpu14=0 cpu15=0
+   physical cores (max of the two threads): 0=0 1=2 2=0 3=1 4=0 5=6 6=1 7=0 | cores below 10 % busy: 8 of 8
+   engine total: 0.00 cores busy on average (max 0.00)
+   other busy processes (mean % of a core): apps.plugin 5, netdata 1
+== DECODE (requests in flight): 55 one-second samples
+   hardware threads busy %: cpu0=0 cpu1=24 cpu2=42 cpu3=1 cpu4=52 cpu5=4 cpu6=1 cpu7=39 cpu8=1 cpu9=3 cpu10=34 cpu11=1 cpu12=7 cpu13=2 cpu14=0 cpu15=0
+   physical cores (max of the two threads): 0=1 1=24 2=42 3=1 4=52 5=4 6=1 7=39 | cores below 10 % busy: 4 of 8
+   engine total: 1.97 cores busy on average (max 1.99)
+   engine thread 2614901  franken_dec_glm  busy  99.9 %  allowed cpus 0-15
+   engine thread 2614954  franken_dec_glm  busy  97.5 %  allowed cpus 0-15
+   other busy processes (mean % of a core): apps.plugin 4, netdata 0, dockerd 0, containerd 0

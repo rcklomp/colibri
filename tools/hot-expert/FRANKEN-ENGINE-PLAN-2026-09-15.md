@@ -14,6 +14,10 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 93 (2026-10-07 18:00 CEST) -- THE CPU LANE'S CORE BUDGET IS MEASURED: THE SERVING ENGINE USES TWO CORES IN DECODE (TWO BUSY-WAITING THREADS) AND NONE IDLE; 6 OF 8 PHYSICAL CORES ARE FREE (record §L5-GLM-CPULANE-CORES).**
+> A 6-worker lane (0.57 ms an expert) fits on cores 2-7 with the engine's two threads pinned to cores 0-1 (they float today). Of the three questions that could kill the lane, two are now answered in its favour (sync cost: rev 92; cores: this rev);
+> left: the numerics (a quality-gated int8-activation lane; an offline experiment on real expert weights and real activations is being written) and the IQ3_S kernel speed. The modeled gain stays 4-5 ms, realistically 1.3-2.7 ms (2-4 %).
+>
 > **Rev 92 (2026-10-07 17:30 CEST) -- THE CPU LANE'S SYNC COST IS MEASURED: ~20 us A LAYER IDLE, 32-41 us UNDER THE FULL STREAM (record §L5-GLM-CPULANE-SYNC); THE MODEL'S 60-120 us WAS 2-4x TOO PESSIMISTIC.**
 > Round trip GPU kernel -> pinned host flag -> spinning host thread -> pinned result -> GPU wait kernel: 3.7 us bare, 13 us with 16 KB each way; the full layer pattern adds 16-22 us (spin wait), 20-26 us (`hipStreamWaitValue32`), under the three-card
 > stream 32 / 41 us, and the GPU streams keep 99.4-100.1 % of their rates. The spin kernel is the choice. Modeled saving with d = 35 us: 4.0 ms (5 cores), 5.4 ms (6 cores), 7.5 ms (8); at the realisation seen for the whole-slab table (1/3 to 1/2) 1.3-2.7 ms

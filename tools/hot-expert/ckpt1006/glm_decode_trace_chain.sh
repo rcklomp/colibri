@@ -8,10 +8,10 @@
 # Launch (on the rig) through run_chain.sh, watched with ckpt1006/watch_chain.sh:
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh \
 #     ~/bench/glm_decode_trace_chain.sh > ~/bench/glm_decode_trace_chain.log 2>&1 < /dev/null &
-# Env: TRACE_BIN (default the dpf worktree's franken_decode_glm_dpf, which at --decode-prefetch 0 is the main path),
+# Env: TRACE_BIN (default franken-engine main's franken_decode_glm, `make -C franken/decode gpu`),
 #      TRACE_OUT (default ~/bench/franken/glm5/dtrace), TRACE_TOKENS (decode tokens traced after the settle, default 12).
 set -u
-BIN=${TRACE_BIN:-$HOME/src/franken-engine-dpf/franken/decode/franken_decode_glm_dpf}
+BIN=${TRACE_BIN:-$HOME/src/franken-engine/franken/decode/franken_decode_glm}
 O=${TRACE_OUT:-$HOME/bench/franken/glm5/dtrace}; rm -rf "$O"; mkdir -p "$O"
 N=${TRACE_TOKENS:-12}
 M=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf

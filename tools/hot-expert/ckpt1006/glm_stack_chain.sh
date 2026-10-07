@@ -7,9 +7,9 @@
 #   decode timing A,B,C,D,D,C,B,A -- A main (pattern, wave 0) / B wave-reduce / C fetch-assign / D both.
 # Launch through run_chain.sh, watch with ckpt1006/watch_chain.sh <chain log> <engine log>:
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_stack_chain.sh > ~/bench/glm_stack_chain.log 2>&1 < /dev/null &
-# Env: ST_BIN (default the wave-reduce worktree's franken_decode_glm_wr), ST_OUT (default ~/bench/franken/glm5/stack).
+# Env: ST_BIN (default franken-engine main's franken_decode_glm, `make -C franken/decode gpu`), ST_OUT (default ~/bench/franken/glm5/stack).
 set -u
-BIN=${ST_BIN:-$HOME/src/franken-engine-wr/franken/decode/franken_decode_glm_wr}
+BIN=${ST_BIN:-$HOME/src/franken-engine/franken/decode/franken_decode_glm}
 VERDICT=${ST_VERDICT:-$HOME/src/franken-engine/franken/decode/glm5_gate_verdict.sh}
 O=${ST_OUT:-$HOME/bench/franken/glm5/stack}; rm -rf "$O"; mkdir -p "$O"
 M=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf

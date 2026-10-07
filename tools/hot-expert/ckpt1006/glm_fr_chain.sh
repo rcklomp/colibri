@@ -7,12 +7,14 @@
 #   exactness (every tap bit-exact against the pre-change reference, chunk 1 + 8 greedy tokens; and 64 greedy tokens at depth 1 500 against an
 #   in-process default dump) for the cap-64 and the all-separate variants, then decode timing A,B,C,C,B,A:
 #   A default (all fused) / B --gemv-fused-max-split 64 / C --gemv-fused-reduce 0 (all separate).
+# NOTE (2026-10-07): since franken-engine 5a4fa03 the GLM default IS the separate reduce, so on a current binary arm A ("default") equals arm C; the experiment's
+# historical A arm was `--gemv-fused-reduce 1` (add it to the A lines to repeat it). The chain is kept as the record of how the result was measured.
 # Launch through run_chain.sh and watch with ckpt1006/watch_chain.sh <chain log> <engine log>:
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh \
 #     ~/bench/glm_fr_chain.sh > ~/bench/glm_fr_chain.log 2>&1 < /dev/null &
-# Env: FR_BIN (default the fused-reduce-split worktree's franken_decode_glm_fr), FR_OUT (default ~/bench/franken/glm5/fr), FR_CAP (default 64).
+# Env: FR_BIN (default franken-engine main's franken_decode_glm, `make -C franken/decode gpu`), FR_OUT (default ~/bench/franken/glm5/fr), FR_CAP (default 64).
 set -u
-BIN=${FR_BIN:-$HOME/src/franken-engine-fr/franken/decode/franken_decode_glm_fr}
+BIN=${FR_BIN:-$HOME/src/franken-engine/franken/decode/franken_decode_glm}
 VERDICT=${FR_VERDICT:-$HOME/src/franken-engine/franken/decode/glm5_gate_verdict.sh}
 O=${FR_OUT:-$HOME/bench/franken/glm5/fr}; rm -rf "$O"; mkdir -p "$O"
 CAP=${FR_CAP:-64}

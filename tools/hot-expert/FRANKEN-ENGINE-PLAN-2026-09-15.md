@@ -14,6 +14,17 @@
 > questions, the second one is the real one, and the first one is mostly
 > already answered by the profile.** Sections 1–5 say why and what to measure.
 >
+> **Rev 86 (2026-10-07 02:20 CEST) -- DECODE -4.7 % FOR FREE: THE SPLIT-GEMV REDUCE AS A SEPARATE LAUNCH (record §L5-GLM-GEMV-REDUCE),
+> BIT-EXACT, A FLAG; GLM DEFAULT NOW.** The decode trace (§L5-GLM-DECODE-TRACE) showed the K-split trunk GEMVs costing ~10 us + 0.1 us x nsplit
+> (the 512-split hc_*_fn GEMVs: 62 us for 0.4 MB, 5.6 ms a token): the fused reduce's one atomic counter per output row serialises. The other path
+> (`k_reduce_splits_gemm`, same partials, same order) was reachable only from the Qwen CLI; franken-engine `5a4fa03` wires `--gemv-fused-reduce 0|1`
+> and `--gemv-fused-max-split N` into the GLM runner and makes 0 the GLM default (CLI, gate, serve env `FRANKEN_GEMV_FUSED_REDUCE`). Exact (1 788 / 1 788
+> taps, chunk 1 + 8 tokens, and 64 tokens at depth 1 500); decode 69.95 -> 66.66 ms/token (A,B,C,C,B,A, one process). **Not yet in service: the installed
+> binary is unchanged; acceptance (`glm_accept_chain.sh`, then `run_ui2.sh`) on a build carrying it is the gate.** Also measured: the steady-state free
+> VRAM at the shipped flags is 732 / 818 / 458 MiB a card (use it for budgets). Open decode levers, by size: the trunk GEMVs further (~10 ms, a reorder needs the
+> quality gate), an optimal per-layer assignment of the missed slabs to the three cards (~3 ms, bit-exact; an agent is building it, branch `fetch-assign`), a
+> finer split of the missed experts over the links (up to ~8 ms).
+>
 > **Rev 85 (2026-10-07 01:30 CEST) -- DECODE LOOKAHEAD PREFETCH IS BUILT, BIT-EXACT AND A NET LOSS: CLOSED (records
 > §L4-LOOKAHEAD-OUTSIDE, §L4-LOOKAHEAD-STEP1).** Outside sources first (llama.cpp's prefetch is prefill-only; a decode prefetch
 > that syncs the host cost 8-13 % elsewhere), then a device-driven design: predict layer l+1's top-k experts on a side stream, copy the

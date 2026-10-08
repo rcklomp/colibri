@@ -9,7 +9,8 @@
 # Launch through run_chain.sh, watch with ckpt1006/watch_chain.sh <chain log> <engine log>:
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_repro_chain.sh > ~/bench/glm_repro_chain.log 2>&1 < /dev/null &
 #   watch: ckpt1006/watch_chain.sh ~/bench/glm_repro_chain.log ~/bench/franken/glm5/repro/p1_run.log
-# Env: RP_BIN (default ~/bench/franken_bin/franken_decode_glm_d3), RP_OUT (default ~/bench/franken/glm5/repro), RP_KS (default "1 4 8 12 16 24"), RP_DEPTH (default 2300), RP_EXTRA (more flags for every config).
+# rc of the chain: 0 when both processes ran to their summary (non-exact oracle configs are the finding, not a failure), else the failing process's rc.
+# Env: RP_ENV (extra docker -e options for BOTH processes, e.g. "-e AMD_SERIALIZE_KERNEL=3 -e AMD_SERIALIZE_COPY=3": if the divergence disappears under serialisation it is a missing dependency between streams), RP_BIN (default ~/bench/franken_bin/franken_decode_glm_d3), RP_OUT (default ~/bench/franken/glm5/repro), RP_KS (default "1 4 8 12 16 24"), RP_DEPTH (default 2300), RP_EXTRA (more flags for every config).
 set -u
 . "$HOME/bench/chain_preflight.sh"
 BIN=${RP_BIN:-$HOME/bench/franken_bin/franken_decode_glm_d3}
@@ -39,15 +40,17 @@ echo "c_x $CTL --greedy 8 $FLAGS --oracle $O/d_ctl" >> "$O/p1_plan.txt"
 echo "c_y $CTL --greedy 8 $FLAGS --oracle $O/d_ctl" >> "$O/p2_plan.txt"
 rig_quiet_wait 1800 || { echo "FATAL: the rig did not become quiet"; say_end 3; }
 run_plan() {   # name plan log
-  docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1 \
+  docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1 ${RP_ENV:-} \
     -e LD_LIBRARY_PATH=/opt/rocm/lib:/home/ronald/src/llama-glm53/build-hip/bin -e HOME=/home/ronald -v /home/ronald:/home/ronald -w /home/ronald/bench \
     rocm/dev-ubuntu-24.04:7.14.0-full "$BIN" --model $M --placement $P --expert-gb $EG --gate-plan "$2" > "$3" 2>&1
 }
 run_plan p1 "$O/p1_plan.txt" "$O/p1_run.log"; rc1=$?
 echo "process 1 rc=$rc1 $(date -Is)"; grep -aE "HIP error|Memory access|out of memory" "$O/p1_run.log" | head -2 | cut -c1-170
-[ $rc1 -ne 0 ] && { echo "process 1 failed; not starting process 2"; tail -n 5 "$O/p1_run.log" | cut -c1-200; say_end $rc1; }
+# rc 1 is NORMAL here: every oracle config that is not bit-exact counts as a failed config (that is the finding); only rc >= 2, a HIP error or a missing summary is a failed run
+if [ $rc1 -ge 2 ] || ! grep -aq "gate_plan_summary" "$O/p1_run.log"; then echo "process 1 failed (rc=$rc1 or no summary); not starting process 2"; tail -n 5 "$O/p1_run.log" | cut -c1-200; say_end $rc1; fi
 rig_quiet_wait 600 || { echo "FATAL: rig not quiet before process 2"; say_end 3; }
 run_plan p2 "$O/p2_plan.txt" "$O/p2_run.log"; rc2=$?
 echo "process 2 rc=$rc2 $(date -Is)"; grep -aE "HIP error|Memory access|out of memory" "$O/p2_run.log" | head -2 | cut -c1-170
 python3 -I "$HOME/bench/repro_report.py" "$O" 2>&1 | cut -c1-240
-say_end $((rc1 + rc2))
+[ $rc2 -ge 2 ] && say_end $rc2
+say_end 0

@@ -16,7 +16,7 @@ say_end() { echo "=== glm_q6k_stall exit rc=$1 $(date -Is)"; exit "$1"; }
 echo "=== glm_q6k_stall start $(date -Is) bin=$(sha256sum "$BIN" 2>/dev/null | cut -c1-16) env=${QS_ENV:-}"
 [ -x "$BIN" ] || { echo "FATAL: no binary $BIN"; say_end 2; }
 rig_quiet_wait 1800 || { echo "FATAL: the rig did not become quiet"; say_end 3; }
-DEFAULT_LIST="gemm 64 4096 1;pair 64 4096 1;gemm 64 4096 2;gemm 64 4096 4;gemm 64 4096 8;gemm 64 4096 16;gemm_nostage 64 4096 16;reduce 64 4096 16;pair 64 4096 16;gemm 64 8192 16;gemm 1024 4096 16;gemm 64 4096 32;api_this 64 4096 0;api_main 64 4096 0"
+DEFAULT_LIST="gemm 64 4096 1;pair 64 4096 1;gemm_cmp 64 4096 16;gemm_cmp 64 4096 2;gemm 64 4096 2;gemm 64 4096 4;gemm 64 4096 8;gemm 64 4096 16;gemm_nostage 64 4096 16;reduce 64 4096 16;pair 64 4096 16;gemm 64 8192 16;gemm 1024 4096 16;gemm 64 4096 32;gemm_cmp 1024 4096 16;gemm_cmp 64 8192 16;api_this 64 4096 0;api_main 64 4096 0"
 LIST=${QS_LIST:-$DEFAULT_LIST}
 nq() { journalctl -k --no-pager --since "$1" 2>/dev/null | grep -c 'sq_intr' ; }
 IFS=';' read -r -a VARS <<< "$LIST"

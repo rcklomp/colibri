@@ -11,23 +11,25 @@
 # Order: w0 (discarded) then the palindrome over the nine masks A..I,I..A (each 8 192 tokens), then three --debug-route configs (the analysis input of PF0 (d) and PF5).
 # Launch (on the rig):  ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_pf0_skip_chain.sh > ~/bench/glm_pf0_skip_chain.log 2>&1 < /dev/null &
 # Watch from the Mac:   tools/hot-expert/ckpt1006/watch_chain.sh ~/bench/glm_pf0_skip_chain.log ~/bench/franken/glm5/pf0_skip/gate_run.log
-# Env: PF0_BIN, PF0_OUT.
+# Env: PF0_BIN, PF0_OUT, PF0_PROMPT (token-ID file of the timing arms, default prose8400), PF0_MASKS (default "0 31 29 30 27 15 7 1 3"), PF0_ROUTES (0 = no --debug-route configs).
 set -u
 . "$HOME/bench/chain_preflight.sh"
 BIN=${PF0_BIN:-$HOME/bench/franken_bin/franken_decode_glm_pf0dbg}
 O=${PF0_OUT:-$HOME/bench/franken/glm5/pf0_skip}; rm -rf "$O"; mkdir -p "$O"
 M=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
-P=/home/ronald/bench/m2/glm; EG=17; B=/home/ronald/bench/franken/glm5; PR=$B/prose8400.txt; REC=$B/rec_depth/rec_ids.txt
+P=/home/ronald/bench/m2/glm; EG=17; B=/home/ronald/bench/franken/glm5; PR=${PF0_PROMPT:-$B/prose8400.txt}; REC=$B/rec_depth/rec_ids.txt
 SHIP="--ctx 262144 --chunk 1024 --adapt-prefill 0 --gemm-lds 1 --glm-prefill-stage 0"
-MASKS="0 31 29 30 27 15 7 1 3"
+MASKS=${PF0_MASKS:-0 31 29 30 27 15 7 1 3}
 say_end() { echo "=== glm_pf0_skip exit rc=$1 $(date -Is)"; exit "$1"; }
 [ -x "$BIN" ] && [ -f "$PR" ] && [ -f "$REC" ] || { echo "FATAL: missing $BIN or $PR or $REC"; say_end 2; }
 { echo "w0 --tokens-file $PR $SHIP --time-prefill 8192"
   for m in $MASKS; do echo "m${m}_a --tokens-file $PR $SHIP --time-prefill 8192 --debug-skip $m"; done
   for m in $(echo $MASKS | tr ' ' '\n' | tac | tr '\n' ' '); do echo "m${m}_b --tokens-file $PR $SHIP --time-prefill 8192 --debug-skip $m"; done
+  if [ "${PF0_ROUTES:-1}" = 1 ]; then
   echo "route_prose   --tokens-file $PR  $SHIP --time-prefill 8192  --debug-route $O/route_prose"
   echo "route_rec8k   --tokens-file $REC $SHIP --time-prefill 8192  --debug-route $O/route_rec8k"
   echo "route_rec32k  --tokens-file $REC $SHIP --time-prefill 32768 --debug-route $O/route_rec32k"
+  fi
 } > "$O/plan.txt"
 echo "=== glm_pf0_skip start $(date -Is) bin=$(sha256sum "$BIN" | cut -c1-16)"; cut -c1-70 "$O/plan.txt"
 rig_quiet_wait 1800 || say_end 3
@@ -43,9 +45,9 @@ grep -aE "gate_plan_summary|HIP error|Memory access|out of memory|FATAL|debug_sk
 grep -aE "vram_dev[0-9]_steady" "$O/gate_run.log" | tail -3 | cut -c1-140
 [ "$rc" -ne 0 ] && { echo "--- engine log tail:"; tail -n 12 "$O/gate_run.log" | cut -c1-200; }
 echo "=== prefill ms/token per mask (8 192 tokens, whole prompt): a = first pass, b = reverse pass"
-awk '/^=== gate-plan config/ { c = $4 } /^prefill_tokens=/ { split($5, v, "="); ms[c] = v[2]; printf "%-14s %9.4f ms/token\n", c, v[2] }
-  END { split("0 31 29 30 27 15 7 1 3", K, " ")
-        for (i = 1; i <= 9; i++) { k = K[i]; if (ms["m" k "_a"] == "" || ms["m" k "_b"] == "") continue; mm[k] = (ms["m" k "_a"] + ms["m" k "_b"]) / 2
+awk -v maskl="$MASKS" '/^=== gate-plan config/ { c = $4 } /^prefill_tokens=/ { split($5, v, "="); ms[c] = v[2]; printf "%-14s %9.4f ms/token\n", c, v[2] }
+  END { nk = split(maskl, K, " ")
+        for (i = 1; i <= nk; i++) { k = K[i]; if (ms["m" k "_a"] == "" || ms["m" k "_b"] == "") continue; mm[k] = (ms["m" k "_a"] + ms["m" k "_b"]) / 2
           printf "mask %-2s mean %8.4f   a-b spread %7.4f\n", k, mm[k], ms["m" k "_a"] - ms["m" k "_b"] }
         if (mm[0] != "" && mm[31] != "") {
           printf "--- skeleton (31) %.3f of %.3f ms/token = %.0f %%\n", mm[31], mm[0], 100 * mm[31] / mm[0]

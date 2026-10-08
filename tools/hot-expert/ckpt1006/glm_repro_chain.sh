@@ -10,7 +10,7 @@
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_repro_chain.sh > ~/bench/glm_repro_chain.log 2>&1 < /dev/null &
 #   watch: ckpt1006/watch_chain.sh ~/bench/glm_repro_chain.log ~/bench/franken/glm5/repro/p1_run.log
 # rc of the chain: 0 when both processes ran to their summary (non-exact oracle configs are the finding, not a failure), else the failing process's rc.
-# Env: RP_ENV (extra docker -e options for BOTH processes, e.g. "-e AMD_SERIALIZE_KERNEL=3 -e AMD_SERIALIZE_COPY=3": if the divergence disappears under serialisation it is a missing dependency between streams), RP_BIN (default ~/bench/franken_bin/franken_decode_glm_d3), RP_OUT (default ~/bench/franken/glm5/repro), RP_KS (default "1 4 8 12 16 24"), RP_DEPTH (default 2300), RP_EXTRA (more flags for every config).
+# Env: RP_CTX (--ctx of the deep configs, default 4096: the allocation layout changes with it), RP_ENV (extra docker -e options for BOTH processes, e.g. "-e AMD_SERIALIZE_KERNEL=3 -e AMD_SERIALIZE_COPY=3": if the divergence disappears under serialisation it is a missing dependency between streams), RP_BIN (default ~/bench/franken_bin/franken_decode_glm_d3), RP_OUT (default ~/bench/franken/glm5/repro), RP_KS (default "1 4 8 12 16 24"), RP_DEPTH (default 2300), RP_EXTRA (more flags for every config).
 set -u
 . "$HOME/bench/chain_preflight.sh"
 BIN=${RP_BIN:-$HOME/bench/franken_bin/franken_decode_glm_d3}
@@ -28,7 +28,7 @@ mkdir -p "$O"
 tr ' ' '\n' < "$B/prose8400.txt" | grep -v '^$' | head -$DEPTH | tr '\n' ' ' > "$O/prompt_deep.txt"
 tr ' ' '\n' < "$B/prose8400.txt" | grep -v '^$' | head -1500 | tr '\n' ' ' > "$O/prompt_ctl.txt"
 echo "prompt ids: deep=$(wc -w < "$O/prompt_deep.txt") control=$(wc -w < "$O/prompt_ctl.txt")"
-DEEP="--tokens-file $O/prompt_deep.txt --ctx 4096 --chunk 512"; CTL="--tokens-file $O/prompt_ctl.txt --ctx 4096 --chunk 512"
+DEEP="--tokens-file $O/prompt_deep.txt --ctx ${RP_CTX:-4096} --chunk 512"; CTL="--tokens-file $O/prompt_ctl.txt --ctx 4096 --chunk 512"
 : > "$O/p1_plan.txt"; : > "$O/p2_plan.txt"
 for k in $KS; do
   echo "r_$k $DEEP --greedy $k $FLAGS --dump $O/d_$k" >> "$O/p1_plan.txt"

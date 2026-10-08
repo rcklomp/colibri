@@ -117,6 +117,32 @@ if [ "${n:-0}" -gt 0 ]; then
 else echo "  ok: none"; fi
 
 echo
+echo "=== the action list (tools/hot-expert/ACTION-LIST.md) ==="
+# Added 2026-10-08 night: the order of work lives in ONE living file; a plan item can be added, finished or dropped without it noticing. Checks: the file exists and CLAUDE.md names it;
+# every status is one of the allowed words; every D / PF / V id in a table resolves to a row or section of a plan; at most one `doing` row needs the rig; a `done` or `dropped` row says
+# where the result is. Whether the order is RIGHT is the closeout skill's governance read-through, not this script's.
+AL=tools/hot-expert/ACTION-LIST.md
+if [ ! -f "$AL" ]; then echo "  MISSING: $AL"; fail=1
+else
+  grep -q "ACTION-LIST.md" CLAUDE.md && echo "  ok: CLAUDE.md names the action list" || { echo "  STALE: CLAUDE.md does not name ACTION-LIST.md"; fail=1; }
+  PLANS="tools/hot-expert/DECODE-OPEN-ITEMS-PLAN-2026-10-08.md tools/hot-expert/PREFILL-OPEN-ITEMS-PLAN-2026-10-08.md $PL"
+  rows=$(awk -F'|' 'function t(x){gsub(/^ +| +$/,"",x);return x} NF>=9 && t($3) ~ /^(D|PF|V)[0-9]+[a-z]?$/ {printf "%s\t%s\t%s\t%s\n", t($3), t($5), t($6), t($9)}' "$AL")
+  nrows=$(printf '%s\n' "$rows" | grep -c . || true)
+  bad=0; doing_rig=0
+  while IFS=$'\t' read -r id st needs res; do
+    [ -n "$id" ] || continue
+    stw=$(printf '%s' "$st" | awk '{print $1}')
+    case "$stw" in todo|doing|gated|blocked|done|dropped|parked) ;; *) echo "  BAD status '$st' on $id"; bad=1;; esac
+    grep -qwE "$id" $PLANS 2>/dev/null || { echo "  DEAD  $id is in the action list but in no plan"; bad=1; }
+    [ "$stw" = doing ] && printf '%s' "$needs" | grep -qi "rig" && doing_rig=$((doing_rig+1))
+    case "$stw" in done|dropped) [ -n "$res" ] || { echo "  NO RESULT pointer on $stw row $id"; bad=1; };; esac
+  done <<<"$rows"
+  [ "$doing_rig" -le 1 ] || { echo "  $doing_rig rows are 'doing' on the rig; one benchmark at a time"; bad=1; }
+  grep -qE '^Last updated: ' "$AL" || { echo "  no 'Last updated:' line"; bad=1; }
+  [ $bad -eq 0 ] && echo "  ok: $nrows action rows, statuses valid, every id resolves in a plan, at most one rig job 'doing'" || fail=1
+fi
+
+echo
 echo
 [ $fail -eq 0 ] && echo "doc_currency: PASS" || echo "doc_currency: FAIL -- the docs are behind the tree"
 exit $fail

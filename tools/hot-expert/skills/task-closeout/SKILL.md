@@ -16,6 +16,7 @@ The owner had to ask for this after every completed task (2026-10-07, angrily). 
    - the record (`ROME-3x7900XTX-2026-09-04.md`) has a section at its END with the numbers and which oracle/gate passed; a claim that was later found wrong is corrected in an erratum, not silently edited;
    - the handoff `HANDOFF-2026-10-06b.md`: section 0 / 1 (state, installed sha, rollbacks), 4 (open tasks), 5 (recipes), 6 (traps) are current; a cold reader must not be misled;
    - `CLAUDE.md` pointers (rev, recipes) are current;
+   - **the action list** (`tools/hot-expert/ACTION-LIST.md`): the rows this task touched have the right status (`doing` while a rig job runs, `done` / `dropped` with a Result pointer and a line in the Done log when the result is in the record), a gate that was decided has released or dropped its `gated` rows, a newly found item has a plan row first and then a list row, the 'Last updated' line is today's; `doc_currency.sh` checks the mechanics, you check that the order is still the right one;
    - memory (`~/.claude/projects/-Users-ronald-Projects/memory/`): the state note says what a future session needs; a new owner correction or confirmed approach is a feedback memory; nothing the repo already records, no passwords or secrets, no volatile detail beyond pointers.
 4. **Clean up what you created:** rig worktrees, one-off sequencers, temp scripts, background watchers that are no longer needed (a rig job still running needs a watcher armed and must be reported).
 5. **Re-run the check until 0 FAIL.**

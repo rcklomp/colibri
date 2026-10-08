@@ -4,6 +4,9 @@
 # The sequence: W1 a long document (pos climbs to ~8.9k), then short FRESH chats (pos restarts near 0: the case the monotonic-position fix is about):
 # W2 hash table, W3 bash script, W4 B-tree vs LSM, W5 = W2's prompt again (same text under greedy decoding below 2 051 tokens of depth, so a placement that has learned must do better).
 # Stdlib only. Never prints the API key.
+# D6 (2026-10-08): every row of OUT also carries t_start / t_end (epoch seconds, request sent / reply received; the decode ran in [t_end - decode_s, t_end]) so the clock
+# sampler's rows (gpu_sampler.py arm) can be matched to the request; and with env SAB_MARK=FILE the driver writes the running request's tag into FILE (and "-" between
+# requests), which the sampler copies into the `req` column of its rows. Unset / empty: nothing is written. The printed lines are unchanged.
 import json, os, re, sys, time, urllib.request
 
 LOG, OUT = sys.argv[1], sys.argv[2]
@@ -31,11 +34,25 @@ def post(content, max_tokens):
         j = json.loads(r.read())
     return time.time() - t0, j
 
+MARK = os.environ.get("SAB_MARK", "")
+
+def mark(tag):
+    if not MARK:
+        return
+    try:
+        with open(MARK + ".tmp", "w") as f:       # replace, so the sampler never reads a half-written name
+            f.write(tag + "\n")
+        os.replace(MARK + ".tmp", MARK)
+    except OSError:
+        pass
+
 rows = []
 seen_adapt = len(re.findall(r"adapt_all pos=", log_text()))
 for tag, content, mt in REQS:
     n_before = len(REQ_RE.findall(log_text()))
+    mark(tag); t_start = time.time()
     dt, j = post(content, mt)
+    t_end = time.time(); mark("-")
     m = None
     for _ in range(40):                     # the engine's req line can trail the HTTP reply by a moment
         found = REQ_RE.findall(log_text())
@@ -44,7 +61,8 @@ for tag, content, mt in REQS:
         time.sleep(0.5)
     txt = (j.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
     adapt_now = len(re.findall(r"adapt_all pos=", log_text()))
-    row = {"tag": tag, "http_s": round(dt, 2), "chars": len(txt), "adapt_windows": adapt_now - seen_adapt}
+    row = {"tag": tag, "http_s": round(dt, 2), "chars": len(txt), "adapt_windows": adapt_now - seen_adapt,
+           "t_start": round(t_start, 2), "t_end": round(t_end, 2)}
     seen_adapt = adapt_now
     if m:
         row.update(req=int(m[0]), prompt=int(m[1]), reused=int(m[2]), emitted=int(m[3]), prefill_s=float(m[4]),

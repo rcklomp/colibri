@@ -1,8 +1,29 @@
-# Plan for the open GLM decode items (2026-10-08)
+# Plan for the open GLM decode items (2026-10-08) -- executed the same evening, outcomes in section 0
 
 Written after the trunk-GEMV work (record §L5-GLM-TRUNK-GEMV, §L5-GLM-ROWSPLIT, §L5-GLM-GEMV-GROUP; decision log `FRANKEN-ENGINE-PLAN-2026-09-15.md` Rev 95-98).
 This file says what is still open, what each item is worth, how it is gated, and in which order it should be done. It does not repeat the evidence: every number below points to a record section.
 Labels: **measured** = a record row exists; **estimate** = derived here from measured numbers, with the derivation; **unknown** = no basis yet.
+
+## 0. Status after the first execution (2026-10-08, evening; plan Rev 99 in `FRANKEN-ENGINE-PLAN-2026-09-15.md`)
+
+The plan was executed in one session (Phases 0-1 and the part of Phase 2 that the gates opened). Outcomes, each with its record section (`ROME-3x7900XTX-2026-09-04.md`, new sections at its end) and the engine notes (franken-engine `GLM5.md` section 22):
+
+| ID | Outcome | Gain (labelled) |
+|---|---|---|
+| D1 `--gemv-lds` | **closed, not enabled.** Slower in isolation (+1..7 %/launch), faster in the trace (-0.18 ms wall, SE 0.10) with a layer-period change of 4 us (gate: 10 us, 1 %); the flag is global (it also stages the prefill GEMMs). The same idea carried into a kernel with no dead generality is D7c below. | 0 (measured) |
+| D2 slow `hc_*_fn` launches | **closed, nothing to fix.** The 22 % population belonged to the old `k_gemm_batch` hc fn and vanished with the row-split kernel (0.10 % of clean launches now); the rest is a clock ramp after host stalls that looks like a tracing artefact. | ~0.01 ms (measured) |
+| D3 rows-based waves rule | **done**: `--gemv-rowsplit-waves 1`, bit-exact (model gate), launcher default. | -0.12 ms wall (SE 0.06), -0.18 ms kernel (measured, paired trace) |
+| D4 Q6_K split stall | **done, fixed and verified.** Cause: a flat load below the LDS allocation in the staged-x path of the Q6_K branch (memory violation); an address-only fix; the unsplit head never hit it. | 0 ms (correctness) |
+| D5 decode past 2 051 deep | **finding, new item D14.** Not the top-k selection or an atomic: a timing-dependent perturbation of layer 4's carried KDA conv window from decode step 2-3 on; not removed by serialising kernels and copies. | 0 ms (verification) |
+| D6 odd serve-A/B arms | **done**: clock / temperature / power / CPU-frequency sampling beside every arm of `glm_serve_ab_chain.sh` (`SAB_SAMPLE`, default 1) and a per-request report with the correlations. | 0 ms (measurement quality) |
+| D7 bandwidth gate | **GO, but not for the reason asked.** The 16-byte exact-order kernel (D7b) is slower than a plain copy of the engine's own loop, so D7b is dropped; the copy itself (`--gemv-q8fast`, **new item D7c**) is 17-21 % faster per launch than the generic `k_gemm_batch` and bit-exact. | **-1.49 ms wall (SE 0.08, -2.3 %), layer period 1 403 -> 1 373 us (measured, paired trace)** |
+| D8 KDA o / DSA o tail | **parked** (<= ~0.4 ms above the copy, below the 0.3 ms stop rule once the exact-order constraint is counted). | -- |
+| D9a / D9 tensor-level split | **D9 parked**: modeled +1.9..2.6 ms, but the model overstated the shipped whole-slab table threefold (realization 0.33), so +0.6..0.9 ms < 1.5 ms. | -- |
+| D10 / D11 / D12 | unchanged, parked for the owner's word. | -- |
+
+**New items.** **D13** (optional, ~0.1 ms): the same recipe for the Q6_K lm_head (one launch, 722 us a token). **D14** (correctness, before any further speed work at depth > 2 051): find the root cause of the carried-state perturbation of D5 -- next experiments are listed in record §L5-GLM-D5 (`--ctx` variation, a read-back of layer 4's conv window after every step, memory checks of the DSA layer's buffers). **D15** (sizing): where do the other two thirds of the fetch model's modeled gain go (the model said -2.9 ms for `--fetch-assign optimal`, the trace -0.97 ms)? Every fetch-side lever is sized with that model, so finding the gap comes before building any of them.
+
+**Where decode stands after this session** (the section-1 numbers are the starting point): **installed `~/bench/franken_bin/franken_dec_glm` = `.fin` sha `ca2bc21c19b451c0`** (franken-engine code `f0fda34`, main `96ff255`; rollbacks `.gr` `1f95c34b2d8bbf06`, `.rs`, `.adm`); the specialised GEMV and the waves rule take ~1.6 ms off a ~63.8 ms traced token (-1.49 ms and -0.12 ms, two separately measured effects, paired kernel trace). Accepted: `accept_live` PASS (warm new chat 0.86 s, follow-up 0.9 s, behind an abandoned request 0.8 s), browser first token 1.06 / 1.05 s. **The serve-path A/B is supportive, not clean:** six of eight arms agree within groups and give +2.8 % on every request, two arms are odd in opposite directions (a cold first arm +4..7 %, an arm whose cards waited -5..-14 %) and with all eight the mean difference is +0.1 % (record §L5-GLM-D7, §L5-GLM-D6); a second A/B with a discarded warm-up arm is addended there. The service is still OFF behind the reservation flag.
 
 ## 1. Where decode stands
 

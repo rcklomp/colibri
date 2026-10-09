@@ -61,7 +61,7 @@ Last updated: **2026-10-09** (plan Rev 104). PF0 found a prefill pipeline stall 
 
 | # | Decision | Needed for |
 |---|---|---|
-| O1 | **GitHub:** the public fork lags (the 2026-10-08 night commits and the whole PF0 work of 2026-10-09; `git ls-remote fork hot-expert-tier` against `git log -1`). Each push needs the go-ahead and the secret scan | nothing; housekeeping |
+| O1 | **GitHub:** the public fork was pushed on 2026-10-09 up to `787d0b63` (owner's go-ahead; secret scan of the net diff and of every commit, clean); the closeout reports its current lag (`git ls-remote fork hot-expert-tier` against `git log -1`). Each further push needs the go-ahead and the secret scan | nothing; housekeeping |
 | O2 | **When GLM goes back into service** (the rig is reserved; recipe handoff §3; the first real unattended restore is unobserved, so do it watched) | nothing in the queue; the service is OFF |
 | O3 | **Is prefill worth more weeks?** PF0 cost a day and took the cold 4.6k tool prompt from 27.4 s to 19.2 s of engine prefill and a 25 k-token document from ~2.3 to ~1.5 minutes (computed from 3.6 ms/token, a long prompt's steady state is lower); warm chats are untouched (PREFILL section 0). PF9 then showed the experts are 2.2 of the 3.6 ms/token (not zero): what is left (PF12 first, then PF4 / PF10 / PF2 / PF3) is smaller per day than PF0 but not small -- the steady state is 3.30 ms/token and the link floor ~1.4 | PF12, PF4, PF10, PF2, PF3 beyond PF9 |
 | O4 | **The quality bar for a non-bit-exact prefill kernel**: proposed 'inside the Wilson interval of the previous binary on MMLU-Pro 70 and no needle regression' | PF2 |

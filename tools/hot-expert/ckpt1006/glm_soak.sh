@@ -4,10 +4,12 @@
 # Why (2026-10-09, plan Rev 110): the PF14 hybrid passed the gates and the acceptance, but acceptance is ~2 minutes of short requests; a service is hours of long ones. Per round (~3-6 min):
 #   a. accept_live.sh -- the owner's own path: a UI-shaped new chat, a warm one, an API follow-up (prefix pin), a reply that finishes, a request behind an abandoned one, the ledger invariant
 #   b. every third round one LONG prompt through the API (15k, 40k, 90k tokens in turn) with an access code buried in the middle; the answer is checked for the code
-# Beside it, every 30 s: VRAM, edge / junction temperature, power and fan per card, the engine's host RSS and MemAvailable.
+# Beside it, every 30 s: VRAM, edge / junction temperature, power and fan per card, the engine's host RSS (total and ANONYMOUS) and MemAvailable.
 # Verdict (all must hold): every accept_live round PASS; no HIP error / memory fault / "engine dispatcher stopped" / HTTP 5xx in the gateway log since the start; VRAM drift per card < 300 MiB
-# (first third against last third); engine RSS drift < 3 GB; warm new-chat ttft last third < 1.5x the first third (decode tok/s of the log's requests is printed, not gated: long prompts decode slower by depth);
-# the engine is still alive and answering at the end. A long prompt that did not contain the code in its answer is reported, not failed (a reasoning model may spend its budget thinking).
+# (first third against last third); engine ANONYMOUS memory drift < 3 GB (the total RSS is NOT gated: ~224 GB of it is the mmap'd GGUF + shared expert staging, and the GGUF map fills with
+# touched pages for the first hours up to its file size -- 2026-10-09 the first soak failed a total-RSS gate on that, +5.7 GB of page-cache fill, anon 1.4 GB flat); warm new-chat ttft last third < 1.5x the first third (decode tok/s of the log's requests is printed, not gated: long prompts decode slower by depth);
+# the engine is still alive and answering at the end. A long prompt that did not contain the code in its answer is reported, not failed (a reasoning model may spend its budget thinking); every long prompt starts with a per-request nonce line so the
+# gateway's prefix cache cannot answer it (2026-10-09: the repeated 90k prompt came back in 0.8-3 s from the cache and tested nothing), and the first 160 characters of the answer go to long.log.
 # Usage: glm_soak.sh [minutes=60]        Out: ~/bench/soak_<date>_<time>/ {summary.txt, rounds.log, long.log, samples.tsv, accept_N.log}
 # Env: GLM53_LOG (gateway log, default ~/bench/serve_alt_franken_glm.log), SOAK_LENS ("15000 40000 90000" prompt tokens).
 set -u
@@ -21,15 +23,16 @@ OFF=$(stat -c %s "$GLM53_LOG")
 echo "=== soak start $(date -Is) minutes=$MIN out=$O log_offset=$OFF engine_sha=$(sha256sum "$HOME/bench/franken_bin/franken_dec_glm" | cut -c1-16)" | tee "$O/rounds.log"
 
 sample() {   # one TSV row per 30 s
-  printf 'epoch\tcard\tvram_mib\ttemp_edge\ttemp_junc\tpower_w\tfan_rpm\trss_mb\tmemavail_mb\n' > "$O/samples.tsv"
+  printf 'epoch\tcard\tvram_mib\ttemp_edge\ttemp_junc\tpower_w\tfan_rpm\trss_mb\tmemavail_mb\trss_anon_mb\n' > "$O/samples.tsv"
   while :; do
     rss=$(ps -eo rss,args | awk '/franken_dec_[g]lm/ && !/docker/ {s+=$1} END {printf "%d", s/1024}'); ma=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
+    an=$(for p in $(pgrep -x franken_dec_glm); do awk '/^RssAnon/ {print $2}' /proc/$p/status 2>/dev/null; done | awk '{s+=$1} END {printf "%d", s/1024}')
     for d in /sys/class/drm/card[0-9]/device; do
       [ -e "$d/mem_info_vram_used" ] || continue
       h=$(ls -d "$d"/hwmon/hwmon* 2>/dev/null | head -1)
-      printf '%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(basename "$(dirname "$d")")" "$(( $(cat "$d/mem_info_vram_used") / 1048576 ))" \
+      printf '%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(basename "$(dirname "$d")")" "$(( $(cat "$d/mem_info_vram_used") / 1048576 ))" \
         "$(( $(cat "$h/temp1_input" 2>/dev/null || echo 0) / 1000 ))" "$(( $(cat "$h/temp2_input" 2>/dev/null || echo 0) / 1000 ))" \
-        "$(( $(cat "$h/power1_average" 2>/dev/null || echo 0) / 1000000 ))" "$(cat "$h/fan1_input" 2>/dev/null || echo 0)" "$rss" "$ma"
+        "$(( $(cat "$h/power1_average" 2>/dev/null || echo 0) / 1000000 ))" "$(cat "$h/fan1_input" 2>/dev/null || echo 0)" "$rss" "$ma" "$an"
     done >> "$O/samples.tsv"
     sleep 30
   done
@@ -45,7 +48,7 @@ chars = toks * 4
 body = (src * (chars // len(src) + 2))[:chars]
 code = "7391"
 mid = len(body) // 2
-doc = body[:mid] + "\n\nNOTE FOR THE READER: the access code is " + code + ".\n\n" + body[mid:]
+doc = "Request id %s-%d (ignore this line).\n\n" % (rnd, int(time.time())) + body[:mid] + "\n\nNOTE FOR THE READER: the access code is " + code + ".\n\n" + body[mid:]
 prompt = doc + "\n\nQuestion: what is the access code mentioned in the note above? Answer with the number only."
 req = urllib.request.Request("http://127.0.0.1:8081/v1/chat/completions", data=json.dumps({"model": "glm-5.3-flash", "messages": [{"role": "user", "content": prompt}], "max_tokens": 3000}).encode(),
                              headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
@@ -53,7 +56,7 @@ t0 = time.time()
 try:
     d = json.loads(urllib.request.urlopen(req, timeout=1500).read())
     u = d.get("usage", {}); c = d["choices"][0]
-    line = "round=%s ok=1 prompt_tokens=%s completion_tokens=%s finish=%s found_code=%d wall_s=%.1f" % (rnd, u.get("prompt_tokens"), u.get("completion_tokens"), c.get("finish_reason"), int(code in (c["message"].get("content") or "")), time.time() - t0)
+    line = "round=%s ok=1 prompt_tokens=%s completion_tokens=%s finish=%s found_code=%d wall_s=%.1f answer=%r" % (rnd, u.get("prompt_tokens"), u.get("completion_tokens"), c.get("finish_reason"), int(code in (c["message"].get("content") or "")), time.time() - t0, (c["message"].get("content") or "")[:160])
 except Exception as e:
     line = "round=%s ok=0 error=%r wall_s=%.1f" % (rnd, e, time.time() - t0)
 open(logf, "a").write(line + "\n"); print(line)
@@ -104,12 +107,16 @@ for card in sorted({r["card"] for r in rows}):
     drift = f(b, "vram_mib") - f(a, "vram_mib")
     print("%s: vram %.0f -> %.0f MiB (drift %+.0f), temp edge max %d junction max %d C, power max %d W, fan max %d rpm" % (card, f(a, "vram_mib"), f(b, "vram_mib"), drift,
           max(int(x["temp_edge"]) for x in rr), max(int(x["temp_junc"]) for x in rr), max(int(x["power_w"]) for x in rr), max(int(x["fan_rpm"]) for x in rr)))
+    hot = lambda t: sum(1 for x in rr if int(x["temp_junc"]) >= t)
+    print("  %s junction samples >= 105 C: %d of %d, >= 110 C (driver crit): %d" % (card, hot(105), len(rr), hot(110)))
     if abs(drift) > 300: bad.append("%s VRAM drift %+.0f MiB" % (card, drift))
 r0 = [r for r in rows if r["card"] == rows[0]["card"]]; a, b = thirds(r0)
 rss_a, rss_b = st.median(float(x["rss_mb"]) for x in a), st.median(float(x["rss_mb"]) for x in b)
+an_a, an_b = st.median(float(x["rss_anon_mb"]) for x in a), st.median(float(x["rss_anon_mb"]) for x in b)
 ma_a, ma_b = st.median(float(x["memavail_mb"]) for x in a), st.median(float(x["memavail_mb"]) for x in b)
-print("engine host RSS %.0f -> %.0f MB (drift %+.0f), MemAvailable %.0f -> %.0f MB" % (rss_a, rss_b, rss_b - rss_a, ma_a, ma_b))
-if rss_b - rss_a > 3000: bad.append("engine RSS drift %+.0f MB" % (rss_b - rss_a))
+print("engine host RSS (total, mostly the mmap'd model + shared staging; not gated) %.0f -> %.0f MB (drift %+.0f), MemAvailable %.0f -> %.0f MB" % (rss_a, rss_b, rss_b - rss_a, ma_a, ma_b))
+print("engine ANONYMOUS memory %.0f -> %.0f MB (drift %+.0f)" % (an_a, an_b, an_b - an_a))
+if an_b - an_a > 3000: bad.append("engine anonymous memory drift %+.0f MB" % (an_b - an_a))
 alive = subprocess.run("ps -eo args | grep -c '[f]ranken_dec_glm'", shell=True, capture_output=True, text=True).stdout.strip()
 print("engine processes at the end:", alive)
 if alive == "0": bad.append("the engine is gone")

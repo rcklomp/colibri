@@ -8,6 +8,7 @@
 #
 #   setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_quant_kld_chain.sh > ~/bench/quant_kld_chain.log 2>&1 < /dev/null &
 #
+# 2026-10-09 10:19: the first start died on a 3.2 GiB compute buffer on card 0 (-b 4096 -ub 2048 with a 1 GiB fit margin): batch 2048 / micro-batch 512 and a 2.5 GiB margin.
 # Env: CAND (default UD-IQ3_XXS), CAND_N (shard count, default 4), CHUNKS (default 10), CTX (default 4096).
 # Steps: (1) the corpus; (2) IQ4_XS writes its logits (--kl-divergence-base); (3) wait for the candidate's download (~/bench/dl_glm_iq3xxs.log DONE); (4) the candidate
 # is scored against them (--kl-divergence); (5) summary.txt. Output ~/bench/quant_kld/. The logits file is ~CHUNKS*CTX/2 * 155 k * 2 bytes (about 6 GB at the defaults).
@@ -36,8 +37,8 @@ run_ppl() {   # run_ppl <name> <gguf> <extra args…>
   say "start $name ($gguf)"
   timeout 9000 docker run --rm --name "quantkld-$name" --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --ipc=host \
     -e "LD_LIBRARY_PATH=/opt/rocm/lib:$BIN" -v /home/ronald:/home/ronald "$IMG" "$BIN/llama-perplexity" \
-    -m "$gguf" -f "$CORPUS" -c "$CTX" -b "$CTX" -ub 2048 --chunks "$CHUNKS" \
-    --fit on --fit-target 1024,1024,1024 --fit-ctx "$CTX" --split-mode layer --device ROCm0,ROCm1,ROCm2 -fa on -t 16 -tb 8 "$@" > "$log" 2>&1
+    -m "$gguf" -f "$CORPUS" -c "$CTX" -b 2048 -ub 512 --chunks "$CHUNKS" \
+    --fit on --fit-target 2560,2560,2560 --fit-ctx "$CTX" --split-mode layer --device ROCm0,ROCm1,ROCm2 -fa on -t 16 -tb 8 "$@" > "$log" 2>&1
   local rc=$?
   [ $rc -eq 124 ] && docker kill "quantkld-$name" >/dev/null 2>&1
   say "end $name rc=$rc"

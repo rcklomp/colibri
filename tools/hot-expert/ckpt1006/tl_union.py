@@ -6,7 +6,7 @@
 Prints (chunks after the first recorded one, the window = end of the first recorded chunk .. end of the last):
   period       per chunk: end of its last device work minus the previous chunk's (the throughput number) and the SPAN (first to last device work of the chunk)
   in flight    mean number of recorded chunks in flight over the window (span-weighted); the engine's two banks cap it at 2
-  busy         per card: main-stream busy, helper-stream busy (help_batch, writeback, packet), their union, the union of the compute classes only
+  busy         per card, over the WINDOW (biased for upstream cards at a full pipeline, see the per-chunk lines below it): main-stream busy, helper-stream busy (help_batch, writeback, packet), their union, the union of the compute classes only
   packet       the longest help_packet of each chunk (two hipMemcpyPeerAsync: ids/plan + x rows) and where it sits: a >100 ms packet is a copy stuck behind another copy
   stall        for each such packet: the device event that ended within 30 ms of it (what it queued behind)
   chain        the owner's layer chain (layer_a start .. moe_c end) per layer, median over the chunks: the sum is the chunk latency
@@ -51,6 +51,21 @@ def main():
         comp = [clip(r) for r in dev if r['card'] == card and r['cls'] in WORK and r['t1'] > w0 and r['t0'] < w1]
         print('card %d: main-stream busy %.1f %%  helper-stream busy %.1f %%  union %.1f %%  union(compute) %.1f %%' % (
             card, 100 * union(m) / W, 100 * union(h) / W, 100 * union(m + h) / W, 100 * union(comp) / W))
+    # PF9 (record §L5-PF9): the window shares above are BIASED for the upstream cards -- a chunk's span is far longer than the window when the pipeline is
+    # full (23 s against 17 s at 32 chunks), so card 0 does its share of the recorded chunks BEFORE the window opens and reads ~0 %. The unbiased number
+    # is per chunk: the card's work on that chunk (union of its intervals) against the steady period.
+    steady = cs[1:]
+    if len(steady) >= 2:
+        pmean = statistics.mean(per[1:]) * 1e6 if len(per) > 1 else (w1 - w0) / (len(cs) - 1)
+        print('per chunk (chunks %s), seconds of device work and share of the %.3f s steady period (chunks after the first two):' % (steady, pmean / 1e6))
+        for card in sorted({r['card'] for r in dev if r['card'] >= 0}):
+            acc = []
+            for c in steady:
+                f = lambda st: union([(r['t0'], r['t1']) for r in dev if r['chunk'] == c and r['card'] == card and r['cls'] in WORK | COPY and (st is None or r['stream'] == st)])
+                acc.append((f('main'), f('help'), f(None)))
+            m = [statistics.mean(a[i] for a in acc) / 1e6 for i in range(3)]
+            print('  card %d: main-stream work %.2f s (%.0f %%)  helper streams %.2f s (%.0f %%)  union %.2f s' % (card, m[0], 100e6 * m[0] / pmean, m[1], 100e6 * m[1] / pmean, m[2]))
+        print('  (a main stream at 100 % binds the period; the helper streams run beside it, so the shares do not add)')
     print('longest help_packet per chunk (ms) and what it ended behind:')
     for c in cs:
         pk = sorted([r for r in dev if r['chunk'] == c and r['cls'] == 'help_packet'], key=lambda r: r['t0'] - r['t1'])[:2]

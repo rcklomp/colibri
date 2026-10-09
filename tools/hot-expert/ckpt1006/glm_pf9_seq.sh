@@ -3,6 +3,7 @@
 #   1. glm_pf9_main_chain    timeline of a 32-chunk prompt, profile, depth curve        (binary franken_decode_glm_pf9main)
 #   2. glm_pf0_skip_chain    skip classes with --glm-help-copy 1 on the prose prompt     (binary franken_decode_glm_pf0dbg, rebuilt from main)
 #   3. glm_pf0_skip_chain    the same on the technical text (the record)
+# ERRATUM: chains 2 and 3 used a binary whose expert skip (bit 1) did nothing in the chunk path (see glm_pf9b_seq.sh); only chain 1 (no masks) and chain 2's non-expert classes stand. Chain 3 was killed.
 # Waits for both builds (build_pf0dbg.sh, then PF0_PLAIN=1) to have finished.  Launch:  setsid nohup bash ~/bench/glm_pf9_seq.sh > ~/bench/glm_pf9_seq.log 2>&1 < /dev/null &
 H=$HOME/src/colibri/tools/hot-expert; B=$HOME/bench
 until grep -q '^done' "$B/build_pf9_plain.log" 2>/dev/null; do sleep 20; done

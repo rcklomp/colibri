@@ -76,8 +76,11 @@ sub('glm5_gpu.inc', [
   "        if (path && *path) { const std::string p = std::string(path) + \".dev\" + std::to_string(dev); dbg_rf_ = std::fopen(p.c_str(), \"w\"); }\n"
   "    }\n"
   "    void set_prefill_stage(int on, int ring_mb) override {"),
- ("        k_glm5_moe<TY><<<dim3((unsigned) ceil_div(rows, DS4_GEMV_ROWS)",
-  "        if (g_.dbg_skip_ & 1) return;   // --debug-skip: TIMING ONLY\n        k_glm5_moe<TY><<<dim3((unsigned) ceil_div(rows, DS4_GEMV_ROWS)"),
+ # PF9 ERRATUM (2026-10-09): the bit-1 skip used to sit in front of `k_glm5_moe<TY><<<`, i.e. AFTER the `if (cp && mg > 1) { k_glm5_moe_blk ...; return; }` branch -- a no-op for every chunk
+ # with FRANKEN_GLM_MOE_G >= 2 (the served G = 8), so PF0's "experts cost 0" and "skeleton 52 %" measured a skeleton that still ran every routed-expert kernel and its link reads.
+ # The check now opens moe_launch, before the blocked branch.
+ ("                    int x_per_slot, float * y, hipStream_t s, int n_items, int n_assign) {\n        // every table entry, ring slot and slab offset is 16-byte aligned",
+  "                    int x_per_slot, float * y, hipStream_t s, int n_items, int n_assign) {\n        if (g_.dbg_skip_ & 1) return;   // --debug-skip: TIMING ONLY (before the blocked-kernel branch: PF9 erratum)\n        // every table entry, ring slot and slab offset is 16-byte aligned"),
  ('        g_.mark(PC_GLM_KDA_CONV); g_.last_op_ = "glm5_kda_conv";',
   '        if (g_.dbg_skip_ & 4) return;\n        g_.mark(PC_GLM_KDA_CONV); g_.last_op_ = "glm5_kda_conv";'),
  ('        g_.mark(PC_GLM_KDA_CONV); g_.last_op_ = "glm5_kda_gate";',

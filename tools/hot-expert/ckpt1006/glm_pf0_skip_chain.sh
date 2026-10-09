@@ -12,7 +12,7 @@
 # Launch (on the rig):  ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_pf0_skip_chain.sh > ~/bench/glm_pf0_skip_chain.log 2>&1 < /dev/null &
 # Watch from the Mac:   tools/hot-expert/ckpt1006/watch_chain.sh ~/bench/glm_pf0_skip_chain.log ~/bench/franken/glm5/pf0_skip/gate_run.log
 # PF9: PF0_EXTRA = extra engine flags for every config (PF9 runs it with --glm-help-copy 1, the shipped default since Rev 102).
-# Env: PF0_BIN, PF0_OUT, PF0_PROMPT (token-ID file of the timing arms, default prose8400), PF0_MASKS (default "0 31 29 30 27 15 7 1 3"), PF0_ROUTES (0 = no --debug-route configs).
+# Env: PF0_BIN, PF0_OUT, PF0_PROMPT (token-ID file of the timing arms, default prose8400), PF0_MASKS (default "0 31 29 30 27 15 7 1 3"), PF0_ROUTES (0 = no --debug-route configs), PF0_CTRL (1 = the positive control).
 set -u
 . "$HOME/bench/chain_preflight.sh"
 BIN=${PF0_BIN:-$HOME/bench/franken_bin/franken_decode_glm_pf0dbg}
@@ -26,6 +26,10 @@ say_end() { echo "=== glm_pf0_skip exit rc=$1 $(date -Is)"; exit "$1"; }
 { echo "w0 --tokens-file $PR $SHIP --time-prefill 8192"
   for m in $MASKS; do echo "m${m}_a --tokens-file $PR $SHIP --time-prefill 8192 --debug-skip $m"; done
   for m in $(echo $MASKS | tr ' ' '\n' | tac | tr '\n' ' '); do echo "m${m}_b --tokens-file $PR $SHIP --time-prefill 8192 --debug-skip $m"; done
+  if [ "${PF0_CTRL:-0}" = 1 ]; then   # POSITIVE CONTROL (PF9 erratum): the expert classes of --profile must fall to ~0 when bit 1 skips the expert kernels
+  echo "ctl_m0 --tokens-file $PR $SHIP --time-prefill 8192 --profile"
+  echo "ctl_m1 --tokens-file $PR $SHIP --time-prefill 8192 --profile --debug-skip 1"
+  fi
   if [ "${PF0_ROUTES:-1}" = 1 ]; then
   echo "route_prose   --tokens-file $PR  $SHIP --time-prefill 8192  --debug-route $O/route_prose"
   echo "route_rec8k   --tokens-file $REC $SHIP --time-prefill 8192  --debug-route $O/route_rec8k"
@@ -60,6 +64,11 @@ awk -v maskl="$MASKS" '/^=== gate-plan config/ { c = $4 } /^prefill_tokens=/ { s
           if (mm[1]  != "") printf "--- marginal experts   ( 0 -  1) %.3f   (everything else = mask 1 = %.3f)\n", mm[0] - mm[1], mm[1]
           if (mm[3]  != "" && mm[1] != "") printf "--- marginal trunk GEMMs ( 1 -  3) %.3f   (KDA + indexer + attention = mask 3 = %.3f; mask 3 minus skeleton = %.3f)\n", mm[1] - mm[3], mm[3], mm[3] - mm[31]
         } }' "$O/gate_run.log"
+if [ "${PF0_CTRL:-0}" = 1 ]; then
+  echo "=== positive control: the expert classes of --profile per prompt token (us), mask 0 against mask 1 -- mask 1 MUST show ~0, else the skip does not skip"
+  awk '/^=== gate-plan config/ { c = $4 } (c == "ctl_m0" || c == "ctl_m1") && /^--- prefill \(per prompt token/ { d = $0; sub(/.*device /, "", d); sub(/ .*/, "", d) }
+    (c == "ctl_m0" || c == "ctl_m1") && /^prof_glm5_expert_(resident_gate_up|missed_and_tail)_us/ { printf "%-7s dev%s %s\n", c, d, $0 }' "$O/gate_run.log"
+fi
 echo "=== sampler"; python3 -I $HOME/bench/gpu_sampler.py summary "$O/samples.tsv" "$O/gate_run.log" | cut -c1-160
 echo "=== route files"; ls -la "$O"/route_* 2>&1 | cut -c1-120
 say_end "$rc"

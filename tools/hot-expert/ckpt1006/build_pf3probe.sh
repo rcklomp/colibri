@@ -6,8 +6,10 @@
 #   trunk  = layer_a(il)                         attention / KDA, norms, hyper-connection, router, plan   (the compute-bound side)
 #   expert = moe_compute_own(layer il + 1)       the card's own share of a chunk's routed experts, resident from VRAM + missed in place over the link, with the plan layer_a(il + 1) left behind
 #            (bank (il + 1) & 1: never the bank layer_a(il) writes, so the expert kernels read a frozen plan)
-# on two probe streams, REPS reps each, under 14 conditions (each run twice, forward then reverse): alone, alone on a CU subset, both at once (default; trunk stream high priority; expert
-# stream high priority; the CUs split in WGPs 8/40, 16/32, 24/24 between the expert and the trunk stream). The output is TIMING ONLY (the hidden state is re-fed to the same layer).
+# on two probe streams, REPS reps each, under 17 conditions (each run twice, forward then reverse): alone, alone on a CU subset, both at once (default; trunk stream high priority; expert
+# stream high priority; the 48 units split 16/32, 24/24, 32/16 and 8/40 between the expert and the trunk stream). CU masks work on gfx1100 (the trunk takes 157 ms on 2/3 of the card against
+# 110 ms on all of it), but the first probe HUNG at its second masked condition (a 16-unit mask that left 4 of the 12 shader arrays empty, probably): the masks now spread over all arrays,
+# the unmasked conditions run first, the waits are bounded (60 s, then the process exits) and every line is flushed. The output is TIMING ONLY (the hidden state is re-fed to the same layer).
 # Lines:  pf3 card= il= dsa= cond= run= trunk_ms= expert_ms=    (ms a rep, from a common start to the last kernel of that stream)
 # The patch asserts every anchor once; a stale anchor stops the build. Output binary: franken_decode_glm_pf3probe (mask-free: `--pf3-probe 0` = the shipped path).
 set -u
@@ -56,17 +58,18 @@ sub('glm5_gpu.inc', [
             HIP_CHECK(hipDeviceGetStreamPriorityRange(&least, &greatest));
             hipDeviceProp_t prop{};
             HIP_CHECK(hipGetDeviceProperties(&prop, g_.dev_));
-            const int ncu = prop.multiProcessorCount, nw = ncu / 2;
+            const int ncu = prop.multiProcessorCount;       // 48 on a 7900 XTX: the WGPs, one mask bit each
             std::vector<int> xw, tw;
-            if (xs_wgps > 0) {           // a spread of WGPs (a stride coprime with nw), the first xs_wgps to the expert stream
+            if (xs_wgps > 0) {           // units spread over the shader engines and arrays whatever the bit order (r * 11 mod 48: every prefix of 16, 24, 32 units and its rest reach all 6 x 2 arrays);
+                                         // the first xs_wgps to the expert stream, the rest to the trunk stream. A mask that leaves a whole array empty hung the first probe.
                 auto gcd = [](int a, int b) { while (b) { const int t = a % b; a = b; b = t; } return a; };
-                int stride = (int) (0.618 * nw); while (gcd(stride, nw) != 1) ++stride;
-                for (int j = 0; j < nw; ++j) (j < xs_wgps ? xw : tw).push_back((j * stride) % nw);
+                const int stride = gcd(11, ncu) == 1 ? 11 : 1;
+                for (int r = 0; r < ncu; ++r) (r < xs_wgps ? xw : tw).push_back((r * stride) % ncu);
             }
             auto mk = [&](hipStream_t * s, int hi, const std::vector<int> & wgps) -> bool {
                 if (wgps.empty()) return hipStreamCreateWithPriority(s, hipStreamNonBlocking, hi ? greatest : least) == hipSuccess;
                 std::vector<uint32_t> m((size_t) (ncu + 31) / 32, 0u);       // a CU mask has no priority argument
-                for (int w : wgps) for (int c = 2 * w; c < 2 * w + 2; ++c) m[(size_t) c / 32] |= 1u << (c % 32);
+                for (int w : wgps) m[(size_t) w / 32] |= 1u << (w % 32);
                 return hipExtStreamCreateWithCUMask(s, (uint32_t) m.size(), m.data()) == hipSuccess;
             };
             if (!mk(&pr_ts_, ts_hi, tw) || !mk(&pr_xs_, xs_hi, xw)) { std::printf("pf3_probe dev=%d: stream create failed\\n", g_.dev_); pr_key_ = -1; return false; }
@@ -86,8 +89,21 @@ sub('glm5_gpu.inc', [
         g_.stream_ = main;
         HIP_CHECK(hipEventRecord(pr_eT_, pr_ts_));
         HIP_CHECK(hipEventRecord(pr_eX_, pr_xs_));
-        HIP_CHECK(hipEventSynchronize(pr_eT_));
-        HIP_CHECK(hipEventSynchronize(pr_eX_));
+        for (hipEvent_t e : {pr_eT_, pr_eX_}) {      // bounded: the first probe hung on a mask and sat at 100 % for 12 minutes
+            const auto w0 = std::chrono::steady_clock::now();
+            for (;;) {
+                const hipError_t q = hipEventQuery(e);
+                if (q == hipSuccess) break;
+                HIP_CHECK(q == hipErrorNotReady ? hipSuccess : q);
+                if (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() > 60.0) {
+                    std::printf("pf3_probe dev=%d: HANG (a stream not finished after 60 s; mode=%d ts_hi=%d xs_hi=%d xs_units=%d) -- exiting\\n", g_.dev_, mode, ts_hi, xs_hi, xs_wgps);
+                    std::fflush(stdout);
+                    std::_Exit(3);
+                }
+                struct timespec nap = {0, 1000000};
+                nanosleep(&nap, nullptr);
+            }
+        }
         float a = 0.f, b = 0.f;
         HIP_CHECK(hipEventElapsedTime(&a, pr_e0_, pr_eT_));
         HIP_CHECK(hipEventElapsedTime(&b, pr_e0_, pr_eX_));
@@ -118,14 +134,18 @@ sub('glm5_graph.cpp', [
 // expert share of layer il + 1 (a frozen plan: layer_a(il + 1) ran once, and layer_a(il) writes the other plan bank) on two probe streams, 14 conditions, forward then reverse.
 void Glm5Runner::pf3_probe(Recorder & rec, int reps) {
     const int T = T_;
-    std::printf("pf3_probe T=%d pos=%d reps=%d (TIMING ONLY: the hidden state is re-fed to the same layer)\n", T, pos_, reps);
+    const bool masks = reps >= 1000;      // --pf3-probe 1003 = 3 reps AND the CU-mask conditions (the first probe hung on one); 3 = the unmasked conditions only
+    if (masks) reps -= 1000;
+    std::printf("pf3_probe T=%d pos=%d reps=%d masks=%d (TIMING ONLY: the hidden state is re-fed to the same layer)\n", T, pos_, reps, masks ? 1 : 0);
     struct Cond { const char * name; int mode, ts_hi, xs_hi, xw; };
+    // xw = the units (of 48) the expert stream gets; the trunk stream gets the rest. Unmasked first; the 8-unit mask (it cannot reach all 12 arrays) last.
     static const Cond conds[] = {
         {"T_alone", 1, 0, 0, 0},       {"X_alone", 2, 0, 0, 0},
-        {"T_on_40w", 1, 0, 0, 8},      {"T_on_32w", 1, 0, 0, 16},     {"T_on_24w", 1, 0, 0, 24},
-        {"X_on_8w", 2, 0, 0, 8},       {"X_on_16w", 2, 0, 0, 16},     {"X_on_24w", 2, 0, 0, 24},
         {"B_default", 3, 0, 0, 0},     {"B_trunk_hi", 3, 1, 0, 0},    {"B_expert_hi", 3, 0, 1, 0},
-        {"B_part_8x40", 3, 0, 0, 8},   {"B_part_16x32", 3, 0, 0, 16}, {"B_part_24x24", 3, 0, 0, 24},
+        {"X_on_32", 2, 0, 0, 32},      {"T_on_32", 1, 0, 0, 16},      {"B_part_X16_T32", 3, 0, 0, 16},
+        {"X_on_24", 2, 0, 0, 24},      {"T_on_24", 1, 0, 0, 24},      {"B_part_X24_T24", 3, 0, 0, 24},
+        {"X_on_16", 2, 0, 0, 16},      {"T_on_16", 1, 0, 0, 32},      {"B_part_X32_T16", 3, 0, 0, 32},
+        {"X_on_8", 2, 0, 0, 8},        {"T_on_40", 1, 0, 0, 8},       {"B_part_X8_T40", 3, 0, 0, 8},
     };
     const int NC = (int) (sizeof(conds) / sizeof(conds[0]));
     for (int c = 0; c < model_.n_devices(); ++c) {
@@ -152,9 +172,10 @@ void Glm5Runner::pf3_probe(Recorder & rec, int reps) {
             for (int pass = 0; pass < 2 && ok; ++pass)
                 for (int k = 0; k < NC && ok; ++k) {
                     const Cond & cd = conds[pass == 0 ? k : NC - 1 - k];     // forward, then reverse
+                    if (cd.xw > 0 && !masks) continue;
                     ok = g.pf3_probe(trunk, expert, reps, cd.mode, cd.ts_hi, cd.xs_hi, cd.xw, ms);
-                    if (ok) std::printf("pf3 card=%d il=%d dsa=%d cond=%s run=%c trunk_ms=%.2f expert_ms=%.2f\n", c, il, pr.second ? 1 : 0,
-                                        cd.name, pass == 0 ? 'a' : 'b', ms[0] / reps, ms[1] / reps);
+                    if (ok) { std::printf("pf3 card=%d il=%d dsa=%d cond=%s run=%c trunk_ms=%.2f expert_ms=%.2f\n", c, il, pr.second ? 1 : 0,
+                                          cd.name, pass == 0 ? 'a' : 'b', ms[0] / reps, ms[1] / reps); std::fflush(stdout); }
                 }
             if (!ok) std::printf("pf3 card=%d il=%d: probe stopped (stream create failed)\n", c, il);
         }

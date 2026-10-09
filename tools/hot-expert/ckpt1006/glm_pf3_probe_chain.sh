@@ -2,8 +2,9 @@
 # glm_pf3_probe_chain.sh -- PF3 route B, step 1 (ACTION-LIST row 5d, plan Rev 104 section 0d; builder: build_pf3probe.sh): does the link-bound expert phase of a card run beside its trunk work?
 # ONE process, binary franken_decode_glm_pf3probe (franken-engine main df401f7 + the DEBUG-ONLY `--pf3-probe`), the SERVED shape: --expert-gb 17 (the probe allocates two streams and three events, no device
 # memory), --ctx 262144 --chunk 1024 --adapt-prefill 0 --gemm-lds 1 --glm-help-copy 1, FRANKEN_GLM_MOE_G=8. Each config prefills 8 192 tokens (so the router, the resident set and the KV state are realistic),
-# then the probe runs per card a KDA and a DSA MoE layer (the layer's attention + router + plan against the NEXT layer's own expert share, a frozen plan), 14 conditions x forward/reverse.
-# Configs: probe_rec (technical text), probe_prose. Lines `pf3 card= il= dsa= cond= run= trunk_ms= expert_ms=` (ms a rep) in gate_run.log; pf3_probe_report.py turns them into the overlap table.
+# then the probe runs per card a KDA and a DSA MoE layer (the layer's attention + router + plan against the NEXT layer's own expert share, a frozen plan), 17 conditions x forward/reverse (the masked ones in the last config only).
+# Configs: probe_rec (technical text) and probe_prose (the unmasked conditions: alone, both at once, stream priorities), then probe_masks (technical text; adds the CU-mask conditions, last because the
+# first probe hung on one: the waits are bounded now (60 s, then the engine exits and the report prints what was read)). Lines `pf3 card= il= dsa= cond= run= trunk_ms= expert_ms=` (ms a rep) in gate_run.log; pf3_probe_report.py turns them into the overlap table.
 # TIMING ONLY: the probe re-feeds the hidden state to one layer; it is not an oracle and no output is compared.
 # Launch (on the rig):  ~/src/colibri/tools/hot-expert/preflight.sh <cmd> && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_pf3_probe_chain.sh > ~/bench/glm_pf3_probe_chain.log 2>&1 < /dev/null &
 # Env: PF3_BIN, PF3_OUT, PF3_EG (default 17), PF3_REPS (default 3).
@@ -19,6 +20,7 @@ say_end() { echo "=== glm_pf3_probe exit rc=$1 $(date -Is)"; exit "$1"; }
 [ -x "$BIN" ] && [ -f "$PR" ] && [ -f "$REC" ] || { echo "FATAL: missing $BIN or $PR or $REC"; say_end 2; }
 { echo "probe_rec   --tokens-file $REC  $BASE --time-prefill 8192 --pf3-probe $REPS"
   echo "probe_prose --tokens-file $PR   $BASE --time-prefill 8192 --pf3-probe $REPS"
+  echo "probe_masks --tokens-file $REC  $BASE --time-prefill 8192 --pf3-probe $((1000 + REPS))"     # LAST: the CU-mask conditions (the first probe hung on one; the waits are bounded now)
 } > "$O/plan.txt"
 echo "=== glm_pf3_probe start $(date -Is) bin=$(sha256sum "$BIN" | cut -c1-16) expert-gb=$EG reps=$REPS"; cut -c1-100 "$O/plan.txt"
 rig_quiet_wait 1800 || say_end 3

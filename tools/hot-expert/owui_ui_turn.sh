@@ -16,6 +16,7 @@ H = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
 def api(method, path, body=None):
     req = urllib.request.Request("http://127.0.0.1:8080" + path, data=json.dumps(body).encode() if body is not None else None, headers=H, method=method)
     return json.loads(urllib.request.urlopen(req, timeout=120).read())
+api("GET", "/api/models")   # what a browser does on page load: Open WebUI caches the model list, and after the gateway was down it says "Model not found" (2026-10-09)
 chat = api("POST", "/api/v1/chats/new", {"chat": {"title": "acceptance turn (temporary)", "models": ["glm-5.3-flash"], "messages": [], "history": {"messages": {}, "currentId": None}}})
 mid = str(uuid.uuid4())
 api("POST", "/api/chat/completions", {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": sys.argv[1]}], "stream": False,

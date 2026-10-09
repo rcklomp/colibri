@@ -5,10 +5,12 @@
 #              the public GitHub fork's lag as INFO (it is pushed only with the owner's go-ahead, never by this script)
 #   docs       tools/hot-expert/doc_currency.sh (the entry-point docs name the plan's top rev, no dead references, no loitering files);
 #              the handoff names the sha of the INSTALLED serving binary
-#   rig        idle or busy (lock, engine/gateway/chain processes, the franken_engine container); VRAM empty when idle; the reservation flag present; one worktree on
-#              the rig; no sequencer scripts left over from the last 24 h; ~/bench copies of repo scripts that DRIFTED from the repo (the stale-copy trap of 2026-10-07)
+#   rig        idle or busy (lock, engine/gateway/chain processes, the franken_engine container); VRAM empty when idle; the reservation flag present; ~/bench copies of repo
+#              scripts that DRIFTED from the repo (the stale-copy trap of 2026-10-07)
+#   hygiene    (--full only; FAIL, not WARN: 'clean up' means clean, 2026-10-09) no leftover local branches in either repo on the Mac or the rig, no merged or unmerged
+#              side branch on Gitea (finished experiments are tags archive/*), one worktree per repo on the rig, no one-off sequencers (any age), no gate dump or download >1 GB older than 2 days in ~/bench
 #   config     the task-closeout skill installed == the repo copy; the Stop hook registered in ~/.claude/settings.json; every memory file the index names exists
-# Exit 0 when no FAIL (WARN and INFO never fail), 1 otherwise. The last stdout line is machine-readable: `rig_busy=0|1`.
+# Exit 0 when no FAIL (WARN and INFO never fail), 1 otherwise. A WARN is still work: the skill says to FIX it, never to name it in the report and leave it. The last stdout line is machine-readable: `rig_busy=0|1`.
 # --quick: what the Stop hook runs (no fetch, no drift scan, only WARN/FAIL lines printed); --full: everything, every line printed.
 set -u
 MODE=full; [ "${1:-}" = "--quick" ] && MODE=quick
@@ -35,13 +37,17 @@ echo "c_dirty=\$(git -C ~/src/colibri status --porcelain 2>/dev/null | wc -l | t
 echo "f_head=\$(git -C ~/src/franken-engine rev-parse $FB 2>/dev/null)"
 echo "f_dirty=\$(git -C ~/src/franken-engine status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 echo "f_worktrees=\$(git -C ~/src/franken-engine worktree list 2>/dev/null | wc -l | tr -d ' ')"
+echo "c_worktrees=\$(git -C ~/src/colibri worktree list 2>/dev/null | wc -l | tr -d ' ')"
+echo "c_branches=\$(git -C ~/src/colibri branch --format='%(refname:short)' 2>/dev/null | grep -vxE 'hot-expert-tier|main' | tr '\n' ' ')"
+echo "f_branches=\$(git -C ~/src/franken-engine branch --format='%(refname:short)' 2>/dev/null | grep -vx main | tr '\n' ' ')"
+echo "big_stale=\$(find ~/bench -type f -size +1G -mtime +2 -printf '%s\n' 2>/dev/null | awk '{s+=\$1;n++} END {printf "%d file(s) %.0f GB", n, s/1e9}')"
 echo "lock=\$([ -d ~/bench/.rig.lock ] && head -1 ~/bench/.rig.lock/owner 2>/dev/null || echo none)"
 echo "flag=\$([ -e ~/bench/.dev_reserved ] && echo present || echo ABSENT)"
 echo "procs=\$(pgrep -fa '[f]ranken_dec_glm|[f]ranken_decode_glm|[f]ranken_decode_ds4|[o]penai_server|[r]un_chain.sh|[g]lm_[a-z0-9_]*chain.sh|[r]ocprofv3|[g]lm53' 2>/dev/null | grep -v 'tail ' | wc -l | tr -d ' ')"
 echo "containers=\$(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')"
 m=0; for d in /sys/class/drm/card[0-9]/device; do u=\$(( \$(cat \$d/mem_info_vram_used 2>/dev/null || echo 0) / 1048576 )); [ \$u -gt \$m ] && m=\$u; done; echo "vram_max=\$m"
 echo "installed=\$(sha256sum ~/bench/franken_bin/franken_dec_glm 2>/dev/null | cut -c1-16)"
-echo "seq_leftovers=\$(find ~/bench -maxdepth 1 -name 'seq*.sh' -mmin -1440 2>/dev/null | wc -l | tr -d ' ')"
+echo "seq_leftovers=\$(find ~/bench -maxdepth 1 -name '*seq*.sh' 2>/dev/null | wc -l | tr -d ' ')"
 while read -r name sum; do
   [ -z "\$name" ] && continue
   [ -f ~/bench/\$name ] || continue
@@ -82,7 +88,6 @@ if [ "$MODE" = full ] && git -C "$C" remote get-url fork >/dev/null 2>&1; then
   fr=$(with_alarm 20 git -C "$C" ls-remote fork "refs/heads/$CB" 2>/dev/null | cut -f1)
   if [ -n "$fr" ]; then lag=$(git -C "$C" rev-list --count "$fr..$CB" 2>/dev/null || echo "?"); info "GitHub fork (PUBLIC) lags $lag commit(s): pushed only with the owner's go-ahead after a secret scan, never by a session on its own"; fi
 fi
-fw=$(rv f_worktrees); [ -z "$fw" ] || [ "$fw" = 1 ] || warn "the rig's franken-engine has $fw worktrees: per-item build trees are temporary, remove yours (git worktree remove --force)"
 
 # ---------------------------------------------------------------- docs
 dc=$(cd "$C" && bash tools/hot-expert/doc_currency.sh 2>&1); dcrc=$?
@@ -105,9 +110,35 @@ else
   [ "${vram:-0}" -gt 1024 ] 2>/dev/null && warn "the rig is idle but a card holds $vram MiB of VRAM"
 fi
 [ "$flag" = ABSENT ] && warn "the rig's reservation flag ~/bench/.dev_reserved is ABSENT: the watchdog may restart a service nobody asked for"
-sl=$(rv seq_leftovers); [ -z "$sl" ] || [ "$sl" = 0 ] || warn "$sl sequencer script(s) ~/bench/seq*.sh from the last 24 h on the rig (recent one-offs: remove yours; older sessions' are listed in the handoff clean-up item)"
 drift=$(printf '%s\n' "$RIGOUT" | sed -n 's/^drift=//p' | tr '\n' ' ')
 [ -z "$drift" ] || warn "~/bench copies that DIFFER from the repo's ckpt1006/: $drift(a stale copy once pointed a chain at a removed worktree; scp the repo version before launching)"
+
+
+# ---------------------------------------------------------------- hygiene (--full: FAIL, because "clean up" means clean -- the owner, 2026-10-09, after a report that named a leftover worktree, an unmerged branch and 500 GB and left them)
+if [ "$MODE" = full ]; then
+  KEEP_C_REMOTE='fix/expert-cache-vs-page-cache|fix/expert-mmap'    # upstream PR heads, unmerged by design (the fork has them too)
+  hyg_local() {   # label dir keep-regex
+    local extra; extra=$(git -C "$2" branch --format='%(refname:short)' | grep -vxE "$3")
+    [ -z "$extra" ] && ok "$1: no leftover local branch on the Mac" || fail "$1: $(printf '%s\n' "$extra" | wc -l | tr -d ' ') leftover local branch(es) on the Mac ($(printf '%s\n' "$extra" | head -4 | tr '\n' ' ')...): merged -> git branch -d; unmerged -> merge it after its gate or tag it archive/<name>, push the tag, delete the branch"
+  }
+  hyg_remote() {  # label dir keep-branch keep-regex
+    local extra; extra=$(git -C "$2" branch -r --format='%(refname:short)' | grep '^origin/' | sed 's#^origin/##' | grep -vxE "HEAD|origin|main|$3|$4")
+    [ -z "$extra" ] && ok "$1: no side branch on Gitea" || fail "$1: side branch(es) on Gitea: $(printf '%s\n' "$extra" | head -5 | tr '\n' ' '): merged -> git push origin --delete; unmerged -> merge or tag archive/<name> first"
+  }
+  hyg_local "colibri" "$C" "$CB|main"; hyg_local "franken-engine" "$F" "$FB"
+  hyg_remote "colibri" "$C" "$CB" "$KEEP_C_REMOTE"; hyg_remote "franken-engine" "$F" "$FB" "ZZZ-none"
+  if [ -n "$RIGOUT" ]; then
+    for k in c f; do
+      n=$(rv ${k}_worktrees); nm=colibri; [ $k = f ] && nm=franken-engine
+      if [ -z "$n" ] || [ "$n" = 1 ]; then ok "the rig's $nm has one worktree"
+      elif [ $busy = 1 ]; then warn "the rig's $nm has $n worktrees while a rig job runs: remove the extra one when it ends (git worktree remove --force)"
+      else fail "the rig's $nm has $n worktrees: per-item build trees are temporary (git worktree remove --force <dir>; copy the gated binary to ~/bench/franken_bin first)"; fi
+      b=$(rv ${k}_branches); [ -z "$(echo $b)" ] && ok "the rig's $nm has no leftover local branch" || fail "the rig's $nm has leftover local branch(es): $b(delete them: merged ones with -d, others tag + push from the Mac first)"
+    done
+    sl=$(rv seq_leftovers); [ -z "$sl" ] || [ "$sl" = 0 ] && ok "no one-off sequencer script in ~/bench" || fail "$sl one-off sequencer script(s) ~/bench/*seq*.sh on the rig (any age): a recipe worth keeping goes into ckpt1006/, the rest is deleted"
+    bs=$(rv big_stale); case "$bs" in "0 file(s) 0 GB"|"") ok "no file over 1 GB older than 2 days in ~/bench";; *) fail "~/bench holds $bs over 1 GB older than 2 days (gate dumps, reference logits, caches of closed items): delete what no open item reads";; esac
+  fi
+fi
 
 # ---------------------------------------------------------------- config
 SK=$C/tools/hot-expert/skills/task-closeout/SKILL.md; IS=$HOME/.claude/skills/task-closeout/SKILL.md
@@ -127,7 +158,7 @@ done
 
 For the model (not scriptable): the plan has a Rev entry for what changed (look up the top Rev first; CLAUDE.md and the handoff name it), the record has a section for it
 (new sections at the END, numbers + which oracle passed), the handoff's state / open-task / recipe / trap lines are current (installed sha, speeds), the memory note says what a
-future session needs and nothing the repo already records, scratch is cleaned (rig worktrees, sequencers, temp scripts), no watcher or rig job is left unreported, and the final
+future session needs and nothing the repo already records, scratch is cleaned (rig worktrees, branches, sequencers, temp scripts, dumps, downloads nobody reads -- the checks above FAIL on the ones they can see), no watcher or rig job is left unreported, and the final
 message says plainly what was verified and what was not, what needs the owner's decision (GitHub pushes, hardware), in few words and few numbers.
 REMIND
 echo "closeout: $fails FAIL, $warns WARN"

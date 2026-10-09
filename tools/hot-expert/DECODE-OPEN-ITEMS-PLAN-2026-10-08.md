@@ -82,7 +82,7 @@ Gates: D7b and D8 as section 2 (microbenchmark bit-exact, model gate maxabs 0, t
 |---|---|---|---|
 | D10 | CPU lane for a layer's straggler slab (record §L5-GLM-CPULANE*, sources `tools/hot-expert/cpulane/`) | 1.3-2.7 realistic (2-4 %) | multi-day build; all three killers answered favourably (sync 20-40 us a layer, 6 of 8 cores free, int8 activations change a layer's MoE output by 0.54 %); remaining weak link: the IQ3_S AVX2 kernel (2.6 GB/s a core); a quality-gated change (`franken_quality_chain.sh`). Start only if D1-D9 leave the owner wanting more |
 | D11 | persist the placement average across restarts | probably ~0 | **evidence against**: in every serve A/B the first request after a cold start (W1) decodes as fast as the later ones (15.4-16.3 vs 15.5-16.3 tok/s), so a generic start costs little. Check the first adapter windows of one cold start; build only if they show a warm-up penalty |
-| D12 | validate the DeepSeek adapter position fix (branch `adapt-ds4`, franken-engine `589e855`, Gitea only, untested) | only if DeepSeek is served | recipe in handoff §4 (two fresh `franken_decode_ds4` builds, `ds4_gpu_gate.sh`, then `glm_serve_ab_chain.sh` with `SAB_START` / `SAB_PGREP`) |
+| D12 | validate the DeepSeek adapter position fix (Gitea tag `archive/adapt-ds4` = franken-engine `589e855`, untested; to run it: `git checkout -b adapt-ds4 archive/adapt-ds4`) | only if DeepSeek is served | recipe in handoff §4 (two fresh `franken_decode_ds4` builds, `ds4_gpu_gate.sh`, then `glm_serve_ab_chain.sh` with `SAB_START` / `SAB_PGREP`) |
 
 ## 4. Order and expected total
 

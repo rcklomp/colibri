@@ -14,11 +14,13 @@
 # 31 is the pure skeleton. A garbage router is safe: k_glm5_router's ids stay in [0, 288) even on NaN logits and k_glm5_chunk_plan only
 # compares them. Purpose: record §M7-HOSTSRC left a factor ~2 in what the engine does beside the copies (27 GB/s with the experts
 # skipped, 57 for the probe's replay of the same lists); handoff 2026-10-06 §5.1(a).
+# PF9 (plan Rev 102): PF0_PLAIN=1 builds `main` UNPATCHED (the headline-number binary); PF0_NAME names the output (default franken_decode_glm_pf0dbg). `main` now carries --glm-help-copy.
 set -u
 SRC=$HOME/src/franken-engine; WT=$HOME/src/franken-engine-pf0dbg; OUT=$HOME/bench/franken_bin
+PLAIN=${PF0_PLAIN:-0}; NAME=${PF0_NAME:-franken_decode_glm_pf0dbg}
 git -C "$SRC" worktree add --detach "$WT" main || exit 1
 cd "$WT/franken/decode" || exit 1
-python3 - <<'PY'
+[ "$PLAIN" = 1 ] || python3 - <<'PY'
 def sub(p, pairs):
     s = open(p).read()
     for a, b in pairs:
@@ -104,6 +106,7 @@ sub('decode_gpu.hip', [
 ])
 PY
 [ $? -eq 0 ] || { echo "PATCH FAILED"; git -C "$SRC" worktree remove --force "$WT"; exit 1; }
-nice -n 19 make -j4 gpu GPU_BIN=franken_decode_glm_pf0dbg 2>&1 | grep -vE "^docker run|^\s+\.\./|^\s*$" | tail -8
-[ -x franken_decode_glm_pf0dbg ] && cp -p franken_decode_glm_pf0dbg "$OUT/" && sha256sum "$OUT/franken_decode_glm_pf0dbg" | cut -c1-16
+nice -n 19 make -j4 gpu GPU_BIN=$NAME 2>&1 | grep -vE "^docker run|^\s+\.\./|^\s*$" | tail -8
+[ -x $NAME ] && cp -p $NAME "$OUT/" && sha256sum "$OUT/$NAME" | cut -c1-16
+git -C "$WT" rev-parse --short HEAD
 git -C "$SRC" worktree remove --force "$WT"; echo done

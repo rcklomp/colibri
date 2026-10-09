@@ -11,6 +11,7 @@
 # Order: w0 (discarded) then the palindrome over the nine masks A..I,I..A (each 8 192 tokens), then three --debug-route configs (the analysis input of PF0 (d) and PF5).
 # Launch (on the rig):  ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_pf0_skip_chain.sh > ~/bench/glm_pf0_skip_chain.log 2>&1 < /dev/null &
 # Watch from the Mac:   tools/hot-expert/ckpt1006/watch_chain.sh ~/bench/glm_pf0_skip_chain.log ~/bench/franken/glm5/pf0_skip/gate_run.log
+# PF9: PF0_EXTRA = extra engine flags for every config (PF9 runs it with --glm-help-copy 1, the shipped default since Rev 102).
 # Env: PF0_BIN, PF0_OUT, PF0_PROMPT (token-ID file of the timing arms, default prose8400), PF0_MASKS (default "0 31 29 30 27 15 7 1 3"), PF0_ROUTES (0 = no --debug-route configs).
 set -u
 . "$HOME/bench/chain_preflight.sh"
@@ -18,7 +19,7 @@ BIN=${PF0_BIN:-$HOME/bench/franken_bin/franken_decode_glm_pf0dbg}
 O=${PF0_OUT:-$HOME/bench/franken/glm5/pf0_skip}; rm -rf "$O"; mkdir -p "$O"
 M=/home/ronald/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
 P=/home/ronald/bench/m2/glm; EG=17; B=/home/ronald/bench/franken/glm5; PR=${PF0_PROMPT:-$B/prose8400.txt}; REC=$B/rec_depth/rec_ids.txt
-SHIP="--ctx 262144 --chunk 1024 --adapt-prefill 0 --gemm-lds 1 --glm-prefill-stage 0"
+SHIP="--ctx 262144 --chunk 1024 --adapt-prefill 0 --gemm-lds 1 --glm-prefill-stage 0 ${PF0_EXTRA:-}"
 MASKS=${PF0_MASKS:-0 31 29 30 27 15 7 1 3}
 say_end() { echo "=== glm_pf0_skip exit rc=$1 $(date -Is)"; exit "$1"; }
 [ -x "$BIN" ] && [ -f "$PR" ] && [ -f "$REC" ] || { echo "FATAL: missing $BIN or $PR or $REC"; say_end 2; }

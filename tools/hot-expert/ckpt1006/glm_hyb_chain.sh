@@ -15,7 +15,7 @@ set -u
 D=${HYB_D:-$HOME/src/franken-engine-pf14/franken/decode}
 GPU=$D/franken_decode_glm_pf14; CPU=$D/franken_decode_glm_cpu; VERDICT=$D/glm5_gate_verdict.sh
 O=${HYB_OUT:-$HOME/bench/franken/glm5/hyb}; mkdir -p "$O"
-HYB=$HOME/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS/GLM-5.3-Flash-HYB-IQ3XXS-00001-of-00001.gguf
+HYB=${HYB_MODEL:-$HOME/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS/GLM-5.3-Flash-HYB-IQ3XXS-00001-of-00001.gguf}   # HYB_MODEL: another hybrid (the UD-Q3_K_XL-expert one needs the IQ3_XXS kernel: build ff6348a or later)
 IXS=$HOME/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
 P=$HOME/bench/m2/glm; B=$HOME/bench/franken/glm5; PR=$B/prose8400.txt; REC=$B/rec_depth/rec_ids.txt
 T6="154822 785 6722 315 9621 374"

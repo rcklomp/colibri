@@ -6,7 +6,7 @@
 PF14 (2026-10-09): our served UD-IQ4_XS has a Q8_0 trunk that the tuned decode kernels (q8fast, rowsplit, grouped GEMV) were built for; Unsloth's UD-IQ3_XXS has smaller experts
 (IQ2_S gate/up, IQ3_S down: 8.98 MB against 11.67) but a Q6_K trunk. The hybrid keeps the first and takes the second's experts. Every `blk.N.ffn_{gate,up,down}_exps.weight` comes from
 the expert set, except layer 45 (the NextN block, unused by the text tower, Q2_K/Q3_K in the candidate) when --keep-last-from-trunk is given; every other tensor and the whole
-key-value section (tokenizer, template, hyper-parameters) from the trunk set, minus the split.* keys (the output is ONE file). Tensor data is copied in 64 MB pieces, 32-byte aligned
+key-value section (tokenizer, template, hyper-parameters) from the trunk set, minus the split.* keys (the output is ONE file). NAME THE OUTPUT ...-00001-of-00001.gguf: the engine's loader (llama.cpp's split-naming check) refuses any other name. Tensor data is copied in 64 MB pieces, 32-byte aligned
 as the GGUF spec asks (general.alignment is honoured). Shards are found from SHARD1's name (...-00001-of-0000N.gguf). --dry-run prints the plan and the output size only.
 """
 import argparse, glob, os, re, struct, sys

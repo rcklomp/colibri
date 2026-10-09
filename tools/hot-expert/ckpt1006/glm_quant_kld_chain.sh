@@ -9,6 +9,9 @@
 #   setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_quant_kld_chain.sh > ~/bench/quant_kld_chain.log 2>&1 < /dev/null &
 #
 # 2026-10-09 10:19: the first start died on a 3.2 GiB compute buffer on card 0 (-b 4096 -ub 2048 with a 1 GiB fit margin): batch 2048 / micro-batch 512 and a 2.5 GiB margin.
+# 2026-10-09 10:35: Unsloth's current UD-IQ3_XXS files say `general.architecture = glm5-next` (every glm5next.* key renamed), which the llama-glm53 build does not load; the candidate
+# is therefore the HYBRID built by gguf_hybrid.py (our IQ4_XS metadata and trunk, the IQ3_XXS experts): CAND=HYB-IQ3XXS CAND_GGUF=<it> CAND_SKIP_WAIT=1.
+# 2026-10-09 10:40: the hybrid's smaller experts let --fit pack the cards tighter and the KLD pass died on a 3.1 GiB compute buffer on card 0: FIT_MARGIN (MiB a card, default 5120).
 # Env: CAND (default UD-IQ3_XXS), CAND_N (shard count, default 4), CHUNKS (default 10), CTX (default 4096).
 # Steps: (1) the corpus; (2) IQ4_XS writes its logits (--kl-divergence-base); (3) wait for the candidate's download (~/bench/dl_glm_iq3xxs.log DONE); (4) the candidate
 # is scored against them (--kl-divergence); (5) summary.txt. Output ~/bench/quant_kld/. The logits file is ~CHUNKS*CTX/2 * 155 k * 2 bytes (about 6 GB at the defaults).
@@ -18,7 +21,7 @@ BIN=/home/ronald/src/llama-glm53/build-hip/bin
 IMG=rocm/dev-ubuntu-24.04:7.14.0-full
 CAND=${CAND:-UD-IQ3_XXS}; CAND_N=${CAND_N:-4}; CHUNKS=${CHUNKS:-10}; CTX=${CTX:-4096}
 BASE_GGUF=$HOME/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
-CAND_GGUF=$HOME/models/GLM-5.3-Flash/$CAND/GLM-5.3-Flash-$CAND-00001-of-0000$CAND_N.gguf
+CAND_GGUF=${CAND_GGUF:-$HOME/models/GLM-5.3-Flash/$CAND/GLM-5.3-Flash-$CAND-00001-of-0000$CAND_N.gguf}   # CAND_GGUF + CAND_SKIP_WAIT=1: a file built here (the hybrid), no download to wait for
 CORPUS=$OUT/corpus.txt; LOGITS=$OUT/base_iq4xs.kld
 say() { echo "$(date +%H:%M:%S) quant_kld: $*"; }
 
@@ -38,7 +41,7 @@ run_ppl() {   # run_ppl <name> <gguf> <extra args…>
   timeout 9000 docker run --rm --name "quantkld-$name" --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --ipc=host \
     -e "LD_LIBRARY_PATH=/opt/rocm/lib:$BIN" -v /home/ronald:/home/ronald "$IMG" "$BIN/llama-perplexity" \
     -m "$gguf" -f "$CORPUS" -c "$CTX" -b 2048 -ub 512 --chunks "$CHUNKS" \
-    --fit on --fit-target 2560,2560,2560 --fit-ctx "$CTX" --split-mode layer --device ROCm0,ROCm1,ROCm2 -fa on -t 16 -tb 8 "$@" > "$log" 2>&1
+    --fit on --fit-target "${FIT_MARGIN:-5120},${FIT_MARGIN:-5120},${FIT_MARGIN:-5120}" --fit-ctx "$CTX" --split-mode layer --device ROCm0,ROCm1,ROCm2 -fa on -t 16 -tb 8 "$@" > "$log" 2>&1
   local rc=$?
   [ $rc -eq 124 ] && docker kill "quantkld-$name" >/dev/null 2>&1
   say "end $name rc=$rc"
@@ -52,10 +55,13 @@ fi
 ls -la "$LOGITS"
 
 # ---- (3) the candidate's download ----
-for i in $(seq 1 360); do grep -q DONE "$HOME/bench/dl_glm_${CAND#UD-}.log" 2>/dev/null && break; sleep 10; done
+if [ -z "${CAND_SKIP_WAIT:-}" ]; then
+for i in $(seq 1 360); do grep -q DONE "$HOME/bench/dl_glm_$(echo "${CAND#UD-}" | tr -d _ | tr A-Z a-z).log" 2>/dev/null && break; sleep 10; done
 sz=$(cat "$HOME/models/GLM-5.3-Flash/$CAND"/*.gguf 2>/dev/null | wc -c)
 say "candidate files: $sz bytes"
 [ "$sz" -gt 100000000000 ] || { say "FATAL: the candidate download is not complete"; exit 1; }
+fi
+[ -s "$CAND_GGUF" ] || { say "FATAL: $CAND_GGUF missing"; exit 1; }
 
 # ---- (4) the candidate against the base ----
 run_ppl "cand_${CAND}" "$CAND_GGUF" --kl-divergence-base "$LOGITS" --kl-divergence || { say "FATAL: the candidate run failed"; tail -20 "$OUT/cand_${CAND}.log"; exit 1; }

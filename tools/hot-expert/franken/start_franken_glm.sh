@@ -75,7 +75,9 @@ set -u
 # status` find it; see that binary's own header comment (franken_dec_glm_main.cpp, in the
 # frankenstack/franken-engine repo) for why it is named 15 characters and not franken_decode_glm.
 BIN=${FRANKEN_GLM_BIN:-$HOME/bench/franken_decode_glm_docker.sh}
-GGUF=${FRANKEN_GGUF:-$HOME/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf}
+# SERVED MODEL since 2026-10-09 (owner decision O6, plan Rev 110): the IQ3_XXS-expert HYBRID (our IQ4_XS metadata + Q8_0 trunk, Unsloth UD-IQ3_XXS experts, ckpt1006/gguf_hybrid.py).
+# ROLLBACK to the former model: FRANKEN_GGUF=$HOME/models/GLM-5.3-Flash/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf (and FG_SNAP_DIR in serve_alt.sh).
+GGUF=${FRANKEN_GGUF:-$HOME/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS/GLM-5.3-Flash-HYB-IQ3XXS-00001-of-00001.gguf}
 GGUF_DIR=$(dirname "$GGUF")
 # A real config.json for this model, for the family resolver only (see this file's own header).
 FAMILY_DIR=${FRANKEN_FAMILY_DIR:-$HOME/models/GLM-5.3-Flash-colibri-int4-g64}

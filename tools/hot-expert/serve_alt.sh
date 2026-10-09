@@ -175,8 +175,9 @@ D4_LOG=$HOME/bench/serve_alt_franken_ds4.log
 # franken_decode_glm_docker.sh wrapper, where the host-visible process is `docker run`, not the
 # binary -- the wrapper's argv still carries the binary's path, which pgrep -f matches).
 FG_START=$HOME/src/colibri/tools/hot-expert/franken/start_franken_glm.sh
-FG_SNAP_DIR=$G_SNAP_DIR
-FG_LABEL="GLM-5.3-Flash UD-IQ4_XS (Franken engine)"
+# Since 2026-10-09 (owner decision O6) the Franken GLM arm serves the IQ3_XXS-expert HYBRID; rollback = UD-IQ4_XS dir + start_franken_glm.sh's FRANKEN_GGUF.
+FG_SNAP_DIR=${FG_SNAP_DIR_OVERRIDE:-$HOME/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS}
+FG_LABEL="GLM-5.3-Flash IQ3_XXS-expert hybrid (Franken engine)"
 FG_LOG=$HOME/bench/serve_alt_franken_glm.log
 
 # --- backend: HIP docker, same bin dir/image the F11 chain used --------------------------------
@@ -768,8 +769,8 @@ start_franken_glm() {
 }
 
 # cmd_franken_glm -- same shape and same safety order as cmd_franken_ds4 (requirement 5), for
-# the GLM-5.3-Flash arm. The weights are FG_SNAP_DIR ($G_SNAP_DIR, the same GGUF the `glm-llama`
-# arm serves via llama-server), so this arm is comparable the same way `franken`/`qwen38` are.
+# the GLM-5.3-Flash arm. The weights are FG_SNAP_DIR (since 2026-10-09 the IQ3_XXS-expert hybrid, not
+# the UD-IQ4_XS GGUF the `glm-llama` arm serves via llama-server: a llama.cpp comparison needs FG_SNAP_DIR_OVERRIDE).
 cmd_franken_glm() {
   echo "=== serve_alt: switching to $FG_LABEL $(date -Is)"
   refuse_if_busy franken-glm || exit 1

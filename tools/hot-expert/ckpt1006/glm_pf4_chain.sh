@@ -10,7 +10,7 @@
 # Env: PF4_D (decode dir of the pf14 build), PF4_OUT, PF4_EG (default 13), PF4_MODEL.
 set -u
 . "$HOME/bench/chain_preflight.sh"
-D=${PF4_D:-$HOME/src/franken-engine-pf14/franken/decode}
+D=${PF4_D:-$HOME/src/franken-engine/franken/decode}
 GPU=$D/franken_decode_glm_pf14; VERDICT=$D/glm5_gate_verdict.sh
 O=${PF4_OUT:-$HOME/bench/franken/glm5/pf4}; rm -rf "$O"; mkdir -p "$O"
 M=${PF4_MODEL:-$HOME/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS/GLM-5.3-Flash-HYB-IQ3XXS-00001-of-00001.gguf}

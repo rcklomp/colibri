@@ -12,7 +12,7 @@
 # Watch with ckpt1006/watch_chain.sh ~/bench/glm_hyb_chain.log ~/bench/franken/glm5/hyb/gate_hyb.log. Env: HYB_D (decode dir with the pf14 binaries), HYB_OUT, HYB_ONLY (comma list of stages).
 set -u
 . "$HOME/bench/chain_preflight.sh"
-D=${HYB_D:-$HOME/src/franken-engine-pf14/franken/decode}
+D=${HYB_D:-$HOME/src/franken-engine/franken/decode}
 GPU=$D/franken_decode_glm_pf14; CPU=$D/franken_decode_glm_cpu; VERDICT=$D/glm5_gate_verdict.sh
 O=${HYB_OUT:-$HOME/bench/franken/glm5/hyb}; mkdir -p "$O"
 HYB=${HYB_MODEL:-$HOME/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS/GLM-5.3-Flash-HYB-IQ3XXS-00001-of-00001.gguf}   # HYB_MODEL: another hybrid (the UD-Q3_K_XL-expert one needs the IQ3_XXS kernel: build ff6348a or later)

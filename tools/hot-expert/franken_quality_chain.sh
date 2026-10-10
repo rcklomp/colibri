@@ -1,6 +1,6 @@
 #!/bin/bash
 # franken_quality_chain.sh -- the L0 quality number (design §9.5 step 4): the Franken engine
-# as served (FRANKEN_GEMM_LDS=1, three cards, 256k) against llama.cpp's Qwen3.8 on the same
+# as served (FRANKEN_GEMM_LDS=1 until 2026-10-10, 3 since; three cards, 256k) against llama.cpp's Qwen3.8 on the same
 # 70-question MMLU-Pro sample and the needle set, both with the same explicit reasoning
 # setting (QE_REASONING_EFFORT, default xhigh = llama.cpp's template default for Qwen3.8), the
 # same 16k answer budget. Ends with GLM back in service whatever happened. Launch detached:
@@ -56,7 +56,7 @@ for arm in ${ARMS//,/ }; do
       run_eval franken-ds4 "$OUT_DIR/franken_ds4.jsonl"
       SUMMARY_ARGS+=(--model "franken_ds4=$OUT_DIR/franken_ds4.jsonl") ;;
     franken-glm)
-      # the Franken engine on GLM-5.3-Flash (franken_dec_glm, FRANKEN_GEMM_LDS=1 as served),
+      # the Franken engine on GLM-5.3-Flash (franken_dec_glm, FRANKEN_GEMM_LDS as start_franken_glm.sh defaults it),
       # against llama.cpp's own GLM-5.3-Flash UD-IQ4_XS below (serve_alt.sh glm-llama)
       "$SERVE_ALT" franken-glm 2>&1 | grep "now serving\|FATAL\|accept_live" || { echo "FATAL: franken-glm did not come up"; exit 1; }
       "$SERVE_ALT" status 2>&1 | grep -q "Franken engine" || { echo "FATAL: not the Franken engine"; exit 1; }

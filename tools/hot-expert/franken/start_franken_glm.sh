@@ -32,9 +32,11 @@
 #                           token fall as 1/chunk; -10 % at the served context, bit-exact; needs franken-engine glm-prefill-final, an older binary
 #                           clamps it to 512 and still runs); decode is chunk 1
 #   FRANKEN_DEVICES         3
-#   FRANKEN_GEMM_LDS        1 here since 2026-09-25 (served ON, as Qwen3.8 is: prefill 16.9 -> 9.3 ms/token, record
-#                           §L5-GLM-LDS; a last-bits order change, judged by the quality run). The engine's own
-#                           default (glm5_serve.cpp) is 0; the export below overrides it.
+#   FRANKEN_GEMM_LDS        3 here since 2026-10-10 (PF2, record §L5-PF2, engine GLM5.md §25: the f16 / rocBLAS trunk GEMM for
+#                           prefill chunks of >= 128 tokens, -14 % prefill, decode unchanged; NOT bit-exact: MMLU-Pro 55/70
+#                           against 56/70, needle 8/8). 1 = the f32 LDS GEMM (since 2026-09-25, §L5-GLM-LDS), 0 = bit-exact.
+#                           Needs a binary from engine `main` >= 9da1fd4 (an older one reads 3 as 1). The engine's own default
+#                           (glm5_serve.cpp) is 0; the export below overrides it.
 #   FRANKEN_GEMV_FUSED_REDUCE  0 since 2026-10-07 (record §L5-GLM-GEMV-REDUCE: -4.7 % decode, bit-exact; 1 = the in-kernel fused reduce)
 #   FRANKEN_GLM_FETCH_ASSIGN optimal since 2026-10-07 (pattern before; bit-exact, critical fetch -3 %, record §L5-GLM-FETCH-FLOOR-ERRATUM addendum)
 #   FRANKEN_GLM_MOE_G       8 since 2026-10-07 (4 before; 1|2|4|8|16 are valid; record §L5-GLM-G8: prefill -2.6 %, bit-exact). Only the docker wrapper's
@@ -48,8 +50,8 @@
 #                           brief: "adapt-prefill 0 for prefill, adaptation on for decode")
 #   FRANKEN_PLACEMENT       ~/bench/m2/glm (M2 histogram; GLM5.md section 5/9) -- which experts
 #                           start resident per card
-#   FRANKEN_EXPERT_GB       17 -- VRAM a card spends on resident experts (CSV, one per card;
-#                           a single value applies to every card)
+#   FRANKEN_EXPERT_GB       16.85 since 2026-10-10 (was 17): the f16 GEMM scratch + rocBLAS take 122 MiB a card, the service had 187 MiB
+#                           free on card 2 (CSV, one per card; a single value applies to every card)
 #   FRANKEN_ADAPT           1 -- adaptive placement learns the hot experts from THIS
 #                           conversation's own routing and swaps them in
 #   FRANKEN_ADAPT_PREFILL_CAP 64 since 2026-10-07, FRANKEN_ADAPT_HALFLIFE 512 (record §L5-GLM-ADAPT): the placement policy; 0 = the old behaviour of the cap
@@ -96,7 +98,7 @@ export FRANKEN_GGUF="$GGUF"
 export FRANKEN_CTX=${FRANKEN_CTX:-262144}
 export FRANKEN_GLM_CHUNK=${FRANKEN_GLM_CHUNK:-1024}   # 2026-10-06: was 512; 1024 + the blocked kernels = prefill 9.5 -> 6.0 ms/token at 262 144 cells (records §L5-GLM-CHUNK, §L5-GLM-MOEBLK, §L5-GLM-HGBLK)
 export FRANKEN_DEVICES=${FRANKEN_DEVICES:-3}
-export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-1}   # 2026-09-25: served ON, as Qwen3.8 is -- prefill 16.9 -> 9.3 ms/token (record §L5-GLM-LDS); a last-bits order change, judged by the quality run
+export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-3}   # 2026-10-10: the f16 / rocBLAS trunk GEMM, prefill -14 % (record §L5-PF2); was 1 since 2026-09-25 (§L5-GLM-LDS: prefill 16.9 -> 9.3 ms/token); not bit-exact, judged by KL + the quality run
 export FRANKEN_GEMV_FUSED_REDUCE=${FRANKEN_GEMV_FUSED_REDUCE:-0}   # 2026-10-07: a split GEMV's partials summed by a SEPARATE launch, not in-kernel behind one atomic counter a row: decode 69.9 -> 66.7 ms/token, bit-exact (record §L5-GLM-GEMV-REDUCE); needs franken-engine fused-reduce-split, an older binary ignores it
 export FRANKEN_GLM_FETCH_ASSIGN=${FRANKEN_GLM_FETCH_ASSIGN:-optimal}   # 2026-10-07: a decode layer's missed slabs split over the three cards by the best table (was the 11-long pattern): the critical fetch -0.97 ms a token (-3.0 %, paired over 12 tokens in two decode traces against two pattern traces whose own difference is 0.01 ms), token wall -0.6..-0.9 ms; bit-exact (record §L5-GLM-GEMV-REDUCE addendum, §L5-GLM-FETCH-FLOOR-ERRATUM addendum)
 export FRANKEN_GLM_GEMV_GROUP=${FRANKEN_GLM_GEMV_GROUP:-1}   # 2026-10-08: a decode token's GEMVs that read one activation (KDA q|k|v, KDA f_a|beta|g_a, the indexer's key|gate|weights) as ONE launch each, every member at the split count it has alone: BIT-EXACT (13 microbenchmark cases x 44 configs, 8 gate configs x 1 788 taps maxabs 0), no new VRAM, -38 us per MoE layer in the paired kernel trace (~ -1.6 ms a token; record §L5-GLM-GEMV-GROUP). Needs a binary built from franken-engine gemv-group or later (an older one ignores it; the wrapper allowlist carries it). 0 = the separate launches
@@ -110,7 +112,7 @@ export FRANKEN_GLM_STAGE_MB=${FRANKEN_GLM_STAGE_MB:-256}   # staging ring a card
 export FRANKEN_ADAPT_PREFILL=${FRANKEN_ADAPT_PREFILL:-0}
 export FRANKEN_HIP_GRAPH=${FRANKEN_HIP_GRAPH:-0}
 export FRANKEN_PLACEMENT=${FRANKEN_PLACEMENT:-$HOME/bench/m2/glm}
-export FRANKEN_EXPERT_GB=${FRANKEN_EXPERT_GB:-17}
+export FRANKEN_EXPERT_GB=${FRANKEN_EXPERT_GB:-16.85}   # 2026-10-10: was 17; gives the f16 GEMM scratch (122 MiB a card) back (record §L5-PF2 item 4)
 export FRANKEN_ADAPT=${FRANKEN_ADAPT:-1}
 export FRANKEN_ADAPT_PREFILL_CAP=${FRANKEN_ADAPT_PREFILL_CAP:-64}   # 2026-10-07: a held prefill span counts as at most 64 tokens in the placement average (was: the whole span, so after an 8 192-token prompt the average WAS the prompt and decode's routing could not move it): decode 64.8 -> 49.5-56.7 ms after a long prompt, 53.8 -> 51.2-51.5 after a short one, missed MB a token -40..-66 %, bit-exact, placement only (record §L5-GLM-ADAPT; engine flag --adapt-prefill-cap, franken_dec_glm.cap and newer; an older binary ignores it)
 export FRANKEN_ADAPT_HALFLIFE=${FRANKEN_ADAPT_HALFLIFE:-512}   # 2026-10-07: tokens for a count to weigh half (was 2048); with the cap, 128 / 512 / 2048 measured alike on a short prompt and 512 best on a long one (trajectory noise past 2 051 tokens: not a ranking)

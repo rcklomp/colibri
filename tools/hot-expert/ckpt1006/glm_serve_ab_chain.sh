@@ -9,6 +9,8 @@
 # Launch through run_chain.sh (the reservation flag stays in place; the chain never moves it), watch with a tail of $SAB_OUT/*.res.txt and the chain log.
 #   ~/src/colibri/tools/hot-expert/preflight.sh && setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_serve_ab_chain.sh > ~/bench/glm_serve_ab_chain.log 2>&1 < /dev/null &
 # 2026-10-10 (PF2): SAB_OLD_GL / SAB_NEW_GL set FRANKEN_GEMM_LDS for the old / new arm (the same binary can be run in two GEMM modes: SAB_OLD=SAB_NEW=franken_dec_glm.f16 SAB_OLD_GL=1 SAB_NEW_GL=3).
+# 2026-10-10 (PF2c): SAB_OLD_ENV / SAB_NEW_ENV = more VAR=val pairs for the old / new arm (e.g. SAB_OLD_ENV="FRANKEN_GEMM_LDS_MIN_ROWS=256 FRANKEN_GEMM_LDS_SPLITK=0" SAB_NEW_ENV="FRANKEN_GEMM_LDS_MIN_ROWS=16 FRANKEN_GEMM_LDS_SPLITK=1"; the
+# docker wrapper's allowlist must carry the names).
 # Env: SAB_OLD / SAB_NEW (binaries), SAB_ARMS (default "old new old new"), SAB_OUT (default ~/bench/franken/glm5/serve_ab), SAB_START / SAB_PGREP (another model's start script and engine process pattern).
 # Clock sampling (D6, 2026-10-08; why: 2 of 16 arms moved 5-7 % with no known cause, records L5-GLM-ROWSPLIT / L5-GLM-GEMV-GROUP): SAB_SAMPLE=1 (default; 0 = off, nothing else changes) runs
 #  `gpu_sampler.py arm` beside every arm, from the arm's start (stop, wait, load, requests) to the end of the driver: every SAB_SAMPLE_PERIOD seconds (default 5) it appends one row per card to
@@ -44,12 +46,12 @@ echo "=== glm_serve_ab start $(date -Is) old=$(sha256sum "$OLD" | cut -c1-16) ne
 trap 'sampler_stop; rig_stop_serving; echo "=== glm_serve_ab chain end $(date -Is): everything stopped"' EXIT
 n=0; rcs=0
 for arm in ${SAB_ARMS:-old new old new}; do
-  n=$((n+1)); tag="${n}_$arm"; bin=$OLD; gl=${SAB_OLD_GL:-}; [ "$arm" = new ] && { bin=$NEW; gl=${SAB_NEW_GL:-}; }
+  n=$((n+1)); tag="${n}_$arm"; bin=$OLD; gl=${SAB_OLD_GL:-}; xenv=${SAB_OLD_ENV:-}; [ "$arm" = new ] && { bin=$NEW; gl=${SAB_NEW_GL:-}; xenv=${SAB_NEW_ENV:-}; }
   echo "=== arm $tag bin=$(basename "$bin") $(date -Is)"
   sampler_start "$tag"
   rig_stop_serving; rig_quiet_wait 900 || { echo "arm $tag: rig not quiet"; rcs=1; sampler_stop; continue; }
   log="$O/$tag.gw.log"
-  env FRANKEN_DOCKER_BIN=$bin FRANKEN_LOG=$log SKIP_WARM=1 ${gl:+FRANKEN_GEMM_LDS=$gl} setsid nohup "$START" > "$log" 2>&1 < /dev/null &
+  env FRANKEN_DOCKER_BIN=$bin FRANKEN_LOG=$log SKIP_WARM=1 ${gl:+FRANKEN_GEMM_LDS=$gl} $xenv setsid nohup "$START" > "$log" 2>&1 < /dev/null &
   up=0
   for i in $(seq 1 240); do
     sleep 5

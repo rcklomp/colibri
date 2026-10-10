@@ -38,6 +38,11 @@
 #                           Needs a binary from engine `main` >= 9da1fd4: an older one would read 3 as the INT8 mode 2, so this script
 #                           lowers the value to 1 when the engine binary has no f16 kernel (guard before the launch; a rollback by `cp` is safe). The engine's own default
 #                           (glm5_serve.cpp) is 0; the export below overrides it.
+#   FRANKEN_GEMM_LDS_MIN_ROWS / FRANKEN_GEMM_LDS_SPLITK  16 / 1 since 2026-10-10 (PF2c, record §L5-PF2c, engine GLM5.md §26): the small trunk matrices (the 24-row
+#                           hyper-connection mix, KDA f_a / g_a / beta, the indexer key / weights) of a chunk of >= 128 tokens on k_gemm_lds, K split over the grid
+#                           with an ordered reduce, instead of the decode kernel at 0.2 TFLOPs: prefill -10 % on top of PF2, 64 MiB a card of VRAM back, chats under
+#                           128 tokens and decode untouched; not bit-exact (MMLU-Pro 59/70, needle 8/8). 256 / 0 = the engine's own defaults (the PF2 behaviour).
+#                           A binary older than engine main f64431d ignores both. The docker wrapper's allowlist carries the names (rig_copies/).
 #   FRANKEN_GEMV_FUSED_REDUCE  0 since 2026-10-07 (record §L5-GLM-GEMV-REDUCE: -4.7 % decode, bit-exact; 1 = the in-kernel fused reduce)
 #   FRANKEN_GLM_FETCH_ASSIGN optimal since 2026-10-07 (pattern before; bit-exact, critical fetch -3 %, record §L5-GLM-FETCH-FLOOR-ERRATUM addendum)
 #   FRANKEN_GLM_MOE_G       8 since 2026-10-07 (4 before; 1|2|4|8|16 are valid; record §L5-GLM-G8: prefill -2.6 %, bit-exact). Only the docker wrapper's
@@ -100,6 +105,8 @@ export FRANKEN_CTX=${FRANKEN_CTX:-262144}
 export FRANKEN_GLM_CHUNK=${FRANKEN_GLM_CHUNK:-1024}   # 2026-10-06: was 512; 1024 + the blocked kernels = prefill 9.5 -> 6.0 ms/token at 262 144 cells (records §L5-GLM-CHUNK, §L5-GLM-MOEBLK, §L5-GLM-HGBLK)
 export FRANKEN_DEVICES=${FRANKEN_DEVICES:-3}
 export FRANKEN_GEMM_LDS=${FRANKEN_GEMM_LDS:-3}   # 2026-10-10: the f16 / rocBLAS trunk GEMM, prefill -14 % (record §L5-PF2); was 1 since 2026-09-25 (§L5-GLM-LDS: prefill 16.9 -> 9.3 ms/token); not bit-exact, judged by KL + the quality run
+export FRANKEN_GEMM_LDS_MIN_ROWS=${FRANKEN_GEMM_LDS_MIN_ROWS:-16}   # 2026-10-10 (PF2c, record §L5-PF2c): matrices under 256 rows take k_gemm_lds for a chunk of >= 128 tokens (the decode kernel's split-K at a chunk ran 0.2 TFLOPs); 256 = off
+export FRANKEN_GEMM_LDS_SPLITK=${FRANKEN_GEMM_LDS_SPLITK:-1}   # 2026-10-10 (PF2c): ... with K split over the grid and an ordered reduce (k_gemm_lds_sk): prefill 2.70 -> 2.42 ms/token (prose 8k); 0 = off
 export FRANKEN_GEMV_FUSED_REDUCE=${FRANKEN_GEMV_FUSED_REDUCE:-0}   # 2026-10-07: a split GEMV's partials summed by a SEPARATE launch, not in-kernel behind one atomic counter a row: decode 69.9 -> 66.7 ms/token, bit-exact (record §L5-GLM-GEMV-REDUCE); needs franken-engine fused-reduce-split, an older binary ignores it
 export FRANKEN_GLM_FETCH_ASSIGN=${FRANKEN_GLM_FETCH_ASSIGN:-optimal}   # 2026-10-07: a decode layer's missed slabs split over the three cards by the best table (was the 11-long pattern): the critical fetch -0.97 ms a token (-3.0 %, paired over 12 tokens in two decode traces against two pattern traces whose own difference is 0.01 ms), token wall -0.6..-0.9 ms; bit-exact (record §L5-GLM-GEMV-REDUCE addendum, §L5-GLM-FETCH-FLOOR-ERRATUM addendum)
 export FRANKEN_GLM_GEMV_GROUP=${FRANKEN_GLM_GEMV_GROUP:-1}   # 2026-10-08: a decode token's GEMVs that read one activation (KDA q|k|v, KDA f_a|beta|g_a, the indexer's key|gate|weights) as ONE launch each, every member at the split count it has alone: BIT-EXACT (13 microbenchmark cases x 44 configs, 8 gate configs x 1 788 taps maxabs 0), no new VRAM, -38 us per MoE layer in the paired kernel trace (~ -1.6 ms a token; record §L5-GLM-GEMV-GROUP). Needs a binary built from franken-engine gemv-group or later (an older one ignores it; the wrapper allowlist carries it). 0 = the separate launches

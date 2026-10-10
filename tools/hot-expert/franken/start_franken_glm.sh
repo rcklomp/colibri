@@ -35,7 +35,8 @@
 #   FRANKEN_GEMM_LDS        3 here since 2026-10-10 (PF2, record §L5-PF2, engine GLM5.md §25: the f16 / rocBLAS trunk GEMM for
 #                           prefill chunks of >= 128 tokens, -14 % prefill, decode unchanged; NOT bit-exact: MMLU-Pro 55/70
 #                           against 56/70, needle 8/8). 1 = the f32 LDS GEMM (since 2026-09-25, §L5-GLM-LDS), 0 = bit-exact.
-#                           Needs a binary from engine `main` >= 9da1fd4 (an older one reads 3 as 1). The engine's own default
+#                           Needs a binary from engine `main` >= 9da1fd4: an older one would read 3 as the INT8 mode 2, so this script
+#                           lowers the value to 1 when the engine binary has no f16 kernel (guard before the launch; a rollback by `cp` is safe). The engine's own default
 #                           (glm5_serve.cpp) is 0; the export below overrides it.
 #   FRANKEN_GEMV_FUSED_REDUCE  0 since 2026-10-07 (record §L5-GLM-GEMV-REDUCE: -4.7 % decode, bit-exact; 1 = the in-kernel fused reduce)
 #   FRANKEN_GLM_FETCH_ASSIGN optimal since 2026-10-07 (pattern before; bit-exact, critical fetch -3 %, record §L5-GLM-FETCH-FLOOR-ERRATUM addendum)
@@ -151,6 +152,14 @@ export COLI_API_KEY="$(cat "$HOME/.colibri_api_key")"
 if [ "${SKIP_WARM:-0}" != "1" ]; then
   echo "[start] warming $GGUF_DIR -- ~110 GB, several minutes"
   cat "$GGUF_DIR"/*.gguf > /dev/null 2>&1 || true
+fi
+# 2026-10-10 (PF2): FRANKEN_GEMM_LDS=3 is the f16 GEMM only in a build from engine main >= 9da1fd4. A OLDER binary (a rollback to franken_dec_glm.pf14 / .hc ...) reads any value >= 2 as
+# the INT8 mode 2 (approximate, never served), so a rollback by `cp` alone would have served a different numerics silently. The real engine binary is what the docker wrapper runs
+# (FRANKEN_DOCKER_BIN, default ~/bench/franken_bin/franken_dec_glm); an f16-capable build contains the kernel name k_f16_dq_q8.
+REAL_BIN=${FRANKEN_DOCKER_BIN:-$HOME/bench/franken_bin/franken_dec_glm}
+if [ "${FRANKEN_GEMM_LDS:-0}" -ge 3 ] 2>/dev/null && [ -f "$REAL_BIN" ] && ! grep -aq k_f16_dq_q8 "$REAL_BIN"; then
+  echo "[start] WARNING: $REAL_BIN has no f16 GEMM kernel (a build older than engine main 9da1fd4): FRANKEN_GEMM_LDS $FRANKEN_GEMM_LDS -> 1 (an old binary would read it as the int8 mode 2)"
+  export FRANKEN_GEMM_LDS=1
 fi
 echo "[start] engine   : $BIN"
 echo "[start] model    : $GGUF"

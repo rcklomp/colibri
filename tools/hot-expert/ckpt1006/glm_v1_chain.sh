@@ -8,11 +8,11 @@
 #  chunks (--gemm-lds 0) are also held bit for bit to the GPU chunk-1 dump; the shipped chunks (--gemm-lds 3, f16 trunk GEMM, PF2) are not bit-exact by design.
 # Stages: 1 = CPU arm speed on 128 tokens (stop if 2 300 would take more than V1_MAX_H hours); 2 = the CPU reference; 3 = the GPU configurations, ONE process each
 #  (each comparison is the first config of a fresh process): c1 (shipped, chunk 1, dumps g_c1), c1024x / c512x (exact path vs g_c1 and vs the CPU sets),
-#  c1024 / c512 (shipped vs the CPU), c1024big (shipped, the served 262 144-cell window).
+#  c1024 / c512 (shipped vs the CPU), c1024big (shipped, the served 262 144-cell window); 4 = the follow-up of stage 3 (the first routing flip, the GPU's own sets).
 # Gate (plan section 8): a table (config, taps, not exact, min cos, sets) in the record; a non-exact tap where exactness is expected is a bug until explained.
 # Launch (rig idle, service OFF, reservation flag in place):
 #   setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_v1_chain.sh > ~/bench/glm_v1_chain.log 2>&1 < /dev/null &
-# Env: V1_GPU, V1_CPU (binaries), V1_OUT, V1_ONLY (1,2,3), V1_N (2300), V1_THREADS (8, the physical cores, as every CPU reference), V1_MAX_H (14).
+# Env: V1_GPU, V1_CPU (binaries), V1_OUT, V1_ONLY (1,2,3; 4 on demand), V1_N (2300), V1_THREADS (8, the physical cores, as every CPU reference), V1_MAX_H (14).
 set -u
 . "$HOME/bench/chain_preflight.sh"
 D=$HOME/src/franken-engine-v1/franken/decode
@@ -73,5 +73,30 @@ if has 3; then
   gpu c512     --ctx 4096 --chunk 512 --oracle "$REF" --routing "$REF"
   gpu c1024big --ctx 262144 --chunk 1024 --oracle "$REF" --routing "$REF"
   echo "CPU greedy: $(grep -a "^greedy_ids" "$REF.log")"
+fi
+if has 4; then
+  # stage 4 (added after stage 3: the GPU's expert sets matched the CPU's at 75 % of (position, layer) pairs, first difference at position 40 layer 42,
+  # agreement falling smoothly with layer depth, layers 0-16 cos 1 at position 2 299): is that rounding noise compounded by discrete routing flips, or a bug?
+  # (a) the first flip: both arms dumped at position 40 (a 41-token prompt), the router's biased scores of layer 42 -> the 8th/9th gap, offline;
+  # (b) the GPU's own per-position sets (chunk 1, and the shipped chunk 1024 whose f16 trunk GEMM is a known-benign perturbation, PF2) for agreement curves by position.
+  F=${V1_FLIP:-41}
+  echo "=== 4a. CPU arm, $F tokens $(date +%T)"
+  "$CPU" --model "$M" --tokens-file "$PR" --max-tokens "$F" --cpu --ctx 4096 --threads "$TH" --chunk 1 --dump "$O/cpu$F" > "$O/cpu$F.log" 2>&1
+  echo "cpu rc=$?"; grep -aE "^prompt_tokens=|^dumped" "$O/cpu$F.log"
+  SHIP="--tokens-file $PR --max-tokens $N --greedy 8 --adapt-prefill 0 --adapt-prefill-cap 64 --adapt-halflife 512 --glm-help-copy 1 --fetch-assign optimal \
+ --gemv-fused-reduce 0 --glm-gemv-group 1 --gemv-rowsplit 1 --gemv-rowsplit-waves 1 --gemv-q8fast 2 --gemm-lds 3 --gemm-lds-min-rows 16 --gemm-lds-splitk 1"
+  gpu4() {
+    local n=$1; shift
+    echo "$n $SHIP $*" > "$O/plan_$n.txt"
+    echo "=== 4. $n $(date +%T): $*"
+    docker run --rm --device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1 -e FRANKEN_GLM_MOE_G=8 \
+      -e LD_LIBRARY_PATH=/opt/rocm/lib:/home/ronald/src/llama-glm53/build-hip/bin -e HOME=/home/ronald -v /home/ronald:/home/ronald -w /home/ronald/bench rocm/dev-ubuntu-24.04:7.14.0-full \
+      "$GPU" --model "$M" --placement "$P" --expert-gb 16.85 --gate-plan "$O/plan_$n.txt" > "$O/$n.log" 2>&1
+    local rc=$?; echo "engine rc=$rc"
+    grep -aE "^prompt_tokens=|^dumped|^routing_out|^greedy_ids|^routing exact_sets|^routing deep_" "$O/$n.log" | cut -c1-200
+  }
+  gpu4 flip    --ctx 4096 --chunk 1 --max-tokens "$F" --greedy 0 --oracle "$O/cpu$F" --dump "$O/g$F"
+  gpu4 r_c1    --ctx 4096 --chunk 1 --routing "$REF" --routing-out "$O/r_c1"
+  gpu4 r_c1024 --ctx 4096 --chunk 1024 --routing "$REF" --routing-out "$O/r_c1024"
 fi
 say_end "$rc_all"

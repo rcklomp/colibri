@@ -11,6 +11,8 @@
 #   fan_od.sh curve    ROOT, after the reboot: per card a fan curve that is fan-friendly (about 40 % at 40 C, 100 % at 85 C of the curve's own axis, clamped to the driver's OD_RANGE) and the zero-RPM stop OFF
 #                      (the fans never stop); reads the result back. Only ever raises fan speed against stock; noise goes up. Does not persist over a reboot (re-run it, or add it to a boot unit once it has proven itself).
 #   fan_od.sh auto     ROOT: back to the stock curve and zero-RPM on ('r' + commit on every file).
+#   fan_od.sh probe    ROOT, ~1 min a card, LOUD: per card a flat 100 % curve, then + acoustic thresholds 3600, then + target temperature 50, the fan command / rpm after each; ends with every
+#                      fan_ctrl file reset to stock. Why: under load (2026-10-12) the curve was obeyed fully by card 2, scaled to ~55 % by card 1 and ignored by card 0.
 # The script asks for sudo itself (you type the password; nothing is stored). Run:  ssh rome 'cd ~/src/colibri/tools/hot-expert/ckpt1006 && ./fan_od.sh status'   and for the root steps:  ssh -t rome '.../fan_od.sh enable'
 # Env: FAN_OD_ROOT (test hook: a fake tree prefix for /sys, /etc and /proc; with it set nothing runs update-initramfs and no sudo is used), FAN_T0 / FAN_P0 (first point, default 40 C / 40 %), FAN_T1 / FAN_P1 (last point, default 85 C / 100 %).
 set -u
@@ -89,6 +91,32 @@ curve() {
   echo "curve set on $n_done card(s). Check the effect under load:  ./fan_od.sh status   (fan rpm must now be non-zero above ~40 C, edge/junction lower than before)"
 }
 
+readback() {   # readback CARD_DEVICE_DIR LABEL: the fan command and tach after the firmware had time to move
+  local h; h=$(hw "$1"); sleep "${FAN_SETTLE:-20}"
+  printf '   %-34s pwm %3s/255  rpm %5s  junction %s C\n' "$2" "$(cat "$h/pwm1" 2>/dev/null)" "$(cat "$h/fan1_input" 2>/dev/null)" "$(( $(cat "$h/temp2_input" 2>/dev/null || echo 0) / 1000 ))"
+}
+
+probe() {   # which knob lets each card reach full fan speed? (2026-10-12: under load card 1 capped at pwm ~140 / 2 200 rpm with the curve, card 0 flat at ~105)
+  need_root "$@"
+  for d in $(cards); do
+    fc=$d/gpu_od/fan_ctrl; n=$(basename "$(dirname "$d")")
+    [ -f "$fc/fan_curve" ] || { echo "$n: no fan_curve (OverDrive off)"; continue; }
+    echo "== $n"
+    readback "$d" "now"
+    i=0; for t in 25 35 45 55 65; do wr "$fc/fan_curve" "$i $t 100" > /dev/null || break; i=$((i + 1)); done; wr "$fc/fan_curve" "c" > /dev/null
+    readback "$d" "A flat 100 % curve"
+    for f in acoustic_limit_rpm_threshold acoustic_target_rpm_threshold; do [ -f "$fc/$f" ] && { wr "$fc/$f" "3600" > /dev/null; wr "$fc/$f" "c" > /dev/null; }; done
+    readback "$d" "B + acoustic limit/target 3600"
+    [ -f "$fc/fan_target_temperature" ] && { wr "$fc/fan_target_temperature" "50" > /dev/null; wr "$fc/fan_target_temperature" "c" > /dev/null; }
+    readback "$d" "C + target temperature 50"
+    for f in fan_curve acoustic_limit_rpm_threshold acoustic_target_rpm_threshold fan_target_temperature fan_zero_rpm_enable; do
+      [ -f "$fc/$f" ] && { wr "$fc/$f" "r" > /dev/null; wr "$fc/$f" "c" > /dev/null; }
+    done
+    readback "$d" "stock again (reset)"
+  done
+  echo "probe done: every card is back on its STOCK fan settings."
+}
+
 auto() {
   need_root "$@"
   for d in $(cards); do
@@ -103,5 +131,6 @@ case "$MODE" in
   enable) enable "$@";;
   curve)  curve "$@";;
   auto)   auto "$@";;
-  *) sed -n 2,3p "$0" | cut -c1-200; echo "usage: $0 status|enable|curve|auto" >&2; exit 2;;
+  probe)  probe "$@";;
+  *) sed -n 2,3p "$0" | cut -c1-200; echo "usage: $0 status|enable|curve|auto|probe" >&2; exit 2;;
 esac

@@ -11,6 +11,8 @@
 #   fan_od.sh curve    ROOT, after the reboot: per card a fan curve that is fan-friendly (about 40 % at 40 C, 100 % at 85 C of the curve's own axis, clamped to the driver's OD_RANGE) and the zero-RPM stop OFF
 #                      (the fans never stop); reads the result back. Only ever raises fan speed against stock; noise goes up. Does not persist over a reboot (re-run it, or add it to a boot unit once it has proven itself).
 #   fan_od.sh auto     ROOT: back to the stock curve and zero-RPM on ('r' + commit on every file).
+#   fan_od.sh target   ROOT, THE ONE TO USE (probe 2026-10-12): no custom curve, zero-RPM off, acoustic thresholds 3600, fan target temperature FAN_TARGET_C (60). `curve` does NOT work
+#                      on this firmware (any committed curve stops the fans at idle and capped card 1 at ~55 % under load).
 #   fan_od.sh probe    ROOT, ~1 min a card, LOUD: per card a flat 100 % curve, then + acoustic thresholds 3600, then + target temperature 50, the fan command / rpm after each; ends with every
 #                      fan_ctrl file reset to stock. Why: under load (2026-10-12) the curve was obeyed fully by card 2, scaled to ~55 % by card 1 and ignored by card 0.
 # The script asks for sudo itself (you type the password; nothing is stored). Run:  ssh rome 'cd ~/src/colibri/tools/hot-expert/ckpt1006 && ./fan_od.sh status'   and for the root steps:  ssh -t rome '.../fan_od.sh enable'
@@ -125,6 +127,23 @@ probe() {   # which knob lets each card reach full fan speed? (2026-10-12: under
   echo "probe done: every card is back on its STOCK fan settings."
 }
 
+target() {   # the setting that works on this firmware (probe 2026-10-12): NO custom curve (any committed curve stopped the fans, a flat 100 % one too), zero-RPM off,
+             # the acoustic thresholds at their maximum, and a LOW target temperature (the firmware steers the fans toward it; stock 85 C / 75 C let the stacked cards run hot)
+  need_root "$@"
+  TT=${FAN_TARGET_C:-60}; AC=${FAN_ACOUSTIC:-3600}
+  for d in $(cards); do
+    fc=$d/gpu_od/fan_ctrl; n=$(basename "$(dirname "$d")")
+    [ -f "$fc/fan_curve" ] || { echo "$n: no fan_ctrl (OverDrive off)"; continue; }
+    echo "== $n"
+    wr "$fc/fan_curve" "r" > /dev/null; wr "$fc/fan_curve" "c" > /dev/null
+    for f in acoustic_limit_rpm_threshold acoustic_target_rpm_threshold; do [ -f "$fc/$f" ] && { wr "$fc/$f" "$AC"; wr "$fc/$f" "c" > /dev/null; }; done
+    [ -f "$fc/fan_target_temperature" ] && { wr "$fc/fan_target_temperature" "$TT"; wr "$fc/fan_target_temperature" "c" > /dev/null; }
+    zr_off "$fc"
+    readback "$d" "target ${TT} C, acoustic ${AC}, zero-RPM off"
+  done
+  echo "target set. Not persistent over a reboot (re-run it). Back to stock: $0 auto"
+}
+
 auto() {
   need_root "$@"
   for d in $(cards); do
@@ -140,5 +159,6 @@ case "$MODE" in
   curve)  curve "$@";;
   auto)   auto "$@";;
   probe)  probe "$@";;
-  *) sed -n 2,3p "$0" | cut -c1-200; echo "usage: $0 status|enable|curve|auto|probe" >&2; exit 2;;
+  target) target "$@";;
+  *) sed -n 2,3p "$0" | cut -c1-200; echo "usage: $0 status|enable|curve|auto|probe|target" >&2; exit 2;;
 esac

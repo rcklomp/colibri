@@ -91,10 +91,12 @@ curve() {
   echo "curve set on $n_done card(s). Check the effect under load:  ./fan_od.sh status   (fan rpm must now be non-zero above ~40 C, edge/junction lower than before)"
 }
 
-readback() {   # readback CARD_DEVICE_DIR LABEL: the fan command and tach after the firmware had time to move
-  local h; h=$(hw "$1"); sleep "${FAN_SETTLE:-20}"
-  printf '   %-34s pwm %3s/255  rpm %5s  junction %s C\n' "$2" "$(cat "$h/pwm1" 2>/dev/null)" "$(cat "$h/fan1_input" 2>/dev/null)" "$(( $(cat "$h/temp2_input" 2>/dev/null || echo 0) / 1000 ))"
+readback() {   # readback CARD_DEVICE_DIR LABEL: the fan command, tach and the zero-RPM setting the driver reports, after the firmware had time to move
+  local h fc; h=$(hw "$1"); fc=$1/gpu_od/fan_ctrl; sleep "${FAN_SETTLE:-20}"
+  printf '   %-34s pwm %3s/255  rpm %5s  junction %s C  zero-rpm %s\n' "$2" "$(cat "$h/pwm1" 2>/dev/null)" "$(cat "$h/fan1_input" 2>/dev/null)" \
+    "$(( $(cat "$h/temp2_input" 2>/dev/null || echo 0) / 1000 ))" "$(sed -n 2p "$fc/fan_zero_rpm_enable" 2>/dev/null | tr -d ' ')"
 }
+zr_off() { [ -f "$1/fan_zero_rpm_enable" ] && { wr "$1/fan_zero_rpm_enable" "0" > /dev/null; wr "$1/fan_zero_rpm_enable" "c" > /dev/null; }; }   # zero-RPM off (re-applied after every commit: 2026-10-12 a curve commit turned it back on)
 
 probe() {   # which knob lets each card reach full fan speed? (2026-10-12: under load card 1 capped at pwm ~140 / 2 200 rpm with the curve, card 0 flat at ~105)
   need_root "$@"
@@ -103,11 +105,17 @@ probe() {   # which knob lets each card reach full fan speed? (2026-10-12: under
     [ -f "$fc/fan_curve" ] || { echo "$n: no fan_curve (OverDrive off)"; continue; }
     echo "== $n"
     readback "$d" "now"
+    zr_off "$fc"
+    readback "$d" "0 zero-RPM off only"
     i=0; for t in 25 35 45 55 65; do wr "$fc/fan_curve" "$i $t 100" > /dev/null || break; i=$((i + 1)); done; wr "$fc/fan_curve" "c" > /dev/null
-    readback "$d" "A flat 100 % curve"
+    readback "$d" "A1 flat 100 % curve (as committed)"
+    zr_off "$fc"
+    readback "$d" "A2 flat 100 % + zero-RPM off again"
     for f in acoustic_limit_rpm_threshold acoustic_target_rpm_threshold; do [ -f "$fc/$f" ] && { wr "$fc/$f" "3600" > /dev/null; wr "$fc/$f" "c" > /dev/null; }; done
+    zr_off "$fc"
     readback "$d" "B + acoustic limit/target 3600"
     [ -f "$fc/fan_target_temperature" ] && { wr "$fc/fan_target_temperature" "50" > /dev/null; wr "$fc/fan_target_temperature" "c" > /dev/null; }
+    zr_off "$fc"
     readback "$d" "C + target temperature 50"
     for f in fan_curve acoustic_limit_rpm_threshold acoustic_target_rpm_threshold fan_target_temperature fan_zero_rpm_enable; do
       [ -f "$fc/$f" ] && { wr "$fc/$f" "r" > /dev/null; wr "$fc/$f" "c" > /dev/null; }

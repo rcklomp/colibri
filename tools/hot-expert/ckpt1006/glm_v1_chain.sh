@@ -3,7 +3,7 @@
 # Why: the deep references (`gpu5/g2200`, `ref512_keep`) are the engine's own GPU dumps (`g2200` = layers 0-3 only); nothing tied the GPU past the indexer's top-k
 #  threshold (2 048 keys) to the CPU arm, which computes every row separately with its own kernels. Here the CPU arm runs the served hybrid on 2 300 prose tokens at
 #  chunk 1 (+ 8 greedy) and writes (a) the last row's taps (--dump) and (b) its routed expert set at EVERY position and layer (--routing-out, franken-engine branch
-#  v1-routing-out); every GPU configuration is then held to both: taps by cosine (CPU and GPU kernels differ, so not bit-exact: the 6-token gate is 1 786 of 1 788
+#  v1-routing-out, merged to main); every GPU configuration is then held to both: taps by cosine (CPU and GPU kernels differ, so not bit-exact: the 6-token gate is 1 786 of 1 788
 #  not bit-exact at cos 1), expert sets per position (`routing exact_sets`, the count past 2 048, the first position that differs), greedy ids. The exact-path
 #  chunks (--gemm-lds 0) are also held bit for bit to the GPU chunk-1 dump; the shipped chunks (--gemm-lds 3, f16 trunk GEMM, PF2) are not bit-exact by design.
 # Stages: 1 = CPU arm speed on 128 tokens (stop if 2 300 would take more than V1_MAX_H hours); 2 = the CPU reference; 3 = the GPU configurations, ONE process each
@@ -15,7 +15,7 @@
 # Env: V1_GPU, V1_CPU (binaries), V1_OUT, V1_ONLY (1,2,3; 4 on demand), V1_N (2300), V1_THREADS (8, the physical cores, as every CPU reference), V1_MAX_H (14).
 set -u
 . "$HOME/bench/chain_preflight.sh"
-D=$HOME/src/franken-engine-v1/franken/decode
+D=$HOME/src/franken-engine/franken/decode   # build first (main has --routing-out since 0753b05): make gpu GPU_BIN=franken_decode_glm_v1; make cpu CPU_BIN=franken_decode_glm_v1_cpu
 GPU=${V1_GPU:-$D/franken_decode_glm_v1}; CPU=${V1_CPU:-$D/franken_decode_glm_v1_cpu}
 O=${V1_OUT:-$HOME/bench/franken/glm5/v1}; mkdir -p "$O"
 M=$HOME/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS/GLM-5.3-Flash-HYB-IQ3XXS-00001-of-00001.gguf

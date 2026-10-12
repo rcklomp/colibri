@@ -31,11 +31,11 @@ while :; do
   ' 2>&1) || { echo "ssh failed (retrying)"; sleep 30; continue; }
   nc=$(echo "$out" | sed -n 's/^N \([0-9]*\) .*/\1/p' | head -1); ne=$(echo "$out" | sed -n 's/^N [0-9]* \([0-9]*\)/\1/p' | head -1)
   alive=$(echo "$out" | sed -n 's/^ALIVE //p' | head -1)
-  body=$(echo "$out" | sed -n '/^--- chain/,/^--- tails/p' | grep -v '^--- ')
+  body=$(echo "$out" | sed -n '/^--- chain/,/^--- tails/p' | grep -av '^--- ')
   ev=$(echo "$body" | grep -aE "$PAT" | cut -c1-260)
   [ -n "$ev" ] && echo "$ev"
   # glog lines (rocprofv3's `E1006 ... Opened result file`) are not errors whatever the letter says
-  echo "$ev" | grep -vE '^[EWI][0-9]{4} ' | grep -aqE "GATE FAIL|ENGINE DIED|HIP error|[Aa]bort|core dumped|out of memory|OOM|REFUSED|Killed|Traceback|active=0|needs [0-9]|exact FAIL|none +FAIL|ref +FAIL|cos +FAIL|rc=[1-9]" && bad=1
+  echo "$ev" | grep -avE '^[EWI][0-9]{4} ' | grep -aqE "GATE FAIL|ENGINE DIED|HIP error|[Aa]bort|core dumped|out of memory|OOM|REFUSED|Killed|Traceback|active=0|needs [0-9]|exact FAIL|none +FAIL|ref +FAIL|cos +FAIL|rc=[1-9]" && bad=1
   if [ "${nc:-0}" = "$last_c" ] && [ "${ne:-0}" = "$last_e" ]; then quiet=$((quiet+1)); else quiet=0; fi
   last_c=${nc:-$last_c}; last_e=${ne:-$last_e}
   if [ "$quiet" -ge "$SILENT_POLLS" ]; then echo "SILENT: no new line in either log for $((SILENT_POLLS*45/60)) min (engine alive=$alive)"; quiet=0; fi

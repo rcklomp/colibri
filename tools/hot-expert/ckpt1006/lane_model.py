@@ -1,10 +1,11 @@
 # E4: offline bound for the fetch levers, from GLM5.md "Optimal fetch assignment" (links: lone 417 us/slab, shared pair 678 us/slab when both fetch, 417 when one does).
 # D15 (2026-10-12, record §L5-D15): `--refined` prices the shared pair as the traces show it -- the card with more slabs runs alone at 417 once its
-# partner is done (m = min, M = max: m*678 + (M-m)*417); `--pn trace` uses the 2026-10-07 trace's own miss-count distribution instead of the binomial-like
+# partner is done (m = min, M = max: m*678 + (M-m)*417); `--pn trace|hybrid` uses the 2026-10-07 IQ4_XS trace's (or the 2026-10-12 hybrid trace's) own miss-count distribution instead of the binomial-like
 # one below; `--slab MB` scales the per-slab times to another expert size (the IQ3_XXS hybrid: ~9.0 MB, 16.84 GB / ~1 870 experts a card).
 import itertools, sys
 P = [.011,.067,.178,.268,.253,.152,.058,.012,.001]; LAYERS = 42
 if "--pn" in sys.argv and sys.argv[sys.argv.index("--pn") + 1] == "trace": P = [.038,.099,.212,.210,.196,.149,.058,.028,.010]
+if "--pn" in sys.argv and sys.argv[sys.argv.index("--pn") + 1] == "hybrid": P = [.124,.143,.166,.214,.130,.119,.031,.048,.026]   # D15 trace of the IQ3_XXS hybrid, 2026-10-12 (counts read with ~10 % error)
 REFINED = "--refined" in sys.argv
 SLAB = float(sys.argv[sys.argv.index("--slab") + 1]) if "--slab" in sys.argv else 11.67
 AL, SH = 417 * SLAB / 11.67, 678 * SLAB / 11.67

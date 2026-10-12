@@ -1,5 +1,5 @@
 #!/bin/bash
-# glm_d15_chain.sh -- D15 (ACTION-LIST row 6, DECODE-OPEN-ITEMS-PLAN section 8): the refined fetch table (franken-engine branch d15-fetch-table, GLM5.md section 31) on the SERVED
+# glm_d15_chain.sh -- D15 (DONE, record §L5-D15; stage 2 needs the fa2 plan, which lives only at engine tag archive/d15-fetch-table, as does the d15-fetch-table worktree it builds: check that tag out into ~/src/franken-engine-d15 to rerun) (ACTION-LIST row 6, DECODE-OPEN-ITEMS-PLAN section 8): the refined fetch table (franken-engine branch d15-fetch-table, GLM5.md section 31) on the SERVED
 # IQ3_XXS hybrid. Offline (record §L5-D15) the 2026-10-07 traces showed why --fetch-assign optimal gained a third of its model: a shared-pair card with more slabs than its partner
 # runs alone at 417 us once the partner is done, so the old model overpriced unequal pair splits; the refined model fits the measured gain (0.96 vs 0.94 ms) and moves one row
 # (n = 5: (2,0,3) -> (2,1,2), modeled -1 ms a token on IQ4_XS). Stages:

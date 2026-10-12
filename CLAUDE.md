@@ -162,7 +162,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   §G15). Every gate from here on runs both arms with the clamp on, as
   `f2_gate_chain.sh` does, or says that it did not. The remaining 1.2 % vs
   the all-CPU reference is placement (summation order), not the clamp.
-- **Prefill streams non-resident experts to the cards (F2, in service
+- [COLIBRI engine, 2026-09-19/20 numbers] **Prefill streams non-resident experts to the cards (F2, in service
   2026-09-19).** `COLI_PREFILL_STREAM=1`: per MoE layer the chunk's
   non-resident experts are copied into a HOST-RAM ring (two banks of 32
   slots per card, 2.72 GB, zero VRAM — a ring in ReBAR VRAM filled at 16
@@ -176,7 +176,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   second (13.4 ms, 17 %). Chunk size alone changes numerics (128 vs 512
   under the clamp: KL 3.7e-04, top-1 99.68 %); the cause is not pinned
   (indexer and tile threshold ruled out, record §F2k).
-- **Prefill attention runs on dev0 (F7, in service 2026-09-20).**
+- [COLIBRI engine, 2026-09-19/20 numbers] **Prefill attention runs on dev0 (F7, in service 2026-09-20).**
   `GLM53_MLA_ATTN_GPU=1`: the MLA score/softmax/pool core of a prefill chunk
   runs batched over its rows in four `mla_attn_*.spv` shaders, from one shared
   scratch (140 MB at 18k, 236 MB at 64k; nothing per layer or per slot);
@@ -341,9 +341,10 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   rollback blamed the UI for the broken G16 engine commit. The preset's
   `builtin_tools` and `memory` capabilities are ON again; the title/tags/
   follow-up tasks stay off. Its 24-tool block (~4 000 tokens) is
-  checkpointed (`CKPT hit prefix=4011` in the server log): (old Colibri engine; on Franken ~0.8 s / ~1 s) a new
-  conversation answers in ~20 s, a follow-up turn in ~2 s; a changed tool
-  set pays one cold prefill (~4.5 min since F2, 274 s measured 2026-09-19; ~10 min before) and is captured again. The server
+  checkpointed (`CKPT hit prefix=4011` in the server log): (Colibri engine: a new conversation ~20 s, a follow-up ~2 s, a changed
+  tool set one cold prefill of ~4.5 min since F2, then captured again.
+  FRANKEN engine, installed: warm new chat ~0.7-0.9 s, follow-up ~0.7-1.0 s,
+  a cold 4 574-token tool prompt ~19 s, handoff 06b section 1). The server
   caches presets: after a `webui.db` edit call `GET /api/models`. Drive its
   backend from inside the container (PyJWT token from `WEBUI_SECRET_KEY`;
   never `import open_webui` in a side process, it runs the migrations); the

@@ -2,7 +2,8 @@
 # closeout_check.sh [--quick|--full] -- the "homework" at the end of every finished task (rule since 2026-10-07; the owner had to ask for it after every task).
 # Deterministic, read-only (the one write is `git fetch` in --full), no GPU, never pushes anywhere. Checks:
 #   repos      colibri (branch hot-expert-tier) and franken-engine (main): working tree clean, nothing unpushed to Gitea, the rig's copy at the same commit (and its tree clean),
-#              the public GitHub fork's lag as INFO (it is pushed only with the owner's go-ahead, never by this script)
+#              the public GitHub fork's lag: a FAIL when it lags (owner, 2026-10-12: push it after EVERY task, after a clean secret scan;
+#              this script never pushes, the session does -- task-closeout skill step 5)
 #   docs       tools/hot-expert/doc_currency.sh (the entry-point docs name the plan's top rev, no dead references, no loitering files);
 #              the handoff names the sha of the INSTALLED serving binary
 #   rig        idle or busy (lock, engine/gateway/chain processes, the franken_engine container); VRAM empty when idle; the reservation flag present; ~/bench copies of repo
@@ -84,9 +85,14 @@ repo_check() {   # label dir branch rig_head_key rig_dirty_key
 }
 repo_check "colibri"        "$C" "$CB" c_head c_dirty
 repo_check "franken-engine" "$F" "$FB" f_head f_dirty
-if [ "$MODE" = full ] && git -C "$C" remote get-url fork >/dev/null 2>&1; then
+if git -C "$C" remote get-url fork >/dev/null 2>&1; then
   fr=$(with_alarm 20 git -C "$C" ls-remote fork "refs/heads/$CB" 2>/dev/null | cut -f1)
-  if [ -n "$fr" ]; then lag=$(git -C "$C" rev-list --count "$fr..$CB" 2>/dev/null || echo "?"); info "GitHub fork (PUBLIC) lags $lag commit(s): pushed only with the owner's go-ahead after a secret scan, never by a session on its own"; fi
+  if [ -z "$fr" ]; then warn "GitHub fork (PUBLIC): unreachable, its lag was not checked"
+  else
+    lag=$(git -C "$C" rev-list --count "$fr..$CB" 2>/dev/null || echo "?")
+    if [ "$lag" = 0 ]; then ok "GitHub fork (PUBLIC) is level with $CB"
+    else fail "GitHub fork (PUBLIC) lags $lag commit(s): secret-scan them and push (standing go-ahead, owner 2026-10-12; task-closeout skill step 5)"; fi
+  fi
 fi
 
 # ---------------------------------------------------------------- docs

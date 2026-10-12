@@ -4,7 +4,8 @@
 #   - the session works in ~/Projects, ~/Projects/colibri* or ~/Projects/franken-engine* (any other project: silent exit 0);
 #   - it has not already blocked this stop once (`stop_hook_active`: never a loop);
 #   - the local state differs from the last PASS (a stamp of both repos' HEAD + working-tree fingerprint: an unchanged, already-verified state costs ~50 ms);
-#   - closeout_check.sh --quick FAILs (an unsynced or dirty repo, stale docs, a handoff that does not name the installed binary, a missing memory file);
+#   - closeout_check.sh --quick FAILs (an unsynced or dirty repo, stale docs, a handoff that does not name the installed binary, a missing memory file,
+#     a GitHub fork that lags: since 2026-10-12 the fork is pushed after every task, so a lag means the closeout was not done);
 #   - the rig is IDLE: while a rig job runs the session is legitimately waiting for its watcher, and the failures are expected mid-run.
 # A timeout, an unreachable rig or any trouble in this script itself NEVER blocks (exit 0). To switch it off: delete the hook entry in ~/.claude/settings.json.
 IN=$(cat)
@@ -18,7 +19,7 @@ active=$(printf '%s\n' "$parsed" | sed -n 1p); cwd=$(printf '%s\n' "$parsed" | s
 case "$cwd" in "$HOME/Projects"|"$HOME/Projects/colibri"*|"$HOME/Projects/franken-engine"*) ;; *) exit 0;; esac
 C=$HOME/Projects/colibri; F=$HOME/Projects/franken-engine
 [ -d "$C/.git" ] && [ -d "$F/.git" ] || exit 0
-fp() { printf '%s %s %s' "$(git -C "$1" rev-parse HEAD 2>/dev/null)" "$(git -C "$1" status --porcelain 2>/dev/null | cksum)" "$(git -C "$1" rev-parse origin/"$2" 2>/dev/null)"; }
+fp() { printf '%s %s %s %s' "$(git -C "$1" rev-parse HEAD 2>/dev/null)" "$(git -C "$1" status --porcelain 2>/dev/null | cksum)" "$(git -C "$1" rev-parse origin/"$2" 2>/dev/null)" "$(git -C "$1" rev-parse fork/"$2" 2>/dev/null)"; }
 STATE="$(fp "$C" hot-expert-tier) | $(fp "$F" main)"
 STAMP=$HOME/.cache/closeout.stamp; mkdir -p "$HOME/.cache" 2>/dev/null
 [ "$(cat "$STAMP" 2>/dev/null)" = "$STATE" ] && exit 0
@@ -29,6 +30,6 @@ echo "$out" | grep -q '^rig_busy=1' && exit 0                 # a rig job is run
 {
   echo "CLOSEOUT CHECK FAILED -- do not end the task like this (rule since 2026-10-07: the owner must never have to ask for this). Fix it, then finish; if something here cannot be fixed, say so plainly in the final message."
   echo "$out" | grep -E '^(FAIL|WARN)' | cut -c1-300
-  echo "How: run the task-closeout skill (full check: bash $C/tools/hot-expert/closeout_check.sh --full); commit, push to Gitea, relay to the rig (handoff 06b section 2); GitHub only with the owner's go-ahead."
+  echo "How: run the task-closeout skill, ALL of it (full check: bash $C/tools/hot-expert/closeout_check.sh --full): governance audit of the docs, commit, push to Gitea, relay to the rig (handoff 06b section 2), secret scan, push the GitHub fork (standing go-ahead since 2026-10-12)."
 } >&2
 exit 2

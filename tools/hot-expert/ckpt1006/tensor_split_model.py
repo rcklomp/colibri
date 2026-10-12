@@ -6,6 +6,8 @@ Offline model, no GPU, python3 stdlib only. Extends lane_model.py (GLM5.md "Opti
   * the cost of a cut expert: a hand-off of the gate+up result (2 048 floats) to the card that holds `down`, ~30 us (cross-card event + P2P), put on the layer's critical path (conservative) or 0 (optimistic).
 Sizes (IQ3_S gate/up 2048x4096 at 3.4375 bpw, IQ4_XS down 4096x2048 at 4.25 bpw): gate+up 7.205 MB, down 4.463 MB, slab 11.668 MB.
 Layer fetch time = max over the three cards of bytes / rate; rate of a pair card = 17.2 GB/s if the partner also fetches, else 28. Whole slab = both pieces on one card; a CUT expert has them on two cards.
+--refined (D15, record §L5-D15): the shared pair shares its upstream link only while BOTH still fetch; the card with more bytes then runs alone at 28 GB/s
+(the 2026-10-07 traces: this model fits the measured pattern / optimal critical fetch to 0.3 %, so no realization factor is needed with it).
 Enumerates, per n missed experts (0..8), every placement of the n gate+up pieces and n down pieces on (lone, A, B); cuts = n - sum_c min(gu_c, dn_c) (pair the pieces on a card as whole experts first).
 """
 import itertools, sys
@@ -22,10 +24,16 @@ def binom(n, k, p):
 def card_us(mb, partner_active):   # MB / (GB/s) = ms/1000... MB/GBps = 1e-3 s = 1000 us
     return 0.0 if mb <= 0 else mb / (SH_BOTH if partner_active else SH_ONE) * 1000.0
 
+REFINED = "--refined" in sys.argv
+
 def layer_us(gu, dn):
     """gu, dn = (lone, A, B) piece counts; returns fetch time of the layer in us (no hand-off)"""
     b = [gu[i] * GU + dn[i] * DN for i in range(3)]
     t_lone = b[0] / LONE * 1000.0
+    if REFINED:
+        lo, hi = sorted((b[1], b[2]))
+        t_pair = (lo / SH_BOTH + (hi - lo) / SH_ONE) * 1000.0 if lo > 0 else hi / SH_ONE * 1000.0
+        return max(t_lone, t_pair)
     t_a = card_us(b[1], b[2] > 0)
     t_b = card_us(b[2], b[1] > 0)
     return max(t_lone, t_a, t_b)

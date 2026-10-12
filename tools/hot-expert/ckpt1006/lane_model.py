@@ -1,8 +1,18 @@
 # E4: offline bound for the fetch levers, from GLM5.md "Optimal fetch assignment" (links: lone 417 us/slab, shared pair 678 us/slab when both fetch, 417 when one does).
-import itertools
+# D15 (2026-10-12, record §L5-D15): `--refined` prices the shared pair as the traces show it -- the card with more slabs runs alone at 417 once its
+# partner is done (m = min, M = max: m*678 + (M-m)*417); `--pn trace` uses the 2026-10-07 trace's own miss-count distribution instead of the binomial-like
+# one below; `--slab MB` scales the per-slab times to another expert size (the IQ3_XXS hybrid: ~9.0 MB, 16.84 GB / ~1 870 experts a card).
+import itertools, sys
 P = [.011,.067,.178,.268,.253,.152,.058,.012,.001]; LAYERS = 42
+if "--pn" in sys.argv and sys.argv[sys.argv.index("--pn") + 1] == "trace": P = [.038,.099,.212,.210,.196,.149,.058,.028,.010]
+REFINED = "--refined" in sys.argv
+SLAB = float(sys.argv[sys.argv.index("--slab") + 1]) if "--slab" in sys.argv else 11.67
+AL, SH = 417 * SLAB / 11.67, 678 * SLAB / 11.67
 def t_cards(cl, ca, cb):
-    return max(cl*417, ca*(678 if cb>0 else 417), cb*(678 if ca>0 else 417))
+    if REFINED:
+        m, M = min(ca, cb), max(ca, cb)
+        return max(cl*AL, m*SH + (M-m)*AL if m else M*AL)
+    return max(cl*AL, ca*(SH if cb>0 else AL), cb*(SH if ca>0 else AL))
 def best(n, tc=None, delta=0.0):
     b = 1e9
     for cl in range(n+1):
@@ -22,7 +32,7 @@ print("opt : " + " ".join("%5.0f"%best(n) for n in range(9)), " avg/layer %.0f u
 # continuous bound. ERRATUM 2026-10-07: this used 52 GB/s, which is M4's all-three figure for an EQUAL split (3 GB over the slowest card's time, the lone card idles
 # after 35 ms); with the loads balanced all three run at once (lone 28 + the shared pair 18 + 18 = 62-64 GB/s, the engine's own 62.4), and THAT is the bound.
 for agg_gbs, why in ((52.0, "WRONG: M4's equal-split artifact"), (62.4, "balanced: 28 + 17.2 + 17.2, the engine's own figure")):
-    agg = 11.67/(agg_gbs*1e3)*1e6   # us per slab
+    agg = SLAB/(agg_gbs*1e3)*1e6   # us per slab
     cont = sum(p*n*agg for n,p in enumerate(P))
     print("continuous 3-link bound at %.1f GB/s (%s): %.0f us/layer -> %.1f ms/token (%.1f ms below the best slab split)" % (agg_gbs, why, cont, cont*LAYERS/1000, (base-cont)*LAYERS/1000))
 mean_n = sum(n*p for n,p in enumerate(P)); print("mean slabs/layer %.2f" % mean_n)
@@ -33,7 +43,7 @@ for tc in (350, 450, 600, 800, 1000, 1400):
     row = []
     for d in (0, 60, 120, 200):
         row.append((base - avg(tc, d))*LAYERS/1000)
-    print("  %6d %5.1f | %5.1f %5.1f %5.1f %5.1f" % (tc, 11.67/tc*1e3, *row))
+    print("  %6d %5.1f | %5.1f %5.1f %5.1f %5.1f" % (tc, SLAB/tc*1e3, *row))
 # upper bound with CPU + a continuous split of the rest
 print()
 print("share of layers where a CPU slab helps (tc=600,d=60):", sum(p for n,p in enumerate(P) if best(n,600,60) < best(n)-1))

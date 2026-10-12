@@ -11,7 +11,9 @@
 #   (stages 2 and 3 take the rig lock through run_chain.sh themselves; stage 1 only builds)
 # Watch: ckpt1006/watch_chain.sh ~/bench/glm_d15_chain.log ~/bench/franken/glm5/d15_gate/gate_run.log
 # Report: python3 ckpt1006/d15_pair_report.py ~/bench/franken/glm5/dtrace_v1d15_1 ~/bench/franken/glm5/dtrace_newd15_2 ~/bench/franken/glm5/dtrace_newd15_3 ~/bench/franken/glm5/dtrace_v1d15_4
-# Env: D15_ONLY (1,2,3), D15_TOKENS (decode tokens traced, default 24).
+# Env: D15_ONLY (1,2,3), D15_TOKENS (decode tokens traced, default 24), D15_ARMS / D15_TAG / D15_SHIPPED (the arms of stage 3, the dir tag, and the
+#   help-copy / adaptation part of the shipped flags; round 2: D15_SHIPPED="--adapt-prefill-cap 64 --adapt-halflife 512 --fetch-assign optimal"
+#   D15_ARMS="hc1=--glm-help-copy 1|hc2=--glm-help-copy 2|hc2=--glm-help-copy 2|hc1=--glm-help-copy 1" D15_TAG=d15b).
 set -u
 . "$HOME/bench/chain_preflight.sh"
 W=$HOME/src/franken-engine-d15; D=$W/franken/decode; BIN=franken_decode_glm_d15
@@ -47,10 +49,10 @@ IN
   [ $rc -ne 0 ] && { echo "exactness gate rc=$rc: no trace"; say_end $rc; }
 fi
 if has 3; then
-  echo "=== 3. paired kernel trace v1 new new v1 $(date +%T)"
-  TS_BIN="$D/$BIN" TS_TOKENS=${D15_TOKENS:-24} TS_TAG=d15 \
-  TS_SHIPPED="--adapt-prefill-cap 64 --adapt-halflife 512 --glm-help-copy 1 --gemm-lds 3 --gemm-lds-min-rows 16 --gemm-lds-splitk 1 --gemv-rowsplit 1 --gemv-rowsplit-waves 1 --gemv-q8fast 2 --glm-gemv-group 1" \
-  TS_ARMS="v1=--fetch-assign optimal-v1|new=--fetch-assign optimal|new=--fetch-assign optimal|v1=--fetch-assign optimal-v1" \
+  echo "=== 3. paired kernel trace, arms: ${D15_ARMS:-v1 new new v1} $(date +%T)"
+  TS_BIN="$D/$BIN" TS_TOKENS=${D15_TOKENS:-24} TS_TAG=${D15_TAG:-d15} \
+  TS_SHIPPED="${D15_SHIPPED:---adapt-prefill-cap 64 --adapt-halflife 512 --glm-help-copy 1} --gemm-lds 3 --gemm-lds-min-rows 16 --gemm-lds-splitk 1 --gemv-rowsplit 1 --gemv-rowsplit-waves 1 --gemv-q8fast 2 --glm-gemv-group 1" \
+  TS_ARMS="${D15_ARMS:-v1=--fetch-assign optimal-v1|new=--fetch-assign optimal|new=--fetch-assign optimal|v1=--fetch-assign optimal-v1}" \
   TRACE_MODEL="$M" TRACE_EG=$EG TRACE_SETTLE=48 \
     "$HOME/src/colibri/tools/hot-expert/ckpt1006/glm_arms_trace_seq.sh"; rc=$?
   say_end $rc

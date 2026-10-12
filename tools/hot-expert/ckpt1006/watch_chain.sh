@@ -32,18 +32,18 @@ while :; do
   nc=$(echo "$out" | sed -n 's/^N \([0-9]*\) .*/\1/p' | head -1); ne=$(echo "$out" | sed -n 's/^N [0-9]* \([0-9]*\)/\1/p' | head -1)
   alive=$(echo "$out" | sed -n 's/^ALIVE //p' | head -1)
   body=$(echo "$out" | sed -n '/^--- chain/,/^--- tails/p' | grep -v '^--- ')
-  ev=$(echo "$body" | grep -E "$PAT" | cut -c1-260)
+  ev=$(echo "$body" | grep -aE "$PAT" | cut -c1-260)
   [ -n "$ev" ] && echo "$ev"
   # glog lines (rocprofv3's `E1006 ... Opened result file`) are not errors whatever the letter says
-  echo "$ev" | grep -vE '^[EWI][0-9]{4} ' | grep -qE "GATE FAIL|ENGINE DIED|HIP error|[Aa]bort|core dumped|out of memory|OOM|REFUSED|Killed|Traceback|active=0|needs [0-9]|exact FAIL|none +FAIL|ref +FAIL|cos +FAIL|rc=[1-9]" && bad=1
+  echo "$ev" | grep -vE '^[EWI][0-9]{4} ' | grep -aqE "GATE FAIL|ENGINE DIED|HIP error|[Aa]bort|core dumped|out of memory|OOM|REFUSED|Killed|Traceback|active=0|needs [0-9]|exact FAIL|none +FAIL|ref +FAIL|cos +FAIL|rc=[1-9]" && bad=1
   if [ "${nc:-0}" = "$last_c" ] && [ "${ne:-0}" = "$last_e" ]; then quiet=$((quiet+1)); else quiet=0; fi
   last_c=${nc:-$last_c}; last_e=${ne:-$last_e}
   if [ "$quiet" -ge "$SILENT_POLLS" ]; then echo "SILENT: no new line in either log for $((SILENT_POLLS*45/60)) min (engine alive=$alive)"; quiet=0; fi
   # a dead engine with a chain that has not exited = a silent death (a crashed engine, a refused launch)
-  if [ "$alive" = 0 ] && ! echo "$body" | grep -qE "exit(ed)? rc"; then dead=$((dead+1)); else dead=0; fi
+  if [ "$alive" = 0 ] && ! echo "$body" | grep -aqE "exit(ed)? rc"; then dead=$((dead+1)); else dead=0; fi
   if [ "$dead" -ge 4 ]; then echo "DEAD: no engine/gate process for 3 min and the chain has not exited"; bad=1; dead=0; fi
-  if echo "$body" | grep -qE "exit(ed)? rc"; then
-    [ "$bad" = 1 ] && { echo "--- last lines of both logs (a bad end):"; echo "$out" | grep -E "^(CHAINTAIL|ENGINETAIL) " | cut -c1-260; }
+  if echo "$body" | grep -aqE "exit(ed)? rc"; then
+    [ "$bad" = 1 ] && { echo "--- last lines of both logs (a bad end):"; echo "$out" | grep -aE "^(CHAINTAIL|ENGINETAIL) " | cut -c1-260; }
     echo "WATCH END (bad=$bad)"; exit 0
   fi
   sleep 45

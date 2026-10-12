@@ -14,6 +14,10 @@
 RIG=${RIG:-rome}
 CHAIN=${1:?chain log on the rig}
 ENGINE=${2:-}
+# a path typed as ~/bench/... on the Mac arrives here as /Users/<me>/bench/... (the LOCAL shell expanded the tilde) and does not exist on the rig: the
+# watcher then saw an empty log forever and reported DEAD on a chain that had ended fine (2026-10-12, three times). Make such paths home-relative
+# (an ssh command runs in the rig's home directory).
+CHAIN=${CHAIN#$HOME/}; ENGINE=${ENGINE#$HOME/}
 SILENT_POLLS=${SILENT_POLLS:-27}              # 27 polls x 45 s = 20 minutes without a new line in either log
 PAT='=== gate-plan|=== glm5|=== dpf|=== run_chain|^[a-z0-9_]+ +(none|exact|cos|ref) +(ok|FAIL|PASS)|FAIL|PASS|rror|HIP error|[Aa]bort|core dumped|out of memory|OOM|needs [0-9]|REFUSED|Killed|Traceback|glm5_dpf |glm5_decode_ms_median|decode ms/token|covered_frac|vram_dev.*steady|^placement all|exit(ed)? rc|active=0|decode_prefetch='
 last_c=0; last_e=0; quiet=0; dead=0; bad=0
@@ -21,6 +25,7 @@ while :; do
   out=$(ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 "$RIG" '
     c='"$CHAIN"'; e='"${ENGINE:-/dev/null}"'
     nc=$(wc -l < $c 2>/dev/null || echo 0); ne=$(wc -l < $e 2>/dev/null || echo 0)
+    [ -f "$c" ] || echo "MISSING chain log $c on the rig"
     echo "N $nc $ne"
     # a live engine = the GPU process (the binary under the docker image shows as the container "franken_engine" or the gate process)
     if pgrep -f "[g]lm5_gpu_gate.sh|[f]ranken_decode_glm|[f]ranken_dec_glm|[f]ranken_decode_ds4|[f]ranken_decode " >/dev/null; then echo "ALIVE 1"; else echo "ALIVE 0"; fi
@@ -31,6 +36,7 @@ while :; do
   ' 2>&1) || { echo "ssh failed (retrying)"; sleep 30; continue; }
   nc=$(echo "$out" | sed -n 's/^N \([0-9]*\) .*/\1/p' | head -1); ne=$(echo "$out" | sed -n 's/^N [0-9]* \([0-9]*\)/\1/p' | head -1)
   alive=$(echo "$out" | sed -n 's/^ALIVE //p' | head -1)
+  echo "$out" | grep -a "^MISSING chain log" | head -1
   body=$(echo "$out" | sed -n '/^--- chain/,/^--- tails/p' | grep -av '^--- ')
   ev=$(echo "$body" | grep -aE "$PAT" | cut -c1-260)
   [ -n "$ev" ] && echo "$ev"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# glm_d21_chain.sh -- D21 (DECODE-OPEN-ITEMS-PLAN section 10, record §L5-D15): is card 0's decode helper on time again? Card 0 started its stage kernel ~350 us after the owner's
+# glm_d21_chain.sh -- D21 (CLOSED 2026-10-12, record §L5-D21: no gain; the baseline trace it reads was removed with the item) (DECODE-OPEN-ITEMS-PLAN section 10, record §L5-D15): is card 0's decode helper on time again? Card 0 started its stage kernel ~350 us after the owner's
 # plan in every 2026-10-12 trace (on time, ~20 us, through 2026-10-08); suspect the OverDrive reboot of 2026-10-11. Run AFTER `fan_od.sh disable` + reboot.
 # 1. builds the CLI from the rig's franken-engine main (franken_decode_glm_d21; not installed); 2. one rocprofv3 trace of the served hybrid at the shipped decode flags
 # (2 048 prompt tokens, 48 settle, 24 traced; the D15 arms' exact flags); 3. d15_wake_report.py on it and on the kept baseline ~/bench/franken/glm5/d21_baseline_trace.

@@ -3,8 +3,9 @@
 //
 //   A,<type>,<mode>,threads=N,<ws>,GBps=..,expert_ms=..,...
 //
-// type: iq4_xs | iq3_s | q6_k (pure expert of that type, rows scaled to ~11.67 MB) | glm (IQ3_S gate/up +
-//       IQ4_XS down, the real GLM-5.3-Flash expert, 11 665 408 B)
+// type: iq4_xs | iq3_s | iq2_s | q6_k (pure expert of that type, rows scaled to ~11.67 MB) | glm (IQ3_S gate/up +
+//       IQ4_XS down, the old IQ4_XS-model's GLM-5.3-Flash expert, 11 665 408 B) | hyb (IQ2_S gate/up + IQ3_S
+//       down, the served IQ3_XXS hybrid's routed expert at its real size, 8 978 432 B)
 // mode: whole = every thread takes WHOLE experts (task = gate + up + act + down); expert_ms = median time of
 //               one task on one thread while the others run too
 //       rows  = ONE expert at a time, its rows split across all threads (gate|up rows, barrier, down rows,
@@ -22,7 +23,7 @@
 using namespace cl;
 
 struct Opts {
-    std::vector<std::string> types{"iq4_xs", "glm", "iq3_s", "q6_k"};
+    std::vector<std::string> types{"iq4_xs", "glm", "iq3_s", "q6_k"};   // hyb and iq2_s only on request (--types)
     std::string mode = "both", ws = "both";
     std::vector<int> threads{1, 2, 3, 4, 5, 6, 7, 8};
     double secs = 1.0, warm = 0.3;       // whole mode: warm-up and measured window per config
@@ -60,7 +61,7 @@ static bool parse_args(int argc, char ** argv, Opts & o) {
         else if (a == "--fill-threads") o.fill_threads = atoi(val("--fill-threads"));
         else {
             fprintf(stderr,
-                "usage: %s [--types iq4_xs,glm,iq3_s,q6_k] [--mode whole|rows|both] [--ws cache|dram|both] [--threads 1-8]\n"
+                "usage: %s [--types iq4_xs,glm,iq3_s,q6_k,hyb,iq2_s] [--mode whole|rows|both] [--ws cache|dram|both] [--threads 1-8]\n"
                 "          [--secs 1.0] [--warm 0.3] [--rows-secs 0.6] [--min-experts 200] [--region-gb 4] [--cache-bytes 2097152]\n"
                 "          [--order 3,4,5,6,7,0,1,2] [--no-thp] [--fill-threads 8]\n", argv[0]);
             return false;
@@ -191,7 +192,7 @@ int main(int argc, char ** argv) {
     if ((int)slot_cpu.size() < maxT) { fprintf(stderr, "need %d distinct physical cores, have %zu in --order\n", maxT, slot_cpu.size()); return 2; }
     for (int t : o.threads) if (t < 1) { fprintf(stderr, "bad thread count\n"); return 2; }
 
-    printf("# cpulane part A. ggml %s (llama-glm53), kernels ggml_vec_dot_{iq4_xs,iq3_s,q6_K}_q8_K x86 AVX2, nrc=1, Q8_K activations\n", GGML_REV);
+    printf("# cpulane part A. ggml %s (llama-glm53), kernels ggml_vec_dot_{iq4_xs,iq3_s,iq2_s,q6_K}_q8_K x86 AVX2, nrc=1, Q8_K activations\n", GGML_REV);
     printf("# physical cores (first hw thread of each):");
     for (size_t i = 0; i < topo.cores.size(); ++i) { printf(" core%zu=cpu", i); for (size_t k = 0; k < topo.cores[i].size(); ++k) printf("%s%d", k ? "/" : "", topo.cores[i][k]); }
     printf("\n# thread slots -> cpu:");
@@ -217,7 +218,7 @@ int main(int argc, char ** argv) {
     int rc = 0;
     for (const std::string & type : o.types) {
         Expert ed, ec;
-        if (!make_expert(type, kExpertBytes, ed) || !make_expert(type, o.cache_bytes, ec)) { fprintf(stderr, "unknown type %s\n", type.c_str()); return 2; }
+        if (!make_expert(type, dram_target_bytes(type), ed) || !make_expert(type, o.cache_bytes, ec)) { fprintf(stderr, "unknown type %s\n", type.c_str()); return 2; }
 
         {   // self-check on one filled piece: the kernels run, results are finite and non-trivial
             ABuf<uint8_t> one(ed.stride);
@@ -230,6 +231,10 @@ int main(int argc, char ** argv) {
                    type.c_str(), ed.bytes, ed.gate.rows, qname(ed.gate.t), ed.down.rows, qname(ed.down.t),
                    outs.g.p[0], outs.u.p[0], outs.o.p[0], s / ed.down.rows, (int)fin);
             if (!fin) { fprintf(stderr, "non-finite output in selfcheck of %s\n", type.c_str()); rc = 1; }
+            if ((type == "hyb" && ed.bytes != kHybExpertBytes) || (type == "glm" && ed.bytes != kExpertBytes) ||
+                (type == "hyb" && (ed.gate.rows != 2048 || ed.down.rows != 4096))) {
+                fprintf(stderr, "expert size of %s is %zu B, not the real one\n", type.c_str(), ed.bytes); rc = 1;
+            }
         }
 
         if (do_cache) fill_region(ec, cache.base, maxT, 4);

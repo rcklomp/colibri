@@ -1,6 +1,6 @@
 // ggml_stubs.c -- stand-ins for the few ggml.c / ggml-cpu.c symbols that ggml-quants.c and the x86 AVX2
 // quant kernels (ggml-cpu/arch/x86/quants.c) reference, so the benchmark links just those two objects and
-// not the whole of ggml. None of the three dot kernels measured here (IQ4_XS, IQ3_S, Q6_K) reads these
+// not the whole of ggml. None of the four dot kernels measured here (IQ4_XS, IQ3_S, IQ2_S, Q6_K) reads these
 // tables on this build (F16C: __F16C__ -> _cvtsh_ss), they are filled anyway for safety.
 #include <math.h>
 #include <stdarg.h>

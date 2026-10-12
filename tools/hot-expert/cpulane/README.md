@@ -8,7 +8,7 @@ arXiv 2608.16157), not two independent bandwidths.
 ## What is measured
 
 **Part A, `bench_cpu_gemv` (CPU only, host).** Batch-1 quantised GEMV with ggml's own x86 AVX2 kernels
-(`ggml_vec_dot_{iq4_xs,iq3_s,q6_K}_q8_K`, nrc = 1, activation quantised to Q8_K first, as llama.cpp does).
+(`ggml_vec_dot_{iq4_xs,iq3_s,iq2_s,q6_K}_q8_K`, nrc = 1, activation quantised to Q8_K first, as llama.cpp does).
 Weight GB/s against 1..8 threads, each on a distinct physical core (`sched_setaffinity`, first hardware thread
 of each core; order 3,4,5,6,7,0,1,2 so threads 1..5 sit on the cores part B gives the workers).
 - `--mode whole`: every thread takes whole experts (task = gate + up + activation + down). `expert_ms` = median
@@ -20,8 +20,10 @@ of each core; order 3,4,5,6,7,0,1,2 so threads 1..5 sit on the cores part B give
   ceiling. `piece_MB` is ~2, so its `expert_ms` is for a 2 MB mini-expert and is NOT comparable with `dram`.
 - `dram`: 4 GB region cut into expert-sized pieces visited in random-permutation order (a piece comes back only
   after all others), each piece read once per visit. This is the real access pattern.
-- types: `iq4_xs`, `iq3_s`, `q6_k` (pure expert, rows scaled so it is 11.67 MB) and `glm` (the real GLM-5.3-Flash
-  expert: IQ3_S gate/up + IQ4_XS down).
+- types: `iq4_xs`, `iq3_s`, `iq2_s`, `q6_k` (pure expert, rows scaled so it is 11.67 MB), `glm` (the expert of the
+  old IQ4_XS model: IQ3_S gate/up + IQ4_XS down, 11.67 MB) and `hyb` (the SERVED IQ3_XXS hybrid's routed expert:
+  IQ2_S gate/up + IQ3_S down, at its real size 8 978 432 B = 8.98 MB, NOT scaled; in `cache` mode it is scaled to ~2 MB
+  like every type). The default `--types` stays `iq4_xs,glm,iq3_s,q6_k`; `hyb` and `iq2_s` run only on request.
 
 **Part B, `bench_h2d_cpu` (HIP, docker; STARTING IT INITIALISES THE GPUs).** Per card one host thread issues blocking
 `hipMemcpyAsync` + `hipStreamSynchronize` of 11 665 408 B pieces, cycling through a 2 GB `hipHostMalloc(Portable)`
@@ -64,12 +66,23 @@ throughput net of the DDR contention), `agg_vs_B2` (what the CPU does to the H2D
 
 ## Assumptions
 
-- Shapes read from `~/src/franken-engine/franken/decode/glm5_shapes.h` and `GLM5.md` section 4: N_EMBD 4096,
+- `hyb` shapes read from the GGUF header of `~/models/GLM-5.3-Flash/hybrid-HYB-IQ3XXS/...-00001-of-00001.gguf`
+  (2026-10-13, `ckpt1006/gguf_tensor_types.py` parser): `blk.N.ffn_gate_exps` / `ffn_up_exps` = ne [4096, 2048, 288]
+  IQ2_S (2048 rows x K 4096, 16 blocks x 82 B = 1312 B/row = 2 686 976 B per expert each), `ffn_down_exps` = ne
+  [2048, 4096, 288] IQ3_S (4096 rows x K 2048, 8 x 110 = 880 B/row = 3 604 480 B): 8 978 432 B. This holds for layers
+  3..43 except 11, 12 (39 layers). Not modelled: layer 11 (IQ3_S/IQ3_S/IQ4_XS = the `glm` expert, 11.67 MB), layers 12
+  and 44 (IQ2_S/IQ2_S/IQ4_XS, 9.83 MB), layer 45 (NextN, Q3_K/Q3_K/Q4_K, unused by the text tower); layers 0-2 are
+  dense. No Q6_K anywhere in the hybrid's experts.
+- Shapes of `glm` read from `~/src/franken-engine/franken/decode/glm5_shapes.h` and `GLM5.md` section 4: N_EMBD 4096,
   N_FF_EXP 2048, 288 experts, 8 used; gate and up 2048 rows x K 4096 (IQ3_S, 1760 B/row = 3.60 MB each), down
   4096 rows x K 2048 (IQ4_XS, 1088 B/row = 4.46 MB): 11 665 408 B. Layer 11 (15.79 MB) and layers 12, 44 (Q6_K
-  down, 14.09 MB) are not modelled. Pure-type experts keep K and the 1 : 1 : 2 row ratio, rows scaled to ~11.67 MB.
+  down, 14.09 MB) are not modelled for `glm`. Pure-type experts keep K and the 1 : 1 : 2 row ratio, rows scaled to ~11.67 MB.
 - Weights are random bytes shaped like valid blocks with a finite fp16 scale (`d` in [2^-8, 2^-7)); outputs are
-  checked finite. Timing does not depend on values.
+  checked finite. Timing does not depend on values. Every bit pattern is a valid payload for all four formats
+  (read from `ggml_vec_dot_iq2_s_q8_K`): the IQ2_S grid index is `qs[i] | (qh bits << 8 & 0x300)` <= 1023 into the
+  1024-entry `iq2s_grid`, the 32 sign bytes and the 4-bit scales take any value, and the grid tables are `static
+  const` in `ggml-common.h` (no `iq2xs_init_impl`, which is quantiser-only). The random grid indices touch the 8 KB
+  `iq2s_grid` uniformly, real weights concentrate on fewer entries: an L1 effect, not a DRAM one.
 - ggml: `~/src/llama-glm53` @ 39931761a (the checkout franken-engine links); the x86 quant kernels are byte-identical in
   `~/src/llama.cpp` and `~/src/llama-latest`. Read only, built in this directory.
 - Per task: gate and up share a pre-quantised Q8_K input (not timed); between up and down `h = clamp(g*u)` stands

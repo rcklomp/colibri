@@ -1,6 +1,6 @@
 // cpu_gemv.h -- shared by bench_cpu_gemv.cpp (part A) and bench_h2d_cpu.hip (part B).
 //
-// Batch-1 quantised GEMV with ggml's own AVX2 dot kernels (ggml_vec_dot_{iq4_xs,iq3_s,q6_K}_q8_K,
+// Batch-1 quantised GEMV with ggml's own AVX2 dot kernels (ggml_vec_dot_{iq4_xs,iq3_s,iq2_s,q6_K}_q8_K,
 // nrc = 1, the shape llama.cpp uses for one decode token), a synthetic "expert" made of three
 // such matrices, a piece-cycling DRAM region, physical-core topology + pinning helpers, a spin
 // barrier, and the whole-expert worker loop that both programs run.
@@ -31,6 +31,7 @@
 extern "C" {
 void ggml_vec_dot_iq4_xs_q8_K(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
 void ggml_vec_dot_iq3_s_q8_K (int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
+void ggml_vec_dot_iq2_s_q8_K (int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K  (int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
 void quantize_row_q8_K_ref(const float * x, void * y, int64_t k);   // ggml-quants.c: what llama.cpp's quantize_row_q8_K calls
 void cpulane_ggml_init(void);                                       // ggml_stubs.c: fills ggml_table_f32_f16 & co
@@ -45,18 +46,28 @@ inline int64_t now_ns() {
 inline void cpu_relax() { __builtin_ia32_pause(); }
 
 // ------------------------------------------------------------------ quant formats
-enum QType : int { Q_IQ4_XS = 0, Q_IQ3_S = 1, Q_Q6_K = 2 };
-constexpr int    QK_K = 256;            // weights per super-block, all three formats
+enum QType : int { Q_IQ4_XS = 0, Q_IQ3_S = 1, Q_Q6_K = 2, Q_IQ2_S = 3 };
+constexpr int    QK_K = 256;            // weights per super-block, all four formats
 constexpr size_t Q8K_BLOCK_BYTES = 292; // block_q8_K: float d + int8 qs[256] + int16 bsums[16]
 
-inline size_t block_bytes(QType t) { return t == Q_IQ4_XS ? 136 : t == Q_IQ3_S ? 110 : 210; }
-// offset of the fp16 super-scale `d` inside a block (block_iq4_xs / block_iq3_s: first; block_q6_K: last)
+// bytes per 256 weights: block_iq4_xs 136, block_iq3_s 110 (2 + 64 + 8 + 32 + 4), block_q6_K 210, block_iq2_s 82 (2 + 64 + 8 + 8)
+inline size_t block_bytes(QType t) {
+    switch (t) { case Q_IQ4_XS: return 136; case Q_IQ3_S: return 110; case Q_IQ2_S: return 82; default: return 210; }
+}
+// offset of the fp16 super-scale `d` inside a block (block_iq4_xs / block_iq3_s / block_iq2_s: first; block_q6_K: last)
 inline size_t d_offset(QType t) { return t == Q_Q6_K ? 208 : 0; }
-inline const char * qname(QType t) { return t == Q_IQ4_XS ? "iq4_xs" : t == Q_IQ3_S ? "iq3_s" : "q6_k"; }
+inline const char * qname(QType t) {
+    switch (t) { case Q_IQ4_XS: return "iq4_xs"; case Q_IQ3_S: return "iq3_s"; case Q_IQ2_S: return "iq2_s"; default: return "q6_k"; }
+}
 
 typedef void (*dot_fn)(int, float *, size_t, const void *, size_t, const void *, size_t, int);
 inline dot_fn dot_for(QType t) {
-    return t == Q_IQ4_XS ? ggml_vec_dot_iq4_xs_q8_K : t == Q_IQ3_S ? ggml_vec_dot_iq3_s_q8_K : ggml_vec_dot_q6_K_q8_K;
+    switch (t) {
+        case Q_IQ4_XS: return ggml_vec_dot_iq4_xs_q8_K;
+        case Q_IQ3_S:  return ggml_vec_dot_iq3_s_q8_K;
+        case Q_IQ2_S:  return ggml_vec_dot_iq2_s_q8_K;
+        default:       return ggml_vec_dot_q6_K_q8_K;
+    }
 }
 inline size_t q8_row_bytes(int K) { return (size_t)(K / QK_K) * Q8K_BLOCK_BYTES; }
 
@@ -66,6 +77,12 @@ inline size_t q8_row_bytes(int K) { return (size_t)(K / QK_K) * Q8K_BLOCK_BYTES;
 // = 7 208 960 + 4 456 448 = 11 665 408 B ("11.67 MB", GLM5.md section 4).
 constexpr size_t kExpertBytes = 11665408;
 constexpr int    kKgu = 4096, kKdown = 2048;
+// The served IQ3_XXS hybrid GGUF (GLM-5.3-Flash-HYB-IQ3XXS; blk.3..43 except 11, 12; read from the GGUF header 2026-10-13):
+//   gate, up [2048 rows x K=4096] IQ2_S (16 blocks x 82 B = 1312 B/row)  + down [4096 rows x K=2048] IQ3_S (8 x 110 = 880 B/row)
+// = 2 * 2 686 976 + 3 604 480 = 8 978 432 B ("8.98 MB"). The `hyb` type is this expert at its real size, NOT scaled to kExpertBytes.
+constexpr size_t kHybExpertBytes = 8978432;
+// bytes of the DRAM-resident expert of a type: the real mixes keep their real size, the pure types are scaled to kExpertBytes
+inline size_t dram_target_bytes(const std::string & name) { return name == "hyb" ? kHybExpertBytes : kExpertBytes; }
 
 struct Mat {
     QType  t = Q_IQ4_XS;
@@ -82,14 +99,17 @@ struct Expert {
     size_t stride = 0;   // piece pitch in a region (bytes rounded up to 4 KiB)
 };
 
-// name: "glm" (the real GLM mix: IQ3_S gate/up, IQ4_XS down), or a pure "iq4_xs" / "iq3_s" / "q6_k".
+// name: "glm" (the old IQ4_XS-model mix: IQ3_S gate/up, IQ4_XS down), "hyb" (the served hybrid's mix: IQ2_S gate/up,
+// IQ3_S down), or a pure "iq4_xs" / "iq3_s" / "iq2_s" / "q6_k".
 // Row counts are chosen so that the expert is ~target_bytes (gate = up = r rows, down = 2r rows, i.e. the
-// real 1 : 1 : 2 row ratio; for "glm" and target = kExpertBytes, r = 2048 exactly).
+// real 1 : 1 : 2 row ratio; for "glm" and target = kExpertBytes, and for "hyb" and target = kHybExpertBytes, r = 2048 exactly).
 inline bool make_expert(const std::string & name, size_t target_bytes, Expert & e) {
     QType tg, td;
     if      (name == "glm")    { tg = Q_IQ3_S;  td = Q_IQ4_XS; }
+    else if (name == "hyb")    { tg = Q_IQ2_S;  td = Q_IQ3_S; }
     else if (name == "iq4_xs") { tg = td = Q_IQ4_XS; }
     else if (name == "iq3_s")  { tg = td = Q_IQ3_S; }
+    else if (name == "iq2_s")  { tg = td = Q_IQ2_S; }
     else if (name == "q6_k")   { tg = td = Q_Q6_K; }
     else return false;
     const size_t rb_gu = (kKgu / QK_K) * block_bytes(tg), rb_dn = (kKdown / QK_K) * block_bytes(td);
@@ -112,9 +132,11 @@ struct Rng {
     float uniform() { return (float)(next() >> 40) * (1.0f / 8388608.0f) - 1.0f; }   // [-1, 1)
 };
 
-// Random bytes shaped like valid blocks: every bit pattern is a valid quant payload for these three
-// formats (IQ3_S grid index <= 511, IQ4_XS nibbles index a 16-entry table, Q6_K any), only the fp16
-// super-scale `d` must be finite, so it is overwritten with a normal value in [2^-8, 2^-7).
+// Random bytes shaped like valid blocks: every bit pattern is a valid quant payload for these four
+// formats (IQ3_S grid index <= 511 of a 512-entry table, IQ2_S grid index qs | (qh & 3) << 8 <= 1023 of a
+// 1024-entry table, sign bytes and 4-bit scales of IQ2_S / IQ3_S take any value, IQ4_XS nibbles index a 16-entry
+// table, Q6_K any), only the fp16 super-scale `d` must be finite, so it is overwritten with a normal value in
+// [2^-8, 2^-7). The iq2s_grid / iq3s_grid tables are static const in ggml-common.h: no init call is needed.
 inline void fill_piece(const Expert & e, uint8_t * p, uint64_t seed) {
     Rng r(seed);
     uint64_t * q = (uint64_t *)p;

@@ -7,6 +7,7 @@
 # NOT verified on the rig: the files do not exist until the module is loaded with the bit, so `curve` and `auto` are untested against the real driver (they are tested against a fake tree, see FAN_OD_ROOT). `status` reads back everything.
 #
 #   fan_od.sh status   read only, no root: per card the temperatures (edge / junction / memory), fan rpm and pwm, the gpu_od/fan_ctrl files, the ppfeaturemask in use and the one configured.
+#   fan_od.sh disable  ROOT: removes that file and runs update-initramfs (back to the stock mask; REBOOT). D21: OverDrive on coincides with card 0's late decode wake.
 #   fan_od.sh enable   ROOT: writes /etc/modprobe.d/amdgpu-od.conf (`options amdgpu ppfeaturemask=<current | 0x4000>`) and runs update-initramfs. Needs a REBOOT to take effect (three busy cards: no module reload). Idempotent.
 #   fan_od.sh curve    ROOT, after the reboot: per card a fan curve that is fan-friendly (about 40 % at 40 C, 100 % at 85 C of the curve's own axis, clamped to the driver's OD_RANGE) and the zero-RPM stop OFF
 #                      (the fans never stop); reads the result back. Only ever raises fan speed against stock; noise goes up. Does not persist over a reboot (re-run it, or add it to a boot unit once it has proven itself).
@@ -57,6 +58,14 @@ enable() {
   echo "wrote ${CONF#$R}: ppfeaturemask $cur -> $new"
   if [ -z "$R" ]; then update-initramfs -u -k all 2>&1 | tail -3; fi
   echo "DONE. Reboot the rig (service is off, the reservation flag stays) and then run:  ./fan_od.sh status   (gpu_od/fan_ctrl must be listed), then  sudo ./fan_od.sh curve"
+}
+
+disable() {   # D21 (2026-10-12): back to the stock mask. Since the OverDrive reboot of 2026-10-11 21:47 UTC card 0's decode helper starts ~350 us after the plan
+  # (on time, ~20 us, in every trace through 2026-10-08, the same binary included); O7 is closed, so the bit has no use left. Needs a REBOOT.
+  need_root "$@"
+  if [ -f "$CONF" ]; then rm -f "$CONF"; echo "removed ${CONF#$R}"; else echo "${CONF#$R} absent: nothing to remove"; fi
+  if [ -z "$R" ]; then update-initramfs -u -k all 2>&1 | tail -3; fi
+  echo "DONE. Reboot the rig; then ./fan_od.sh status must say 'OverDrive bit 0x4000 CLEARED'"
 }
 
 axis_range() {   # axis_range FILE "FAN_CURVE(hotspot temp)" -> "lo hi" (numbers only) from the OD_RANGE block of fan_curve
@@ -156,9 +165,10 @@ auto() {
 case "$MODE" in
   status) status;;
   enable) enable "$@";;
+  disable) disable "$@";;
   curve)  curve "$@";;
   auto)   auto "$@";;
   probe)  probe "$@";;
   target) target "$@";;
-  *) sed -n 2,3p "$0" | cut -c1-200; echo "usage: $0 status|enable|curve|auto|probe|target" >&2; exit 2;;
+  *) sed -n 2,3p "$0" | cut -c1-200; echo "usage: $0 status|enable|disable|curve|auto|probe|target" >&2; exit 2;;
 esac

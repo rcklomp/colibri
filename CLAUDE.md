@@ -266,7 +266,8 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   `~/src/franken-engine` (build there: `make -C franken/decode cpu gpu`, ds4/glm
   targets per its README); agents commit there and the orchestrator pushes as
   `claude-bot` (Gitea only; the Mac's `~/.config/git/gitea-credentials`, mode 600, never printed): `git -c credential.helper= -c "credential.helper=store --file=$HOME/.config/git/gitea-credentials" push origin main` (land recipe: handoff 06b §2). The copies under
-  `tools/hot-expert/franken` and `tools/hot-expert/m1` in THIS repo are frozen
+  `tools/hot-expert/franken` (except the live launchers `start_franken*.sh`,
+  edited at every install) and `tools/hot-expert/m1` in THIS repo are frozen
   history -- do not edit them. The measurement record, plan, gateway and all
   serving/acceptance tooling stay here.
 - **Port 8081 may not be GLM (since 2026-09-21).** `tools/hot-expert/serve_alt.sh

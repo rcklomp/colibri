@@ -1,6 +1,8 @@
 # cpulane: can 5-6 CPU cores compute missed experts while three GPUs stream over PCIe?
 
-Question: of the experts that miss VRAM (avg 3.4 of 8 per layer, 11.67 MB each), could the CPU compute some
+Status 2026-10-13: the question is answered yes. The engine's lane is built (D10, record §L5-D10-LANE); this directory is the benchmark whose `hyb` type (0.465 ms an expert on 6 cores) sized it.
+
+Question: of the experts that miss VRAM (avg 3.4 of 8 per layer, 11.67 MB each; IQ4_XS era, the served hybrid's expert is 8.98 MB and the CLI plan misses ~2.4 a layer), could the CPU compute some
 straight from host RAM (~20 GB/s of weights, one expert in ~0.5-0.6 ms) *while* the three H2D streams run? The
 CPU GEMV and the DMA reads share the DDR controllers, so part B measures the concurrent pair (FreeToken,
 arXiv 2608.16157), not two independent bandwidths.
@@ -92,9 +94,6 @@ throughput net of the DDR contention), `agg_vs_B2` (what the CPU does to the H2D
   also keeps its workers spinning.
 - The rig's CPU governor/boost is not pinned; results are at whatever clock the 7F32 runs under this load.
 
-## Not verified
+## What was run
 
-Part B was compiled, never started (no GPU run was allowed). Its fake-HIP logic (phases, counters, line format,
-thread start/stop) was exercised on a Mac with stub HIP/ggml, which says nothing about real rates. Part A's full
-matrix (128 configs, estimated ~2.5 min) was not run either, only a 1-thread smoke: IQ4_XS 10.9 GB/s cache and
-10.3 GB/s DRAM, Q6_K 21.0, IQ3_S 2.6, glm mix 3.6 GB/s cache-resident per core.
+Part A and Part B were run 2026-10-07 through `run_chain.sh` (results/{A,B,vsA}.txt, record §L5-GLM-CPULANE); `hyb` part A 2026-10-13 (results/hyb_A.txt). Not run: part B with `hyb`.

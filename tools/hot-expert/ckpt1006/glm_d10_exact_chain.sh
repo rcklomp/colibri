@@ -1,4 +1,5 @@
 #!/bin/bash
+# The d10l binaries were deleted after the install (2026-10-13); to rerun, build main's lane CLI/serve with ckpt1006/build_d10adapt.sh and pass the path (D10X_LANE_BIN).
 # glm_d10_exact_chain.sh -- D10 (ACTION-LIST row 8): is the CPU lane's branch (franken-engine d10-cpu-lane 0436ded; CLI ~/bench/franken_bin/franken_decode_glm_d10l) BIT-EXACT to main (fe7607a = the installed .pf15
 # code 890b75f + docs) with the lane OFF (`--cpu-lane 0`, the default: no lane object, no lane kernel, the plan's CPU count 0), and does `--cpu-lane 6` decode sane text? Exactness and sanity only; the task-level
 # quality of the lane (MMLU-Pro, needle) is glm_d10_quality_chain.sh.

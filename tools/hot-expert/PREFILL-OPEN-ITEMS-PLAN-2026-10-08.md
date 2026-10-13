@@ -1,8 +1,8 @@
-# PLAN 2026-10-08 (night) -- the open PREFILL items of GLM-5.3-Flash on `rome` (plan Rev 121; Rev 122-127 changed nothing prefill (124 process, the rest decode))
+# PLAN 2026-10-08 (night) -- the open PREFILL items of GLM-5.3-Flash on `rome` (plan Rev 121; Rev 122-128 changed nothing prefill (124 process, the rest decode))
 
 Companion of `DECODE-OPEN-ITEMS-PLAN-2026-10-08.md`; the master plan is `FRANKEN-ENGINE-PLAN-2026-09-15.md`, the state is `HANDOFF-2026-10-06b.md`. This file owns **prefill only**. It is separate from the decode plan for one reason: **the gate is different.** A decode change must be bit-exact (maxabs 0 on 1 788 taps) and is judged by the paired kernel trace; a prefill change that reorders a sum (a new GEMM tile kernel) cannot be bit-exact and goes through the **quality gate** (`franken_quality_chain.sh`: the 70-question MMLU-Pro sample and the needle set, record §L0-QUALITY), and the instrument is the prefill device timeline (`--timeline`), not the decode trace. The served `--gemm-lds 1` is the precedent: prefill 16.9 -> 9.3 ms/token, "a last-bits order change, judged by the quality run" (`start_franken_glm.sh`).
 
-Status (2026-10-12, plan Rev 121; Rev 122-127 changed nothing prefill (124 process, the rest decode)): **PF15 is done and installed (section 0j, record §L5-PF15-INSTALL: prefill 2.214 ms/token on 8k prose).** Nothing prefill is queued; PF13 and PF16 (shrink the f32 attention partial buffers for --expert-gb, from 0j) are parked. Done or closed: PF0, PF9, PF12, PF3 (stopped), PF4 (closed), PF10 (stopped), PF14 (installed, owner decision O6 = yes), PF2, PF2c, PF15. **Read section 0j first; where lettered sections disagree, the later letter wins.** Section 0 (the numbered one) and sections 1-7 are the plan as written on 2026-10-08 night, before measuring, kept as written; every number in them is quoted with its source and conditions; 'estimate' means no run supports it.
+Status (2026-10-12, plan Rev 121; Rev 122-128 changed nothing prefill (124 process, the rest decode)): **PF15 is done and installed (section 0j, record §L5-PF15-INSTALL: prefill 2.214 ms/token on 8k prose).** Nothing prefill is queued; PF13 and PF16 (shrink the f32 attention partial buffers for --expert-gb, from 0j) are parked. Done or closed: PF0, PF9, PF12, PF3 (stopped), PF4 (closed), PF10 (stopped), PF14 (installed, owner decision O6 = yes), PF2, PF2c, PF15. **Read section 0j first; where lettered sections disagree, the later letter wins.** Section 0 (the numbered one) and sections 1-7 are the plan as written on 2026-10-08 night, before measuring, kept as written; every number in them is quoted with its source and conditions; 'estimate' means no run supports it.
 
 ## 0j. PF15 -- the DSA attention kernel at a chunk (opened 2026-10-10 in 0i; READ and build 2026-10-12, plan Rev 120; DONE and INSTALLED 2026-10-12, plan Rev 121) -- READ THIS FIRST; where it disagrees with 0i, 0j wins
 
@@ -173,7 +173,7 @@ PF0 ends with a table in the record and a ranked list. **Decision rule:** each o
 | ID | Item | Why |
 |---|---|---|
 | PF7 | staging back on / DMA tricks | in place beats staging at every chunk size (§L5-GLM-STAGECROSS: -4..-7 % at 512-1 024 rows); revisit only if PF3 changes what the links can do |
-| PF8 | CPU-assisted prefill (the EPYC computes part of the experts) | decode's CPU lane (D10) needs the same quantised CPU kernels; look at it only after D10's gate |
+| PF8 | CPU-assisted prefill (the EPYC computes part of the experts) | decode's CPU lane (D10) needs the same quantised CPU kernels; look at it only after D10's gate [Rev 128: D10 is done and its CPU slab kernels exist (record §L5-D10-LANE item 1); PF8 stays parked] |
 
 ## 4. Order and expected total
 

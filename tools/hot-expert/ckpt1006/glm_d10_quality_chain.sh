@@ -1,7 +1,8 @@
 #!/bin/bash
+# The d10l binaries were deleted after the install (2026-10-13); to rerun, build main's lane CLI/serve with ckpt1006/build_d10adapt.sh and pass the path (D10Q_BIN).
 # glm_d10_quality_chain.sh -- D10 (ACTION-LIST row 8): the task-level quality of the CPU lane (`FRANKEN_GLM_CPU_LANE=6` on top of the shipped config) through the REAL gateway,
 # same protocol as §L5-PF2c / §L5-PF14-QUALITY: franken_quality_chain.sh ARMS=franken-glm, the frozen 70-question MMLU-Pro sample, reasoning xhigh, 16 000-token budget, greedy, then the
-# needle set. The engine is the D10 serving build `franken_dec_glm_d10l` (NOT installed, franken-engine branch d10-cpu-lane) on the hybrid GGUF; results ~/bench/franken_quality/franken_glm_d10.jsonl.
+# needle set. The engine is the D10 serving build `franken_dec_glm_d10l` (the fixed-table lane build; installed later as .d10a with the adaptive table) on the hybrid GGUF; results ~/bench/franken_quality/franken_glm_d10.jsonl.
 # Why a task-level gate: a CPU slot runs ggml's Q8_K activation chain (CPU vs GPU row rel-L2 1.8 %, max 2.1 %, record §L5-D10-LANE); answers change.
 # Bar (O4, set before the run): MMLU-Pro inside the Wilson interval of the installed .pf15 (55/70 = 78.6 %, 95 % [67.6, 86.6], i.e. fewer than 48 of 70 is a fail)
 # and no needle miss the installed binary got right (8/8 at 30k/60k/120k/200k).

@@ -1,4 +1,5 @@
 #!/bin/bash
+# The d10l binaries were deleted after the install (2026-10-13); to rerun, build main's lane CLI/serve with ckpt1006/build_d10adapt.sh and pass the path (edit GPU=).
 # glm_d10_lane_chain.sh -- D10 (ACTION-LIST row 8): the CPU lane, first GPU runs. One process: a check arm (--cpu-lane-check 1: CPU vs GPU row rel-L2) then lane off,on,on,off at the §L5-D21 plan and shipped flags.
 # Launch (rig idle, service OFF, reservation flag in place):
 #   setsid nohup ~/src/colibri/tools/hot-expert/run_chain.sh ~/bench/glm_d10_lane_chain.sh > ~/bench/glm_d10_lane_chain.log 2>&1 < /dev/null &

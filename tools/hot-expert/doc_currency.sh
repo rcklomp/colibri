@@ -119,14 +119,14 @@ else echo "  ok: none"; fi
 echo
 echo "=== the action list (tools/hot-expert/ACTION-LIST.md) ==="
 # Added 2026-10-08 night: the order of work lives in ONE living file; a plan item can be added, finished or dropped without it noticing. Checks: the file exists and CLAUDE.md names it;
-# every status is one of the allowed words; every D / PF / V id in a table resolves to a row or section of a plan; at most one `doing` row needs the rig; a `done` or `dropped` row says
+# every status is one of the allowed words; every D / PF / V / QB id in a table resolves to a row or section of a plan; at most one `doing` row needs the rig; a `done` or `dropped` row says
 # where the result is. Whether the order is RIGHT is the closeout skill's governance read-through, not this script's.
 AL=tools/hot-expert/ACTION-LIST.md
 if [ ! -f "$AL" ]; then echo "  MISSING: $AL"; fail=1
 else
   grep -q "ACTION-LIST.md" CLAUDE.md && echo "  ok: CLAUDE.md names the action list" || { echo "  STALE: CLAUDE.md does not name ACTION-LIST.md"; fail=1; }
-  PLANS="tools/hot-expert/DECODE-OPEN-ITEMS-PLAN-2026-10-08.md tools/hot-expert/PREFILL-OPEN-ITEMS-PLAN-2026-10-08.md $PL"
-  rows=$(awk -F'|' 'function t(x){gsub(/^ +| +$/,"",x);return x} NF>=9 && t($3) ~ /^(D|PF|V)[0-9]+[a-z]?$/ {printf "%s\t%s\t%s\t%s\n", t($3), t($5), t($6), t($9)}' "$AL")
+  PLANS="tools/hot-expert/DECODE-OPEN-ITEMS-PLAN-2026-10-08.md tools/hot-expert/PREFILL-OPEN-ITEMS-PLAN-2026-10-08.md tools/hot-expert/QUALITY-BENCH-PLAN-2026-10-13.md $PL"
+  rows=$(awk -F'|' 'function t(x){gsub(/^ +| +$/,"",x);return x} NF>=9 && t($3) ~ /^(D|PF|V|QB)[0-9]+[a-z]?$/ {printf "%s\t%s\t%s\t%s\n", t($3), t($5), t($6), t($9)}' "$AL")
   nrows=$(printf '%s\n' "$rows" | grep -c . || true)
   bad=0; doing_rig=0
   while IFS=$'\t' read -r id st needs res; do

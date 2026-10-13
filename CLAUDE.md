@@ -7,7 +7,7 @@ Follow it before forming any plan.
 
 ## Read first, in this order
 
-**Step 0, before any of the four below: run `tools/hot-expert/doc_currency.sh`.**
+**Step 0, before anything below: run `tools/hot-expert/doc_currency.sh`.**
 It exits non-zero when the docs this section tells you to trust are behind the
 tree, and it takes seconds — no rig, no engine. It exists because on 2026-09-15
 three separate stale pointers were found in one day and every one of them was
@@ -345,7 +345,7 @@ editing on both sides. Bench scripts and logs on the rig are in `~/bench`.
   checkpointed (`CKPT hit prefix=4011` in the server log): (Colibri engine: a new conversation ~20 s, a follow-up ~2 s, a changed
   tool set one cold prefill of ~4.5 min since F2, then captured again.
   FRANKEN engine, installed: warm new chat ~0.7-0.9 s, follow-up ~0.7-1.0 s,
-  a cold 4 574-token tool prompt ~19 s, handoff 06b section 1). The server
+  a cold 4 574-token tool prompt 19 s on `.hc`, 16.5 s on `.pf14`, not re-measured since PF2/PF2c/PF15, handoff 06b section 1). The server
   caches presets: after a `webui.db` edit call `GET /api/models`. Drive its
   backend from inside the container (PyJWT token from `WEBUI_SECRET_KEY`;
   never `import open_webui` in a side process, it runs the migrations); the
